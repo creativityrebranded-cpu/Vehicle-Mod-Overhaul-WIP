@@ -321,7 +321,7 @@ namespace vehicleflight
 		Shared& g_sh = g_shs[0];
 		const char* Who(int idx)
 		{
-			static const char* names[kPilots] = { "Rover", "NPC rover 1", "NPC rover 2", "NPC rover 3" };
+			static const char* names[kPilots] = { "Rover", "NPC rover 1", "NPC rover 2", "NPC rover 3", "NPC rover 4", "NPC rover 5", "NPC rover 6" };
 			return names[std::clamp(idx, 0, kPilots - 1)];
 		}
 

@@ -25,7 +25,7 @@ namespace prefetch
 		// Core: buried-player rescue (floor below / surface above).
 		kSlotRescue0 = kSlotCheck0 + kSlotCheckCount,
 		// SeamlessVehicle: NPC pilots 1..3, 16 each (7 model samples, then 9 avoidance corridors).
-		kSlotPilot0 = kSlotRescue0 + 2, kSlotPilotEach = 16, kSlotPilotCount = 3,
+		kSlotPilot0 = kSlotRescue0 + 2, kSlotPilotEach = 16, kSlotPilotCount = 6,
 		kSlotCount = kSlotPilot0 + kSlotPilotEach * kSlotPilotCount };
 
 	// Also service probes when the engine updates the loaded grid around this reference (the flown ship).

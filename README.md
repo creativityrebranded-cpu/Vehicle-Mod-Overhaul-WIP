@@ -22,7 +22,7 @@ SFSE works with the **Steam** version only (not Game Pass / Microsoft Store).
 | Mod | What it adds here | Link |
 |---|---|---|
 | **Parked Vehicles** (SarthesArai) | Parked REV-8 / Deimog / Moon Jumper props at cities and outposts. The plugin's vehicle registry records vehicles there; it does not create vehicles. | [Nexus mod 13838](https://www.nexusmods.com/starfield/mods/13838) |
-| **The Gang's All Here** (Aurelianis) | Several companions and crew following you at once (planned: each gets a vehicle). | [Nexus mod 7469](https://www.nexusmods.com/starfield/mods/7469) |
+| **The Gang's All Here** (Aurelianis) | Several companions and crew following you at once. When you get in a vehicle, each follower gets one too (see [Gang vehicles](#gang-vehicles)). Works with any followers; this mod just lets you have more. | [Nexus mod 7469](https://www.nexusmods.com/starfield/mods/7469) |
 | Deimog (Bethesda, free Creation) | Lets Parked Vehicles show Deimogs. | In-game Creations menu |
 
 Follow each optional mod's own install instructions. For The Gang's All Here, its page says to dismiss followers,
@@ -99,6 +99,21 @@ blue while on). The scanner shows Summon [N], Follow [U] and a SUMMONING / FOLLO
   Three contacts in 10 s: moved next to you.
 - **Flipped:** tipped over for 2 s: set upright where it is.
 
+## Gang vehicles
+
+Your followers (the game's follower list, which The Gang's All Here fills) take vehicles when you do:
+
+- **You get in a vehicle:** after about 1 s, every follower within 80 m who isn't already riding gets one:
+  1. your **spare vehicles** first (owned by you, or your own vehicle while you're in another one), within 400 m;
+  2. then the nearest **free vehicle** within 120 m of them, unowned before owned.
+
+  Nothing is spawned. Followers the game seats as your passengers stay passengers.
+- **While you drive:** they escort you in formation (left, right, then rows further back), match your speed and use
+  the same obstacle and trail navigation as your own vehicle.
+- **You get out:** they land and get out; their vehicles stay where they landed.
+- Up to **6** NPC vehicles at once; extra followers stay on foot.
+- **.** (period) switches them between Escort and Pursuit. Pursuit currently targets you; targeting enemies is next.
+
 ## Vehicle registry
 
 Nothing is spawned. Every real vehicle in the loaded area is recorded with its place, owner and who uses it
@@ -113,8 +128,12 @@ at Parked Vehicles spots are hidden once (one is kept).
 Tested in game: hover flight, gears, HUD buttons, summon / follow, NPC boarding with the comma key, NPC vehicles
 following with trail navigation and the gear system.
 
-Built, **not yet tested in game**: NPC vehicle weapon fire (Pursuit), aiming shots at the player, the
-tight-space handling, flip recovery, the vehicle registry and duplicate cleanup.
+Built, **not yet tested in game**: gang vehicles (boarding with you, formation, landing with you, 6 NPC
+vehicles), NPC vehicle weapon fire (Pursuit), aiming shots at the player, the tight-space handling, flip recovery,
+the vehicle registry and duplicate cleanup.
+
+Planned next: autopilot for your own vehicle (**B**), a contextual on-foot panel (Summon / Follow / Get in, no scanner),
+summon teleport rules, and gang combat against enemies (vehicle vs vehicle, passengers, getting out to fight).
 
 Logs to send when something goes wrong: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` (and
 `SeamlessVehicle.prev.log` for the previous session).

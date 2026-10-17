@@ -44,7 +44,7 @@ namespace npcvehicles
 
 		constexpr std::uint32_t kMountActor = 0x01951FB0, kCanMount = 0x0063AF00, kDismount = 0x01952530, kLookupForm = 0x005DE3B0,
 			kGetOwner = 0x0050AAD0, kIsVehicle = 0x00EC72A0;
-		constexpr int kJobs = 3;                 // NPC vehicles at once (vehicleflight pilots 1..3)
+		constexpr int kJobs = 6;                 // NPC vehicles at once (vehicleflight pilots 1..6)
 		constexpr double kFaceRange = 60.0;      // m: the force key picks an NPC in front of the player within this ...
 		constexpr double kFaceCone = 0.35;       // rad (20 degrees) either side of where the player faces
 		// Follow (the user, 2026-10-17: "the same as my rover", to see both): the rover's follow numbers (vehicleflight
@@ -87,6 +87,7 @@ namespace npcvehicles
 			double tx = 0, ty = 0, tvx = 0, tvy = 0;  // the followed target's last position and smoothed velocity
 			ULONGLONG aggroAt = 0;             // last combat request (attack)
 			Profile profile = Profile::Escort;
+			bool gang = false;                 // started by the gang (mirrors the player), not by the force key
 			bool firing = false;               // the vehicle weapon's fire input is held
 			ULONGLONG fireAt = 0;              // when the current burst / gap started
 			unsigned bursts = 0;
@@ -465,6 +466,7 @@ namespace npcvehicles
 			j.relaunchAt = 0;
 			j.stillSince = 0;
 			if (p == Phase::Idle) {
+				j.gang = false;
 				j.directTried = false;
 				j.moved = false;
 				j.directAt = 0;
@@ -519,13 +521,17 @@ namespace npcvehicles
 			pp.y += float(j.tvy * kFollowLead);
 			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 			const double yaw = tsp > 3.0 ? std::atan2(j.tvx, j.tvy) : At<game::Vec3>(target, off::kRefRotation).z;  // moving: its track
-			const double side = kFollowSide + kFollowSpread * (j.pilot - 1);
-			x = pp.x - std::sin(yaw) * kFollowBack - std::cos(yaw) * side;  // left of the player (the rover is on the right)
-			y = pp.y - std::cos(yaw) * kFollowBack + std::sin(yaw) * side;
+			// Formation (2026-10-17, gang): slot 0 left, 1 right, then rows further back, alternating sides.
+			const int slot = j.pilot - 1;
+			const double side = (slot % 2 ? -1.0 : 1.0) * (kFollowSide + 2.0 + 3.0 * (slot / 2));  // + left, - right
+			const double back = kFollowBack + kFollowSpread * (slot / 2);
+			(void)kFollowSpread;
+			x = pp.x - std::sin(yaw) * back - std::cos(yaw) * side;
+			y = pp.y - std::cos(yaw) * back + std::sin(yaw) * side;
 			const double to = std::hypot(double(vp.x) - pp.x, double(vp.y) - pp.y);
 			if (to < kFollowNear && to > 0.1) {  // too close: back off along the line from the player
-				x = pp.x + (vp.x - pp.x) / to * kFollowBack;
-				y = pp.y + (vp.y - pp.y) / to * kFollowBack;
+				x = pp.x + (vp.x - pp.x) / to * back;
+				y = pp.y + (vp.y - pp.y) / to * back;
 			}
 		}
 
@@ -906,6 +912,29 @@ namespace npcvehicles
 
 		// The force key: the NPC the player faces (within kFaceCone of the player's heading, up to kFaceRange; the most
 		// centred, then the nearest) gets into the free vehicle nearest that NPC.
+		// Sends `npc` to `vehicle` (the game's get-in; a driver-seat keyword when the seat refuses) and starts the job.
+		bool StartJob(Job& slot, uptr npc, uptr vehicle, bool gang)
+		{
+			const std::uint32_t npcId = At<std::uint32_t>(npc, off::kFormId);
+			if (!CanMount(npc, vehicle)) {
+				LogSeats(npc, vehicle);
+				const uptr kw = DriverSeatKeyword(vehicle);
+				if (kw) GiveKeyword(npc, kw);
+			}
+			const bool seat = CanMount(npc, vehicle);
+			const int r = seat ? Mount(npc, vehicle) : 0;
+			const uptr base = At<uptr>(vehicle, 0x98);
+			logger::Write("NPC vehicles: [%d] NPC %08X -> vehicle %08X (base %08X, %.0f m from it); seat %s; get-in -> %d", slot.pilot, npcId,
+				At<std::uint32_t>(vehicle, off::kFormId), base ? At<std::uint32_t>(base, off::kFormId) : 0, Dist(npc, vehicle), seat ? "free" : "REFUSED", r);
+			if (r != 1) return false;
+			slot.npc = npcId;
+			slot.vehicle = At<std::uint32_t>(vehicle, off::kFormId);
+			slot.gang = gang;
+			slot.profile = Profile::Escort;
+			Set(slot, Phase::Boarding);
+			return true;
+		}
+
 		void Force(uptr player)
 		{
 			Job* slot = nullptr;
@@ -916,7 +945,7 @@ namespace npcvehicles
 				}
 			}
 			if (!slot) {
-				notify::Show("3 NPC vehicles already busy");
+				notify::Show("%d NPC vehicles already busy", kJobs);
 				logger::Write("NPC vehicles: force: all %d slots busy", kJobs);
 				return;
 			}
@@ -972,26 +1001,156 @@ namespace npcvehicles
 				notify::Show("No free vehicle nearby");
 				return;
 			}
-			const std::uint32_t npcId = At<std::uint32_t>(npc, off::kFormId);
-			if (!CanMount(npc, vehicle)) {
-				LogSeats(npc, vehicle);
-				const uptr kw = DriverSeatKeyword(vehicle);
-				if (kw) GiveKeyword(npc, kw);
-			}
-			const bool seat = CanMount(npc, vehicle);
-			const int r = seat ? Mount(npc, vehicle) : 0;
-			const uptr base = At<uptr>(vehicle, 0x98);
-			logger::Write("NPC vehicles: [%d] force: NPC %08X (%s, %.0f m in front of you, %.0f deg off) -> vehicle %08X (base %08X, %.0f m from it); seat %s; get-in -> %d",
-				slot->pilot, npcId, modscene::RttiName(npc), npcDist, npcOff * 57.2958, At<std::uint32_t>(vehicle, off::kFormId), base ? At<std::uint32_t>(base, off::kFormId) : 0,
-				bestV, seat ? "free" : "REFUSED", r);
-			if (r != 1) {
+			logger::Write("NPC vehicles: [%d] force: NPC %08X (%s, %.0f m in front of you, %.0f deg off)", slot->pilot, At<std::uint32_t>(npc, off::kFormId),
+				modscene::RttiName(npc), npcDist, npcOff * 57.2958);
+			if (!StartJob(*slot, npc, vehicle, false)) {
 				notify::Show("That NPC can't get in");
 				return;
 			}
-			slot->npc = npcId;
-			slot->vehicle = At<std::uint32_t>(vehicle, off::kFormId);
-			Set(*slot, Phase::Boarding);
 			notify::Show("NPC sent to a vehicle (%.0f m)", bestV);
+		}
+
+		// ---- The gang (The Gang's All Here, or any followers): the game's own follower list ----
+		// Game.GetPlayerFollowers (FUN_14200B760): the player's extra data of type 0x1B holds {.. +0x18 count, +0x20
+		// array of 8-byte entries, handle first}; each handle's actor counts when FUN_14192A290(actor, player) is true.
+		constexpr std::uint32_t kGetExtra = 0x00347170, kIsFollowing = 0x0192A290;
+		constexpr double kGangRange = 80.0;      // m: followers this close to the player get a vehicle
+		constexpr double kSpareRange = 400.0;    // m: the player's spare vehicles are used from this far
+		constexpr double kLocalRange = 120.0;    // m: other vehicles (the registry's) within this of the follower
+		constexpr ULONGLONG kMirrorMs = 1200;    // the player in / out of a vehicle this long before the gang follows
+
+		uptr HandleRef(std::uint32_t handle)
+		{
+			uptr ref = 0;
+			uptr* out = &ref;
+			struct
+			{
+				uptr vtbl;
+				uptr** capture;
+			} lookup{ game::Base() + addr::kHandleToRefFunctorVtbl, &out };
+			EngineFn<void (*)(uptr, std::uint32_t, void*)>(addr::kHandleLookup)(Ptr(addr::kRefHandleTablePtr), handle, &lookup);
+			if (ref) EngineFn<void (*)(uptr)>(addr::kRefRelease)(ref);  // the world keeps the actor; we only read it this frame
+			return ref;
+		}
+
+		int Followers(uptr player, uptr* out, int max)
+		{
+			int n = 0;
+			__try {
+				const uptr data = EngineFn<uptr (*)(uptr, std::uint32_t)>(kGetExtra)(At<uptr>(player, 0xC8), 0x1B);
+				if (!data) return 0;
+				const std::uint32_t count = std::min<std::uint32_t>(At<std::uint32_t>(data, 0x18), 64);
+				const auto* arr = At<const std::uint32_t*>(data, 0x20);
+				for (std::uint32_t i = 0; arr && i < count && n < max; ++i) {
+					const uptr a = HandleRef(arr[i * 2]);
+					if (a && EngineFn<bool (*)(uptr, uptr)>(kIsFollowing)(a, player)) out[n++] = a;
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			return n;
+		}
+
+		// The vehicle for a gang member: the player's spare vehicles first (owned by the player, or the player's own
+		// vehicle when the player is in another one), then the nearest other free vehicle within kLocalRange of them
+		// (unowned before owned). Never generated: only vehicles already in the world (the registry's).
+		uptr GangVehicle(uptr player, uptr npc, const std::vector<uptr>& vehicles, bool& spare)
+		{
+			const uptr playerBase = At<uptr>(player, 0x98);
+			const std::uint32_t playerBaseId = playerBase ? At<std::uint32_t>(playerBase, off::kFormId) : 0;
+			const std::uint32_t own = vehicleflight::OwnRoverId();
+			uptr best = 0;
+			double bestScore = 1e18;
+			for (const uptr v : vehicles) {
+				if (!DriverSeatKeyword(v) && !CanMount(npc, v)) continue;
+				const std::uint32_t id = At<std::uint32_t>(v, off::kFormId);
+				const std::uint32_t owner = OwnerId(v);
+				const bool isSpare = id == own || (playerBaseId && owner == playerBaseId);
+				const double dn = Dist(v, npc), dp = Dist(v, player);
+				double score;
+				if (isSpare && dp < kSpareRange) score = dn;                      // spares first
+				else if (!isSpare && dn < kLocalRange) score = 1e6 + dn + (owner ? 1e5 : 0.0);  // then local, unowned first
+				else continue;
+				if (score < bestScore) { bestScore = score; best = v; spare = isSpare; }
+			}
+			return best;
+		}
+
+		bool g_playerRiding = false;
+		ULONGLONG g_ridingSince = 0, g_mirrorAt = 0;
+
+		void GangTick(uptr player)
+		{
+			const ULONGLONG now = GetTickCount64();
+			const bool riding = InVehicle(player) != 0;
+			if (riding != g_playerRiding) {
+				g_playerRiding = riding;
+				g_ridingSince = now;
+			}
+			if (now - g_ridingSince < kMirrorMs || now - g_mirrorAt < 1000) return;
+			g_mirrorAt = now;
+			if (!riding) {
+				// The player got out: gang vehicles land and their drivers get out (the vehicles stay where they land).
+				for (auto& j : g_jobs) {
+					if (!j.gang) continue;
+					if (j.phase == Phase::Boarding) {
+						logger::Write("NPC vehicles: [%d] gang: you got out; NPC %08X stops boarding", j.pilot, j.npc);
+						Set(j, Phase::Idle);
+					}
+					else if (j.phase == Phase::Following) {
+						vehicleflight::PilotStop(j.pilot, "gang: the player got out");
+						logger::Write("NPC vehicles: [%d] gang: you got out; NPC %08X lands and gets out", j.pilot, j.npc);
+						Set(j, Phase::Settling);
+					}
+				}
+				return;
+			}
+			// The player is in a vehicle: every follower near the player without one gets one.
+			uptr gang[32];
+			const int n = Followers(player, gang, 32);
+			if (!n) return;
+			std::vector<uptr> vehicles;
+			bool haveList = false;
+			const uptr playerVehicle = InVehicle(player);
+			for (int i = 0; i < n; ++i) {
+				const uptr npc = gang[i];
+				const std::uint32_t npcId = At<std::uint32_t>(npc, off::kFormId);
+				if (Locked(npcId) || Dead(npc) || InVehicle(npc) || Dist(npc, player) > kGangRange) continue;
+				Job* slot = nullptr;
+				for (auto& j : g_jobs) {
+					if (j.phase == Phase::Idle) { slot = &j; break; }
+				}
+				if (!slot) {
+					static ULONGLONG lastSay = 0;
+					if (now - lastSay > 30000) { lastSay = now; logger::Write("NPC vehicles: gang: all %d vehicle slots busy; the rest stay on foot", kJobs); }
+					return;
+				}
+				if (!haveList) {
+					haveList = true;
+					const std::uint32_t ownId = vehicleflight::OwnRoverId();
+					for (const uptr r : modscene::LoadedRefs(8000)) {
+						if (!IsVehicle(r) || Disabled(r) || !Has3D(r) || r == playerVehicle) continue;
+						const std::uint32_t id = At<std::uint32_t>(r, off::kFormId);
+						if (Locked(id)) continue;
+						(void)ownId;
+						vehicles.push_back(r);
+					}
+				}
+				bool spare = false;
+				const uptr v = GangVehicle(player, npc, vehicles, spare);
+				if (!v) {
+					static ULONGLONG lastNone = 0;
+					if (now - lastNone > 30000) {
+						lastNone = now;
+						logger::Write("NPC vehicles: gang: no vehicle for NPC %08X (no spare within %.0f m, no free vehicle within %.0f m of them)", npcId, kSpareRange, kLocalRange);
+					}
+					continue;
+				}
+				vehicles.erase(std::remove(vehicles.begin(), vehicles.end(), v), vehicles.end());
+				logger::Write("NPC vehicles: [%d] gang: NPC %08X (%s) -> %s vehicle %08X (owner %08X, %.0f m from them)", slot->pilot, npcId, modscene::RttiName(npc),
+					spare ? "your spare" : "local", At<std::uint32_t>(v, off::kFormId), OwnerId(v), Dist(v, npc));
+				StartJob(*slot, npc, v, true);
+			}
 		}
 	}
 
@@ -1003,6 +1162,7 @@ namespace npcvehicles
 		const bool fdown = g_forceKey && Focused() && (GetAsyncKeyState(g_forceKey) & 0x8000) != 0;
 		if (fdown && !g_forceDown) Force(player);
 		g_forceDown = fdown;
+		GangTick(player);
 		const bool adown = Focused() && (GetAsyncKeyState(kAggroKey) & 0x8000) != 0;
 		if (adown && !g_aggroDown) {
 			// Any vehicle in escort -> all to pursuit; otherwise all back to escort.
