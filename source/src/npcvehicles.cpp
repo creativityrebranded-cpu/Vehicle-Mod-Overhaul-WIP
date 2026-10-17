@@ -1273,6 +1273,171 @@ namespace npcvehicles
 			}
 		}
 
+		// ---- NPCs forcing the player out (2026-10-17) ----
+		// Owners (the vehicle's owner, or a member of its owning faction) reclaim it; hostile NPCs hijack it; guards
+		// (hostile and with a crime faction) take the player out. Only while the vehicle is on the ground (hover off) and
+		// slow, after a kForceWarnMs warning the player can escape by driving off. The player's own vehicle is never
+		// reclaimed, the gang never forces anyone. Game checks: IsInFaction = actor vtable +0xBA0(actor, faction);
+		// IsHostileToActor = FUN_14191FCA0(actor, target); GetCrimeFaction = FUN_141949090(actor); exits: the animated
+		// dismount FUN_141952530 (owners, guards), the instant FUN_141A9C530 (hijackers, and when the exit is blocked).
+		constexpr std::uint32_t kIsHostileTo = 0x0191FCA0, kCrimeFaction = 0x01949090;
+		constexpr double kForceReach = 4.0;        // m from the vehicle
+		constexpr double kForceSlow = 3.0;         // m/s
+		constexpr ULONGLONG kForceWarnMs = 2000, kForceCooldownMs = 15000;
+		enum class Forcer : std::uint8_t { None, Owner, Hijacker, Guard };
+		const char* ForcerName(Forcer f) { return f == Forcer::Owner ? "owner" : f == Forcer::Hijacker ? "hijacker" : f == Forcer::Guard ? "guard" : "none"; }
+
+		struct ForceOut
+		{
+			std::uint32_t actor = 0, vehicle = 0;
+			Forcer kind = Forcer::None;
+			ULONGLONG at = 0;                      // eject at this time (after the warning)
+			ULONGLONG cooldownUntil = 0;
+			std::uint32_t cooldownActor = 0;
+			double vx = 0, vy = 0;                 // the player's vehicle: last position (speed)
+			ULONGLONG lastAt = 0;
+			double speed = 0;
+		} g_force;
+
+		bool HostileTo(uptr actor, uptr target)
+		{
+			__try {
+				return EngineFn<bool (*)(uptr, uptr)>(kIsHostileTo)(actor, target);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		bool HasCrimeFaction(uptr actor)
+		{
+			__try {
+				return EngineFn<uptr (*)(uptr)>(kCrimeFaction)(actor) != 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		bool InFaction(uptr actor, uptr faction)
+		{
+			__try {
+				auto** vt = *reinterpret_cast<void***>(actor);
+				return reinterpret_cast<bool (*)(uptr, uptr)>(vt[0xBA0 / 8])(actor, faction);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		uptr OwnerForm(uptr ref)
+		{
+			__try {
+				const uptr extra = At<uptr>(ref, 0xC8);
+				return extra ? EngineFn<uptr (*)(uptr)>(kGetOwner)(extra) : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		// Who may force the player out of `vehicle`: a guard first, then the owner, then a hijacker.
+		Forcer ForcerKind(uptr player, uptr vehicle, uptr actor)
+		{
+			const bool hostile = HostileTo(actor, player) && InCombat(actor);
+			if (hostile && HasCrimeFaction(actor)) return Forcer::Guard;
+			const std::uint32_t vid = At<std::uint32_t>(vehicle, off::kFormId);
+			const uptr owner = OwnerForm(vehicle);
+			const uptr playerBase = At<uptr>(player, 0x98);
+			if (owner && owner != playerBase && vid != vehicleflight::OwnRoverId() && !hostile) {
+				const uptr base = At<uptr>(actor, 0x98);
+				if (base == owner || (At<std::uint8_t>(owner, 0x2E) == 0x0D && InFaction(actor, owner))) return Forcer::Owner;
+			}
+			if (hostile) return Forcer::Hijacker;
+			return Forcer::None;
+		}
+
+		void EjectPlayer(uptr player, Forcer kind)
+		{
+			bool out = false;
+			if (kind != Forcer::Hijacker) out = Dismount(player) == 1;  // the game's own exit (with its obstruction checks)
+			if (!out) out = EndInteraction(player);
+			logger::Write("NPC vehicles: force-out: you were taken out by a %s (%s exit) -> %s", ForcerName(kind), kind == Forcer::Hijacker ? "instant" : "animated",
+				out ? "out" : "FAILED");
+		}
+
+		void ForceOutTick(uptr player)
+		{
+			const ULONGLONG now = GetTickCount64();
+			const uptr pv = InVehicle(player);
+			if (!pv) {
+				if (g_force.kind != Forcer::None && g_force.at) {
+					// out (by the force-out or by the player): the forcer takes over
+					const uptr a = RefById(g_force.actor), v = RefById(g_force.vehicle);
+					if (a && v && !InVehicle(player)) {
+						if (g_force.kind == Forcer::Owner) {
+							const int r = Mount(a, v);
+							logger::Write("NPC vehicles: force-out: owner %08X gets back in %08X -> %d", g_force.actor, g_force.vehicle, r);
+						}
+						else if (g_force.kind == Forcer::Hijacker) {
+							for (auto& j : g_jobs) {
+								if (j.phase != Phase::Idle) continue;
+								if (StartJob(j, a, v, false)) {
+									j.profile = Profile::Pursuit;
+									logger::Write("NPC vehicles: [%d] force-out: hijacker %08X takes %08X and comes after you", j.pilot, g_force.actor, g_force.vehicle);
+								}
+								break;
+							}
+						}
+					}
+				}
+				g_force.kind = Forcer::None;
+				g_force.at = 0;
+				g_force.lastAt = 0;
+				return;
+			}
+			// the vehicle's ground speed
+			const auto p = At<game::Vec3>(pv, off::kRefPosition);
+			if (g_force.lastAt && now > g_force.lastAt) {
+				const double dt = (now - g_force.lastAt) / 1000.0;
+				const double inst = std::hypot(p.x - g_force.vx, p.y - g_force.vy) / dt;
+				if (dt < 1.0) g_force.speed += (inst - g_force.speed) * std::min(1.0, dt * 4.0);
+			}
+			g_force.vx = p.x; g_force.vy = p.y; g_force.lastAt = now;
+			const bool slow = g_force.speed < kForceSlow && !vehicleflight::Active();
+			if (g_force.kind != Forcer::None) {
+				const uptr a = RefById(g_force.actor);
+				if (!slow || !a || Dead(a) || Dist(a, pv) > kForceReach + 2.0) {
+					logger::Write("NPC vehicles: force-out: %s %08X gave up (%s)", ForcerName(g_force.kind), g_force.actor, !slow ? "you drove off" : "gone");
+					g_force.cooldownActor = g_force.actor;
+					g_force.cooldownUntil = now + kForceCooldownMs;
+					g_force.kind = Forcer::None;
+					g_force.at = 0;
+					return;
+				}
+				if (now >= g_force.at) EjectPlayer(player, g_force.kind);
+				return;
+			}
+			if (!slow || now % 500 > 40) return;
+			for (const uptr r : modscene::LoadedRefs(30)) {
+				if (r == player || !IsActorRef(r) || IsVehicle(r) || Dead(r) || InVehicle(r)) continue;
+				if (Dist(r, pv) > kForceReach) continue;
+				const std::uint32_t id = At<std::uint32_t>(r, off::kFormId);
+				if (id == g_force.cooldownActor && now < g_force.cooldownUntil) continue;
+				if (Locked(id) || IsFollower(player, r)) continue;  // the gang never forces anyone
+				const Forcer k = ForcerKind(player, pv, r);
+				if (k == Forcer::None) continue;
+				g_force.kind = k;
+				g_force.actor = id;
+				g_force.vehicle = At<std::uint32_t>(pv, off::kFormId);
+				g_force.at = now + kForceWarnMs;
+				notify::Show(k == Forcer::Owner ? "Owner: \"Get out of my vehicle!\"" : k == Forcer::Guard ? "Guard: \"Step out of the vehicle!\"" : "Hijacker! Drive off!");
+				logger::Write("NPC vehicles: force-out: %s %08X at your vehicle %08X (%.1f m); out in %.0f s unless you drive off", ForcerName(k), id, g_force.vehicle,
+					Dist(r, pv), kForceWarnMs / 1000.0);
+				return;
+			}
+		}
+
 		bool g_playerRiding = false;
 		ULONGLONG g_ridingSince = 0, g_mirrorAt = 0;
 
@@ -1361,6 +1526,7 @@ namespace npcvehicles
 		g_forceDown = fdown;
 		GangTick(player);
 		SeatTick(player);
+		ForceOutTick(player);
 		const bool adown = Focused() && (GetAsyncKeyState(kAggroKey) & 0x8000) != 0;
 		if (adown && !g_aggroDown) {
 			// Any vehicle in escort -> all to pursuit; otherwise all back to escort.

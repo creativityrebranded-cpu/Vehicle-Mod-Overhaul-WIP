@@ -124,8 +124,22 @@ When you press **Activate (E)** at a vehicle (within 5 m, in front of you) that 
 | Neutral NPC | **Blocked** ("Occupied - hold E to pull them out") | **Pulled out:** assault alarm, plus a theft alarm if someone else owns the vehicle |
 | Hostile NPC | **Blocked** | **Hijack:** they're pulled out and fight you on foot |
 
-Empty vehicles use the game's own get-in and theft rules. Planned next: NPCs forcing you out (owners, hijackers,
-guards), riding as a passenger, "drive me", take the wheel, and orders.
+Empty vehicles use the game's own get-in and theft rules.
+
+### NPCs forcing you out
+
+Only while your vehicle is on the ground (hover off) and slow (under 3 m/s), and only after a 2 s warning:
+**drive off to escape**.
+
+| Who (within 4 m) | When | What happens |
+|---|---|---|
+| **Guard** | Hostile to you and part of a crime faction (you're wanted) | You're taken out (the game's own exit); the game's arrest / fight follows |
+| **Owner** | The vehicle's owner, or a member of its owning faction; you're in their vehicle | You're taken out, and they get back in |
+| **Hijacker** | Hostile NPC in combat with you | You're pulled out at once; they take the vehicle and come after you (Pursuit) |
+
+Your own vehicle is never reclaimed by an owner, and your gang never forces anyone out.
+
+Planned next: riding as a passenger, "drive me", take the wheel, and orders.
 
 ## Vehicle registry
 
