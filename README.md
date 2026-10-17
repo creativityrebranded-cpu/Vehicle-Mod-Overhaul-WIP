@@ -114,6 +114,19 @@ Your followers (the game's follower list, which The Gang's All Here fills) take 
 - Up to **6** NPC vehicles at once; extra followers stay on foot.
 - **.** (period) switches them between Escort and Pursuit. Pursuit currently targets you; targeting enemies is next.
 
+## Getting into an occupied vehicle
+
+When you press **Activate (E)** at a vehicle (within 5 m, in front of you) that has someone in the driver seat:
+
+| Driver | Tap E | Hold E (1 s) |
+|---|---|---|
+| Your gang / follower | **Hand-over:** they get out at once and you get in | same |
+| Neutral NPC | **Blocked** ("Occupied - hold E to pull them out") | **Pulled out:** assault alarm, plus a theft alarm if someone else owns the vehicle |
+| Hostile NPC | **Blocked** | **Hijack:** they're pulled out and fight you on foot |
+
+Empty vehicles use the game's own get-in and theft rules. Planned next: NPCs forcing you out (owners, hijackers,
+guards), riding as a passenger, "drive me", take the wheel, and orders.
+
 ## Vehicle registry
 
 Nothing is spawned. Every real vehicle in the loaded area is recorded with its place, owner and who uses it

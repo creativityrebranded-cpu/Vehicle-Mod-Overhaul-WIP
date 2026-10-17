@@ -296,6 +296,7 @@ namespace npcvehicles
 			}
 		}
 
+		std::uint32_t OwnerId(uptr ref);
 		std::uint32_t OwnerId(uptr ref)
 		{
 			__try {
@@ -893,10 +894,141 @@ namespace npcvehicles
 			return 0;
 		}
 
+		// ---- Seat rules (2026-10-17; notes/VEHICLE_INTERACTIONS_RESEARCH_20261017.md) ----
+		// FUN_14219BE30 runs after ANY actor's sit (caller 1419F7750), so the player's own attempt is told apart by the
+		// player's Activate press at a vehicle (the intent below). Rules for the player and an occupied vehicle:
+		//   gang driver -> HAND-OVER (out at once, the player sits);  neutral / hostile -> BLOCK on a tap,
+		//   EJECT on Activate held kPullMs (neutral: assault alarm, plus a theft alarm when someone else owns it).
+		// Out at once = FUN_141A9C530(actor) (what the game's dismount uses for distant actors); the alarms are the
+		// Papyrus natives' cores: Actor.SendAssaultAlarm FUN_141FC9770(_, _, victim), ObjectReference.SendStealAlarm
+		// FUN_14207F050(_, _, ref, thief).
+		constexpr std::uint32_t kEndInteraction = 0x01A9C530, kAssaultAlarm = 0x01FC9770, kStealAlarm = 0x0207F050;
+		constexpr ULONGLONG kPullMs = 1000;        // hold Activate this long to pull a driver out
+		constexpr ULONGLONG kIntentMs = 2500;      // a player-seat call this soon after the press is the player's
+		constexpr double kReachRange = 5.0;        // m: the vehicle in front of the player
+		constexpr double kReachCone = 0.8;         // rad
+
+		enum class Relation : std::uint8_t { None, Gang, Neutral, Hostile };
+		const char* RelationName(Relation r) { return r == Relation::Gang ? "gang" : r == Relation::Neutral ? "neutral" : r == Relation::Hostile ? "hostile" : "none"; }
+
+		struct Intent
+		{
+			std::uint32_t vehicle = 0, occupant = 0;
+			Relation relation = Relation::None;
+			ULONGLONG pressAt = 0;
+			bool acted = false;                    // hand-over / eject done for this press
+			ULONGLONG seatAt = 0;                  // seat the player at this time (after the occupant is out)
+		} g_intent;
+		bool g_activateDown = false;
+		int g_activateKey = 0;
+
+		bool IsFollower(uptr player, uptr actor);
+
+		Relation RelationOf(uptr player, uptr npc)
+		{
+			if (!npc) return Relation::None;
+			const std::uint32_t id = At<std::uint32_t>(npc, off::kFormId);
+			for (const auto& j : g_jobs) {
+				if (j.npc == id && j.gang) return Relation::Gang;
+			}
+			if (IsFollower(player, npc)) return Relation::Gang;
+			return InCombat(npc) ? Relation::Hostile : Relation::Neutral;
+		}
+
+		// The actor in the vehicle's driver seat (the one the game says is in it; the player excluded).
+		uptr DriverOf(uptr vehicle, uptr player)
+		{
+			const std::uint32_t vid = At<std::uint32_t>(vehicle, off::kFormId);
+			for (const auto& j : g_jobs) {
+				if (j.phase != Phase::Idle && j.vehicle == vid) {
+					const uptr n = RefById(j.npc);
+					if (n && InVehicle(n) == vehicle) return n;
+				}
+			}
+			for (const uptr r : modscene::LoadedRefs(200)) {
+				if (r == player || !IsActorRef(r) || IsVehicle(r) || Dead(r)) continue;
+				if (Dist(r, vehicle) < 8.0 && InVehicle(r) == vehicle) return r;
+			}
+			return 0;
+		}
+
+		uptr FacingVehicle(uptr player)
+		{
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			const double facing = At<game::Vec3>(player, off::kRefRotation).z;
+			uptr best = 0;
+			double bestD = 1e9;
+			for (const uptr r : modscene::LoadedRefs(200)) {
+				if (!IsVehicle(r) || Disabled(r)) continue;
+				const auto q = At<game::Vec3>(r, off::kRefPosition);
+				const double dx = double(q.x) - pp.x, dy = double(q.y) - pp.y, d = std::hypot(dx, dy);
+				if (d > kReachRange) continue;
+				double off = std::atan2(dx, dy) - facing;
+				while (off > 3.14159265) off -= 6.28318531;
+				while (off < -3.14159265) off += 6.28318531;
+				if (d > 2.0 && std::fabs(off) > kReachCone) continue;
+				if (d < bestD) { bestD = d; best = r; }
+			}
+			return best;
+		}
+
+		bool EndInteraction(uptr actor)
+		{
+			__try {
+				EngineFn<void (*)(uptr)>(kEndInteraction)(actor);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		void CrimeAlarms(uptr victim, uptr vehicle, uptr player, bool assault)
+		{
+			__try {
+				if (assault) EngineFn<void (*)(uptr, uptr, uptr)>(kAssaultAlarm)(0, 0, victim);
+				if (OwnerId(vehicle) && OwnerId(vehicle) != At<std::uint32_t>(At<uptr>(player, 0x98), off::kFormId))
+					EngineFn<void (*)(uptr, std::uint32_t, uptr, uptr)>(kStealAlarm)(0, 0, vehicle, player);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::Write("NPC vehicles: seat rules: crime alarm raised an exception");
+			}
+		}
+
+		// Takes the occupant out (ends its job if it had one) and seats the player a moment later.
+		void TakeSeat(uptr player, uptr vehicle, uptr occupant, const char* why)
+		{
+			const std::uint32_t oid = At<std::uint32_t>(occupant, off::kFormId);
+			for (auto& j : g_jobs) {
+				if (j.phase != Phase::Idle && j.npc == oid) {
+					vehicleflight::PilotStop(j.pilot, why);
+					Set(j, Phase::Idle);
+				}
+			}
+			g_allowDismount = true;
+			const bool out = EndInteraction(occupant);
+			g_allowDismount = false;
+			g_intent.acted = true;
+			g_intent.seatAt = GetTickCount64() + 150;
+			logger::Write("NPC vehicles: seat rules: %s: %08X out of %08X (%s) -> %s; you get in next", why, oid, At<std::uint32_t>(vehicle, off::kFormId),
+				RelationName(g_intent.relation), out ? "out" : "FAILED");
+			(void)player;
+		}
+
 		void SeatPlayerDetour(uptr vehicle)
 		{
 			const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress()) - game::Base();
 			const std::uint32_t id = vehicle ? At<std::uint32_t>(vehicle, off::kFormId) : 0;
+			// The player's own attempt at an occupied vehicle: the seat rules decide (a tap never seats past a driver).
+			if (id && g_intent.vehicle == id && GetTickCount64() - g_intent.pressAt < kIntentMs && !g_intent.acted) {
+				const uptr player = Ptr(addr::kPlayerCharacterPtr);
+				const uptr occ = player ? DriverOf(vehicle, player) : 0;
+				if (occ) {
+					logger::Write("NPC vehicles: seat rules: you tried vehicle %08X with %s driver %08X -> BLOCKED (%s)", id, RelationName(g_intent.relation),
+						At<std::uint32_t>(occ, off::kFormId), g_intent.relation == Relation::Gang ? "handing over" : "hold to pull out");
+					return;
+				}
+			}
 			const bool block = id && OursVehicle(id);
 			logger::Write("NPC vehicles: the game seats the player in vehicle %08X (caller 14%07llX) -> %s", id, static_cast<unsigned long long>(caller),
 				block ? "BLOCKED (an NPC job's vehicle)" : "allowed");
@@ -1076,6 +1208,71 @@ namespace npcvehicles
 			return best;
 		}
 
+		bool IsFollower(uptr player, uptr actor)
+		{
+			uptr gang[32];
+			const int n = Followers(player, gang, 32);
+			for (int i = 0; i < n; ++i) {
+				if (gang[i] == actor) return true;
+			}
+			return false;
+		}
+
+		void SeatPlayerNow(uptr vehicle)
+		{
+			__try {
+				g_seatPlayerOriginal(vehicle);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+		}
+
+		// The player's Activate at a vehicle: tap = hand-over (gang) or blocked; held kPullMs = pull the driver out.
+		void SeatTick(uptr player)
+		{
+			const ULONGLONG now = GetTickCount64();
+			if (g_intent.seatAt && now >= g_intent.seatAt) {
+				g_intent.seatAt = 0;
+				const uptr v = RefById(g_intent.vehicle);
+				if (v && !InVehicle(player)) {
+					SeatPlayerNow(v);
+					logger::Write("NPC vehicles: seat rules: you get in %08X -> %s", g_intent.vehicle, InVehicle(player) == v ? "seated" : "not seated yet");
+				}
+			}
+			if (!g_activateKey || now % 5000 < 20) g_activateKey = controlmap::KeyFor("Gameplay", "Activate", 'E');
+			const bool down = Focused() && (GetAsyncKeyState(g_activateKey) & 0x8000) != 0;
+			const bool pressed = down && !g_activateDown;
+			g_activateDown = down;
+			if (InVehicle(player)) return;
+			if (pressed) {
+				g_intent = Intent{};
+				const uptr v = FacingVehicle(player);
+				if (!v) return;
+				const uptr occ = DriverOf(v, player);
+				g_intent.vehicle = At<std::uint32_t>(v, off::kFormId);
+				g_intent.pressAt = now;
+				if (!occ) return;  // empty: the game's own get-in (and its theft rules)
+				g_intent.occupant = At<std::uint32_t>(occ, off::kFormId);
+				g_intent.relation = RelationOf(player, occ);
+				if (g_intent.relation == Relation::Gang) {
+					TakeSeat(player, v, occ, "hand-over");
+					notify::Show("They hand you the vehicle");
+				}
+				else {
+					notify::Show("Occupied - hold [%s] to pull them out", controlmap::KeyName(g_activateKey).c_str());
+				}
+				return;
+			}
+			if (down && g_intent.occupant && !g_intent.acted && now - g_intent.pressAt >= kPullMs) {
+				const uptr v = RefById(g_intent.vehicle), occ = RefById(g_intent.occupant);
+				if (!v || !occ || InVehicle(occ) != v || Dist(player, v) > kReachRange + 1.0) return;
+				TakeSeat(player, v, occ, g_intent.relation == Relation::Hostile ? "hijack" : "pulled out");
+				CrimeAlarms(occ, v, player, g_intent.relation == Relation::Neutral);
+				if (g_intent.relation == Relation::Hostile) Aggro(occ, player);
+				notify::Show(g_intent.relation == Relation::Hostile ? "Hijacked" : "You pulled them out");
+			}
+		}
+
 		bool g_playerRiding = false;
 		ULONGLONG g_ridingSince = 0, g_mirrorAt = 0;
 
@@ -1163,6 +1360,7 @@ namespace npcvehicles
 		if (fdown && !g_forceDown) Force(player);
 		g_forceDown = fdown;
 		GangTick(player);
+		SeatTick(player);
 		const bool adown = Focused() && (GetAsyncKeyState(kAggroKey) & 0x8000) != 0;
 		if (adown && !g_aggroDown) {
 			// Any vehicle in escort -> all to pursuit; otherwise all back to escort.
