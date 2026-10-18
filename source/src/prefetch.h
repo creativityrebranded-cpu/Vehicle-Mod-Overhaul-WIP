@@ -44,19 +44,41 @@ namespace prefetch
 	// Forward obstacle rays (2026-10-17): a straight ray from -> to through the game's own hknpBSWorld::CastRay
 	// (the query the vertical ground ray builds, FUN_140583CB0, with our own end points), on `mask`'s collision layers
 	// (64-bit, bit n = layer n). Queued and run like the ground probes; the nearest hit comes back next frame.
-	enum { kRaySlots = 24 };  // pilot * 3 + corridor (pilots 0..6, straight / left / right), and 3 spare
+	// 0..20: pilot * 3 + corridor (pilots 0..6, straight / left / right); 24..44: pilot * 3 + k, the sweep rays that feed the nav map.
+	enum { kRaySlots = 48 };
 	struct RayHit
 	{
 		bool hit = false;
 		float distance = 0;          // metres from `from`
 		float x = 0, y = 0, z = 0;   // the hit point
-		std::uint32_t raw[28] = {};  // the hit record (0x70 bytes, hknpCollisionResult) for layout research
 		std::uint32_t bodyId = 0;    // hit record +0x48 (fork research, 2026-10-17; unconfirmed)
 		std::uint32_t layer = 0;     // hit record +0x5C & 0x7F
 		std::uint32_t formId = 0;    // the reference that owns the hit body (the game's own body -> ref path), 0 unknown
+		float from[3] = {}, to[3] = {};  // the ray as asked (so a late result is never matched with a newer request)
+		bool normalOk = false;       // hit record +0x10 held a unit vector (the surface normal, as hknpCollisionResult usually has it)
+		float nx = 0, ny = 0, nz = 0;
 	};
 	void RequestRay(int slot, const float from[3], const float to[3], std::uint64_t mask);
 	bool LatestRay(int slot, RayHit& out, unsigned& age);
+
+	// Hull sweeps (2026-10-18, step 3 of the nav service): the vehicle's OWN collision shape cast along a level line through
+	// the game's hknpBSWorld::CastShape (FUN_142362840, query laid out as the vehicle-exit check FUN_14219AE90 builds it;
+	// notes/VEHICLE_SHAPE_CAST_RESEARCH_20261017.md). One slot per pilot (0..6). The cast starts at the physics body of
+	// `instance` (the hknpBSVehicleInstance the physics step runs on) and runs `range` metres along (dirX, dirY). Hits on
+	// the vehicle's own body, and terrain / ground not above its origin + 0.5 m, are left out (ground is the height probes' job).
+	enum { kSweepSlots = 8 };
+	struct SweepHit
+	{
+		bool hit = false;
+		float distance = 0;              // metres along the sweep to the nearest hit that counts
+		float x = 0, y = 0, z = 0;       // its contact point
+		std::uint32_t layer = 0, bodyId = 0;
+		float from[3] = {}, to[3] = {};  // the sweep as cast (body position to its end)
+		unsigned micros = 0;             // time the cast took
+		int kept = 0, skipped = 0;       // hits that counted / were left out (own body, ground below)
+	};
+	void RequestSweep(int slot, std::uintptr_t instance, float dirX, float dirY, float range, std::uint64_t mask);
+	bool LatestSweep(int slot, SweepHit& out, unsigned& age);
 	// Load-ahead lead time in seconds (the grid is centred this far ahead along the velocity, capped by the grid size).
 	void SetLeadSeconds(float seconds);
 }

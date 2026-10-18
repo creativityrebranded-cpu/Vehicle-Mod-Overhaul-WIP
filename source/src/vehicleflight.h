@@ -4,6 +4,8 @@
 
 #include <cstdint>
 
+#include "vcontract.h"
+
 // Planetary flight on the REV-8 rover (user, 2026-10-14; design: notes/plan-vehicle-flight.md). While driving, H
 // toggles hover: the rover holds a height above the ground with an infinite boost and flies with the flight model's
 // controls (W/S speed lever, mouse yaw with hysteresis, A/D slide, Space/Ctrl move the hold height), with the
@@ -23,6 +25,8 @@ namespace vehicleflight
 	// False: not allowed (the player's rover, or another pilot has this vehicle).
 	bool PilotFly(int pilot, std::uintptr_t vehicle, double x, double y, double stop, unsigned timeoutMs, bool keepGoing = false,
 		double z = std::numeric_limits<double>::quiet_NaN());
+	// The same from a profile's goal (vcontract::Goal): the nav settings and the target in one call. The one drive call for goal-driven pilots.
+	bool PilotFly(int pilot, std::uintptr_t vehicle, const vcontract::Goal& goal, unsigned timeoutMs = 0, bool keepGoing = true);
 	bool PilotActive(int pilot);
 	const char* PilotEndReason(int pilot);  // why the pilot last stopped ("arrived", "stuck", ...)
 	void PilotStop(int pilot, const char* why);
@@ -53,6 +57,8 @@ namespace vehicleflight
 		unsigned holdMs = 300;
 	};
 	bool PilotCommand(int pilot, const Command& c);  // false: that pilot is not on autopilot
+
+	// The navigation settings of a profile (vcontract::Goal::nav) travel with the goal: PilotFly(pilot, vehicle, Goal) stores them; nothing else sets them.
 
 	// Flipped-vehicle protocol: call every frame for a vehicle we look after (the player's own rover, NPC job
 	// vehicles). Tipped past ~65 degrees and slow for 2 s: its hover (if any) ends and it is set upright 1.5 m higher

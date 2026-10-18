@@ -1,4 +1,5 @@
 #include "addresses.h"
+#include "context.h"
 #include "core_api.h"
 #include "crash.h"
 #include "flighttune.h"
@@ -6,9 +7,12 @@
 #include "hoverui.h"
 #include "realvehicles.h"
 #include "log.h"
+#include "modscene.h"
+#include "navmap.h"
 #include "npcvehicles.h"
 #include "passenger.h"
 #include "traffic.h"
+#include "profiles.h"
 #include "routeplan.h"
 #include "vehicleworld.h"
 #include "vehicleaim.h"
@@ -18,6 +22,7 @@
 #include "telemetry.h"
 #include "vehicle_probe.h"
 #include "vehicleflight.h"
+#include "viewdist.h"
 
 #include "sfse/PluginAPI.h"
 
@@ -49,20 +54,29 @@ namespace
 		npcvehicles::Reset();
 		passenger::Reset();
 		traffic::Reset();
+		context::Reset();
+		viewdist::Reset();
+		profiles::Reset();
 		routeplan::Reset();
 		world::Reset();
+		navmap::Reset();
 	}
 
 	void Frame()
 	{
+		modscene::NewFrame();  // the shared scan of loaded references starts over
 		world::Publish();      // the shared vehicle list (positions, velocities, sizes), once per frame
 		routeplan::Frame();    // its copy for the lane planner
 		vehicleflight::Tick();
+		navmap::Tick();
 		shipvehicle::Tick();
 		realvehicles::Tick();
 		npcvehicles::Tick();
 		passenger::Tick();
 		traffic::Tick();
+		context::Tick();
+		viewdist::Tick();
+		profiles::Tick();
 	}
 
 	class FrameTask final : public SFSETaskInterface::ITaskDelegate
@@ -96,6 +110,7 @@ namespace
 		}
 		hoverui::Install();
 		npcvehicles::Install();
+		profiles::Install();
 		vehicleaim::Install();
 		flighttune::Load();
 		api.OnFrame(&Frame);
@@ -118,6 +133,7 @@ namespace
 		g_standalone = true;
 		hoverui::Install();
 		npcvehicles::Install();
+		profiles::Install();
 		vehicleaim::Install();
 		flighttune::Load();
 		g_tasks->AddTaskPermanent(&g_frameTask);

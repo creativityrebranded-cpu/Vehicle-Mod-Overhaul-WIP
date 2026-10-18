@@ -32,6 +32,9 @@ namespace hoverui
 	void SetAuto(const char* key, bool on, const char* line);
 	// Main thread: the gang line (NPC vehicles following: count, profile, the profile key); count 0 hides it.
 	void SetGang(int count, const char* profile, const char* key);
+	// Main thread: one line per NPC vehicle / rider under the gang line (at most kMaxRows; count 0 hides them). Placed relative to the gang element.
+	constexpr int kMaxRows = 4;
+	void SetRows(int count, const char* const* lines);
 	// A save load or reload: forget the button objects (the HUD movie is rebuilt).
 	void Reset();
 	// Main thread, every frame: layout editor. F7 on / off (saves). In the vehicle, Page Up / Page Down pick one element

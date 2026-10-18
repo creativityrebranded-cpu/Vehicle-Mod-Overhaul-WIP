@@ -22,6 +22,18 @@ namespace controlmap
 	int KeyFor(const char* context, const char* event, int fallback);
 	// Key name for messages ("H", "F9").
 	std::string KeyName(int vk);
+	// ---- The one key table of the mod: every key we use is claimed here by (owner, action), so two of our modules never take the same key and the
+	// whole table can be logged / shown in one place. Claim* only records and returns; the game's own binding check (KeyFree) still decides what is free.
+	// Claim: take this key if the game leaves it free and we have not given it away; false (and a log line) otherwise.
+	bool Claim(const char* owner, const char* action, int vk);
+	// The first of the candidates that is free in the game and unclaimed by us, claimed; 0 when none.
+	int ClaimFirst(const char* owner, const char* action, std::initializer_list<int> vks);
+	// Records a key an owner chose by its own rule (no free check), so the table is complete and a later Claim cannot take it.
+	void Note(const char* owner, const char* action, int vk);
+	// Logs the table (owner, action, key), one line each.
+	void LogTable();
+	// Test / debug keys (board, exit, escort-pursuit, NPC profile cycle) exist only with Logs\SeamlessVehicle\seamless.ini [keys] debug=1. The context engine does their job.
+	bool DebugKeys();
 	// Writes every context's keyboard bindings to Logs\SeamlessPlanets\controlmap.txt (once per session).
 	void Dump();
 }

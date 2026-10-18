@@ -53,7 +53,7 @@ namespace notify
 		va_start(args, fmt);
 		std::vsnprintf(buf, sizeof(buf), fmt, args);
 		va_end(args);
-		logger::Write("Notify (log only): %s", buf);
+		if (logger::Verbose()) logger::Write("Notify (log only): %s", buf);
 	}
 
 	void Show(const char* fmt, ...)

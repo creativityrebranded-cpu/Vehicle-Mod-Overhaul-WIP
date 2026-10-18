@@ -15,6 +15,11 @@ namespace crash
 		thread_local bool t_expected = false;
 		HMODULE g_self = nullptr;
 
+		struct CrumbEntry { const char* what; int arg; DWORD thread; ULONGLONG at; };
+		constexpr unsigned kCrumbs = 24;
+		CrumbEntry g_crumbs[kCrumbs];
+		std::atomic<unsigned> g_crumbNext{ 0 };
+
 		// "Starfield.exe+0x1234567" style description of a code address.
 		void Describe(DWORD64 address, char* out, size_t size)
 		{
@@ -81,6 +86,18 @@ namespace crash
 			logger::WriteUnlocked("  r8=%llX r9=%llX r10=%llX r11=%llX r12=%llX r13=%llX r14=%llX r15=%llX rsp=%llX",
 				c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15, c->Rsp);
 
+			// What the plugin did lately (newest last), with its age and thread.
+			{
+				const ULONGLONG now = GetTickCount64();
+				const unsigned next = g_crumbNext.load();
+				logger::WriteUnlocked("  plugin breadcrumbs (oldest first; now = thread %lu):", GetCurrentThreadId());
+				for (unsigned k = 0; k < kCrumbs; ++k) {
+					const CrumbEntry& e = g_crumbs[(next + k) % kCrumbs];
+					if (!e.what) continue;
+					logger::WriteUnlocked("    -%llu ms  thread %lu  %s %d", now - e.at, e.thread, e.what, e.arg);
+				}
+			}
+
 			// Unwind the faulting thread's stack.
 			CONTEXT ctx = *c;
 			for (int frame = 0; frame < 24 && ctx.Rip; ++frame) {
@@ -123,6 +140,12 @@ namespace crash
 			t_expected = expected;
 			return g_previous ? g_previous(info) : EXCEPTION_CONTINUE_SEARCH;
 		}
+	}
+
+	void Crumb(const char* what, int arg)
+	{
+		const unsigned i = g_crumbNext.fetch_add(1) % kCrumbs;
+		g_crumbs[i] = { what, arg, GetCurrentThreadId(), GetTickCount64() };
 	}
 
 	void Install()

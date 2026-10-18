@@ -2,12 +2,15 @@
 
 #include "addresses.h"
 #include "controlmap.h"
+#include "vcontract.h"
 #include "flight.h"
 #include "game.h"
 #include "hook.h"
 #include "hoverui.h"
 #include "log.h"
 #include "modscene.h"
+#include "navmap.h"
+#include "npcvehicles.h"
 #include "notify.h"
 #include "prefetch.h"
 #include "routeplan.h"
@@ -51,6 +54,10 @@
 //  - Elevation assist: a height hold above the terrain (rising early for higher ground ahead) and a 2.5 m floor.
 namespace vehicleflight
 {
+	// Internal: the navigation settings of the profile driving this pilot (pilot 0 = the player's vehicle), stored with each goal and read by the navigation service.
+	void PilotNav(int pilot, const vcontract::NavParams& nav);
+	const vcontract::NavParams& PilotNavOf(int pilot);
+
 	namespace
 	{
 		template <class T>
@@ -242,9 +249,16 @@ namespace vehicleflight
 		// invisible wall / small anim, 30 char controller, 33 biped no CC, 35 collision box. Not triggers (12), water
 		// (11) or other non-solid volumes, so trigger boxes in cities are not walls.
 		constexpr std::uint64_t kSolidLayers = 0xA5C12671Eull;
+		// Walls only for every navigation query (rays, sweep ring, hull sweep): no characters (8 biped, 30 character controller,
+		// 33 biped no CC). The player and the people around are not walls; the forward rays had never once run before 2026-10-18,
+		// so no behaviour depends on them hitting characters.
+		constexpr std::uint64_t kWallLayers = kSolidLayers & ~((1ull << 8) | (1ull << 30) | (1ull << 33));
 		constexpr double kRayStart = 3.5;         // m ahead of the vehicle's origin (past its own hull)
 		constexpr double kRayLift = 1.0;          // m above its origin
 		constexpr double kRayMin = 15.0;          // m: the shortest look ahead
+		// Sweep rays (2026-10-18, the shared nav map): three more rays a frame per autopilot vehicle, walking round a fixed
+		// ring of 16 compass directions (a full turn in about 6 frames), only to fill the map the heading sampler reads.
+		constexpr int kSweepSlot0 = 24, kSweepRays = 3, kSweepRing = 16;
 		constexpr double kSelfHitBand = 3.0;      // m: a front sample this close to the rover's own height is the rover
 		constexpr double kLandHeight = 1.0;       // m: settling under this (not climbing) for kLandMs ends the hover
 		constexpr ULONGLONG kLandMs = 1500;
@@ -511,17 +525,21 @@ namespace vehicleflight
 			// vehicle except those whose boost our flight model replaces: hovering ones, the vehicle the player drives (Shift is
 			// the gear key there) and the player's own unattended rover -- unless drive mode is using the game's boost.
 			const bool noBoost = !drive && (hovering || (driven && ctxVehicle == driven) || (own && ctxVehicle != driven));
+			// Only vehicles in use get the pinned charge (2026-10-18: small parked vehicles kept hopping about; a permanently full charge on an idle
+			// vehicle is one suspect, so parked ones keep the game's own charge).
+			const bool inUse = hovering || drive || own || (driven && ctxVehicle == driven) ||
+				(ctxVehicle && npcvehicles::UsesVehicle(*reinterpret_cast<std::uint32_t*>(ctxVehicle + 0x28)));
 			if (component && noBoost) {
 				*reinterpret_cast<float*>(component + 0x238) = 0.0f;
 			}
-			else if (component) {
+			else if (component && inUse) {
 				*reinterpret_cast<float*>(component + 0x238) = 1.0f;
 			}
 			g_boostOriginal(component, context);
 			if (component && noBoost) {
 				*reinterpret_cast<float*>(component + 0x238) = 0.0f;
 			}
-			else if (component) {
+			else if (component && inUse) {
 				*reinterpret_cast<float*>(component + 0x238) = 1.0f;
 			}
 			const auto set = EngineFn<void (*)(std::uintptr_t, std::uintptr_t, char, int)>(addr::kSetGraphBool);
@@ -1011,6 +1029,10 @@ namespace vehicleflight
 			prefetch::RayHit ray[3];
 			bool rayValid[3] = {};
 			double rayRange[3] = {};
+			unsigned sweepPhase = 0;                     // which part of the 16-direction ring the next sweep rays look at
+			bool hullValid = false, hullHit = false;     // the hull sweep along the planned heading (prefetch::LatestSweep)
+			double hullDist = 0, hullRange = 0;
+			ULONGLONG hullLogAt = 0;
 			std::uintptr_t lastBlocker = 0;
 			ULONGLONG lastBlockerAt = 0;
 			ULONGLONG landedSince = 0;
@@ -1134,18 +1156,8 @@ namespace vehicleflight
 		int CorridorSlot(int idx, int i) { return idx ? prefetch::kSlotPilot0 + (idx - 1) * prefetch::kSlotPilotEach + 7 + i : prefetch::kSlotCheck0 + i; }
 		int MoveSlot(int idx) { return idx ? CorridorSlot(idx, 0) : prefetch::kSlotRescue0; }
 
-		// Where an autopilot flies: a point, the stop radius, and whether arriving ends the flight (follow keeps going).
-		struct Goal
-		{
-			double x = 0, y = 0;
-			double stop = 8.0;
-			bool keepGoing = false;
-			ULONGLONG timeoutMs = 90000;
-			bool cruise = false;           // Auto with the player aboard: a moving point ahead, flown at cruiseSpeed
-			double cruiseSpeed = 0;
-			bool hold = false;             // hold a fixed spot (the player got out with Auto on)
-			double z = std::numeric_limits<double>::quiet_NaN();  // world height to fly at (NaN: skim the terrain)
-		};
+		// Where an autopilot flies: the shared goal type (vcontract.h): a point, the stop radius, hold / keep-going / cruise, nav settings.
+		using Goal = vcontract::Goal;
 
 		bool Focused()
 		{
@@ -1254,6 +1266,14 @@ namespace vehicleflight
 			logger::Write("Rover call key: %s, follow key: %s", g_keys.call ? controlmap::KeyName(g_keys.call).c_str() : "NONE FREE",
 				g_keys.follow ? controlmap::KeyName(g_keys.follow).c_str() : "NONE FREE");
 			g_keys.chosen = true;
+			controlmap::Note("flight", "hover toggle", g_keys.toggle);
+			controlmap::Note("flight", "roll left", g_keys.rollLeft);
+			controlmap::Note("flight", "roll right", g_keys.rollRight);
+			controlmap::Note("flight", "up", g_keys.up);
+			controlmap::Note("flight", "down", g_keys.down);
+			controlmap::Note("flight", "call", g_keys.call);
+			controlmap::Note("flight", "follow", g_keys.follow);
+			controlmap::Note("flight", "auto", g_keys.autoKey);
 			logger::Write("Rover flight keys: toggle %s, roll %s / %s, up %s / down %s; mouse aims (yaw + pitch), W/S throttle, Shift boost; extra mouse buttons unused",
 				g_keys.toggle ? controlmap::KeyName(g_keys.toggle).c_str() : "NONE FREE", g_keys.rollLeft ? controlmap::KeyName(g_keys.rollLeft).c_str() : "none",
 				g_keys.rollRight ? controlmap::KeyName(g_keys.rollRight).c_str() : "none", g_keys.up ? controlmap::KeyName(g_keys.up).c_str() : "none",
@@ -1267,6 +1287,8 @@ namespace vehicleflight
 
 		// ---- The player's rover, remembered by form id (resolved through the form map, never a stale pointer) ----
 		std::uint32_t g_roverId = 0;
+		bool g_remote = false;                                // HOOK 2b: the autopilot is running a vcontract profile for the player's EMPTY vehicle
+		const vcontract::Profile* g_remoteDone = nullptr;     // the profile that finished / parked; not restarted until the assignment changes
 		bool g_follow = false;            // follow mode (outlives hover starts / stops)
 		ULONGLONG g_followStill = 0;      // since when the player has not moved
 		ULONGLONG g_relaunchAt = 0;       // follow waits until this after a collision ended the flight (15:07: ten relaunches a second)
@@ -1694,8 +1716,7 @@ namespace vehicleflight
 		}
 
 		// The object the straight ray hit: the nearest loaded reference to the hit point (not this vehicle, not the player),
-		// logged once per object and at most once a second. The first hits also log the raw hit record, to find the
-		// body / layer fields in it.
+		// logged once per object and at most once a second (only with the verbose log: it scans every loaded reference).
 		void NameBlocker(int idx)
 		{
 			State& g = g_gs[idx];
@@ -1711,14 +1732,6 @@ namespace vehicleflight
 				const auto p = At<game::Vec3>(r, off::kRefPosition);
 				const double d = std::sqrt(std::pow(p.x - h.x, 2) + std::pow(p.y - h.y, 2) + std::pow(p.z - h.z, 2));
 				if (d < bestD) { bestD = d; best = r; }
-			}
-			static unsigned rawSaid = 0;
-			if (rawSaid < 5) {
-				++rawSaid;
-				logger::Write("%s: forward ray hit record %08X %08X %08X %08X | %08X %08X %08X %08X | %08X %08X %08X %08X %08X %08X %08X %08X | %08X %08X %08X %08X %08X %08X %08X %08X | %08X %08X %08X %08X",
-					Who(idx), h.raw[0], h.raw[1], h.raw[2], h.raw[3], h.raw[4], h.raw[5], h.raw[6], h.raw[7], h.raw[8], h.raw[9], h.raw[10], h.raw[11], h.raw[12],
-					h.raw[13], h.raw[14], h.raw[15], h.raw[16], h.raw[17], h.raw[18], h.raw[19], h.raw[20], h.raw[21], h.raw[22], h.raw[23], h.raw[24], h.raw[25],
-					h.raw[26], h.raw[27]);
 			}
 			// The exact owner of the hit body, when the body -> ref path gave one.
 			if (h.formId) {
@@ -1756,10 +1769,28 @@ namespace vehicleflight
 				const double range = std::max(kRayMin, speed * 1.6);
 				const float from[3] = { float(pos.x + std::sin(hd) * kRayStart), float(pos.y + std::cos(hd) * kRayStart), float(pos.z + kRayLift) };
 				const float to[3] = { float(from[0] + std::sin(hd) * range), float(from[1] + std::cos(hd) * range), from[2] };
-				prefetch::RequestRay(idx * 3 + c, from, to, kSolidLayers);
+				prefetch::RequestRay(idx * 3 + c, from, to, kWallLayers);
 				g.rayRange[c] = range;
 			}
 			g.haveCorr = true;
+			if (g.autopilot && navmap::HullEnabled()) {
+				// The vehicle's own shape swept along the planned heading (hull-sized: what a thin ray cannot know).
+				const std::uintptr_t inst = g_shs[idx].instance.load(std::memory_order_relaxed);
+				if (inst) {
+					g.hullRange = std::max(kRayMin, speed * 1.6);
+					prefetch::RequestSweep(idx, inst, float(std::sin(heading)), float(std::cos(heading)), float(g.hullRange), kWallLayers);
+				}
+			}
+			if (g.autopilot) {
+				const double sweepRange = std::clamp(speed * 2.0, 20.0, 60.0);
+				for (int k = 0; k < kSweepRays; ++k) {
+					const double hd = double((g.sweepPhase * kSweepRays + k) % kSweepRing) * (6.283185307179586 / kSweepRing);
+					const float from[3] = { float(pos.x + std::sin(hd) * kRayStart), float(pos.y + std::cos(hd) * kRayStart), float(pos.z + kRayLift) };
+					const float to[3] = { float(from[0] + std::sin(hd) * sweepRange), float(from[1] + std::cos(hd) * sweepRange), from[2] };
+					prefetch::RequestRay(kSweepSlot0 + idx * kSweepRays + k, from, to, kWallLayers);
+				}
+				++g.sweepPhase;
+			}
 		}
 
 		void ReadCorridors(int idx)
@@ -1771,6 +1802,7 @@ namespace vehicleflight
 				unsigned age = 0;
 				g.corr[i].valid = prefetch::LatestGround(CorridorSlot(idx, i), h, age) && age <= kProbeMaxAge && h > -1e30f && h != -500.0f;
 				g.corr[i].h = h;
+				if (g.corr[i].valid) navmap::NoteGround(g.corr[i].x, g.corr[i].y, h);
 			}
 			// A hit on the player (their character controller) is where the vehicle is going, not a wall.
 			const std::uintptr_t player = Ptr(addr::kPlayerCharacterPtr);
@@ -1779,9 +1811,36 @@ namespace vehicleflight
 				unsigned age = 0;
 				g.rayValid[c] = prefetch::LatestRay(idx * 3 + c, g.ray[c], age) && age <= kProbeMaxAge;
 				auto& h = g.ray[c];
+				const bool rawHit = h.hit;
 				if (g.rayValid[c] && h.hit && player && std::hypot(h.x - pp.x, h.y - pp.y) < 2.5 && h.z > pp.z - 1.0 && h.z < pp.z + 3.0) h.hit = false;
+				if (g.rayValid[c]) navmap::NoteRay(h.from, h.to, rawHit, h.x, h.y, h.z, h.layer, h.normalOk);  // characters are free space to the map, not walls
 			}
-			if (g.autopilot && g.rayValid[0] && g.ray[0].hit) NameBlocker(idx);
+			g.hullValid = g.hullHit = false;
+			if (g.autopilot && navmap::HullEnabled()) {
+				prefetch::SweepHit sw;
+				unsigned age = 0;
+				g.hullValid = prefetch::LatestSweep(idx, sw, age) && age <= kProbeMaxAge;
+				if (g.hullValid) {
+					g.hullDist = sw.distance;
+					g.hullHit = sw.hit && sw.distance >= 1.0f;  // (a hit inside the first metre is the vehicle's own surroundings)
+					if (!sw.hit || g.hullHit) navmap::NoteRay(sw.from, sw.to, sw.hit, sw.x, sw.y, sw.z, sw.layer, false);
+					const bool rayBlocked = g.rayValid[0] && g.ray[0].hit && g.ray[0].distance < g.rayRange[0];
+					navmap::NoteHull(rayBlocked, g.hullHit && g.hullDist < g.hullRange);
+					const ULONGLONG nowMs = GetTickCount64();
+					if (g.hullHit && g.hullDist < g.hullRange && !rayBlocked && nowMs - g.hullLogAt >= 2000) {
+						g.hullLogAt = nowMs;
+						logger::Write("%s: hull sweep blocked %.1f m ahead (layer %u, body %u) where the thin ray saw nothing", Who(idx), sw.distance, sw.layer, sw.bodyId);
+					}
+				}
+			}
+			if (g.autopilot) {
+				for (int k = 0; k < kSweepRays; ++k) {
+					prefetch::RayHit sh;
+					unsigned age = 0;
+					if (prefetch::LatestRay(kSweepSlot0 + idx * kSweepRays + k, sh, age) && age <= kProbeMaxAge) navmap::NoteRay(sh.from, sh.to, sh.hit, sh.x, sh.y, sh.z, sh.layer, sh.normalOk);
+				}
+			}
+			if (g.autopilot && g.rayValid[0] && g.ray[0].hit && logger::Verbose()) NameBlocker(idx);
 		}
 
 		// A corridor: 0 clear at the current height, 1 clear with a climb that fits in time, 2 blocked (or unknown).
@@ -1792,6 +1851,11 @@ namespace vehicleflight
 			double need = -1e9;
 			// Something solid straight along this corridor at the vehicle's own height: blocked, whatever the ground says.
 			if (g.autopilot && g.rayValid[c] && g.ray[c].hit && g.ray[c].distance < g.rayRange[c]) {
+				needOut = kAvoidMaxClimb + 1.0;
+				return 2;
+			}
+			// The vehicle's own shape swept along the planned heading hits something: blocked, however the thin ray read.
+			if (g.autopilot && c == 0 && g.hullHit && g.hullDist < g.hullRange) {
 				needOut = kAvoidMaxClimb + 1.0;
 				return 2;
 			}
@@ -1891,6 +1955,44 @@ namespace vehicleflight
 			AskPilotMove(idx, At<std::uint32_t>(vehicle, 0x28), goal.x, goal.y, pp.z, At<game::Vec3>(player, off::kRefRotation).z);
 		}
 
+		// A contact at the vehicle's place, for the shared nav map (up = pushed up by a floor, else a side bump ahead).
+		void NoteContactAt(std::uintptr_t vehicle, bool up)
+		{
+			const auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
+			const double h = At<game::Vec3>(vehicle, off::kRefRotation).z;
+			navmap::NoteContact(pos.x, pos.y, pos.z, up, std::sin(h), std::cos(h));
+		}
+
+		// The heading sampler for a blocked straight way (navmap::ChooseHeading): sets g.detourAng to the best open heading
+		// the shared map knows of; false = nothing usable (the old +-35 degree stepping runs). The profile's nav settings
+		// shape the hull: margin (default 1.2 m), squeeze (0.4 m), minClearance.
+		bool SamplerDetour(int idx, State& g, const game::Vec3& pos, double bearing, double sp, const char* who, int l, int r, double needL, double needR)
+		{
+			const auto& nv = PilotNavOf(idx);
+			navmap::HeadingQuery q;
+			q.pos[0] = pos.x; q.pos[1] = pos.y; q.pos[2] = pos.z;
+			q.bearing = bearing;
+			q.haveAvoid = true;
+			q.avoidOffset = g.detourAng;
+			q.currentOffset = g.detourAng;
+			q.speed = sp;
+			q.halfWidth = 1.3 + (nv.margin > 0 ? double(nv.margin) : (nv.squeeze ? 0.4 : 1.2));
+			q.clearance = nv.minClearance > 0 ? double(nv.minClearance) : kAvoidClear;
+			q.climbRate = kHoldMaxVz;
+			const auto c = navmap::ChooseHeading(q);
+			navmap::NoteSampler(c.found);
+			if (!c.found) return false;
+			const double oldSide = g.detourAng != 0 ? (g.detourAng > 0 ? 1.0 : -1.0)
+				: (l < 2 && (r == 2 || needL <= needR)) ? -1.0 : (r < 2 ? 1.0 : (needL <= needR ? -1.0 : 1.0));
+			const double before = g.detourAng;
+			g.detourAng = std::clamp(c.offset, -kDetourMax, kDetourMax);
+			if (std::fabs(g.detourAng - before) > 0.05) {
+				logger::Write("%s: path blocked; sampler: heading %+.0f deg off the target (open %.0f m, score %.2f; %d usable, %d blocked, %d unknown); the old rule would turn %s",
+					who, g.detourAng * 57.2958, c.freeDist, c.score, c.usable, c.blocked, c.unknown, oldSide < 0 ? "left" : "right");
+			}
+			return true;
+		}
+
 		// One frame of a hovering pilot: the assist, avoidance, height hold and (autopilot) the flight to the goal.
 		void Fly(int idx, std::uintptr_t vehicle, const Goal& goal, bool focused)
 		{
@@ -1920,6 +2022,7 @@ namespace vehicleflight
 					++b.count;
 					b.at = nowMs;
 					g.cramped = std::min(kCrampedMax, g.cramped + (up ? 2.0 : 1.0));  // contacts raise the drive-mode score
+					NoteContactAt(vehicle, up);
 					const auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
 					if (b.count >= kBumpLimit) {
 						// Cramped: climb out over it and keep flying (contacts never end a flight; the stuck check, which
@@ -1963,15 +2066,18 @@ namespace vehicleflight
 						g.floorUntil = nowMs + kFloorMs;
 						g.contactGraceUntil = nowMs + kPushGraceMs;
 						logger::Write("%s: contact %.0f m/s up at z %.1f: ground under it; holding above it", wf, delta, pos.z);
+						NoteContactAt(vehicle, true);
 					}
 					else if (delta < kCrashDelta) {
 						logger::Write("%s: bump %.0f m/s (side); still flying", wf, delta);
+						NoteContactAt(vehicle, false);
 					}
 					else {
 						// A hard hit no longer ends the flight (the user, 2026-10-17: the recovery handles it): the hover keeps
 						// flying; the next half second of contacts is the same hit settling, not new crashes.
 						g.contactGraceUntil = nowMs + kHitGraceMs;
 						logger::Write("%s: hard hit %.0f m/s (side); still flying", wf, delta);
+						NoteContactAt(vehicle, false);
 					}
 				}
 			}
@@ -2253,6 +2359,10 @@ namespace vehicleflight
 			double yawWant = 0.0;
 
 			double top = g.aiGears ? kAiGearTop[apGear] : boosting ? kGearTop[apGear] : std::max(kGearTop[apGear], kSpeedCap);  // AI: the gear caps it
+			if (g.autopilot) {
+				const auto& nv = PilotNavOf(idx);  // the profile's speed limit (0 = the gears' own)
+				if (nv.speedLimit > 0) top = std::min(top, double(nv.speedLimit));
+			}
 			// ---- Avoidance controller (10 Hz decisions, held at least kAvoidHoldMs) ----
 			bool braking = sBrake;
 			{
@@ -2274,6 +2384,10 @@ namespace vehicleflight
 						g.detourAt = nowMs;
 						logger::Write("%s: path blocked; following your trail (%u points)", wc, g_trailCount);
 					}
+					else if (f == 2 && !hold && navmap::SamplerEnabled() && SamplerDetour(idx, g, pos, apBearing, sp, wc, l, r, needL, needR)) {
+						g.detourAt = nowMs;
+						g.clearSince = 0;
+					}
 					else if (f == 2 && !hold) {
 						const double side = g.detourAng != 0 ? (g.detourAng > 0 ? 1.0 : -1.0)
 							: (l < 2 && (r == 2 || needL <= needR)) ? -1.0 : (r < 2 ? 1.0 : (needL <= needR ? -1.0 : 1.0));
@@ -2291,8 +2405,7 @@ namespace vehicleflight
 					else if (f < 2 && g.detourAng != 0 && !hold) {
 						const int back = g.detourAng > 0 ? l : r;  // the corridor one step back toward the target
 						if (back == 0) {
-							g.detourAng -= (g.detourAng > 0 ? 1.0 : -1.0) * kAvoidSide;
-							if (std::fabs(g.detourAng) < 1e-3) g.detourAng = 0;
+							g.detourAng = std::fabs(g.detourAng) <= kAvoidSide + 1e-3 ? 0.0 : g.detourAng - (g.detourAng > 0 ? 1.0 : -1.0) * kAvoidSide;  // (the sampler's headings are not multiples of a step)
 							g.detourAt = nowMs;
 							logger::Write("%s: way back toward the target clear; detour %+.0f deg", wc, g.detourAng * 57.2958);
 						}
@@ -2316,7 +2429,7 @@ namespace vehicleflight
 							// that does not meet (routeplan.h).
 							routeplan::Query rq;
 							rq.selfId = At<std::uint32_t>(vehicle, 0x28);
-							rq.priority = idx == 0 ? 120 : 60;
+							rq.priority = PilotNavOf(idx).priority > 0 ? PilotNavOf(idx).priority : (idx == 0 ? 120 : 60);
 							rq.pos[0] = pos.x; rq.pos[1] = pos.y; rq.pos[2] = pos.z;
 							rq.dir[0] = float(std::sin(apBearing));
 							rq.dir[1] = float(std::cos(apBearing));
@@ -2685,7 +2798,7 @@ namespace vehicleflight
 					g_sh.matched = false;
 					g_sh.steps = 0;
 				}
-				logger::Write("%s: pos (%.1f, %.1f, %.1f) body %s, %u steps/2 s; speed %.1f (cap %.0f, ahead %s [%d%d%d], rays [%d%d%d], cells [%d%d%d]) vz %.1f; %.1f m above %s, %s %.1f, ref ground %.1f (front %s); "
+				if (logger::Verbose()) logger::Write("%s: pos (%.1f, %.1f, %.1f) body %s, %u steps/2 s; speed %.1f (cap %.0f, ahead %s [%d%d%d], rays [%d%d%d], cells [%d%d%d]) vz %.1f; %.1f m above %s, %s %.1f, ref ground %.1f (front %s); "
 					"pitch %.2f (aim %.2f: camera %.2f, rest %.2f) roll %.2f (in %.0f, signs %.0f / %.0f), yaw spin %.2f; gear %d boost %d; heading %.2f, camera %s (%s) %.2f gap %.2f -> turn %.2f; lift %.0f; thrust %d assist %d; gravity %.2f; %d bad velocities replaced; %u ground samples rejected",
 					wf, pos.x, pos.y, pos.z, matched ? "matched" : "NOT matched", steps, sp, g.cap, aheadLoaded ? "loaded" : "NOT loaded",
 					near0 ? 1 : 0, near1 ? 1 : 0, far2 ? 1 : 0,
@@ -2843,6 +2956,14 @@ namespace vehicleflight
 					logger::Write("Rover follow: you own no vehicle");
 				}
 			}
+			if ((callPressed || followPressed) && g_roverId && vcontract::AssignedTo(g_roverId)) {
+				vcontract::Unassign(g_roverId);  // the player's commands always win over a profile
+				logger::Write("Rover profile: unassigned (summon / follow pressed)");
+				if (g_remote) {
+					g_remote = false;
+					if (g.autopilot) Stop("profile replaced by summon / follow");
+				}
+			}
 			if ((callPressed || followPressed) && !driven && g.holdId) Stop("hold ended (summon / follow)");
 			if (callPressed && !driven) {
 				bool takeOver = false;
@@ -2940,6 +3061,40 @@ namespace vehicleflight
 				}
 				else if (playerStill && distP < kFollowFar) {
 					Stop("follow: player stopped; parked");
+				}
+			}
+		}
+		// ---- HOOK 2b (vehicle contract, Profile Fork): a profile on the player's own EMPTY vehicle (scout / return home / hold) ----
+		{
+			const vcontract::Profile* rp = g_roverId ? vcontract::AssignedTo(g_roverId) : nullptr;
+			if (!rp) g_remoteDone = nullptr;
+			if (driven) {
+				if (rp) {
+					vcontract::Unassign(g_roverId);  // remote profiles are for an empty vehicle; Cruise is handled by hook 2a
+					logger::Write("Rover profile: unassigned (you got in)");
+				}
+				g_remote = false;
+			}
+			else if (!rp) {
+				if (g_remote) {
+					g_remote = false;
+					if (g.autopilot) Stop("profile unassigned");
+				}
+			}
+			else if (!g_follow && rp != g_remoteDone) {
+				if (g_remote && !g.autopilot) g_remote = false;  // something else stopped the autopilot: do not pretend it still runs
+				if (!g_remote && !g.autopilot) {
+					const auto rover = Rover();
+					const auto loaded = rover ? At<std::uintptr_t>(rover, off::kRefLoadedData) : 0;
+					if (rover && loaded && At<std::uintptr_t>(loaded, 0x08)) {
+						Start(rover);
+						g.autopilot = true;
+						g.apClimb = true;
+						g.autopilotSince = GetTickCount64();
+						g.gear = std::max(g.gear, 2);
+						g_remote = true;
+						logger::Write("Rover profile: %s runs on your empty vehicle %08X", rp->name, g_roverId);
+					}
 				}
 			}
 		}
@@ -3069,6 +3224,17 @@ namespace vehicleflight
 				goal.stop = 1.5;
 				goal.hold = true;
 			}
+			else if (vcontract::Goal pg; vcontract::GoalFor(vcontract::User::Player, 0, vehicle, player, pg)) {
+				// HOOK 2a of the vehicle contract (Profile Fork): the player drives with Auto on and a profile is assigned to this vehicle.
+				PilotNav(0, pg.nav);
+				goal.x = pg.x;
+				goal.y = pg.y;
+				goal.stop = pg.stop;
+				goal.z = pg.z;
+				goal.cruise = !pg.hold;
+				goal.cruiseSpeed = kAiGearTop[std::clamp(g.gear, 1, 4)];
+				goal.hold = pg.hold;
+			}
 			else {
 				// Taxi test: Auto never moves on its own; only the player's custom map marker gives it somewhere to go.
 				double mx = 0, my = 0;
@@ -3109,6 +3275,41 @@ namespace vehicleflight
 					goal.stop = 1.5;
 				}
 				goal.hold = true;
+			}
+		}
+		else if (g.autopilot && g_remote) {
+			// HOOK 2b: the goal comes from the assigned profile; false = it finished (or was unassigned): stop and keep the vehicle where it is.
+			vcontract::Goal pg;
+			const auto rpos = At<game::Vec3>(vehicle, off::kRefPosition);
+			if (vcontract::GoalFor(vcontract::User::PlayerRemote, 0, vehicle, player, pg)) {
+				PilotNav(0, pg.nav);  // the profile's navigation settings (speed limit, clearance ...) for the shared navigation service
+				goal.x = pg.x;
+				goal.y = pg.y;
+				goal.stop = pg.stop;
+				goal.z = pg.z;
+				goal.keepGoing = true;
+				goal.cruise = false;
+				goal.hold = pg.hold;
+				goal.timeoutMs = 3600000;
+				// Return home / hold: once at the spot and nearly still, settle (this stands in for the navigation service's own settle-on-arrival).
+				static double lx = 0, ly = 0;
+				static ULONGLONG lt = 0;
+				const ULONGLONG tNow = GetTickCount64();
+				double speed = 99.0;
+				if (lt && tNow > lt && tNow - lt < 1000) speed = std::hypot(rpos.x - lx, rpos.y - ly) / ((tNow - lt) / 1000.0);
+				lx = rpos.x; ly = rpos.y; lt = tNow;
+				if (pg.hold && pg.nav.landOnArrival && std::hypot(pg.x - rpos.x, pg.y - rpos.y) <= pg.stop + 2.0 && speed < 1.0) {
+					g_remoteDone = vcontract::AssignedTo(g_roverId);
+					g_remote = false;
+					Stop("arrived; parked");
+					return;
+				}
+			}
+			else {
+				g_remoteDone = vcontract::AssignedTo(g_roverId);
+				g_remote = false;
+				Stop("profile done");
+				return;
 			}
 		}
 		else if (g.autopilot) {
@@ -3222,6 +3423,12 @@ namespace vehicleflight
 		return true;
 	}
 
+	bool PilotFly(int pilot, std::uintptr_t vehicle, const vcontract::Goal& goal, unsigned timeoutMs, bool keepGoing)
+	{
+		PilotNav(pilot, goal.nav);
+		return PilotFly(pilot, vehicle, goal.x, goal.y, goal.stop, timeoutMs, keepGoing, goal.z);
+	}
+
 	bool PilotActive(int pilot) { return pilot >= 1 && pilot < kPilots && g_gs[pilot].active; }
 
 	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out)
@@ -3298,6 +3505,36 @@ namespace vehicleflight
 		const auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
 		const bool ok = Upright(vehicle, pos, rot.z);
 		logger::Write("%s: %08X flipped (pitch %.0f, roll %.0f deg) -> set upright %s", who, id, rot.x * 57.2958, rot.y * 57.2958, ok ? "" : "FAILED");
+	}
+
+	namespace
+	{
+		vcontract::NavParams g_nav[kPilots];
+		ULONGLONG g_navAt[kPilots] = {};
+	}
+
+	void PilotNav(int pilot, const vcontract::NavParams& nav)
+	{
+		if (pilot < 0 || pilot >= kPilots) return;
+		const auto& old = g_nav[pilot];
+		const bool fresh = GetTickCount64() - g_navAt[pilot] <= 1000;
+		const bool same = fresh && old.speedLimit == nav.speedLimit && old.minClearance == nav.minClearance && old.height == nav.height &&
+			old.margin == nav.margin && old.squeeze == nav.squeeze && old.priority == nav.priority && old.passThrough == nav.passThrough &&
+			old.landOnArrival == nav.landOnArrival && (old.arriveYaw == nav.arriveYaw || (std::isnan(old.arriveYaw) && std::isnan(nav.arriveYaw)));
+		if (!same) {
+			static const char* const heights[3] = { "auto", "hug", "high" };
+			logger::Write("%s: nav settings: speed limit %.0f, clearance %.1f, height %s, margin %.1f, squeeze %d, priority %d, pass through %d, land on arrival %d",
+				Who(pilot), nav.speedLimit, nav.minClearance, heights[std::clamp(int(nav.height), 0, 2)], nav.margin, nav.squeeze ? 1 : 0, nav.priority,
+				nav.passThrough ? 1 : 0, nav.landOnArrival ? 1 : 0);
+		}
+		g_nav[pilot] = nav;
+		g_navAt[pilot] = GetTickCount64();
+	}
+
+	const vcontract::NavParams& PilotNavOf(int pilot)
+	{
+		static const vcontract::NavParams none;
+		return pilot >= 0 && pilot < kPilots && GetTickCount64() - g_navAt[pilot] <= 1000 ? g_nav[pilot] : none;
 	}
 
 	bool PilotCommand(int pilot, const Command& c)

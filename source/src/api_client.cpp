@@ -70,6 +70,14 @@ namespace prefetch
 	{
 		return !A() && vehicle_probe::LatestRay(slot, out, age);
 	}
+	void RequestSweep(int slot, std::uintptr_t instance, float dirX, float dirY, float range, std::uint64_t mask)
+	{
+		if (!A()) vehicle_probe::RequestSweep(slot, instance, dirX, dirY, range, mask);
+	}
+	bool LatestSweep(int slot, SweepHit& out, unsigned& age)
+	{
+		return !A() && vehicle_probe::LatestSweep(slot, out, age);
+	}
 }
 
 namespace rebase

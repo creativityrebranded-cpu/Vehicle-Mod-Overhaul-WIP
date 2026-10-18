@@ -351,7 +351,8 @@ namespace passenger
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player) return;
 		if (!g_key) {
-			g_key = controlmap::FirstFree({ 'G', 'I', 'L', 'M', 'X', 'V', VK_OEM_2 });
+			// The main-row / (VK_OEM_2) was this key; it is lent to the NPC probe selector for now (2026-10-18), so the passenger key is off unless one of the others is free.
+			g_key = controlmap::ClaimFirst("passenger", "ride along", { 'G', 'I', 'L', 'M', 'X', 'V' });
 			logger::Write("Passenger: key %s (near a vehicle an NPC flies: ride along; again: get out)", g_key ? controlmap::KeyName(g_key).c_str() : "NONE FREE");
 			if (!g_key) g_key = -1;
 		}

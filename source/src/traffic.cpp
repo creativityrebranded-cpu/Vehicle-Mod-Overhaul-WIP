@@ -177,7 +177,7 @@ namespace traffic
 					d.kind = away >= kTripMetres ? Kind::Trip : Kind::Short;
 					++travelling;
 					++logged;
-					logger::Write("Traffic: NPC %08X at (%.0f, %.0f) -> goal (%.0f, %.0f, %.0f) %.0f m away, %.0f m of path, %u points, package type %d%s",
+					if (logger::Verbose()) logger::Write("Traffic: NPC %08X at (%.0f, %.0f) -> goal (%.0f, %.0f, %.0f) %.0f m away, %.0f m of path, %u points, package type %d%s",
 						At<std::uint32_t>(r, 0x28), ap.x, ap.y, d.x, d.y, d.z, away, d.remaining, d.points, d.packageType, d.kind == Kind::Trip ? " TRIP" : "");
 				}
 			}
@@ -185,7 +185,7 @@ namespace traffic
 			const ULONGLONG now = GetTickCount64();
 			if (now - lastSummary >= 30000) {
 				lastSummary = now;
-				logger::Write("Traffic: probe: %d NPCs within %.0f m, %d with a path", seen, kProbeRange, travelling);
+				if (logger::Verbose()) logger::Write("Traffic: probe: %d NPCs within %.0f m, %d with a path", seen, kProbeRange, travelling);
 			}
 		}
 	}

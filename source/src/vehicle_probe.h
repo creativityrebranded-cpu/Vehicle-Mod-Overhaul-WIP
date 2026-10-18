@@ -15,4 +15,7 @@ namespace vehicle_probe
 	// Forward rays (prefetch::RequestRay / LatestRay in this DLL).
 	void RequestRay(int slot, const float from[3], const float to[3], std::uint64_t mask);
 	bool LatestRay(int slot, prefetch::RayHit& out, unsigned& age);
+	// Hull sweeps (prefetch::RequestSweep / LatestSweep in this DLL).
+	void RequestSweep(int slot, std::uintptr_t instance, float dirX, float dirY, float range, std::uint64_t mask);
+	bool LatestSweep(int slot, prefetch::SweepHit& out, unsigned& age);
 }

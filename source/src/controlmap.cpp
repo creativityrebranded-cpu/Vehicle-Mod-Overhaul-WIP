@@ -116,7 +116,11 @@ namespace controlmap
 				const auto namePtr = *reinterpret_cast<const char* const*>(game::Base() + kContextNames + raw[i].context * 8);
 				g_keys.push_back({ namePtr ? namePtr : "?", raw[i].event ? raw[i].event : "", raw[i].key, raw[i].key2, raw[i].device });
 			}
-			logger::Write("Control map: %zu keyboard and mouse bindings read", g_keys.size());
+			{
+				static bool said = false;  // it is re-read every few seconds: say it once
+				if (!said || logger::Verbose()) logger::Write("Control map: %zu keyboard and mouse bindings read", g_keys.size());
+				said = true;
+			}
 			return !g_keys.empty();
 		}
 
@@ -199,6 +203,79 @@ namespace controlmap
 			}
 		}
 		return true;
+	}
+
+	namespace
+	{
+		struct Claimed { std::string owner, action; int vk; };
+		std::vector<Claimed> g_claimed;
+		std::mutex g_claimLock;
+		const Claimed* ClaimOf(int vk)
+		{
+			for (const auto& c : g_claimed) {
+				if (c.vk == vk) return &c;
+			}
+			return nullptr;
+		}
+	}
+
+	bool Claim(const char* owner, const char* action, int vk)
+	{
+		if (vk <= 0) return false;
+		std::lock_guard lk(g_claimLock);
+		if (const Claimed* c = ClaimOf(vk)) {
+			logger::Write("Keys: %s/%s wanted %s, already %s/%s", owner, action, KeyName(vk).c_str(), c->owner.c_str(), c->action.c_str());
+			return false;
+		}
+		if (!KeyFree(vk)) return false;
+		g_claimed.push_back({ owner, action, vk });
+		return true;
+	}
+
+	int ClaimFirst(const char* owner, const char* action, std::initializer_list<int> vks)
+	{
+		for (const int vk : vks) {
+			{
+				std::lock_guard lk(g_claimLock);
+				if (ClaimOf(vk)) continue;
+			}
+			if (Claim(owner, action, vk)) return vk;
+		}
+		return 0;
+	}
+
+	void Note(const char* owner, const char* action, int vk)
+	{
+		if (vk <= 0) return;
+		std::lock_guard lk(g_claimLock);
+		if (const Claimed* c = ClaimOf(vk)) {
+			if (c->owner != owner) logger::Write("Keys: %s/%s uses %s, also %s/%s", owner, action, KeyName(vk).c_str(), c->owner.c_str(), c->action.c_str());
+			return;
+		}
+		g_claimed.push_back({ owner, action, vk });
+	}
+
+	void LogTable()
+	{
+		std::lock_guard lk(g_claimLock);
+		for (const auto& c : g_claimed) logger::Write("Keys: %-8s %-18s %s", c.owner.c_str(), c.action.c_str(), KeyName(c.vk).c_str());
+	}
+
+	bool DebugKeys()
+	{
+		static ULONGLONG lastRead = 0;
+		static bool value = false;
+		const ULONGLONG now = GetTickCount64();
+		if (!lastRead || now - lastRead >= 5000) {
+			lastRead = now;
+			PWSTR docs = nullptr;
+			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				CoTaskMemFree(docs);
+				value = GetPrivateProfileIntW(L"keys", L"debug", 0, ini.c_str()) != 0;
+			}
+		}
+		return value;
 	}
 
 	int FirstFree(std::initializer_list<int> vks)

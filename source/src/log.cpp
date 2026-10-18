@@ -36,6 +36,23 @@ namespace logger
 		g_file = _wfopen(path.c_str(), L"w");
 	}
 
+	bool Verbose()
+	{
+		static ULONGLONG lastRead = 0;
+		static bool value = false;
+		const ULONGLONG now = GetTickCount64();
+		if (!lastRead || now - lastRead >= 5000) {
+			lastRead = now;
+			PWSTR docs = nullptr;
+			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				CoTaskMemFree(docs);
+				value = GetPrivateProfileIntW(L"log", L"verbose", 0, ini.c_str()) != 0;
+			}
+		}
+		return value;
+	}
+
 	void Write(const char* fmt, ...)
 	{
 		if (!g_file) {

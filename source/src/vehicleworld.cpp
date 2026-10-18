@@ -208,6 +208,17 @@ namespace world
 			if (t.have) {
 				const double dt = double(qpc.QuadPart - t.at.QuadPart) / double(freq.QuadPart);
 				const float jump = std::hypot(p.x - t.last[0], p.y - t.last[1]);
+				{
+					// A parked vehicle that moves by itself (the hopping small vehicles, 2026-10-18): name it.
+					const float d3 = std::sqrt((p.x - t.last[0]) * (p.x - t.last[0]) + (p.y - t.last[1]) * (p.y - t.last[1]) + (p.z - t.last[2]) * (p.z - t.last[2]));
+					static unsigned hopLogged = 0;
+					if (!r || r == driven || npcvehicles::UsesVehicle(id)) {
+					}
+					else if (d3 > 0.6f && d3 < 50.0f && hopLogged < 40) {
+						++hopLogged;
+						logger::Write("Vehicle hop: %08X (base %08X) moved %.1f m while parked, to (%.1f, %.1f, %.1f)", id, v.baseId, d3, p.x, p.y, p.z);
+					}
+				}
 				if (dt > 1e-4 && dt < 0.5 && jump < 50.0f) {
 					const float a = float(std::min(1.0, dt * 8.0));
 					const float cur[3] = { p.x - t.last[0], p.y - t.last[1], p.z - t.last[2] };

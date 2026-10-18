@@ -126,10 +126,10 @@ namespace hoverui
 		enum { kW, kA, kS, kD, kGearDown, kGearUp, kHover, kGear, kButtons };
 		// Editor selections: each element (W, A, S, D, Gear-, Gear+, Hover, Gear box, Auto, Auto line, Gang), each of the
 		// rover widget's own clips (kSelNative + i, e.g. the Exit button), then the groups.
-		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelNative = 100 };
-		constexpr int kFootEls = 7, kCarEls = 3;
-		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject" };
-		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh" };
+		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelNative = 100 };
+		constexpr int kFootEls = 8, kCarEls = 4;
+		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject", "vehicles" };
+		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh", "vehiclesinveh" };
 		constexpr double kDefOff[kButtons][2] = { { 0.0, -31.0 }, { -23.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 0.0 }, { -2.0, 0.0 } };
 		struct Layout_t
 		{
@@ -153,8 +153,8 @@ namespace hoverui
 			bool oldRows = false;      // only the earlier per-row positions are known: derive the column from them
 			double oldX[3] = {}, oldY[3] = {};  // Gear+, Gear-, Hover (the earlier order)
 			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] }, { kDefOff[4][0], kDefOff[4][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
-			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang, Passenger, Eject)
-			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang)
+			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang, Passenger, Eject, vehicles)
+			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang, vehicles)
 			// The rover widget's own clips (found by name when the widget is first seen) and their nudges.
 			std::vector<std::string> natNames;
 			std::map<std::string, std::pair<double, double>> natOff;
@@ -301,6 +301,8 @@ namespace hoverui
 			std::string occKey;
 			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey;
 			int gang = 0;
+			std::string rows[kMaxRows];
+			int rowCount = 0;
 		} g_ctx;
 		std::atomic<bool> g_footShown{ false };
 		std::atomic<int> g_gear{ 2 };
@@ -794,7 +796,7 @@ namespace hoverui
 			if (now - g_lastReport >= 60000) {
 				if (!g_lastReport) logger::Write("Hover UI: HUD movie advances on thread %lu", GetCurrentThreadId());
 				g_lastReport = now;
-				logger::Write("Hover UI: HUD movie advanced %u times in the last minute", g_calls);
+				if (logger::Verbose()) logger::Write("Hover UI: HUD movie advanced %u times in the last minute", g_calls);
 				g_calls = 0;
 			}
 			__try {
@@ -932,13 +934,13 @@ namespace hoverui
 		{
 			uptr movie = 0;
 			Value meters, widget;          // RightMeters_mc (on foot) and HUDVehicle_mc (in the vehicle)
-			MonoEl fSummon, fFollow, fGetIn, fStatus, fGang, fPass, fEject;
-			MonoEl vAuto, vLine, vGang;
+			MonoEl fSummon, fFollow, fGetIn, fStatus, fGang, fPass, fEject, fRows;
+			MonoEl vAuto, vLine, vGang, vRows;  // fRows / vRows: the per-vehicle line (one box, movable in the F7 editor)
 			bool built = false, failed = false;
 		} g_ex;
 
-		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fGang, &g_ex.fPass, &g_ex.fEject };
-		MonoEl* CarEls[kCarEls] = { &g_ex.vAuto, &g_ex.vLine, &g_ex.vGang };
+		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fGang, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows };
+		MonoEl* CarEls[kCarEls] = { &g_ex.vAuto, &g_ex.vLine, &g_ex.vGang, &g_ex.vRows };
 
 		bool IsOurExtra(void* object)
 		{
@@ -990,7 +992,8 @@ namespace hoverui
 		void RefreshExtras()
 		{
 			bool own, nearOwn, autoOn, occupied;
-			int gang;
+			int gang, rowCount = 0;
+			std::string rows[kMaxRows];
 			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey, occKey;
 			{
 				std::lock_guard lk(g_ctx.lock);
@@ -998,6 +1001,8 @@ namespace hoverui
 				occupied = g_ctx.occupied; occKey = g_ctx.occKey;
 				summonKey = g_ctx.summonKey; followKey = g_ctx.followKey; useKey = g_ctx.useKey; status = g_ctx.status;
 				autoKey = g_ctx.autoKey; autoLine = g_ctx.autoLine; gangText = g_ctx.gangText; gangKey = g_ctx.gangKey;
+				rowCount = g_ctx.rowCount;
+				for (int i = 0; i < kMaxRows; ++i) rows[i] = g_ctx.rows[i];
 			}
 			const bool inVehicle = g_inVehicle.load();
 			const bool foot = !inVehicle && own;
@@ -1019,7 +1024,16 @@ namespace hoverui
 			ElSet(g_ex.fGetIn, foot && (nearOwn || ed), "Get in", useKey);
 			ElSet(g_ex.fStatus, foot && !status.empty(), " ", status);
 			MonoTint(g_ex.movie, g_ex.fStatus, !status.empty());
-			ElSet(g_ex.fGang, !inVehicle && (gang > 0 || (ed && foot)), gangText.c_str(), gangKey);
+			// Text inside one rounded box (label blank), like the FOLLOWING status box.
+			const std::string gangBox = gangText + (gangKey.empty() ? std::string() : "  [" + gangKey + "]");
+			std::string rowsBox;
+			for (int i = 0; i < kMaxRows && i < rowCount; ++i) {
+				if (rows[i].empty()) continue;
+				rowsBox += (rowsBox.empty() ? "" : "  |  ") + rows[i];
+			}
+			if (ed && rowsBox.empty()) rowsBox = "pursuit REV8 83 m";
+			ElSet(g_ex.fGang, !inVehicle && (gang > 0 || (ed && foot)), " ", gangBox);
+			ElSet(g_ex.fRows, !inVehicle && (gang > 0 || (ed && foot)) && !rowsBox.empty(), " ", rowsBox);
 			// Facing an occupied vehicle on foot: tap = the passenger seat, hold = eject the driver (half-size prompts).
 			g_ex.fPass.scale = g_ex.fEject.scale = 0.5;
 			const bool occShow = !inVehicle && (occupied || (ed && foot));
@@ -1029,7 +1043,8 @@ namespace hoverui
 			MonoTint(g_ex.movie, g_ex.vAuto, autoOn);
 			ElSet(g_ex.vLine, inVehicle && (autoOn || ed) && !autoLine.empty(), " ", autoLine);
 			MonoTint(g_ex.movie, g_ex.vLine, true);
-			ElSet(g_ex.vGang, inVehicle && (gang > 0 || ed), gangText.c_str(), gangKey);
+			ElSet(g_ex.vGang, inVehicle && (gang > 0 || ed), " ", gangBox);
+			ElSet(g_ex.vRows, inVehicle && (gang > 0 || ed) && !rowsBox.empty(), " ", rowsBox);
 			if (ed) gang = std::max(gang, 1);
 			// Places: the on-foot panel in RightMeters_mc's coordinates; the extras in the rover widget's, beside the
 			// column (Auto) and under the WASD cluster (status, gang).
@@ -1058,7 +1073,7 @@ namespace hoverui
 			}
 			const bool blinkOff = edit && (GetTickCount64() / 300) % 2 == 0;
 			if (foot || gang > 0 || occupied) {
-				const double at[kFootEls][2] = { { fx, fy }, { fx + 120.0, fy }, { fx + 240.0, fy }, { fx + 80.0, fy + 52.0 }, { fx + 80.0, fy + 98.0 }, { fx + 240.0, fy + 52.0 }, { fx + 240.0, fy + 98.0 } };
+				const double at[kFootEls][2] = { { fx, fy }, { fx + 120.0, fy }, { fx + 240.0, fy }, { fx + 80.0, fy + 52.0 }, { fx + 80.0, fy + 98.0 }, { fx + 240.0, fy + 52.0 }, { fx + 240.0, fy + 98.0 }, { fx + 80.0, fy + 98.0 } };
 				for (int i = 0; i < kFootEls; ++i) {
 					if (!FootEls[i]->shown) continue;
 					if (FootEls[i]->scale != 1.0) {
@@ -1071,7 +1086,7 @@ namespace hoverui
 				}
 			}
 			if (inVehicle) {
-				const double at[kCarEls][2] = { { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey }, { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey } };
+				const double at[kCarEls][2] = { { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey }, { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { cx + ex, cy + 1.7 * d + ey } };
 				for (int i = 0; i < kCarEls; ++i) {
 					if (!CarEls[i]->shown) continue;
 					PlaceButtonKey(CarEls[i]->button, at[i][0] + co[i][0], at[i][1] + co[i][1], false);
@@ -1328,11 +1343,22 @@ namespace hoverui
 	void SetGang(int count, const char* profile, const char* key)
 	{
 		char t[64];
-		std::snprintf(t, sizeof(t), "Gang %d  %s", count, profile ? profile : "");
+		if (profile && profile[0]) std::snprintf(t, sizeof(t), "Gang %d  %s", count, profile);
+		else std::snprintf(t, sizeof(t), "Gang %d", count);
 		std::lock_guard lk(g_ctx.lock);
 		g_ctx.gang = count;
 		if (g_ctx.gangText != t) g_ctx.gangText = t;
 		if (g_ctx.gangKey != key) g_ctx.gangKey = key;
+	}
+
+	void SetRows(int count, const char* const* lines)
+	{
+		std::lock_guard lk(g_ctx.lock);
+		g_ctx.rowCount = std::clamp(count, 0, kMaxRows);
+		for (int i = 0; i < kMaxRows; ++i) {
+			const std::string t = i < g_ctx.rowCount && lines && lines[i] ? lines[i] : "";
+			if (g_ctx.rows[i] != t) g_ctx.rows[i] = t;
+		}
 	}
 
 	void Reset() { g_reset = true; }
@@ -1343,7 +1369,7 @@ namespace hoverui
 		std::vector<int> SelOrder()
 		{
 			std::vector<int> o;
-			for (int i = 0; i <= kSelGang; ++i) o.push_back(i);
+			for (int i = 0; i <= kSelRows; ++i) o.push_back(i);
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) o.push_back(kSelNative + i);
 			for (int i : { int(kSelCluster), int(kSelColumn), int(kSelExtras), int(kSelAll) }) o.push_back(i);
 			return o;
@@ -1353,11 +1379,11 @@ namespace hoverui
 		std::string SelName(bool inVehicle)
 		{
 			if (!inVehicle) {
-				const char* foot[kFootEls + 1] = { "Summon", "Follow", "Get in", "Status", "Gang", "Passenger", "Eject", "Panel" };
+				const char* foot[kFootEls + 1] = { "Summon", "Follow", "Get in", "Status", "Gang", "Passenger", "Eject", "Vehicles", "Panel" };
 				return foot[std::clamp(g_lay.fsel, 0, kFootEls)];
 			}
 			const int s = g_lay.sel;
-			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Gear-", "Gear+", "Hover", "Gear box", "Auto", "Auto line", "Gang", "WASD", "Column", "Extras",
+			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Gear-", "Gear+", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "WASD", "Column", "Extras",
 				"All" };
 			if (s >= 0 && s <= kSelAll) return names[s];
 			if (s >= kSelNative && s - kSelNative < int(g_lay.natNames.size())) return g_lay.natNames[s - kSelNative];
@@ -1444,7 +1470,7 @@ namespace hoverui
 			if (all || sel == kGear) { g_lay.gx += dx; g_lay.gy += dy; }
 			if (all || sel == kSelExtras) { g_lay.eox += dx; g_lay.eoy += dy; }
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] += dx; g_lay.off[sel][1] += dy; }
-			if (sel >= kSelAuto && sel <= kSelGang) { g_lay.carOff[sel - kSelAuto][0] += dx; g_lay.carOff[sel - kSelAuto][1] += dy; }
+			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] += dx; g_lay.carOff[sel - kSelAuto][1] += dy; }
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) {
 				if (all || sel == kSelNative + i) {
 					auto& o = g_lay.natOff[g_lay.natNames[i]];
@@ -1457,7 +1483,7 @@ namespace hoverui
 		if (press[9]) {
 			// Delete: the picked element back to its default place.
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] = kDefOff[sel][0]; g_lay.off[sel][1] = kDefOff[sel][1]; changed = true; }
-			if (sel >= kSelAuto && sel <= kSelGang) { g_lay.carOff[sel - kSelAuto][0] = g_lay.carOff[sel - kSelAuto][1] = 0.0; changed = true; }
+			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] = g_lay.carOff[sel - kSelAuto][1] = 0.0; changed = true; }
 			if (sel >= kSelNative && sel - kSelNative < int(g_lay.natNames.size())) { g_lay.natOff.erase(g_lay.natNames[sel - kSelNative]); changed = true; }
 		}
 		if (dd != 0.0) {

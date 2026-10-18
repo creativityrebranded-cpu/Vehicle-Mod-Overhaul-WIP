@@ -100,7 +100,22 @@ namespace modscene
 		Walk(root, cls, out, limit, 0, visited);
 	}
 
-	std::vector<std::uintptr_t> LoadedRefs(unsigned limit)
+	namespace
+	{
+		std::vector<std::uintptr_t> g_shared;   // the shared scan of this frame
+		unsigned g_sharedLimit = 0;             // the limit it was taken with
+		bool g_sharedValid = false;
+		ULONGLONG g_frameAt = 0;                // when NewFrame was last called (0: never)
+		constexpr ULONGLONG kFrameAliveMs = 250;
+	}
+
+	void NewFrame()
+	{
+		g_sharedValid = false;
+		g_frameAt = GetTickCount64();
+	}
+
+	std::vector<std::uintptr_t> ScanRefs(unsigned limit)
 	{
 		std::vector<std::uintptr_t> out;
 		const auto tes = Ptr(addr::kTESPtr);
@@ -117,6 +132,21 @@ namespace modscene
 			EngineFn<int (*)(std::uintptr_t, RefCollector*, char)>(addr::kForEachRefInCell)(cell, &cb, 0);
 		}
 		return out;
+	}
+
+
+	std::vector<std::uintptr_t> LoadedRefs(unsigned limit)
+	{
+		const ULONGLONG now = GetTickCount64();
+		if (!g_frameAt || now - g_frameAt > kFrameAliveMs) return ScanRefs(limit);  // nobody calls NewFrame: no sharing
+		const bool truncated = g_sharedValid && g_shared.size() >= g_sharedLimit;
+		if (!g_sharedValid || (truncated && limit > g_sharedLimit)) {
+			g_shared = ScanRefs(limit);
+			g_sharedLimit = limit;
+			g_sharedValid = true;
+		}
+		if (g_shared.size() <= limit) return g_shared;
+		return std::vector<std::uintptr_t>(g_shared.begin(), g_shared.begin() + limit);
 	}
 
 	bool IsActor(std::uintptr_t ref)
