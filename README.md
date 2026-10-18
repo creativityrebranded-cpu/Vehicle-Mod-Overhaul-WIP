@@ -39,8 +39,12 @@ save and exit before installing or upgrading.
    ```
    <Starfield>\Data\SFSE\Plugins\SeamlessVehicle.dll
    ```
-3. Start the game with **`sfse_loader.exe`** (Steam running), not the normal launcher.
-4. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` starts with
+3. Enable the two data plugins that came in the same `Data` folder (add them to your plugin list, below Parked Vehicles):
+   - **`Vehicles - Real.esm`**: turns the Parked Vehicles props into real, drivable vehicles (needs Parked Vehicles = `Vehicles.esm`).
+   - **`SeamlessPilots.esm`**: the quest package that makes an NPC walk to a vehicle and get in. Without it NPCs cannot be sent to vehicles.
+   Both are built from the game's own data by the scripts in `tools/` (`make_vehicles_real.py`, `make_pilots_esm.py`).
+4. Start the game with **`sfse_loader.exe`** (Steam running), not the normal launcher.
+5. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` starts with
    `SeamlessVehicle 0.60.0 loaded`.
 
 To uninstall, delete `Data\SFSE\Plugins\SeamlessVehicle.dll`. Vehicles in your save are kept.
@@ -241,6 +245,30 @@ Logs to send when something goes wrong: `Documents\My Games\Starfield\SFSE\Logs\
 
 ---
 
+## Settings
+
+All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\` (re-read every 5 seconds):
+
+| File | Section | Key | What it does |
+|---|---|---|---|
+| `seamless.ini` | `[log]` | `verbose=1` | The chatty log lines (per-second NPC state, pilot positions, HUD notices) |
+| `seamless.ini` | `[context]` | `enabled=0` | Turns the NPC rules engine off |
+| `seamless.ini` | `[keys]` | `debug=1` | Manual test keys: board the NPC you face `;`, exit all `Insert`, escort / pursuit toggle `.`, NPC profile cycle `[` |
+| `seamless.ini` | `[view]` | `objectFade=3`, `actorFade=1` | Fade distance multipliers (1 = the game's own, 0 = never fade) |
+| `nav.ini` | `[nav]` | `sampler=0`, `shape=0`, `rays=0` | Turn off the heading sampler, the hull sweeps, or all engine ray and sweep queries |
+| `hoverui.ini` | | | HUD layout, saved by the F7 editor |
+
+## Troubleshooting
+
+- **Nothing happens / no log:** the plugin only runs on Starfield **1.16.244** with SFSE for that build. The first log line says why when it disables itself.
+- **NPCs never go to a vehicle:** `SeamlessPilots.esm` is not enabled (the log says so).
+- **Parked props, not real vehicles:** `Vehicles - Real.esm` is not enabled, or Parked Vehicles is missing.
+- **A crash:** send `SeamlessVehicle.log` (and `.prev.log`). The report lists the faulting address, the stack and what the plugin did in the last moments.
+- **Frame rate drops with Auto or NPC vehicles:** set `[nav] rays=0` to test; lower `[view] objectFade`.
+
+More: `docs/ARCHITECTURE.md` (how it fits together), `docs/ENGINE_NOTES.md` (engine addresses and findings), `docs/TESTING.md` (what is tested, the in-game checklist),
+`docs/KNOWN_ISSUES.md` (open bugs and next steps), `docs/research/` (research notes).
+
 ## Building from source
 
 Needs Visual Studio 2022 Build Tools (C++ workload) and CMake 3.24+.
@@ -259,9 +287,12 @@ needed for this mod.
 
 ```
 Data/SFSE/Plugins/SeamlessVehicle.dll   the built plugin (copy into the Starfield folder)
-source/                                 full C++ source and CMake build
-  src/vehicleflight.cpp                 hover flight model, autopilot, navigation, gears
-  src/npcvehicles.cpp                   NPC boarding, escort / pursuit profiles, vehicle weapon
-  src/realvehicles.cpp                  vehicle registry
-  src/hoverui.cpp                       on-screen buttons (Scaleform)
+Data/SeamlessPilots.esm                 the walk-to-vehicle quest package (enable it)
+Data/Vehicles - Real.esm                Parked Vehicles props -> real vehicles (enable it)
+source/                                 C++ source and CMake build (src/, tests/)
+tools/                                  integrate.sh (build + install), make_vehicles_real.py, make_pilots_esm.py
+docs/                                   ARCHITECTURE, ENGINE_NOTES, TESTING, KNOWN_ISSUES, research/
 ```
+
+`bash tools/integrate.sh "note"` builds and installs (it refuses to install while the game runs). It needs the SFSE headers for 1.16.244 in `ref/sfse`
+next to this folder (`git clone https://github.com/ianpatt/sfse ref/sfse`) or `SFSE_ROOT` set.
