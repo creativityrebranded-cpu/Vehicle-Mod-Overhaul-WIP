@@ -94,6 +94,7 @@ namespace npcvehicles
 			ULONGLONG aggroAt = 0;             // last combat request (attack)
 			Profile profile = Profile::Escort;
 			bool gang = false;                 // started by the gang (mirrors the player), not by the force key
+			bool driving = false;              // drive mode controls are being submitted
 			bool firing = false;               // the vehicle weapon's fire input is held
 			ULONGLONG fireAt = 0;              // when the current burst / gap started
 			unsigned bursts = 0;
@@ -650,6 +651,16 @@ namespace npcvehicles
 		{
 			auto* h = g_fireHandler[slot];
 			std::memset(h + 0x80, 0, 0x20);
+			// The input block (handler + 0x80; FUN_141324650): +0x10 steer, +0x14 accelerate, +0x18 brake, +0x1C forward
+			// boost, +0x1E vertical boost, +0x1F fire. Drive mode (vehicleflight) fills the movement fields.
+			vehicleflight::DriveInput di;
+			if (vehicleflight::DriveFor(vehicleId, di)) {
+				*reinterpret_cast<float*>(h + 0x90) = di.steer;
+				*reinterpret_cast<float*>(h + 0x94) = di.accel;
+				*reinterpret_cast<float*>(h + 0x98) = di.brake;
+				h[0x9C] = di.boost ? 1 : 0;
+				h[0x9E] = di.vert ? 1 : 0;
+			}
 			h[0x9F] = fire ? 1 : 0;
 			__try {
 				const uptr sys = EngineFn<uptr (*)()>(kVehicleSystem)();
@@ -662,6 +673,17 @@ namespace npcvehicles
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
+			}
+		}
+
+		// A vehicle in drive mode gets its controls every tick (and one zero block when drive mode ends).
+		void PushDrive(Job& j)
+		{
+			vehicleflight::DriveInput di;
+			const bool drv = vehicleflight::DriveFor(j.vehicle, di);
+			if (drv || j.driving) {
+				SubmitFire(j.pilot - 1, j.vehicle, false);
+				j.driving = drv;
 			}
 		}
 
@@ -1723,6 +1745,7 @@ namespace npcvehicles
 		for (int i = 0; i < kJobs; ++i) {
 			g_jobs[i].pilot = i + 1;
 			if (g_jobs[i].phase != Phase::Idle) Update(g_jobs[i], player);
+			if (g_jobs[i].phase == Phase::Following && !g_jobs[i].firing) PushDrive(g_jobs[i]);
 		}
 		// The HUD's gang line: NPC vehicles following, and their profile (the period key switches it).
 		int n = 0;
@@ -1772,6 +1795,18 @@ namespace npcvehicles
 			bool ours = false;
 			for (int i = 0; i < kJobs; ++i) {
 				if (input == reinterpret_cast<uptr>(g_fireHandler[i]) + 0x80) { ours = true; break; }
+			}
+			if (!ours && component && input) {
+				// The player's vehicle while Auto drives it (drive mode): the autopilot's controls replace the player's input.
+				vehicleflight::DriveInput di;
+				if (vehicleflight::DriveFor(At<std::uint32_t>(component, 0xC), di)) {
+					auto* in = reinterpret_cast<std::uint8_t*>(input);
+					*reinterpret_cast<float*>(in + 0x10) = di.steer;
+					*reinterpret_cast<float*>(in + 0x14) = di.accel;
+					*reinterpret_cast<float*>(in + 0x18) = di.brake;
+					in[0x1C] = di.boost ? 1 : 0;
+					in[0x1E] = di.vert ? 1 : 0;
+				}
 			}
 			if (!ours || !component) {
 				g_applyOriginal(component, input);

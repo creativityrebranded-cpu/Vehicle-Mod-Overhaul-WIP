@@ -109,6 +109,30 @@ F7 moves everything (on foot the arrows move the whole panel).
   Three contacts in 10 s: moved next to you.
 - **Flipped:** tipped over for 2 s: set upright where it is.
 
+### Not meeting other vehicles (lane planner)
+
+Every autopilot vehicle (yours on Auto / summon / follow, and every NPC vehicle) predicts its own path and every other
+vehicle's about 10 s ahead, in 3D. If two paths are closing on each other, the vehicle with the lower right of way
+yields, trying in order: a higher **altitude lane** (+8 / +16 / +24 m), a **side offset** (keep right first), both, and
+finally a **speed cap** (stopping short). Right of way: the vehicle you drive > your own autopilot vehicle > NPC
+vehicles (ties: the lower form id passes); parked vehicles never move, so everyone yields to them. A lane is held at
+least 3 s and released after the path has been clear for 3 s. Oncoming vehicles both keep right. Vehicles moving side
+by side at a steady gap (the gang's formation) are not a conflict. Log lines: `Route plan: …`.
+
+### Drive mode (cramped spaces)
+
+Hover's terrain assist struggles in tight spaces. After repeated contacts, push-ups, stuck decisions or being boxed in,
+an autopilot vehicle with someone aboard (NPC driver, or you while Auto flies) **turns hover off and drives with the
+game's own controls**: steer, accelerate, brake, **forward boost** (when open and aligned and the speed wanted is above
+30 m/s) and **vertical boost** (over what is ahead, a climb phase, or a hop after being stuck). After 8 s, once the way is
+clear again, hover comes back on. Log lines: `drive mode ON / off`, `drive: speed …`.
+
+### Unlimited boost
+
+The game's boost charge is kept full for every vehicle, so boosting never runs out. Exceptions: a hovering vehicle (the
+flight model replaces the boost), the vehicle you are driving (Shift is the gear key there) and your own unattended
+vehicle, unless drive mode is using the game's boost.
+
 ## Gang vehicles
 
 Your followers (the game's follower list, which The Gang's All Here fills) take vehicles when you do:
@@ -182,7 +206,8 @@ the vehicle registry and duplicate cleanup. Also new (2026-10-17 evening): NPC v
 6 m above you) and fire only with the nose on you; no driver, no flight (you or an NPC driver dying stops that
 vehicle); ground contact no longer cuts the hover at low height; every HUD item moves on its own in the F7 editor.
 
-Also built, **not yet tested in game**: the contextual HUD (on-foot panel, no scanner), **Auto** for your own vehicle
+Also built, **not yet tested in game**: the lane planner (vehicles not meeting each other), drive mode (cramped spaces),
+unlimited boost, and the contextual HUD (on-foot panel, no scanner), **Auto** for your own vehicle
 (T), holding position when you get out with Auto on, and the summon teleport rule (over 150 m, behind you).
 
 Planned next: Auto to the map marker, and gang combat against enemies (vehicle vs vehicle, passengers, getting out to

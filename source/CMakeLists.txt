@@ -38,7 +38,7 @@ target_link_libraries(SeamlessPlanets PRIVATE sp_common Synchronization)
 
 add_library(SeamlessVehicle SHARED
     src/main_vehicle.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/crash.cpp
-    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/modscene.cpp
+    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/vehicleworld.cpp src/routeplan.cpp src/modscene.cpp
     src/vehicleflight.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(SeamlessVehicle)

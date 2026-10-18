@@ -10,6 +10,7 @@
 #include "modscene.h"
 #include "notify.h"
 #include "prefetch.h"
+#include "routeplan.h"
 #include "telemetry.h"
 
 #include <Windows.h>
@@ -205,6 +206,13 @@ namespace vehicleflight
 		// ended four flights in a row as "collision 125-268 m/s"). A contact no longer ends an autopilot flight:
 		// a push up = something under it the rays miss (held above it for kFloorMs); sideways = a bump (back off).
 		// kBumpLimit bumps in kBumpWindowMs: moved to the target.
+		// Drive mode (2026-10-17, the user: "hover struggles with terrain assist and close quarters ... hover off and boost for
+		// up and forward respectively and normal driving"): repeated contacts, push-ups, stuck and boxed-in decisions raise a
+		// score; at kCrampedOn the autopilot turns hover off and drives with the game's controls (steer, accelerate, brake,
+		// forward boost, vertical boost). Back to hover after kDriveMinMs once the score is gone and the way ahead is clear.
+		constexpr double kCrampedOn = 3.0, kCrampedDecay = 0.25;  // score; per second
+		constexpr ULONGLONG kDriveMinMs = 8000;
+		constexpr double kDriveTop = 30.0;           // m/s: faster than this on the ground needs the forward boost
 		constexpr ULONGLONG kFloorMs = 8000;
 		constexpr double kFloorClear = 2.0;          // m kept over that floor
 		constexpr int kBumpLimit = 3;
@@ -444,6 +452,15 @@ namespace vehicleflight
 			ULONGLONG lastTold = 0;
 		} g_camRest;
 
+		// Drive mode output per pilot (frame thread writes, the input hooks read): the controls for the vehicle's input block.
+		struct DriveOut
+		{
+			std::atomic<bool> on{ false };
+			std::atomic<std::uint32_t> vehicleId{ 0 };
+			std::atomic<float> steer{ 0 }, accel{ 0 }, brake{ 0 };
+			std::atomic<bool> boost{ false }, vert{ false };
+		} g_driveOut[kPilots];
+
 		using Step_t = std::uint64_t (*)(std::uintptr_t, std::uintptr_t);
 		Step_t g_original = nullptr;
 
@@ -473,19 +490,30 @@ namespace vehicleflight
 			for (int i = 0; ctxVehicle && i < kPilots && hp < 0; ++i) {
 				if (g_hoverVehicles[i].load() == ctxVehicle) hp = i;
 			}
-			const bool hovering = hp >= 0;
+			const bool drive = hp >= 0 && g_driveOut[hp].on.load(std::memory_order_relaxed);  // driving, not hovering
+			const bool hovering = hp >= 0 && !drive;
 			const auto vehicle = ctxVehicle;
 			const auto driven = g_driverVehicle.load(std::memory_order_relaxed);
 			// Shift only changes gears (hovering and driving): the game's own boost gets no charge (+0x238), so its
 			// Shift boost does nothing for the player's rover; other vehicles keep a full charge.
 			const bool own = ctxVehicle && ctxVehicle == g_ownRover.load();
-			const bool noBoost = hovering || (driven && ctxVehicle == driven) || (own && ctxVehicle != driven);  // never boosts unattended
+			// Unlimited boost (the user, 2026-10-17: "all vehicles should now have unlimited boost"): the game itself pins the
+			// charge at 1.0 when its unlimited flag is set (FUN_1413211F0 start: component +0x238 = 1.0); done here for every
+			// vehicle except those whose boost our flight model replaces: hovering ones, the vehicle the player drives (Shift is
+			// the gear key there) and the player's own unattended rover -- unless drive mode is using the game's boost.
+			const bool noBoost = !drive && (hovering || (driven && ctxVehicle == driven) || (own && ctxVehicle != driven));
 			if (component && noBoost) {
 				*reinterpret_cast<float*>(component + 0x238) = 0.0f;
+			}
+			else if (component) {
+				*reinterpret_cast<float*>(component + 0x238) = 1.0f;
 			}
 			g_boostOriginal(component, context);
 			if (component && noBoost) {
 				*reinterpret_cast<float*>(component + 0x238) = 0.0f;
+			}
+			else if (component) {
+				*reinterpret_cast<float*>(component + 0x238) = 1.0f;
 			}
 			const auto set = EngineFn<void (*)(std::uintptr_t, std::uintptr_t, char, int)>(addr::kSetGraphBool);
 			for (int i = 0; ctxVehicle && i < kPilots; ++i) {
@@ -986,6 +1014,14 @@ namespace vehicleflight
 			int gearCap = 4;               // the highest gear the path allows
 			ULONGLONG capClearSince = 0;
 			int lastF = 0;                 // last frame's straight-ahead corridor verdict
+			int lastL = 0, lastR = 0;      // the left / right corridors
+			double lastNeed = 0;           // metres to climb to pass the straight-ahead corridor
+			double laneZ = 0;              // metres added to the cruise height by the lane planner
+			bool drive = false;            // drive mode: hover off, the game's controls
+			ULONGLONG driveSince = 0, hopUntil = 0, drvLog = 0;
+			double cramped = 0;            // score that switches drive mode on
+			double drvX = 0, drvY = 0, drvSp = 0, drvHead = 0, steerSign = 1.0, steerResp = 0, drvSteer = 0;
+			ULONGLONG drvT = 0;
 			int aiGear = 1;
 			ULONGLONG shiftAt = 0;
 		};
@@ -1446,6 +1482,8 @@ namespace vehicleflight
 				g_sh.collided = false;
 			}
 			g_hoverVehicles[idx] = 0;
+			g_driveOut[idx].on.store(false);
+			routeplan::Forget(idx);
 			g_forwardBoosts[idx] = false;
 			{
 				std::lock_guard lk(g_sh.lock);
@@ -1765,6 +1803,28 @@ namespace vehicleflight
 
 	namespace
 	{
+		// Drive mode off: hover on again (a lift-off from where it is), the game's controls are no longer overridden.
+		void LeaveDrive(int idx, std::uintptr_t vehicle, const char* why)
+		{
+			State& g = g_gs[idx];
+			Shared& g_sh = g_shs[idx];
+			(void)vehicle;
+			g.drive = false;
+			g_driveOut[idx].on.store(false);
+			{
+				std::lock_guard lk(g_sh.lock);
+				g_sh.active = true;
+				g_sh.haveLast = false;
+				g_sh.collided = false;
+				g_sh.wYaw = g_sh.wPitch = g_sh.wRoll = 0;
+				g_sh.holding = false;
+			}
+			g.liftoff = true;
+			g.holding = false;
+			QueryPerformanceCounter(&g.last);
+			logger::Write("%s: drive mode off (%s): hover on", idx ? Who(idx) : "Rover call", why);
+		}
+
 		// Stuck or lost on autopilot: stop and move the vehicle next to the target (pilot 0: next to the player, as the
 		// far summon; NPC pilots: to their goal point). Following picks up again from there.
 		void EscapeMove(int idx, std::uintptr_t vehicle, const Goal& goal)
@@ -1821,6 +1881,7 @@ namespace vehicleflight
 					if (nowMs - b.at > kBumpWindowMs) b.count = 0;
 					++b.count;
 					b.at = nowMs;
+					g.cramped += up ? 2.0 : 1.0;  // contacts raise the drive-mode score
 					const auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
 					if (b.count >= kBumpLimit) {
 						// Cramped: climb out over it and keep flying (contacts never end a flight; the stuck check, which
@@ -1876,6 +1937,8 @@ namespace vehicleflight
 					}
 				}
 			}
+
+			if (g.drive && !g.autopilot) LeaveDrive(idx, vehicle, "autopilot ended");  // never keep overriding the controls
 
 			LARGE_INTEGER now, freq;
 			QueryPerformanceCounter(&now);
@@ -2098,6 +2161,7 @@ namespace vehicleflight
 								}
 								stuck = 0;
 								logger::Write("%s: stuck (moved %.1f m in 3 s); backing out, detour %+.0f deg", wc, moved, g.detourAng * 57.2958);
+								g.cramped += 2.0;
 							}
 							else if (e.count == 1) {
 								e.count = 2;
@@ -2152,6 +2216,9 @@ namespace vehicleflight
 				double needF = 0, needL = 0, needR = 0;
 				const int f = Corridor(idx, 0, pos.z, sp, needF), l = Corridor(idx, 1, pos.z, sp, needL), r = Corridor(idx, 2, pos.z, sp, needR);
 				g.lastF = f;
+				g.lastL = l;
+				g.lastR = r;
+				g.lastNeed = needF;
 				int want = 0;
 				if (g.autopilot && apSteer && !g.apClimb) {
 					// Corridors here are cast along the target bearing plus the detour (castHeading), not the velocity.
@@ -2201,6 +2268,29 @@ namespace vehicleflight
 						logger::Write("%s: obstacle %.0f m ahead; backing away", wc, c0.d);
 					}
 					apBearing += g.detourAng;
+						{
+							// The lane planner: predict this and every other vehicle ~10 s ahead in 3D and pick a lane / side / speed
+							// that does not meet (routeplan.h).
+							routeplan::Query rq;
+							rq.selfId = At<std::uint32_t>(vehicle, 0x28);
+							rq.priority = idx == 0 ? 120 : 60;
+							rq.pos[0] = pos.x; rq.pos[1] = pos.y; rq.pos[2] = pos.z;
+							rq.dir[0] = float(std::sin(apBearing));
+							rq.dir[1] = float(std::cos(apBearing));
+							rq.speed = float(std::max(g.drive ? g.drvSp : sp, 6.0));
+							rq.ground = g.drive;
+							rq.distToGoal = float(std::hypot(goal.x - pos.x, goal.y - pos.y));
+							const routeplan::Plan pl = routeplan::Update(idx, rq);
+							apBearing += pl.yawOffset;
+							g.laneZ = g.drive ? 0.0 : pl.laneZ;
+							if (pl.speedCap >= 0.0f) {
+								top = std::min(top, double(pl.speedCap));
+								if (pl.speedCap < 1.0f) {
+									boosting = false;
+									sBrake = (g.drive ? g.drvSp : sp) > 1.0;
+								}
+							}
+						}
 					want = f == 1 ? 1 : 0;
 					if (g.detourAng != 0 || f == 2) top = std::min(top, f == 2 ? 12.0 : kDetourSlowTo);
 				}
@@ -2312,6 +2402,94 @@ namespace vehicleflight
 			const double capResponse = capWanted >= g.cap ? 0.5 : near0 ? 1.5 : 3.0;
 			g.cap += (capWanted - g.cap) * (1.0 - std::exp(-dt * capResponse));
 
+			// ---- Drive mode ----
+			if (g.autopilot) {
+				const ULONGLONG tNow = GetTickCount64();
+				g.cramped = std::max(0.0, g.cramped - kCrampedDecay * dt);
+				const bool occupied = idx >= 1 || g_driverVehicle.load(std::memory_order_relaxed) == vehicle;  // never an empty vehicle
+				if (!g.drive && occupied && g.cramped >= kCrampedOn && !g.apClimb) {
+					g.drive = true;
+					g.driveSince = tNow;
+					g.drvT = 0;
+					g.drvSteer = 0;
+					{
+						std::lock_guard lk(g_sh.lock);
+						g_sh.active = false;  // the hover model stops writing; the game's own step runs
+						g_sh.haveLast = false;
+					}
+					g_driveOut[idx].vehicleId.store(At<std::uint32_t>(vehicle, 0x28));
+					g_driveOut[idx].on.store(true);
+					g_clearBoosts[idx] = vehicle;
+					g_forwardBoosts[idx] = false;
+					logger::Write("%s: drive mode ON (cramped %.1f): hover off, driving with boost for forward and up", wc, g.cramped);
+				}
+				else if (g.drive && tNow - g.driveSince > kDriveMinMs && g.cramped < 0.5 && g.lastF == 0 && g.lastL < 2 && g.lastR < 2 && !g.apClimb) {
+					LeaveDrive(idx, vehicle, "clear again");
+				}
+				if (g.drive) {
+					// Speed from position differences (no physics step in this mode); the steer sign is checked against the
+					// heading change it causes.
+					if (g.drvT && tNow > g.drvT) {
+						const double dd = (tNow - g.drvT) / 1000.0;
+						if (dd >= 0.02) {
+							const double inst = std::hypot(pos.x - g.drvX, pos.y - g.drvY) / dd;
+							g.drvSp += (inst - g.drvSp) * std::min(1.0, dd * 4.0);
+							if (g.drvSp > 3.0 && std::fabs(g.drvSteer) > 0.4) g.steerResp += g.drvSteer * g.steerSign * Wrap(heading - g.drvHead);
+							g.drvX = pos.x; g.drvY = pos.y; g.drvT = tNow; g.drvHead = heading;
+						}
+					}
+					else if (!g.drvT) {
+						g.drvX = pos.x; g.drvY = pos.y; g.drvT = tNow; g.drvHead = heading; g.drvSp = 0;
+					}
+					if (g.steerResp < -0.15) {
+						g.steerSign = -g.steerSign;
+						g.steerResp = 0;
+						logger::Write("%s: drive: steering ran the other way; sign reversed", wc);
+					}
+					else if (g.steerResp > 0.6) {
+						g.steerResp = 0.6;
+					}
+					const double spD = g.drvSp;
+					const double e = Wrap(apBearing - heading);  // + : the target is to the right
+					double steer = std::clamp(1.8 * e, -1.0, 1.0);
+					double tgt = std::min(top, kDriveTop);
+					bool fwdBoost = false;
+					if (top > kDriveTop && std::fabs(e) < 0.35 && g.lastF == 0) {  // open and aligned: the forward boost
+						tgt = top;
+						fwdBoost = true;
+					}
+					double accel = std::clamp((tgt - spD) / 5.0, 0.0, 1.0);
+					double brake = spD > tgt + 3.0 ? std::clamp((spD - tgt) / 8.0, 0.0, 1.0) : 0.0;
+					if (sBrake || braking || tgt < 0.5) { accel = 0.0; brake = 1.0; }
+					if (std::fabs(e) > 1.3) accel = std::min(accel, 0.5);
+					// Up: over what is ahead (the corridor's climb need), a climb phase, or a hop after being stuck.
+					bool vert = g.apClimb || tNow < g.hopUntil || (g.lastNeed > 0.5 && g.lastF >= 1 && spD > 1.0);
+					if (groundOk && above > 25.0) vert = false;
+					// Back away: boxed in, or told to (stuck / close ahead).
+					const bool boxed = g.lastF == 2 && g.lastL == 2 && g.lastR == 2 && spD < 2.0;
+					if (tNow < g.reverseUntil || boxed) {
+						accel = 0.0;
+						brake = 1.0;
+						steer = -steer;
+					}
+					const bool boost = fwdBoost || (vert && accel > 0.4);
+					g.drvSteer = steer;
+					g_driveOut[idx].steer.store(float(steer * g.steerSign));
+					g_driveOut[idx].accel.store(float(accel));
+					g_driveOut[idx].brake.store(float(brake));
+					g_driveOut[idx].boost.store(boost);
+					g_driveOut[idx].vert.store(vert);
+					if (tNow - g.drvLog >= 2000) {
+						g.drvLog = tNow;
+						logger::Write("%s: drive: speed %.1f (want %.0f), steer %+.2f accel %.2f brake %.2f boost %d up %d; ahead %d need %.1f m, left %d right %d; %.1f m above ground",
+							wc, spD, tgt, steer * g.steerSign, accel, brake, boost ? 1 : 0, vert ? 1 : 0, g.lastF, g.lastNeed, g.lastL, g.lastR, above);
+					}
+					AskSamples(idx, pos, heading, std::sin(heading) * spD, std::cos(heading) * spD);
+					AskCorridors(idx, pos, apBearing, std::max(spD, 10.0));
+					return;
+				}
+			}
+
 			// ---- Lift-off: switched on near the ground, climb to a short hover height first ----
 			if (g.liftoff && groundOk) {
 				if (above >= kLiftoffHeight - 0.5 || above > kLiftoffBelow + 5.0) {
@@ -2346,7 +2524,7 @@ namespace vehicleflight
 					if (haveGoalZ) want = std::max(want, std::min(goalZ - refGround, kGoalMaxAbove));
 					const double sink = haveGoalZ ? kGoalSink : kCruiseSink;
 					g.cruiseHold = want >= g.cruiseHold ? want : std::max(want, g.cruiseHold - sink * dt);
-					g.hold = g.cruiseHold + g.cruiseExtra;
+					g.hold = g.cruiseHold + g.cruiseExtra + g.laneZ;
 				}
 				g.holding = true;
 				g.liftoff = false;
@@ -2989,6 +3167,22 @@ namespace vehicleflight
 
 	bool PilotActive(int pilot) { return pilot >= 1 && pilot < kPilots && g_gs[pilot].active; }
 
+	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out)
+	{
+		if (!vehicleFormId) return false;
+		for (int i = 0; i < kPilots; ++i) {
+			const auto& d = g_driveOut[i];
+			if (!d.on.load(std::memory_order_relaxed) || d.vehicleId.load(std::memory_order_relaxed) != vehicleFormId) continue;
+			out.steer = d.steer.load(std::memory_order_relaxed);
+			out.accel = d.accel.load(std::memory_order_relaxed);
+			out.brake = d.brake.load(std::memory_order_relaxed);
+			out.boost = d.boost.load(std::memory_order_relaxed);
+			out.vert = d.vert.load(std::memory_order_relaxed);
+			return true;
+		}
+		return false;
+	}
+
 	bool ViewHeading(double& yaw) { return CameraHeading(yaw); }
 
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y)
@@ -3085,6 +3279,7 @@ namespace vehicleflight
 		// identity from the previous save into the new one.
 		for (int i = 0; i < kPilots; ++i) {
 			g_gs[i] = State{};
+			g_driveOut[i].on.store(false);
 			{
 				std::lock_guard lk(g_shs[i].lock);
 				g_shs[i].active = false;

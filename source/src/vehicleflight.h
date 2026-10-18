@@ -29,6 +29,10 @@ namespace vehicleflight
 	std::uint32_t OwnRoverId();  // the player's own vehicle (form id), never flown by an NPC
 	// The player's view heading (world yaw, atan2(x, y)); false when unreadable. For a passenger steering an NPC pilot.
 	bool ViewHeading(double& yaw);
+	// Drive mode (hover off, the game's own controls): the controls an autopilot wants for this vehicle right now. For the
+	// input block of an NPC-driven vehicle (npcvehicles) and for the player's vehicle while Auto drives it.
+	struct DriveInput { float steer = 0, accel = 0, brake = 0; bool boost = false, vert = false; };  // steer + is right
+	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out);
 	// The player's custom map marker as a point in `vehicle`'s world (false: none, not loaded, another worldspace, too far).
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y);
 

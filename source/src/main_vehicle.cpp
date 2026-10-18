@@ -8,6 +8,8 @@
 #include "log.h"
 #include "npcvehicles.h"
 #include "passenger.h"
+#include "routeplan.h"
+#include "vehicleworld.h"
 #include "vehicleaim.h"
 #include "plugininfo.h"
 #include "shipmodel.h"
@@ -45,10 +47,14 @@ namespace
 		realvehicles::Reset();
 		npcvehicles::Reset();
 		passenger::Reset();
+		routeplan::Reset();
+		world::Reset();
 	}
 
 	void Frame()
 	{
+		world::Publish();      // the shared vehicle list (positions, velocities, sizes), once per frame
+		routeplan::Frame();    // its copy for the lane planner
 		vehicleflight::Tick();
 		shipvehicle::Tick();
 		realvehicles::Tick();
