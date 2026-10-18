@@ -335,7 +335,12 @@ namespace vehicleflight
 			bool haveLast = false;
 			bool collided = false;
 			bool airborne = false;         // frame: clear of the ground (gravity is measured only then)
-			unsigned launches = 0;         // steps where an upward kick from a contact was refused
+			unsigned launches = 0;         // steps where an upward kick from a contact was capped
+			// Carried speed (autopilot): a run of steps where the body's speed read ~0 and ours was restored; if the body did not move
+			// as that speed says, it is blocked and the carry stops for a while.
+			unsigned carryRun = 0;
+			ULONGLONG carryT0 = 0, carryBlockedUntil = 0;
+			float carryX = 0, carryY = 0;
 			float collisionDelta = 0;
 			bool collisionUp = false;      // the contact pushed the vehicle up (something under it)
 			LARGE_INTEGER lastStep{};
@@ -728,9 +733,30 @@ namespace vehicleflight
 					// The parked wipe leaves the sideways speed at (almost exactly) zero: carry ours. Anything else is the
 					// physics (a contact): keep it, or the rover pushes into the obstacle and is launched (13:50:34, 56 m/s).
 					const double bodyH = std::hypot(v[0], v[1]), ourH = std::hypot(double(g_sh.lastV[0]), double(g_sh.lastV[1]));
-					if (ourH > 0.3 && bodyH < 0.1 * ourH) {
+					const ULONGLONG tick = GetTickCount64();
+					if (ourH > 0.3 && bodyH < 0.1 * ourH && tick >= g_sh.carryBlockedUntil) {
+						if (!g_sh.carryRun) {
+							g_sh.carryX = P[0];
+							g_sh.carryY = P[1];
+							g_sh.carryT0 = tick;
+						}
+						++g_sh.carryRun;
 						v[0] = g_sh.lastV[0];
 						v[1] = g_sh.lastV[1];
+						if (tick - g_sh.carryT0 >= 250) {  // judged per 250 ms: did it travel what the carried speed says?
+							const double moved = std::hypot(double(P[0]) - g_sh.carryX, double(P[1]) - g_sh.carryY), expected = ourH * double(tick - g_sh.carryT0) / 1000.0;
+							g_sh.carryRun = 0;
+							if (moved < 0.25 * expected) {
+								// Blocked (a wall, an overlap): restoring the speed every step pressed it into the obstacle forever (the "magnet").
+								g_sh.carryBlockedUntil = tick + 1000;
+								v[0] = bodyH > 0.0 ? v[0] : 0.0;
+								v[1] = bodyH > 0.0 ? v[1] : 0.0;
+								logger::Write("Rover flight: carried speed %.0f m/s is blocked (moved %.1f of %.1f m); not pushing into it", ourH, moved, expected);
+							}
+						}
+					}
+					else if (bodyH >= 0.1 * ourH) {
+						g_sh.carryRun = 0;
 					}
 				}
 			}
@@ -746,7 +772,9 @@ namespace vehicleflight
 				g_sh.collisionUp = true;
 				g_sh.collided = true;
 				g_sh.collisionDelta = float(v[2] - g_sh.lastV[2]);
-				v[2] = std::min(double(g_sh.lastV[2]), 5.0);
+				// Cap, never refuse: refusing the push-out kept the overlap alive, so the solver kicked again every step (22:25:56: 127-287 m/s
+				// six times in four seconds) and the vehicle stayed stuck in the object ("magnetized"). 14 m/s clears an overlap in a few steps.
+				v[2] = std::min(v[2], 14.0);
 				++g_sh.launches;
 			}
 			v[2] = std::clamp(v[2], -60.0, 40.0);  // the model never climbs faster than this
