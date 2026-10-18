@@ -152,11 +152,15 @@ Your followers (the game's follower list, which The Gang's All Here fills) take 
 
 When you press **Activate (E)** at a vehicle (within 5 m, in front of you) that has someone in the driver seat:
 
-| Driver | Tap E | Hold E (1 s) |
+| | Tap E | Hold E (1 s) |
 |---|---|---|
-| Your gang / follower | **Hand-over:** they get out at once and you get in | same |
-| Neutral NPC | **Blocked** ("Occupied - hold E to pull them out") | **Pulled out:** assault alarm, plus a theft alarm if someone else owns the vehicle |
-| Hostile NPC | **Blocked** | **Hijack:** they're pulled out and fight you on foot |
+| **Any driver** | You get the **passenger seat** (the companion seat) and ride along | Pulls the driver out and you take the wheel |
+| Your gang / follower | same | They hand you the wheel (no crime) |
+| Neutral NPC | same | **Pulled out:** assault alarm, plus a theft alarm if someone else owns the vehicle |
+| Hostile NPC | same | **Hijack:** they're pulled out and fight you on foot |
+
+While you face an occupied vehicle on foot, two small prompts appear next to Get in (half size): **Passenger** (tap) and
+**Hold: eject**, both showing the Activate key. They can be moved with the F7 layout editor (Page Up / Down: Passenger, Eject).
 
 Empty vehicles use the game's own get-in and theft rules.
 

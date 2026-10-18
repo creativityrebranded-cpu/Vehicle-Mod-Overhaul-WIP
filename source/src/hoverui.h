@@ -25,6 +25,9 @@ namespace hoverui
 	// with their keys, Get in (the game's Activate key) when near the own vehicle, and a status box (e.g. "FOLLOWING 42 m";
 	// empty: hidden).
 	void SetFoot(bool own, bool nearOwn, const char* summonKey, const char* followKey, const char* useKey, const char* status);
+	// Main thread: facing an occupied vehicle on foot: the Passenger (tap) and Hold: eject prompts show, at half size,
+	// with the Activate key's name.
+	void SetOccupied(bool facing, const char* key);
 	// Main thread: in the vehicle, the Auto button (its key; empty: hidden), whether Auto flies, and its status line.
 	void SetAuto(const char* key, bool on, const char* line);
 	// Main thread: the gang line (NPC vehicles following: count, profile, the profile key); count 0 hides it.

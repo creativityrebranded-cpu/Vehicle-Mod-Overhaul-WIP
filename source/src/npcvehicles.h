@@ -15,6 +15,8 @@ namespace npcvehicles
 	bool UsesVehicle(std::uint32_t vehicleId);  // an NPC job is boarding / driving it
 	// The pilot (1..) whose NPC drives this vehicle (a job following), else 0.
 	int PilotFor(std::uint32_t vehicleId);
+	// Anyone (a job NPC, a gang driver, a stranger) sits in the driver seat of this vehicle.
+	bool HasDriver(std::uint32_t vehicleId);
 	// Take the wheel: stops that job and takes its NPC out at once (the NPC's form id, 0 when nobody drives it).
 	std::uint32_t TakeDriver(std::uint32_t vehicleId);
 	// Seats the player as the driver of the vehicle (the game's own put-the-player-in), true when the game agrees.

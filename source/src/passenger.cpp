@@ -246,6 +246,8 @@ namespace passenger
 			g_wheel = Wheel{};
 		}
 
+		void BoardTo(uptr player, uptr vehicle);
+
 		void Board(uptr player)
 		{
 			if (VehicleOf(player)) {
@@ -258,6 +260,12 @@ namespace passenger
 				logger::Write("Passenger: no vehicle an NPC is flying within %.0f m", kReach);
 				return;
 			}
+			BoardTo(player, vehicle);
+		}
+
+		// The companion seat of `vehicle` (any occupied vehicle: a gang driver, a job, a hijacker).
+		void BoardTo(uptr player, uptr vehicle)
+		{
 			const std::uint32_t id = At<std::uint32_t>(vehicle, off::kFormId);
 			const uptr seat = PassengerSeat(vehicle);
 			if (!seat) {
@@ -281,11 +289,18 @@ namespace passenger
 				return;
 			}
 			g_lead = 50.0;
-			notify::Show("Passenger: look to steer, W/S speed");
+			notify::Show(npcvehicles::PilotFor(id) ? "Passenger: look to steer, W/S speed" : "Passenger");
 		}
 	}
 
 	std::uint32_t RidingVehicle() { return g_riding.load(); }
+
+	bool BoardVehicle(std::uintptr_t player, std::uintptr_t vehicle)
+	{
+		if (!player || !vehicle || VehicleOf(player)) return false;
+		BoardTo(player, vehicle);
+		return g_riding.load() == At<std::uint32_t>(vehicle, off::kFormId);
+	}
 
 	void Steer(int pilot, std::uintptr_t vehicle)
 	{
@@ -371,7 +386,7 @@ namespace passenger
 			}
 			if (release && g_downAt && !g_wheelAsked) { g_downAt = 0; GetOut(player, "key"); return; }
 			if (release) g_downAt = 0;
-			if (!npcvehicles::PilotFor(riding)) GetOut(player, "the driver left");
+			if (!npcvehicles::PilotFor(riding) && !npcvehicles::HasDriver(riding)) GetOut(player, "the driver left");
 			return;
 		}
 		g_arrived = false;

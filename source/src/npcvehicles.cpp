@@ -5,6 +5,7 @@
 #include "game.h"
 #include "hook.h"
 #include "hoverui.h"
+#include "hoverui.h"
 #include "log.h"
 #include "modscene.h"
 #include "notify.h"
@@ -1409,7 +1410,23 @@ namespace npcvehicles
 			if (!g_activateKey || now % 5000 < 20) g_activateKey = controlmap::KeyFor("Gameplay", "Activate", 'E');
 			const bool down = Focused() && (GetAsyncKeyState(g_activateKey) & 0x8000) != 0;
 			const bool pressed = down && !g_activateDown;
+			const bool released = !down && g_activateDown;
 			g_activateDown = down;
+			{
+				// The HUD prompts (Passenger / Hold: eject) while the player faces an occupied vehicle on foot.
+				static ULONGLONG lastHud = 0;
+				static bool shown = false;
+				if (now - lastHud >= 200) {
+					lastHud = now;
+					bool occupied = false;
+					if (!InVehicle(player)) {
+						const uptr fv = FacingVehicle(player);
+						occupied = fv && DriverOf(fv, player);
+					}
+					if (occupied || shown) hoverui::SetOccupied(occupied, controlmap::KeyName(g_activateKey).c_str());
+					shown = occupied;
+				}
+			}
 			if (InVehicle(player)) return;
 			if (pressed) {
 				g_intent = Intent{};
@@ -1421,22 +1438,26 @@ namespace npcvehicles
 				if (!occ) return;  // empty: the game's own get-in (and its theft rules)
 				g_intent.occupant = At<std::uint32_t>(occ, off::kFormId);
 				g_intent.relation = RelationOf(player, occ);
-				if (g_intent.relation == Relation::Gang) {
-					TakeSeat(player, v, occ, "hand-over");
-					notify::Show("They hand you the vehicle");
-				}
-				else {
-					notify::Show("Occupied - hold [%s] to pull them out", controlmap::KeyName(g_activateKey).c_str());
+				// A tap (released before kPullMs) = the passenger seat; holding = pull the driver out (below).
+				return;
+			}
+			if (released && g_intent.occupant && !g_intent.acted && now - g_intent.pressAt < kPullMs) {
+				g_intent.acted = true;
+				const uptr v = RefById(g_intent.vehicle);
+				if (v && Dist(player, v) <= kReachRange + 1.0) {
+					const bool ok = passenger::BoardVehicle(player, v);
+					logger::Write("NPC vehicles: seat rules: tap on occupied vehicle %08X (%s driver %08X) -> passenger seat %s", g_intent.vehicle, RelationName(g_intent.relation),
+						g_intent.occupant, ok ? "taken" : "NOT taken");
 				}
 				return;
 			}
 			if (down && g_intent.occupant && !g_intent.acted && now - g_intent.pressAt >= kPullMs) {
 				const uptr v = RefById(g_intent.vehicle), occ = RefById(g_intent.occupant);
 				if (!v || !occ || InVehicle(occ) != v || Dist(player, v) > kReachRange + 1.0) return;
-				TakeSeat(player, v, occ, g_intent.relation == Relation::Hostile ? "hijack" : "pulled out");
-				CrimeAlarms(occ, v, player, g_intent.relation == Relation::Neutral);
+				TakeSeat(player, v, occ, g_intent.relation == Relation::Gang ? "hand-over" : g_intent.relation == Relation::Hostile ? "hijack" : "pulled out");
+				if (g_intent.relation != Relation::Gang) CrimeAlarms(occ, v, player, g_intent.relation == Relation::Neutral);
 				if (g_intent.relation == Relation::Hostile) Aggro(occ, player);
-				notify::Show(g_intent.relation == Relation::Hostile ? "Hijacked" : "You pulled them out");
+				notify::Show(g_intent.relation == Relation::Gang ? "They hand you the wheel" : g_intent.relation == Relation::Hostile ? "Hijacked" : "You pulled them out");
 			}
 		}
 
@@ -1957,6 +1978,13 @@ namespace npcvehicles
 			if (vehicleId && j.phase == Phase::Following && j.vehicle == vehicleId) return j.pilot;
 		}
 		return 0;
+	}
+
+	bool HasDriver(std::uint32_t vehicleId)
+	{
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		const uptr v = RefById(vehicleId);
+		return player && v && DriverOf(v, player) != 0;
 	}
 
 	std::uint32_t TakeDriver(std::uint32_t vehicleId)
