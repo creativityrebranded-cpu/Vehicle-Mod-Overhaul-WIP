@@ -56,8 +56,9 @@ the log (`Rover call key: …`, `Rover flight keys: …`). The defaults on a sta
 
 | Key | Action |
 |---|---|
-| **N** | **Summon** your own vehicle. Far away (over 300 m, not loaded or another worldspace): it is moved next to you. Close: it flies to you and stops 8 m away. Press again to cancel. |
+| **N** | **Summon** your own vehicle. Far away (over 150 m, not loaded or another worldspace): it is moved 12 m behind you, out of view. Close: it flies to you and stops 8 m away. Press again to cancel. |
 | **U** | **Follow** on / off: your vehicle trails you, parks when you stand still and lifts off when you move away. |
+| **E** (the game's Activate) | **Get in**: the HUD shows it when you are within 6 m of your own vehicle. |
 | **,** (comma) | The NPC you are facing (within 60 m, 20° of your heading) gets into the nearest free vehicle and follows you. |
 | **.** (period) | Switch every NPC vehicle that is following you between **Escort** (trails you, parks, never fires) and **Pursuit** (hostile, circles you at 30 m, fires the vehicle weapon). |
 
@@ -73,14 +74,23 @@ Only your own vehicle (the one the game links to you) can be summoned or set to 
 | **Shift + W / Shift + S** | Gear up / down (gears 1–4). Shift alone does nothing. **1–4** pick a gear directly. |
 | **A / D** | Turn / roll. Mouse aims (yaw and pitch). |
 | **Q / Z** | Up / down. **Shift + Space**: down. |
+| **T** | **Auto** on / off: the autopilot flies you where you look (mouse), at your current gear's speed, with the same terrain following and obstacle avoidance as summon / follow. Any of **W / A / S / D** takes control back. Lifts off first if you were not hovering. |
+| *Get out with Auto on* | The vehicle **holds where it is** (it neither follows nor lands). Summon or Follow ends the hold; getting back in gives you control. |
 | **F7** | Edit the on-screen layout: Page Up / Page Down pick any item (each button, the game's own vehicle HUD parts, or a group), arrows move it (Ctrl: x10), Delete resets it. Saved to `Logs\SeamlessVehicle\hoverui.ini`. |
 
 Driving on the ground, the gears cap speed at 25 / 50 / 75 / 100 %. Movement keys follow your Vehicle bindings.
 
-### On-screen buttons
+### On-screen buttons (contextual)
 
-Above the vehicle health bar: the W/A/S/D keys with labels, Gear− / Gear+ / Hover, and a GEAR box (Hover turns
-blue while on). The scanner shows Summon [N], Follow [U] and a SUMMONING / FOLLOWING status.
+Buttons only show when they can be used; the scanner is no longer needed.
+
+- **On foot** (only if you own a vehicle): **Summon [N]**, **Follow [U]**, **Get in [E]** (only near your vehicle), a
+  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*, *HOLDING*, *MOVED TO YOU*) and the gang line (*Gang 3 escort [.]*)
+  when NPC vehicles follow you.
+- **In the vehicle**: the W/A/S/D keys with labels, Gear− / Gear+ / Hover, a GEAR box (Hover turns blue while on),
+  **Auto [T]** (blue while on, the W/A/S/D keys dim), an *AUTO GEAR n* line while Auto flies, and the gang line.
+
+F7 moves everything (on foot the arrows move the whole panel).
 
 ---
 
@@ -172,8 +182,11 @@ the vehicle registry and duplicate cleanup. Also new (2026-10-17 evening): NPC v
 6 m above you) and fire only with the nose on you; no driver, no flight (you or an NPC driver dying stops that
 vehicle); ground contact no longer cuts the hover at low height; every HUD item moves on its own in the F7 editor.
 
-Planned next: autopilot for your own vehicle (**B**), a contextual on-foot panel (Summon / Follow / Get in, no scanner),
-summon teleport rules, and gang combat against enemies (vehicle vs vehicle, passengers, getting out to fight).
+Also built, **not yet tested in game**: the contextual HUD (on-foot panel, no scanner), **Auto** for your own vehicle
+(T), holding position when you get out with Auto on, and the summon teleport rule (over 150 m, behind you).
+
+Planned next: Auto to the map marker, and gang combat against enemies (vehicle vs vehicle, passengers, getting out to
+fight).
 
 Logs to send when something goes wrong: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` (and
 `SeamlessVehicle.prev.log` for the previous session).
