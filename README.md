@@ -148,6 +148,18 @@ Your followers (the game's follower list, which The Gang's All Here fills) take 
 - Up to **6** NPC vehicles at once; extra followers stay on foot.
 - **.** (period) switches them between Escort and Pursuit. Pursuit currently targets you; targeting enemies is next.
 
+## Sending an NPC to a vehicle, step by step (Walk / Enter)
+
+Built from the game's own pieces (from its console command `CommandedActivate`, the follower "use this" command):
+
+| Key | What it does |
+|---|---|
+| **Walk** (the first free of `[` `;` `'`; named in the log: `WALK key …`) | The NPC you face is **commanded** with the game's own follower command to use the nearest free vehicle: it walks there (the command-mode packages), no instant seat. The log prints a state line every second: distance, process level, package type, flags, seat interaction. |
+| **Enter** (the first free of `]` `\` `-`) | That NPC does the **get-in now**: the entry animation the player uses, wherever it stands. |
+| *(trigger)* | The moment the game reports the NPC seated, control is handed to the autopilot (escort / pursuit) as before. |
+
+The older `,` key (send, with a fallback that seats the NPC after 5 s) still works.
+
 ## Getting into an occupied vehicle
 
 When you press **Activate (E)** at a vehicle (within 5 m, in front of you) that has someone in the driver seat:

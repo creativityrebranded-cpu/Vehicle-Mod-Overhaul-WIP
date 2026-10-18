@@ -95,6 +95,8 @@ namespace npcvehicles
 			ULONGLONG aggroAt = 0;             // last combat request (attack)
 			Profile profile = Profile::Escort;
 			bool gang = false;                 // started by the gang (mirrors the player), not by the force key
+			bool cmd = false;                  // sent with the game's own follower command (Walk key): no instant-seat fallback
+			ULONGLONG cmdLog = 0;
 			bool driving = false;              // drive mode controls are being submitted
 			bool firing = false;               // the vehicle weapon's fire input is held
 			ULONGLONG fireAt = 0;              // when the current burst / gap started
@@ -155,6 +157,8 @@ namespace npcvehicles
 		constexpr std::uint32_t kApplyVehicleInput = 0x01324650;
 		constexpr double kFireRange = 80.0;        // m
 		bool g_forceDown = false, g_keyChosen = false;
+		int g_walkKey = 0, g_enterKey = 0;
+		bool g_walkDown = false, g_enterDown = false;
 		// The led aim point of each job that may fire, for vehicleaim's projectile launch hook (any thread): refreshed by
 		// Update() every frame while attacking; older than kAimSnapMs counts as gone.
 		struct AimSnap
@@ -511,6 +515,10 @@ namespace npcvehicles
 			g_forceKey = VK_OEM_COMMA;  // fixed: the comma key (the user wants one known button)
 			if (!controlmap::KeyFree(g_forceKey)) logger::Write("NPC vehicles: note: the game also binds the force key ,");
 			logger::Write("NPC vehicles: force key %s (the NPC you face gets into the nearest vehicle)", controlmap::KeyName(g_forceKey).c_str());
+			g_walkKey = controlmap::FirstFree({ VK_OEM_4, VK_OEM_1, VK_OEM_7 });
+			g_enterKey = controlmap::FirstFree({ VK_OEM_6, VK_OEM_5, VK_OEM_MINUS });
+			logger::Write("NPC vehicles: WALK key %s (the game's own follower command: the NPC you face walks to the nearest free vehicle and uses it), ENTER key %s (the get-in animation now)",
+				g_walkKey ? controlmap::KeyName(g_walkKey).c_str() : "NONE FREE", g_enterKey ? controlmap::KeyName(g_enterKey).c_str() : "NONE FREE");
 		}
 
 		bool Focused()
@@ -541,6 +549,7 @@ namespace npcvehicles
 			j.stillSince = 0;
 			if (p == Phase::Idle) {
 				j.gang = false;
+				j.cmd = false;
 				j.directTried = false;
 				j.standing = false;
 				j.pkgSampled = false;
@@ -560,6 +569,8 @@ namespace npcvehicles
 			}
 			return false;
 		}
+
+		void LogCmdState(const Job& j, uptr npc, uptr vehicle);
 
 		bool Busy(std::uint32_t id)
 		{
@@ -799,6 +810,10 @@ namespace npcvehicles
 			if (j.phase == Phase::Following) vehicleflight::WatchFlip(vehicle, "NPC vehicles");
 			switch (j.phase) {
 			case Phase::Boarding:
+				if (j.cmd && now - j.cmdLog >= 1000) {
+					j.cmdLog = now;
+					LogCmdState(j, npc, vehicle);
+				}
 				if (aboard) {
 					logger::Write("NPC vehicles: [%d] NPC %08X aboard after %.1f s", j.pilot, j.npc, (now - j.since) / 1000.0);
 					double fx, fy;
@@ -847,7 +862,7 @@ namespace npcvehicles
 						Set(j, Phase::Idle);
 					}
 				}
-				else if (!j.directTried && now - j.since > kWalkMs && Dist(npc, vehicle) > j.startDist - 2.0) {
+				else if (!j.cmd && !j.directTried && now - j.since > kWalkMs && Dist(npc, vehicle) > j.startDist - 2.0) {
 					// Not walking (its AI never ran the get-in package): the game's own instant seat, as it does for middle / low
 					// process NPCs. The player-seat hook stays in front of it (seats this NPC, never the player).
 					j.directTried = true;
@@ -1206,6 +1221,65 @@ namespace npcvehicles
 
 		// The force key: the NPC the player faces (within kFaceCone of the player's heading, up to kFaceRange; the most
 		// centred, then the nearest) gets into the free vehicle nearest that NPC.
+		// ---- The game's own follower command (2026-10-17, from the console command CommandedActivate = FUN_140C7B370) ----
+		// The console command: FUN_14194D150(actor, 1, 0) marks the actor as commanded (selected); the player's command target
+		// (+0xF90) is the reference; the player's command type (+0xFA0) is chosen from the target's base form type (a vehicle base
+		// is 0x2F: type 5 unless it carries one special keyword); FUN_141A35DB0(player) turns the type into a command id and
+		// starts that command package on the actor (CommandModeActivatePackage / CommandModeTravelPackage default objects:
+		// the NPC walks to the reference and uses it); FUN_141A5E990(player, 0) deselects. FUN_141A5E910(player) = the selected
+		// actor. Events TESCommandMode{Enter,Exit,GiveCommand,CompleteCommand} exist; the seated check below is the trigger.
+		constexpr std::uint32_t kCmdSelectActor = 0x0194D150, kCmdIssue = 0x01A35DB0, kCmdSelect = 0x01A5E990, kCmdSelected = 0x01A5E910;
+		constexpr std::uint32_t kPlayerCmdTarget = 0xF90, kPlayerCmdType = 0xFA0, kCmdTypeUse = 5;
+
+		bool CommandUse(uptr npc, uptr vehicle)
+		{
+			const uptr player = Ptr(addr::kPlayerCharacterPtr);
+			if (!player) return false;
+			uptr selected = 0;
+			__try {
+				EngineFn<void (*)(uptr, char, char)>(kCmdSelectActor)(npc, 1, 0);
+				selected = EngineFn<uptr (*)(uptr)>(kCmdSelected)(player);
+				if (selected != npc) {  // the select call did not make it the selected actor: select it as the console flow expects
+					EngineFn<void (*)(uptr, uptr)>(kCmdSelect)(player, npc);
+					selected = EngineFn<uptr (*)(uptr)>(kCmdSelected)(player);
+				}
+				At<uptr>(player, kPlayerCmdTarget) = vehicle;
+				At<std::uint32_t>(player, kPlayerCmdType) = kCmdTypeUse;
+				EngineFn<void (*)(uptr)>(kCmdIssue)(player);
+				EngineFn<void (*)(uptr, uptr)>(kCmdSelect)(player, 0);
+				logger::Write("NPC vehicles: command: NPC %08X selected %s, target vehicle %08X, type %u issued", At<std::uint32_t>(npc, off::kFormId), selected == npc ? "yes" : "NO",
+					At<std::uint32_t>(vehicle, off::kFormId), kCmdTypeUse);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				logger::Write("NPC vehicles: command: raised an exception");
+				return false;
+			}
+		}
+
+		// One line a second for a commanded NPC: where it is, what package it runs, whether it is getting in.
+		void LogCmdState(const Job& j, uptr npc, uptr vehicle)
+		{
+			int pkg = -1;
+			unsigned level = 0xFF, flags = 0, interaction = 0;
+			__try {
+				const uptr proc = At<uptr>(npc, 0x228);
+				if (proc) {
+					level = At<std::uint8_t>(proc, 0xE7);
+					const uptr ap = At<uptr>(proc, 0x18);
+					const uptr tp = ap ? At<uptr>(ap, 0x08) : 0;
+					if (tp) pkg = At<std::uint8_t>(tp, 0x3C);
+				}
+				flags = At<std::uint32_t>(npc, 0x378);
+				interaction = EngineFn<char (*)(uptr, int)>(0x002C5C90)(At<uptr>(npc, 0xC8), 0xA5) ? 1 : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			const uptr in = InVehicle(npc);
+			logger::Write("NPC vehicles: [%d] command: NPC %08X %.1f m from %08X; process level %u, package type %d, flags %08X (getting on/off %u), seat interaction %u, %s", j.pilot,
+				j.npc, Dist(npc, vehicle), j.vehicle, level, pkg, flags, (flags >> 3) & 1, interaction, in == vehicle ? "SEATED" : in ? "in another vehicle" : "not in a vehicle");
+		}
+
 		// Sends `npc` to `vehicle` (the game's get-in; a driver-seat keyword when the seat refuses) and starts the job.
 		bool StartJob(Job& slot, uptr npc, uptr vehicle, bool gang)
 		{
@@ -1235,7 +1309,22 @@ namespace npcvehicles
 			return true;
 		}
 
-		void Force(uptr player)
+		// The Enter key: the commanded NPC does the get-in now (the entry animation the player uses; FUN_141951FB0), wherever it is.
+		void EnterNow()
+		{
+			for (auto& j : g_jobs) {
+				if (!j.cmd || j.phase != Phase::Boarding) continue;
+				const uptr npc = RefById(j.npc), vehicle = RefById(j.vehicle);
+				if (!npc || !vehicle) continue;
+				const int r = Mount(npc, vehicle);
+				logger::Write("NPC vehicles: [%d] ENTER: NPC %08X, %.1f m from %08X, get-in -> %d (1 walking, 2 standing up, 3 seated, 0 refused)", j.pilot, j.npc, Dist(npc, vehicle), j.vehicle, r);
+				notify::Show(r ? "Get-in started" : "The get-in was refused");
+				return;
+			}
+			notify::Show("No commanded NPC");
+		}
+
+		void Force(uptr player, bool command = false)
 		{
 			Job* slot = nullptr;
 			for (auto& j : g_jobs) {
@@ -1303,6 +1392,22 @@ namespace npcvehicles
 			}
 			logger::Write("NPC vehicles: [%d] force: NPC %08X (%s, %.0f m in front of you, %.0f deg off)", slot->pilot, At<std::uint32_t>(npc, off::kFormId),
 				modscene::RttiName(npc), npcDist, npcOff * 57.2958);
+			if (command) {
+				// The Walk key: the game's own follower command. The job only watches (no instant seat); Enter and the seated check follow.
+				if (!CommandUse(npc, vehicle)) {
+					notify::Show("The command failed");
+					return;
+				}
+				slot->npc = At<std::uint32_t>(npc, off::kFormId);
+				slot->vehicle = At<std::uint32_t>(vehicle, off::kFormId);
+				slot->gang = false;
+				slot->profile = Profile::Escort;
+				Set(*slot, Phase::Boarding);
+				slot->cmd = true;
+				slot->cmdLog = 0;
+				notify::Show("Walk command given (%.0f m)", bestV);
+				return;
+			}
 			if (!StartJob(*slot, npc, vehicle, false)) {
 				notify::Show("That NPC can't get in");
 				return;
@@ -1733,6 +1838,12 @@ namespace npcvehicles
 		const bool fdown = g_forceKey && Focused() && (GetAsyncKeyState(g_forceKey) & 0x8000) != 0;
 		if (fdown && !g_forceDown) Force(player);
 		g_forceDown = fdown;
+		const bool wdown = g_walkKey && Focused() && (GetAsyncKeyState(g_walkKey) & 0x8000) != 0;
+		if (wdown && !g_walkDown) Force(player, true);
+		g_walkDown = wdown;
+		const bool edown = g_enterKey && Focused() && (GetAsyncKeyState(g_enterKey) & 0x8000) != 0;
+		if (edown && !g_enterDown) EnterNow();
+		g_enterDown = edown;
 		GangTick(player);
 		SeatTick(player);
 		ForceOutTick(player);
