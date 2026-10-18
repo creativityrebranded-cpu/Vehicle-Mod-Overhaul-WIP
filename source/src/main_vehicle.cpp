@@ -8,6 +8,7 @@
 #include "log.h"
 #include "npcvehicles.h"
 #include "passenger.h"
+#include "traffic.h"
 #include "routeplan.h"
 #include "vehicleworld.h"
 #include "vehicleaim.h"
@@ -47,6 +48,7 @@ namespace
 		realvehicles::Reset();
 		npcvehicles::Reset();
 		passenger::Reset();
+		traffic::Reset();
 		routeplan::Reset();
 		world::Reset();
 	}
@@ -60,6 +62,7 @@ namespace
 		realvehicles::Tick();
 		npcvehicles::Tick();
 		passenger::Tick();
+		traffic::Tick();
 	}
 
 	class FrameTask final : public SFSETaskInterface::ITaskDelegate

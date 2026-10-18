@@ -217,6 +217,10 @@ namespace vehicleflight
 		constexpr double kFloorClear = 2.0;          // m kept over that floor
 		constexpr int kBumpLimit = 3;
 		constexpr ULONGLONG kBumpWindowMs = 10000;
+		// One contact episode is one bump: a grinding or bouncing vehicle reports a contact on every physics step (22:22:02: about
+		// 150 "bumps" in 6 s, each flipping the detour and raising the drive-mode score to 148).
+		constexpr ULONGLONG kBumpDebounceMs = 700;
+		constexpr double kCrampedMax = 8.0;
 		constexpr double kFlipUp = 0.42;             // cos(pitch) * cos(roll) under this: flipped (~65 degrees)
 		constexpr ULONGLONG kFlipMs = 2000;
 		constexpr double kStrafeAcc = 9.0;           // m/s^2 sideways at full strafe
@@ -1022,13 +1026,15 @@ namespace vehicleflight
 			double cramped = 0;            // score that switches drive mode on
 			double drvX = 0, drvY = 0, drvSp = 0, drvHead = 0, steerSign = 1.0, steerResp = 0, drvSteer = 0;
 			ULONGLONG drvT = 0;
+			ULONGLONG airSince = 0;
+			double steerSecs = 0, stuckGX = 0, stuckGY = 0;
 			int aiGear = 1;
 			ULONGLONG shiftAt = 0;
 		};
 		State g_gs[kPilots];
 		// Kept across relaunches: a pilot stuck again soon after climbing out is moved instead.
 		struct Escape { int count = 0; ULONGLONG at = 0; } g_escape[kPilots];
-		struct Bumps { int count = 0; ULONGLONG at = 0; } g_bumps[kPilots];
+		struct Bumps { int count = 0; ULONGLONG at = 0; ULONGLONG ev = 0; } g_bumps[kPilots];
 		struct HeldCommand { Command c; ULONGLONG until = 0; } g_cmds[kPilots];
 
 		// The player's trail (ring buffer, by sequence number) and smoothed velocity, updated every frame.
@@ -1875,13 +1881,17 @@ namespace vehicleflight
 						g_sh.collisionUp = false;
 					}
 				}
-				if (hit && g.autopilot) {
+				if (hit && g.autopilot && GetTickCount64() - g_bumps[idx].ev < kBumpDebounceMs) {
+					// the same contact episode: counted once
+				}
+				else if (hit && g.autopilot) {
 					const ULONGLONG nowMs = GetTickCount64();
 					auto& b = g_bumps[idx];
+					b.ev = nowMs;
 					if (nowMs - b.at > kBumpWindowMs) b.count = 0;
 					++b.count;
 					b.at = nowMs;
-					g.cramped += up ? 2.0 : 1.0;  // contacts raise the drive-mode score
+					g.cramped = std::min(kCrampedMax, g.cramped + (up ? 2.0 : 1.0));  // contacts raise the drive-mode score
 					const auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
 					if (b.count >= kBumpLimit) {
 						// Cramped: climb out over it and keep flying (contacts never end a flight; the stuck check, which
@@ -2139,6 +2149,11 @@ namespace vehicleflight
 					ULONGLONG& lt = g.stuckAt;
 					int& stuck = g.stuckCount;
 					const ULONGLONG nowMs = GetTickCount64();
+					if (std::hypot(goal.x - g.stuckGX, goal.y - g.stuckGY) > 5.0) {  // a new target: the window starts over
+						g.stuckGX = goal.x;
+						g.stuckGY = goal.y;
+						lt = 0;
+					}
 					if (!lt || nowMs - g.autopilotSince < 100) { lx = pos.x; ly = pos.y; lt = nowMs; stuck = 0; }
 					else if (nowMs - lt >= 3000) {
 						const double moved = std::hypot(pos.x - lx, pos.y - ly);
@@ -2161,7 +2176,7 @@ namespace vehicleflight
 								}
 								stuck = 0;
 								logger::Write("%s: stuck (moved %.1f m in 3 s); backing out, detour %+.0f deg", wc, moved, g.detourAng * 57.2958);
-								g.cramped += 2.0;
+								g.cramped = std::min(kCrampedMax, g.cramped + 2.0);
 							}
 							else if (e.count == 1) {
 								e.count = 2;
@@ -2407,7 +2422,7 @@ namespace vehicleflight
 				const ULONGLONG tNow = GetTickCount64();
 				g.cramped = std::max(0.0, g.cramped - kCrampedDecay * dt);
 				const bool occupied = idx >= 1 || g_driverVehicle.load(std::memory_order_relaxed) == vehicle;  // never an empty vehicle
-				if (!g.drive && occupied && g.cramped >= kCrampedOn && !g.apClimb) {
+				if (!g.drive && occupied && g.cramped >= kCrampedOn && !g.apClimb && std::fabs(v[2]) < 4.0) {  // not mid-fall or mid-climb (it may stand on a structure the ground rays miss)
 					g.drive = true;
 					g.driveSince = tNow;
 					g.drvT = 0;
@@ -2434,43 +2449,55 @@ namespace vehicleflight
 						if (dd >= 0.02) {
 							const double inst = std::hypot(pos.x - g.drvX, pos.y - g.drvY) / dd;
 							g.drvSp += (inst - g.drvSp) * std::min(1.0, dd * 4.0);
-							if (g.drvSp > 3.0 && std::fabs(g.drvSteer) > 0.4) g.steerResp += g.drvSteer * g.steerSign * Wrap(heading - g.drvHead);
+							if (g.drvSp > 4.0 && std::fabs(g.drvSteer) > 0.5 && tNow >= g.hopUntil && !g.apClimb) {
+								g.steerResp += g.drvSteer * g.steerSign * Wrap(heading - g.drvHead);
+								g.steerSecs += dd;
+							}
 							g.drvX = pos.x; g.drvY = pos.y; g.drvT = tNow; g.drvHead = heading;
 						}
 					}
 					else if (!g.drvT) {
 						g.drvX = pos.x; g.drvY = pos.y; g.drvT = tNow; g.drvHead = heading; g.drvSp = 0;
 					}
-					if (g.steerResp < -0.15) {
-						g.steerSign = -g.steerSign;
+					if (g.steerSecs >= 2.0) {  // judged over 2 s of steering on the ground, never on noise
+						if (g.steerResp < -0.4 && tNow - g.driveSince > 3000) {
+							g.steerSign = -g.steerSign;
+							logger::Write("%s: drive: steering ran the other way (%.2f over %.1f s); sign reversed", wc, g.steerResp, g.steerSecs);
+						}
 						g.steerResp = 0;
-						logger::Write("%s: drive: steering ran the other way; sign reversed", wc);
-					}
-					else if (g.steerResp > 0.6) {
-						g.steerResp = 0.6;
+						g.steerSecs = 0;
 					}
 					const double spD = g.drvSp;
 					const double e = Wrap(apBearing - heading);  // + : the target is to the right
 					double steer = std::clamp(1.8 * e, -1.0, 1.0);
-					double tgt = std::min(top, kDriveTop);
+					// Boxed in by something climbable (the hover assist stops dead there): go over it with the boost instead; only a tall
+					// wall (more than 40 m) means backing away.
+					const bool wall = g.lastNeed > 40.0;
+					double topD = top;
+					if (g.avoid == 4 && !wall) topD = std::max(topD, 12.0);
+					double tgt = std::min(topD, kDriveTop);
 					bool fwdBoost = false;
-					if (top > kDriveTop && std::fabs(e) < 0.35 && g.lastF == 0) {  // open and aligned: the forward boost
-						tgt = top;
+					if (topD > kDriveTop && std::fabs(e) < 0.35 && g.lastF == 0) {  // open and aligned: the forward boost
+						tgt = topD;
 						fwdBoost = true;
 					}
 					double accel = std::clamp((tgt - spD) / 5.0, 0.0, 1.0);
 					double brake = spD > tgt + 3.0 ? std::clamp((spD - tgt) / 8.0, 0.0, 1.0) : 0.0;
-					if (sBrake || braking || tgt < 0.5) { accel = 0.0; brake = 1.0; }
+					if (sBrake || (braking && wall) || tgt < 0.5) { accel = 0.0; brake = 1.0; }
 					if (std::fabs(e) > 1.3) accel = std::min(accel, 0.5);
 					// Up: over what is ahead (the corridor's climb need), a climb phase, or a hop after being stuck.
-					bool vert = g.apClimb || tNow < g.hopUntil || (g.lastNeed > 0.5 && g.lastF >= 1 && spD > 1.0);
-					if (groundOk && above > 25.0) vert = false;
+					bool vert = g.apClimb || tNow < g.hopUntil || (g.lastNeed > 0.3 && g.lastNeed <= 40.0 && g.lastF >= 1);
 					// Back away: boxed in, or told to (stuck / close ahead).
 					const bool boxed = g.lastF == 2 && g.lastL == 2 && g.lastR == 2 && spD < 2.0;
-					if (tNow < g.reverseUntil || boxed) {
+					if (tNow < g.reverseUntil || (boxed && wall)) {
 						accel = 0.0;
 						brake = 1.0;
 						steer = -steer;
+					}
+					else if (boxed) {  // climbable: up and forward
+						vert = true;
+						accel = 1.0;
+						brake = 0.0;
 					}
 					const bool boost = fwdBoost || (vert && accel > 0.4);
 					g.drvSteer = steer;
@@ -2731,6 +2758,8 @@ namespace vehicleflight
 					g.playerAuto = true;
 					g.taxiWait = false;
 					g.taxiMarker = 0;
+					g.cramped = 0;  // a new Auto flight starts with a clean slate (no leftover contact score)
+					g_bumps[0] = Bumps{};
 					g.apClimb = !wasHovering;
 					g.autopilotSince = GetTickCount64();
 					notify::Log("Auto on - place a map marker to go; W/A/S/D takes over");
