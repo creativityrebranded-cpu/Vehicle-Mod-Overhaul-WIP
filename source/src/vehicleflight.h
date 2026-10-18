@@ -27,6 +27,10 @@ namespace vehicleflight
 	const char* PilotEndReason(int pilot);  // why the pilot last stopped ("arrived", "stuck", ...)
 	void PilotStop(int pilot, const char* why);
 	std::uint32_t OwnRoverId();  // the player's own vehicle (form id), never flown by an NPC
+	// The player's view heading (world yaw, atan2(x, y)); false when unreadable. For a passenger steering an NPC pilot.
+	bool ViewHeading(double& yaw);
+	// The player's custom map marker as a point in `vehicle`'s world (false: none, not loaded, another worldspace, too far).
+	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y);
 
 	// Direct control of an autopilot (pilot 1..3, or 0 = the player's rover while it flies itself): every channel in
 	// `set` overrides the autopilot's own for holdMs, then hands back. Channels left out stay with the autopilot.

@@ -1,0 +1,386 @@
+#include "passenger.h"
+
+#include "addresses.h"
+#include "controlmap.h"
+#include "game.h"
+#include "log.h"
+#include "modscene.h"
+#include "notify.h"
+#include "npcvehicles.h"
+#include "vehicleflight.h"
+
+#include <Windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <intrin.h>
+
+namespace passenger
+{
+	namespace
+	{
+		using uptr = std::uintptr_t;
+		template <class T>
+		T& At(uptr p, std::uint32_t o) { return *reinterpret_cast<T*>(p + o); }
+		uptr Ptr(std::uint32_t rva) { return *reinterpret_cast<uptr*>(game::Base() + rva); }
+		template <class Fn>
+		Fn EngineFn(std::uint32_t rva) { return reinterpret_cast<Fn>(game::Base() + rva); }
+
+		constexpr std::uint32_t kSeatLink = 0x01995460, kSeatFinish = 0x01A9C8C0, kEndInteraction = 0x01A9C530;
+		constexpr std::uint32_t kGetInteraction = 0x00531E20;  // (extraList, smart ptr* out): the actor's 0xA5 interaction
+		constexpr std::uint32_t kHasExtra = 0x002C5C90;        // (extraList, type)
+		constexpr std::uint32_t kLookupForm = 0x005DE3B0;
+		constexpr double kReach = 6.0;                         // m: a vehicle this close can be boarded
+		constexpr double kLeadMin = 0.0, kLeadMax = 120.0;     // m ahead the autopilot aims (sets the cruise speed)
+		constexpr double kLeadStep = 25.0;                     // m per second of W / S held
+
+		constexpr double kTaxiStop = 6.0;                      // m: the taxi holds this close over the marker
+		constexpr ULONGLONG kArriveMs = 2500;                  // near the marker this long: arrived, the player is let out
+		constexpr ULONGLONG kWheelMs = 1000;                   // hold the key this long: take the wheel
+
+		std::atomic<std::uint32_t> g_riding{ 0 };
+		bool g_arrived = false;
+		ULONGLONG g_nearSince = 0, g_downAt = 0;
+		bool g_wheelAsked = false;
+		struct Wheel
+		{
+			int stage = 0;                                     // 1 seat the player as driver, 2 seat the NPC as passenger
+			ULONGLONG at = 0;
+			std::uint32_t vehicle = 0, npc = 0;
+		} g_wheel;
+		int g_key = 0;
+		bool g_keyDown = false;
+		double g_lead = 50.0;
+		ULONGLONG g_lastTick = 0;
+
+		bool Focused()
+		{
+			DWORD pid = 0;
+			GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+			return pid == GetCurrentProcessId();
+		}
+
+		uptr RefById(std::uint32_t id)
+		{
+			if (!id) return 0;
+			__try {
+				const uptr r = EngineFn<uptr (*)(std::uint32_t)>(kLookupForm)(id);
+				return r && At<std::uint32_t>(r, off::kFormId) == id ? r : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		uptr VehicleOf(uptr actor)
+		{
+			__try {
+				return EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(actor);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		// The actor's seat keyword (its interaction +0x20; 0 = driver or none), -1 when unreadable.
+		std::intptr_t SeatOf(uptr actor)
+		{
+			__try {
+				const uptr extra = At<uptr>(actor, 0xC8);
+				if (!extra || !EngineFn<char (*)(uptr, int)>(kHasExtra)(extra, 0xA5)) return 0;
+				uptr inter = 0;
+				EngineFn<void (*)(uptr, uptr*)>(kGetInteraction)(extra, &inter);
+				if (!inter) return 0;
+				const uptr seat = At<uptr>(inter, 0x20);
+				auto* rc = reinterpret_cast<volatile long*>(inter + 8);
+				if (_InterlockedDecrement(rc) == 0) {
+					auto** vt = *reinterpret_cast<void***>(inter);
+					reinterpret_cast<void (*)(uptr, int)>(vt[0])(inter, 1);
+				}
+				return static_cast<std::intptr_t>(seat);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return -1;
+			}
+		}
+
+		// The vehicle's seats (base +0x270 count, +0x264 enabled mask, +0x278 array of 0x28-byte entries, keyword at
+		// +0x10; FUN_1412B2C40): the first enabled seat after the driver's (seat 0) = the companion seat.
+		uptr PassengerSeat(uptr vehicle)
+		{
+			__try {
+				const uptr base = At<uptr>(vehicle, 0x98);
+				const std::uint32_t n = std::min<std::uint32_t>(At<std::uint32_t>(base, 0x270), 20);
+				const std::uint32_t mask = At<std::uint32_t>(base, 0x264);
+				const uptr arr = At<uptr>(base, 0x278);
+				for (std::uint32_t i = 1; arr && i < n; ++i) {
+					if (!((mask >> i) & 1)) continue;
+					const uptr kw = At<uptr>(arr + i * 0x28, 0x10);
+					if (kw) return kw;
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			return 0;
+		}
+
+		// A vehicle within kReach that an NPC job is flying (nearest).
+		uptr NpcVehicleNear(uptr player)
+		{
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			uptr best = 0;
+			double bestD = kReach;
+			for (const uptr r : modscene::LoadedRefs(4000)) {
+				const std::uint32_t id = At<std::uint32_t>(r, off::kFormId);
+				if (!npcvehicles::PilotFor(id)) continue;
+				const auto q = At<game::Vec3>(r, off::kRefPosition);
+				const double d = std::sqrt(double(q.x - pp.x) * (q.x - pp.x) + double(q.y - pp.y) * (q.y - pp.y) + double(q.z - pp.z) * (q.z - pp.z));
+				if (d < bestD) { bestD = d; best = r; }
+			}
+			return best;
+		}
+
+		// Seats the player in the vehicle's companion seat: the game's interaction build, the seat set before it completes.
+		int SeatPlayer(uptr player, uptr vehicle, uptr seatKw)
+		{
+			uptr link = 0;
+			__try {
+				EngineFn<void (*)(uptr, uptr, uptr*)>(kSeatLink)(player, vehicle, &link);
+				if (!link) return 0;
+				At<uptr>(link, 0x20) = seatKw;
+				EngineFn<void (*)(uptr)>(kSeatFinish)(player);
+				auto* rc = reinterpret_cast<volatile long*>(link + 8);
+				if (_InterlockedDecrement(rc) == 0) {
+					auto** vt = *reinterpret_cast<void***>(link);
+					reinterpret_cast<void (*)(uptr, int)>(vt[0])(link, 1);
+				}
+				return 1;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return -1;
+			}
+		}
+
+		bool EndSeat(uptr actor)
+		{
+			__try {
+				EngineFn<void (*)(uptr)>(kEndInteraction)(actor);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		// Sets the player 3.5 m to the vehicle's left, facing its way.
+		bool PlaceBeside(uptr player, uptr vehicle)
+		{
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			const double yaw = At<game::Vec3>(vehicle, off::kRefRotation).z;
+			const uptr cell = At<uptr>(vehicle, off::kRefParentCell);
+			const uptr ws = cell ? At<uptr>(cell, off::kCellWorldspace) : 0;
+			if (!cell) return false;
+			float pos[3] = { float(vp.x - std::cos(yaw) * 3.5), float(vp.y + std::sin(yaw) * 3.5), vp.z + 1.0f };
+			float rot[3] = { 0.0f, 0.0f, float(yaw) };
+			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
+			__try {
+				EngineFn<void (*)(uptr, std::uint64_t*, uptr, uptr, float*, float*)>(addr::kMoveReference)(player, &handle, cell, ws, pos, rot);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		void GetOut(uptr player, const char* why)
+		{
+			const std::uint32_t id = g_riding.exchange(0);
+			const uptr vehicle = RefById(id);
+			const bool out = EndSeat(player);
+			const bool placed = vehicle && PlaceBeside(player, vehicle);
+			logger::Write("Passenger: out of %08X (%s) -> %s, %s", id, why, out ? "seat ended" : "seat end FAILED", placed ? "set beside it" : "not moved");
+			notify::Show("Passenger: out");
+		}
+
+		// Take the wheel: the driver steps out, the player is seated as the driver, then the NPC takes the companion seat.
+		void StartWheel(uptr player, uptr vehicle)
+		{
+			const std::uint32_t vid = At<std::uint32_t>(vehicle, off::kFormId);
+			const uptr seat = PassengerSeat(vehicle);
+			const std::uint32_t npc = npcvehicles::TakeDriver(vid);
+			if (!npc) {
+				notify::Show("Nobody to swap with");
+				logger::Write("Passenger: take the wheel: no NPC drives %08X", vid);
+				return;
+			}
+			EndSeat(player);
+			g_riding = 0;
+			g_wheel = { 1, GetTickCount64() + 300, vid, npc };
+			logger::Write("Passenger: take the wheel of %08X: driver %08X out, your seat ended; you drive next (passenger seat %08X)", vid, npc,
+				seat ? At<std::uint32_t>(seat, off::kFormId) : 0);
+		}
+
+		void WheelTick(uptr player, ULONGLONG now)
+		{
+			if (now < g_wheel.at) return;
+			const uptr vehicle = RefById(g_wheel.vehicle);
+			if (!vehicle) { g_wheel = Wheel{}; return; }
+			if (g_wheel.stage == 1) {
+				const bool ok = npcvehicles::SeatPlayerDriver(vehicle);
+				logger::Write("Passenger: you take the wheel of %08X -> %s", g_wheel.vehicle, ok ? "seated as the driver" : "NOT seated");
+				notify::Show(ok ? "You have the wheel" : "Could not take the wheel");
+				g_wheel.stage = ok ? 2 : 0;
+				g_wheel.at = now + 800;
+				return;
+			}
+			const uptr npc = RefById(g_wheel.npc);
+			const uptr seat = PassengerSeat(vehicle);
+			if (npc && seat && !VehicleOf(npc)) {
+				const int r = SeatPlayer(npc, vehicle, seat);  // the same seat build, for the NPC
+				logger::Write("Passenger: NPC %08X into the passenger seat of %08X -> %d (game says it is in %08X)", g_wheel.npc, g_wheel.vehicle, r,
+					VehicleOf(npc) ? At<std::uint32_t>(VehicleOf(npc), off::kFormId) : 0);
+			}
+			(void)player;
+			g_wheel = Wheel{};
+		}
+
+		void Board(uptr player)
+		{
+			if (VehicleOf(player)) {
+				logger::Write("Passenger: you are already in a vehicle");
+				return;
+			}
+			const uptr vehicle = NpcVehicleNear(player);
+			if (!vehicle) {
+				notify::Show("No NPC vehicle near you");
+				logger::Write("Passenger: no vehicle an NPC is flying within %.0f m", kReach);
+				return;
+			}
+			const std::uint32_t id = At<std::uint32_t>(vehicle, off::kFormId);
+			const uptr seat = PassengerSeat(vehicle);
+			if (!seat) {
+				notify::Show("That vehicle has no passenger seat");
+				logger::Write("Passenger: %08X has no seat after the driver's", id);
+				return;
+			}
+			g_riding = id;  // before seating: the player-seat hook and the flight code see a passenger from the first frame
+			const int r = SeatPlayer(player, vehicle, seat);
+			const uptr in = VehicleOf(player);
+			const std::intptr_t seatNow = SeatOf(player);
+			const auto pp = At<game::Vec3>(player, off::kRefPosition), vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			logger::Write("Passenger: seat %08X in %08X -> %d; the game says you are in %08X, seat %08X (wanted %08X); you are %.1f m from it",
+				At<std::uint32_t>(seat, off::kFormId), id, r, in ? At<std::uint32_t>(in, off::kFormId) : 0,
+				seatNow > 0 ? At<std::uint32_t>(static_cast<uptr>(seatNow), off::kFormId) : 0, At<std::uint32_t>(seat, off::kFormId),
+				std::sqrt(double(pp.x - vp.x) * (pp.x - vp.x) + double(pp.y - vp.y) * (pp.y - vp.y) + double(pp.z - vp.z) * (pp.z - vp.z)));
+			if (r != 1 || in != vehicle) {
+				g_riding = 0;
+				if (in == vehicle) EndSeat(player);
+				notify::Show("Passenger: could not take the seat");
+				return;
+			}
+			g_lead = 50.0;
+			notify::Show("Passenger: look to steer, W/S speed");
+		}
+	}
+
+	std::uint32_t RidingVehicle() { return g_riding.load(); }
+
+	void Steer(int pilot, std::uintptr_t vehicle)
+	{
+		const ULONGLONG now = GetTickCount64();
+		// Taxi: a map marker is the destination; arriving lets the player out.
+		double mx = 0, my = 0;
+		if (vehicleflight::MarkerPoint(vehicle, mx, my)) {
+			vehicleflight::PilotFly(pilot, vehicle, mx, my, kTaxiStop, 0, true);
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			const double d = std::hypot(mx - vp.x, my - vp.y);
+			if (d < kTaxiStop + 5.0) {
+				if (!g_nearSince) g_nearSince = now;
+				else if (now - g_nearSince >= kArriveMs) g_arrived = true;
+			}
+			else {
+				g_nearSince = 0;
+			}
+			static ULONGLONG lastTaxi = 0;
+			if (now - lastTaxi >= 5000) {
+				lastTaxi = now;
+				logger::Write("Passenger: taxi to your map marker, %.0f m to go", d);
+			}
+			return;
+		}
+		g_nearSince = 0;
+		// No marker: W / S: the aim point ahead moves out / in (the gap sets the cruise speed; 0 = hover in place).
+		const double dt = g_lastTick && now > g_lastTick ? std::min(0.1, (now - g_lastTick) / 1000.0) : 0.0;
+		g_lastTick = now;
+		if (Focused()) {
+			const int fwd = controlmap::KeyFor("Vehicle", "VehicleAccel", 'W'), back = controlmap::KeyFor("Vehicle", "VehicleBrake", 'S');
+			if (GetAsyncKeyState(fwd) & 0x8000) g_lead = std::min(kLeadMax, g_lead + kLeadStep * dt);
+			if (GetAsyncKeyState(back) & 0x8000) g_lead = std::max(kLeadMin, g_lead - kLeadStep * 2.0 * dt);
+		}
+		double yaw = 0;
+		if (!vehicleflight::ViewHeading(yaw)) yaw = At<game::Vec3>(vehicle, off::kRefRotation).z;
+		const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+		const double lead = std::max(g_lead, 3.5);  // at 0 the goal sits inside the stop radius: it holds still
+		vehicleflight::PilotFly(pilot, vehicle, vp.x + std::sin(yaw) * lead, vp.y + std::cos(yaw) * lead, 3.0, 0, true);
+		static ULONGLONG lastSay = 0;
+		if (now - lastSay >= 5000) {
+			lastSay = now;
+			logger::Write("Passenger: pilot %d flying where you look (heading %.0f deg), aim %.0f m ahead", pilot, yaw * 57.2958, g_lead);
+		}
+	}
+
+	void Tick()
+	{
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		if (!player) return;
+		if (!g_key) {
+			g_key = controlmap::FirstFree({ 'G', 'I', 'L', 'M', 'X', 'V', VK_OEM_2 });
+			logger::Write("Passenger: key %s (near a vehicle an NPC flies: ride along; again: get out)", g_key ? controlmap::KeyName(g_key).c_str() : "NONE FREE");
+			if (!g_key) g_key = -1;
+		}
+		const bool down = g_key > 0 && Focused() && (GetAsyncKeyState(g_key) & 0x8000) != 0;
+		const bool press = down && !g_keyDown;
+		const bool release = !down && g_keyDown;
+		g_keyDown = down;
+		const ULONGLONG now = GetTickCount64();
+		if (g_wheel.stage) {
+			WheelTick(player, now);
+			return;
+		}
+		const std::uint32_t riding = g_riding.load();
+		if (riding) {
+			const uptr vehicle = RefById(riding);
+			if (!vehicle || VehicleOf(player) != vehicle) {
+				g_riding = 0;
+				logger::Write("Passenger: no longer in %08X (the game ended the seat)", riding);
+				return;
+			}
+			if (g_arrived) {
+				g_arrived = false;
+				logger::Write("Passenger: arrived at your map marker");
+				GetOut(player, "arrived");
+				return;
+			}
+			if (press) { g_downAt = now; g_wheelAsked = false; }
+			if (down && g_downAt && !g_wheelAsked && now - g_downAt >= kWheelMs) {
+				g_wheelAsked = true;
+				StartWheel(player, vehicle);
+				return;
+			}
+			if (release && g_downAt && !g_wheelAsked) { g_downAt = 0; GetOut(player, "key"); return; }
+			if (release) g_downAt = 0;
+			if (!npcvehicles::PilotFor(riding)) GetOut(player, "the driver left");
+			return;
+		}
+		g_arrived = false;
+		if (press) Board(player);
+	}
+
+	void Reset()
+	{
+		g_riding = 0;
+		g_keyDown = false;
+	}
+}

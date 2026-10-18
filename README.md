@@ -139,7 +139,18 @@ Only while your vehicle is on the ground (hover off) and slow (under 3 m/s), and
 
 Your own vehicle is never reclaimed by an owner, and your gang never forces anyone out.
 
-Planned next: riding as a passenger, "drive me", take the wheel, and orders.
+### Riding as a passenger (taxi) and taking the wheel
+
+Next to a vehicle a gang member is flying (within 6 m), press the **passenger key** (the first free of G, I, L, M, X, V, /;
+the log line `Passenger: key …` names it):
+
+| Action | What happens |
+|---|---|
+| **Tap** | You take the companion seat. The driver flies where **you look**; **W / S** set how far ahead it aims (its cruise speed). Tap again to get out. |
+| **Map marker placed** | **Taxi:** the driver flies to your marker and holds 6 m from it; after 2.5 s there you are let out. Remove the marker and it flies where you look again. |
+| **Hold 1 s** | **Take the wheel:** the driver steps out, you are seated as the driver, then the driver takes the companion seat. |
+
+Nobody forces a passenger out of the vehicle. Planned next: hailing a taxi and orders.
 
 ## Vehicle registry
 
@@ -155,7 +166,7 @@ at Parked Vehicles spots are hidden once (one is kept).
 Tested in game: hover flight, gears, HUD buttons, summon / follow, NPC boarding with the comma key, NPC vehicles
 following with trail navigation and the gear system.
 
-Built, **not yet tested in game**: gang vehicles (boarding with you, formation, landing with you, 6 NPC
+Built, **not yet tested in game**: riding as a passenger / taxi / take the wheel, the seat rules and forced exits, gang vehicles (boarding with you, formation, landing with you, 6 NPC
 vehicles), NPC vehicle weapon fire (Pursuit), aiming shots at the player, the tight-space handling, flip recovery,
 the vehicle registry and duplicate cleanup. Also new (2026-10-17 evening): NPC vehicles fly at your height (attackers
 6 m above you) and fire only with the nose on you; no driver, no flight (you or an NPC driver dying stops that

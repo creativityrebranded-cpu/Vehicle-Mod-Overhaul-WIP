@@ -7,6 +7,8 @@
 #include "realvehicles.h"
 #include "log.h"
 #include "npcvehicles.h"
+#include "passenger.h"
+#include "vehicleaim.h"
 #include "plugininfo.h"
 #include "shipmodel.h"
 #include "shipvehicle.h"
@@ -42,6 +44,7 @@ namespace
 		vehicle_probe::Reset();
 		realvehicles::Reset();
 		npcvehicles::Reset();
+		passenger::Reset();
 	}
 
 	void Frame()
@@ -50,6 +53,7 @@ namespace
 		shipvehicle::Tick();
 		realvehicles::Tick();
 		npcvehicles::Tick();
+		passenger::Tick();
 	}
 
 	class FrameTask final : public SFSETaskInterface::ITaskDelegate
@@ -83,6 +87,7 @@ namespace
 		}
 		hoverui::Install();
 		npcvehicles::Install();
+		vehicleaim::Install();
 		flighttune::Load();
 		api.OnFrame(&Frame);
 		api.OnPlayerUpdate(&shipmodel::OnPlayerUpdate);
@@ -104,6 +109,7 @@ namespace
 		g_standalone = true;
 		hoverui::Install();
 		npcvehicles::Install();
+		vehicleaim::Install();
 		flighttune::Load();
 		g_tasks->AddTaskPermanent(&g_frameTask);
 		logger::Write("Vehicle: standalone ground and physics service started");

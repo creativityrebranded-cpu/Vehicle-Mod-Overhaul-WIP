@@ -8,12 +8,14 @@
 #include "log.h"
 #include "modscene.h"
 #include "notify.h"
+#include "passenger.h"
 #include "vehicleflight.h"
 
 #include <Windows.h>
 #include <intrin.h>
 
 #include <cmath>
+#include <mutex>
 #include <cstring>
 #include <cstdint>
 #include <initializer_list>
@@ -82,6 +84,9 @@ namespace npcvehicles
 			double stillX = 0, stillY = 0;
 			ULONGLONG stillSince = 0;
 			bool directTried = false;
+			bool standing = false;           // the get-in only stood the NPC up: ask again shortly
+			bool pkgSampled = false;         // the 1 s package check of this boarding was logged
+			bool reasked = false;            // the get-in was asked a second time (its package was gone at 1 s)
 			bool moved = false;                // moved next to the vehicle (step 3)
 			double startDist = 0;              // NPC -> vehicle when boarding began
 			ULONGLONG directAt = 0;
@@ -100,6 +105,7 @@ namespace npcvehicles
 		// 1 walk (FUN_141951FB0); 2 no 2 m of progress after kWalkMs: direct board (FUN_141993710); 3 still out kDirectMs
 		// later: moved next to the vehicle and direct-boarded again.
 		constexpr ULONGLONG kWalkMs = 5000, kDirectMs = 4000;
+		constexpr ULONGLONG kStandMs = 1500;  // a sitting NPC asked to get in stands first; asked again after this
 		bool g_told = false;
 		int g_forceKey = 0;
 		// Aggro (the user, 2026-10-17: "a button to make them aggro so they can shoot at me with the vehicle"): the
@@ -147,6 +153,23 @@ namespace npcvehicles
 		constexpr std::uint32_t kApplyVehicleInput = 0x01324650;
 		constexpr double kFireRange = 80.0;        // m
 		bool g_forceDown = false, g_keyChosen = false;
+		// The led aim point of each job that may fire, for vehicleaim's projectile launch hook (any thread): refreshed by
+		// Update() every frame while attacking; older than kAimSnapMs counts as gone.
+		struct AimSnap
+		{
+			std::uint32_t vehicle = 0, npc = 0;
+			double x = 0, y = 0, z = 0;
+			bool fire = false;
+			ULONGLONG at = 0;
+		};
+		std::mutex g_aimLock;
+		AimSnap g_aimSnap[8];
+		constexpr ULONGLONG kAimSnapMs = 500;
+		void StoreAim(int slot, const AimSnap& a)  // (its own function: Update has __try blocks, no unwinding there)
+		{
+			std::lock_guard lk(g_aimLock);
+			g_aimSnap[slot] = a;
+		}
 
 		// ---- Combat (from the console commands' cores; the pre-revoke build) ----
 		//  IsInCombat: actor vtable +0xB58. StopCombat: the console handler FUN_140C256C0(_, _, ref). StartCombat:
@@ -245,36 +268,75 @@ namespace npcvehicles
 			}
 		}
 
-		// The game's own way an actor gets into a vehicle (2026-10-17 research): Activate (FUN_140B47920) ->
-		// FUN_14192A3F0: vehicle test, seat check FUN_14063AF00, then FUN_141951FB0(actor, vehicle), which gives the actor
-		// a temporary get-in package (type 0x29); the package procedure (FUN_1419DAC80 case 0x29) walks the actor to the
-		// seat and, in range, seats it (FUN_1419E5CF0 -> FUN_141993710). The package only runs once the actor's AI
-		// re-evaluates: FUN_141914750(actor, 0, 0) is that (the console's EvaluatePackage / evp, FUN_140C33A30).
-		constexpr std::uint32_t kEvaluatePackage = 0x01914750;
-		int Evaluate(uptr actor)
+		// The actor's current package type (process +8 middle-high +0x40 package, its +0x3C type; else process +0x20) and
+		// IsInCombat (vtable +0xB58), for the boarding check. -1 when unreadable.
+		void PackageState(uptr actor, int& type, int& combat)
 		{
+			type = combat = -1;
 			__try {
-				// immediate = 1: switch to the new package now, not at the AI's next routine check (2026-10-17 16:52: with
-				// 0 the high-process NPC kept its own package and never walked).
-				EngineFn<void (*)(uptr, char, char)>(kEvaluatePackage)(actor, 1, 0);
-				return 1;
+				const uptr proc = At<uptr>(actor, 0x228);
+				uptr pkg = 0;
+				if (proc) {
+					const uptr mh = At<uptr>(proc, 8);
+					pkg = mh ? At<uptr>(mh, 0x40) : 0;
+					if (!pkg) pkg = At<uptr>(proc, 0x20);
+				}
+				if (pkg) type = At<std::uint8_t>(pkg, 0x3C);
+				combat = reinterpret_cast<bool (*)(uptr)>((*reinterpret_cast<void***>(actor))[0xB58 / 8])(actor) ? 1 : 0;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
-				return -1;
 			}
 		}
 
+		// What FUN_141951FB0(actor, vehicle) really does (2026-10-17 evening, decompile; the 19:56 log: one NPC got
+		// "get-in -> 1" and never moved, another "-> 0"):
+		//  - Actor +0x378 bit 3 ("getting on / off") set: the package push (Actor vtable +0xB38 = FUN_1418D9EA0) returns at
+		//    once, yet FUN_141951FB0 still says 1. The game clears the bit when a mount completes (FUN_141993710 /
+		//    FUN_141A03F70), is cancelled (FUN_141995310) or times out (FUN_141A098E0). A stale one is cleared here first,
+		//    the way FUN_141995310 does it (bit off, the middle-high +0x4D8 mount timer to -FLT_MAX).
+		//  - Sitting / in furniture (the state object at actor +0xF0, vfunc +0x1A0, not 0): it only makes the actor get up
+		//    (vtable +0xB30) and says 1, no package. Asked again once standing.
+		//  - Process level 0: the get-in package (type 0x29), unless no seat entry is reachable (FUN_141A05D40: says 0).
+		//    Never followed by EvaluatePackage: with immediate = 1 that clears the process's package stack
+		//    (FUN_141A07C90) and picks the actor's own package again (FUN_1419B5E40); only a type 0x27 package survives.
+		//    That threw away every get-in package since 16:52.
+		//  - Level 1: seats at once (FUN_141995460 + FUN_141993710 snap) and returns whether the vehicle has a passenger
+		//    keyword, 0 for a REV-8 even when seated. Level 2+: only builds the interaction and always says 0.
+		// Returns 1 walking (package given), 2 standing up (ask again), 3 seated, 0 refused, -1 fault.
 		int Mount(uptr actor, uptr vehicle)
 		{
-			int r = 0;
+			const uptr proc = At<uptr>(actor, 0x228);
+			const int level = proc ? At<std::uint8_t>(proc, 0xE7) : 0xFF;
+			int sit = 0;
+			bool r = false;
 			__try {
-				r = EngineFn<bool (*)(uptr, uptr)>(kMountActor)(actor, vehicle) ? 1 : 0;
+				const uptr state = actor + 0xF0;
+				sit = reinterpret_cast<int (*)(uptr)>((*reinterpret_cast<void***>(state))[0x1A0 / 8])(state);
+				auto& flags = At<std::uint32_t>(actor, 0x378);
+				if ((flags & 8) && InVehicle(actor) != vehicle) {
+					flags &= ~8u;
+					if (proc && level < 2 && At<uptr>(proc, 8)) At<std::uint32_t>(At<uptr>(proc, 8), 0x4D8) = 0xFF7FFFFF;
+					logger::Write("NPC vehicles: NPC %08X had a stale get-on flag; cleared", At<std::uint32_t>(actor, off::kFormId));
+				}
+				r = EngineFn<bool (*)(uptr, uptr)>(kMountActor)(actor, vehicle);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				return -1;
 			}
-			if (r == 1) Evaluate(actor);
-			return r;
+			int out = 0;
+			if (InVehicle(actor) == vehicle) out = 3;
+			else if (level == 0 && sit != 0) out = 2;
+			else if (level == 0 && r) out = 1;
+			else if (level >= 1 && level != 0xFF) {
+				// Level 1 said "no passenger keyword", level 2+ never seats: the game's instant seat.
+				int seated = -1;
+				InstantSeat(actor, vehicle, seated);
+				out = InVehicle(actor) == vehicle ? 3 : 0;
+			}
+			logger::Write("NPC vehicles: get-in NPC %08X -> vehicle %08X: process level %d, sit state %d, game says %d -> %s", At<std::uint32_t>(actor, off::kFormId),
+				At<std::uint32_t>(vehicle, off::kFormId), level, sit, r ? 1 : 0,
+				out == 3 ? "seated" : out == 2 ? "standing up first" : out == 1 ? "walking to it" : "refused (no reachable seat)");
+			return out;
 		}
 
 		int Dismount(uptr actor)
@@ -478,6 +540,9 @@ namespace npcvehicles
 			if (p == Phase::Idle) {
 				j.gang = false;
 				j.directTried = false;
+				j.standing = false;
+				j.pkgSampled = false;
+				j.reasked = false;
 				j.moved = false;
 				j.directAt = 0;
 				j.npc = 0;
@@ -724,6 +789,41 @@ namespace npcvehicles
 						Leave(j, npc, "pilot refused");
 					}
 				}
+				else if (!j.pkgSampled && now - j.since > 1000) {
+					// 20:45 / 20:47: "walking to it", then 15 m -> 15 m in 5 s and the fallback seated it (the "teleport").
+					// Is the get-in package (type 0x29) still the current one, and is the NPC fighting?
+					j.pkgSampled = true;
+					int type = -1, combat = -1;
+					PackageState(npc, type, combat);
+					logger::Write("NPC vehicles: [%d] NPC %08X 1 s into boarding: current package type %d (0x29 = get in), in combat %d, %.1f m from the vehicle (started %.1f)",
+						j.pilot, j.npc, type, combat, Dist(npc, vehicle), j.startDist);
+					// The package push (FUN_1418D9EA0) re-evaluates the AI only out of combat (vtable +0xB58); in combat the
+					// get-in waits behind the combat AI and the NPC never walks. Not the get-in now: calm, ask once more.
+					if (type != 0x29 && !j.reasked) {
+						j.reasked = true;
+						if (combat == 1) Calm(npc);
+						const int r = Mount(npc, vehicle);
+						logger::Write("NPC vehicles: [%d] NPC %08X get-in asked again (%s) -> %d", j.pilot, j.npc, combat == 1 ? "calmed first" : "package was replaced", r);
+						if (r >= 1) {
+							Set(j, Phase::Boarding);
+							j.standing = r == 2;
+							j.pkgSampled = false;
+						}
+					}
+				}
+				else if (j.standing && now - j.since > kStandMs) {
+					// Up from the chair / furniture: the get-in for real now (the walk timer starts again).
+					const int r = Mount(npc, vehicle);
+					const bool keep = r >= 1;
+					if (keep) {
+						Set(j, Phase::Boarding);
+						j.standing = r == 2;
+					}
+					else {
+						logger::Write("NPC vehicles: [%d] NPC %08X stood up but the get-in was refused", j.pilot, j.npc);
+						Set(j, Phase::Idle);
+					}
+				}
 				else if (!j.directTried && now - j.since > kWalkMs && Dist(npc, vehicle) > j.startDist - 2.0) {
 					// Not walking (its AI never ran the get-in package): the game's own instant seat, as it does for middle / low
 					// process NPCs. The player-seat hook stays in front of it (seats this NPC, never the player).
@@ -773,6 +873,9 @@ namespace npcvehicles
 					vehicleflight::PilotStop(j.pilot, "driver got out");
 					Set(j, Phase::Idle);
 				}
+				else if (passenger::RidingVehicle() == j.vehicle) {
+					passenger::Steer(j.pilot, vehicle);  // taxi: the map marker, else where the passenger looks
+				}
 				else if (!Outdoors(player) || toPlayer > kGiveUp) {
 					logger::Write("NPC vehicles: [%d] stopped following (%s, %.0f m)", j.pilot, Outdoors(player) ? "too far" : "you went indoors", toPlayer);
 					vehicleflight::PilotStop(j.pilot, "gave up");
@@ -804,7 +907,9 @@ namespace npcvehicles
 					const double pitchWant = std::atan2(azp - vp.z, std::max(1.0, std::hypot(axp - vp.x, ayp - vp.y)));
 					const double pitchErr = std::fabs(pitchWant + vr.x);
 					const bool onTarget = aimErr < kFireCone && pitchErr < kFireCone * 1.5;
-					const bool canFire = kProfiles[int(j.profile)].fire && Dist3(vehicle, player) < kFireRange && onTarget;
+					const bool inRange = kProfiles[int(j.profile)].fire && Dist3(vehicle, player) < kFireRange;
+					const bool canFire = inRange && onTarget;
+					StoreAim(j.pilot - 1, AimSnap{ j.vehicle, j.npc, axp, ayp, azp, inRange, now });
 					const int slot = j.pilot - 1;
 					if (j.firing) {
 						if (!canFire || now - j.fireAt >= kBurstMs) {
@@ -1088,11 +1193,17 @@ namespace npcvehicles
 				if (kw) GiveKeyword(npc, kw);
 			}
 			const bool seat = CanMount(npc, vehicle);
+			// In combat the get-in package never runs (it waits behind the combat AI): calm first.
+			if (seat && InCombat(npc)) {
+				Calm(npc);
+				logger::Write("NPC vehicles: [%d] NPC %08X was in combat; calmed for the get-in", slot.pilot, npcId);
+			}
 			const int r = seat ? Mount(npc, vehicle) : 0;
+			slot.standing = r == 2;
 			const uptr base = At<uptr>(vehicle, 0x98);
 			logger::Write("NPC vehicles: [%d] NPC %08X -> vehicle %08X (base %08X, %.0f m from it); seat %s; get-in -> %d", slot.pilot, npcId,
 				At<std::uint32_t>(vehicle, off::kFormId), base ? At<std::uint32_t>(base, off::kFormId) : 0, Dist(npc, vehicle), seat ? "free" : "REFUSED", r);
-			if (r != 1) return false;
+			if (r < 1) return false;
 			slot.npc = npcId;
 			slot.vehicle = At<std::uint32_t>(vehicle, off::kFormId);
 			slot.gang = gang;
@@ -1404,6 +1515,11 @@ namespace npcvehicles
 		{
 			const ULONGLONG now = GetTickCount64();
 			const uptr pv = InVehicle(player);
+			if (pv && passenger::RidingVehicle() && passenger::RidingVehicle() == At<std::uint32_t>(pv, off::kFormId)) {
+				g_force.kind = Forcer::None;  // riding as a passenger: nobody forces a passenger out
+				g_force.at = 0;
+				return;
+			}
 			if (!pv) {
 				if (g_force.kind != Forcer::None && g_force.at) {
 					// out (by the force-out or by the player): the forcer takes over
@@ -1743,20 +1859,9 @@ namespace npcvehicles
 						mine = v && Dist(v, who) < 6.0 && shooter != At<std::uint32_t>(player, off::kFormId);
 					}
 					if (!mine) continue;
-					int aimed = -1;
-					__try {
-						aimed = AimProjectiles(event, j, player);
-					}
-					__except (EXCEPTION_EXECUTE_HANDLER) {
-						aimed = -1;
-					}
-					static ULONGLONG lastSay = 0;
-					const ULONGLONG now = GetTickCount64();
-					if (now - lastSay >= 1000) {
-						lastSay = now;
-						logger::Write("NPC vehicles: [%d] shot fired by %08X (%s); %d projectile(s) aimed at you", j.pilot, shooter,
-							shooter == j.vehicle ? "the vehicle" : shooter == j.npc ? "the NPC" : "near the vehicle", aimed);
-					}
+					// Shots are aimed at launch now (vehicleaim, Projectile::Launch); the projectiles here are not set up yet
+					// (direction and speed 0), so nothing is done with them.
+					(void)&AimProjectiles;
 					break;
 				}
 			}
@@ -1811,6 +1916,40 @@ namespace npcvehicles
 
 	bool UsesVehicle(std::uint32_t vehicleId) { return vehicleId && Busy(vehicleId); }
 
+	int PilotFor(std::uint32_t vehicleId)
+	{
+		for (const auto& j : g_jobs) {
+			if (vehicleId && j.phase == Phase::Following && j.vehicle == vehicleId) return j.pilot;
+		}
+		return 0;
+	}
+
+	std::uint32_t TakeDriver(std::uint32_t vehicleId)
+	{
+		for (auto& j : g_jobs) {
+			if (!vehicleId || j.phase != Phase::Following || j.vehicle != vehicleId) continue;
+			const std::uint32_t npcId = j.npc;
+			const uptr npc = RefById(npcId);
+			vehicleflight::PilotStop(j.pilot, "the player took the wheel");
+			Set(j, Phase::Idle);
+			if (npc) {
+				g_allowDismount = true;
+				EndInteraction(npc);
+				g_allowDismount = false;
+			}
+			return npc ? npcId : 0;
+		}
+		return 0;
+	}
+
+	bool SeatPlayerDriver(std::uintptr_t vehicle)
+	{
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		if (!player || !vehicle || !g_seatPlayerOriginal) return false;
+		SeatPlayerNow(vehicle);
+		return InVehicle(player) == vehicle;
+	}
+
 	const char* ProfileOf(std::uint32_t vehicleId)
 	{
 		for (const auto& j : g_jobs) {
@@ -1824,5 +1963,21 @@ namespace npcvehicles
 		for (auto& j : g_jobs) j = Job{};
 		g_seatLogged.clear();
 		g_told = false;
+	}
+
+	bool AimFor(std::uint32_t shooterFormId, double& x, double& y, double& z)
+	{
+		if (!shooterFormId) return false;
+		const ULONGLONG now = GetTickCount64();
+		std::lock_guard lk(g_aimLock);
+		for (const auto& a : g_aimSnap) {
+			if (!a.fire || now - a.at > kAimSnapMs) continue;
+			if (shooterFormId != a.vehicle && shooterFormId != a.npc) continue;
+			x = a.x;
+			y = a.y;
+			z = a.z;
+			return true;
+		}
+		return false;
 	}
 }

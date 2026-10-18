@@ -13,5 +13,14 @@ namespace npcvehicles
 	void Tick();   // main thread, every frame
 	void Reset();  // a save load
 	bool UsesVehicle(std::uint32_t vehicleId);  // an NPC job is boarding / driving it
+	// The pilot (1..) whose NPC drives this vehicle (a job following), else 0.
+	int PilotFor(std::uint32_t vehicleId);
+	// Take the wheel: stops that job and takes its NPC out at once (the NPC's form id, 0 when nobody drives it).
+	std::uint32_t TakeDriver(std::uint32_t vehicleId);
+	// Seats the player as the driver of the vehicle (the game's own put-the-player-in), true when the game agrees.
+	bool SeatPlayerDriver(std::uintptr_t vehicle);
 	const char* ProfileOf(std::uint32_t vehicleId);  // "escort" / "pursuit" for a vehicle an NPC drives, else null
+	// Any thread (vehicleaim's projectile launch hook): the led world aim point (player chest + velocity x flight time,
+	// ref +0x8C frame) for a job allowed to fire whose vehicle or NPC is `shooterFormId`; false otherwise.
+	bool AimFor(std::uint32_t shooterFormId, double& x, double& y, double& z);
 }

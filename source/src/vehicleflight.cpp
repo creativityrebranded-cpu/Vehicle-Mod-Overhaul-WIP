@@ -7,6 +7,7 @@
 #include "hook.h"
 #include "hoverui.h"
 #include "log.h"
+#include "modscene.h"
 #include "notify.h"
 #include "prefetch.h"
 #include "telemetry.h"
@@ -216,12 +217,22 @@ namespace vehicleflight
 		constexpr double kLostFar = 60.0;            // m: farther than this and not kLostGain closer in kLostMs: moved
 		constexpr double kLostGain = 5.0;
 		constexpr ULONGLONG kLostMs = 12000;
+		constexpr double kLostMove = 15.0;           // m: a vehicle that moved this far in the window is chasing, not lost
 		constexpr double kFollowLead = 1.2;          // s: the follow point leads the player's movement
 		constexpr double kCallSkim = 2.5;         // m: then it flies this low, rising only when terrain or obstacles need it
 		constexpr std::uint32_t kLookupForm = 0x005DE3B0;  // (form id) -> TESForm* (global form map), or null
 		// Misc
 		constexpr ULONGLONG kDoubleTapMs = 350;   // two presses within this = a double tap
 		constexpr double kCastAbove = 80.0;       // m: ahead / side rays start this far above the rover (0.54.2)
+		// Forward rays (2026-10-17 20:37: the summoned rover sat 10 s at 0 m/s against something the ground rays never
+		// saw, all corridors clear). Every solid Havok layer: 1 static, 2 anim static, 3 transparent, 4 clutter,
+		// 8 biped, 9 trees, 10 props, 13 terrain, 14 trap, 17 ground, 20 debris large, 26-28 transparent small /
+		// invisible wall / small anim, 30 char controller, 33 biped no CC, 35 collision box. Not triggers (12), water
+		// (11) or other non-solid volumes, so trigger boxes in cities are not walls.
+		constexpr std::uint64_t kSolidLayers = 0xA5C12671Eull;
+		constexpr double kRayStart = 3.5;         // m ahead of the vehicle's origin (past its own hull)
+		constexpr double kRayLift = 1.0;          // m above its origin
+		constexpr double kRayMin = 15.0;          // m: the shortest look ahead
 		constexpr double kSelfHitBand = 3.0;      // m: a front sample this close to the rover's own height is the rover
 		constexpr double kLandHeight = 1.0;       // m: settling under this (not climbing) for kLandMs ends the hover
 		constexpr ULONGLONG kLandMs = 1500;
@@ -235,7 +246,9 @@ namespace vehicleflight
 		// lifting off ground it touched or scraping it low): contacts in the first kContactGraceMs or during lift-off are
 		// ignored, a push up is ground under it (held above it, like autopilot), and only a hard side hit ends the flight.
 		constexpr ULONGLONG kContactGraceMs = 2000;
-		constexpr float kCrashDelta = 20.0f;      // m/s: a sideways change this big ends a player flight
+		constexpr ULONGLONG kPushGraceMs = 1000;  // after a push up: contacts ignored this long
+		constexpr ULONGLONG kHitGraceMs = 500;    // after a hard side hit: contacts ignored this long
+		constexpr float kCrashDelta = 20.0f;      // m/s: a sideways change this big is a hard hit (logged; the flight goes on)
 
 		double Wrap(double a)
 		{
@@ -915,17 +928,31 @@ namespace vehicleflight
 			ULONGLONG wLastPress = 0;
 			bool liftoff = false;          // climbing to kLiftoffHeight after switching on near the ground
 			ULONGLONG startedAt = 0;       // when the flight switched on (contacts are ignored for kContactGraceMs)
+			ULONGLONG contactGraceUntil = 0;  // after a push up, contacts until then are its aftermath, not a crash
 			unsigned contactsIgnored = 0;
 			bool autopilot = false;        // called: flying to the player with nobody aboard
 			bool playerAuto = false;       // Auto: the player is aboard and the autopilot flies (any W/A/S/D takes over)
 			std::uint32_t holdId = 0;      // the player got out with Auto on: this vehicle holds its spot
 			double holdX = 0, holdY = 0;
+			// Taxi test (Auto, 2026-10-17): no map marker, it hovers where Auto was switched on (or where the marker went
+			// away); a marker, it flies there and holds over it.
+			bool taxiWait = false;
+			double taxiWaitX = 0, taxiWaitY = 0;
+			std::uint32_t taxiMarker = 0;
+			double taxiMx = 0, taxiMy = 0, taxiLeft = 0;
+			bool taxiArrived = false;
 			bool apClimb = false;          // the first climb straight up, before moving
 			ULONGLONG autopilotSince = 0;
 			int avoid = 0;                 // 0 none, 1 climb, 2 left, 3 right, 4 stop
 			ULONGLONG avoidSince = 0;
 			bool haveCorr = false;
 			struct { double x = 0, y = 0, d = 0; bool valid = false; double h = 0; } corr[9];  // [corridor * 3 + distance]
+			// Forward rays (one per corridor, at the vehicle's height, every solid collision layer): what blocks it.
+			prefetch::RayHit ray[3];
+			bool rayValid[3] = {};
+			double rayRange[3] = {};
+			std::uintptr_t lastBlocker = 0;
+			ULONGLONG lastBlockerAt = 0;
 			ULONGLONG landedSince = 0;
 			double baseZ = 0;
 			LARGE_INTEGER last{};
@@ -945,8 +972,9 @@ namespace vehicleflight
 			ULONGLONG clearSince = 0;
 			double castHeading = 0;
 			bool haveCast = false;
-			double bestDist = 1e9;
-			ULONGLONG bestAt = 0;
+			double bestDist = 1e9;         // the lost check: the distance to the target, and the vehicle's place, when the
+			ULONGLONG bestAt = 0;          // current kLostMs window started
+			double lostX = 0, lostY = 0;
 			ULONGLONG reverseUntil = 0;    // backing away (the nose still turns toward the detour)
 			double floorZ = -1e9;          // a floor the ground rays miss (learned from a push up)
 			ULONGLONG floorUntil = 0;
@@ -1263,6 +1291,45 @@ namespace vehicleflight
 		int MoveSlot(int idx);
 		std::uintptr_t RefById(std::uint32_t id);
 
+		// The player's custom map marker (form id at player +0xE40, placed by SetCustomMarker) as a point in the
+		// vehicle's world: none, not loaded, another worldspace or absurdly far counts as no marker.
+		constexpr double kTaxiStop = 6.0;          // m: the taxi holds this close over the marker
+		constexpr double kTaxiMaxRange = 30000.0;  // m
+		bool TaxiMarker(std::uintptr_t player, std::uintptr_t vehicle, std::uint32_t& id, double& x, double& y)
+		{
+			id = At<std::uint32_t>(player, off::kPlayerCustomMarker);
+			// 21:03-21:05: Auto waited with no "marker" line at all. Every 3 s while waiting: what the read sees.
+			static ULONGLONG said = 0;
+			const ULONGLONG now = GetTickCount64();
+			const bool say = now - said >= 3000;
+			if (say) said = now;
+			if (!id) {
+				if (say) logger::Write("Rover taxi: waiting; no custom marker (player +0xE40 is 0)");
+				return false;
+			}
+			const std::uintptr_t m = RefById(id);
+			if (!m) {
+				if (say) logger::Write("Rover taxi: waiting; marker id %08X does not resolve to a loaded reference", id);
+				return false;
+			}
+			const auto mc = At<std::uintptr_t>(m, off::kRefParentCell), vc = At<std::uintptr_t>(vehicle, off::kRefParentCell);
+			const auto mws = mc ? At<std::uintptr_t>(mc, off::kCellWorldspace) : 0, vws = vc ? At<std::uintptr_t>(vc, off::kCellWorldspace) : 0;
+			const auto mp = At<game::Vec3>(m, off::kRefPosition), vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			if (mws && vws && mws != vws) {
+				if (say) logger::Write("Rover taxi: waiting; marker %08X at (%.0f, %.0f, %.0f) is in another worldspace (%p vs %p)", id, mp.x, mp.y, mp.z,
+					reinterpret_cast<void*>(mws), reinterpret_cast<void*>(vws));
+				return false;
+			}
+			x = mp.x;
+			y = mp.y;
+			const double d = std::hypot(x - vp.x, y - vp.y);
+			if (d >= kTaxiMaxRange) {
+				if (say) logger::Write("Rover taxi: waiting; marker %08X at (%.0f, %.0f) is %.0f m away (over %.0f m)", id, mp.x, mp.y, d, kTaxiMaxRange);
+				return false;
+			}
+			return true;
+		}
+
 		void AskMove(std::uintptr_t player)
 		{
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
@@ -1514,6 +1581,64 @@ namespace vehicleflight
 		}
 
 		// Avoidance corridors: ahead, left, right of the travel heading, three distances each, rays from high above.
+		// A reference's display name (vtable +0x268, what the console's PickLastRef prints), or "".
+		const char* DisplayName(std::uintptr_t ref)
+		{
+			__try {
+				const char* n = reinterpret_cast<const char* (*)(std::uintptr_t)>((*reinterpret_cast<void***>(ref))[0x268 / 8])(ref);
+				return n ? n : "";
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return "";
+			}
+		}
+
+		// The object the straight ray hit: the nearest loaded reference to the hit point (not this vehicle, not the player),
+		// logged once per object and at most once a second. The first hits also log the raw hit record, to find the
+		// body / layer fields in it.
+		void NameBlocker(int idx)
+		{
+			State& g = g_gs[idx];
+			const ULONGLONG now = GetTickCount64();
+			if (now - g.lastBlockerAt < 1000) return;
+			g.lastBlockerAt = now;
+			const auto& h = g.ray[0];
+			const std::uintptr_t self = g_hoverVehicles[idx].load(), player = Ptr(addr::kPlayerCharacterPtr);
+			std::uintptr_t best = 0;
+			double bestD = 12.0;
+			for (const auto r : modscene::LoadedRefs()) {
+				if (!r || r == self || r == player) continue;
+				const auto p = At<game::Vec3>(r, off::kRefPosition);
+				const double d = std::sqrt(std::pow(p.x - h.x, 2) + std::pow(p.y - h.y, 2) + std::pow(p.z - h.z, 2));
+				if (d < bestD) { bestD = d; best = r; }
+			}
+			static unsigned rawSaid = 0;
+			if (rawSaid < 5) {
+				++rawSaid;
+				logger::Write("%s: forward ray hit record %08X %08X %08X %08X | %08X %08X %08X %08X | %08X %08X %08X %08X %08X %08X %08X %08X | %08X %08X %08X %08X %08X %08X %08X %08X | %08X %08X %08X %08X",
+					Who(idx), h.raw[0], h.raw[1], h.raw[2], h.raw[3], h.raw[4], h.raw[5], h.raw[6], h.raw[7], h.raw[8], h.raw[9], h.raw[10], h.raw[11], h.raw[12],
+					h.raw[13], h.raw[14], h.raw[15], h.raw[16], h.raw[17], h.raw[18], h.raw[19], h.raw[20], h.raw[21], h.raw[22], h.raw[23], h.raw[24], h.raw[25],
+					h.raw[26], h.raw[27]);
+			}
+			// The exact owner of the hit body, when the body -> ref path gave one.
+			if (h.formId) {
+				const std::uintptr_t exact = RefById(h.formId);
+				if (exact && exact != self) best = exact, bestD = 0.0;
+			}
+			if (best == g.lastBlocker) return;
+			g.lastBlocker = best;
+			if (!best) {
+				logger::Write("%s: blocked %.1f m ahead at (%.1f, %.1f, %.1f), layer %u, body %u: no loaded object within 12 m of the hit (terrain or a large mesh)", Who(idx),
+					h.distance, h.x, h.y, h.z, h.layer, h.bodyId);
+				return;
+			}
+			const char* name = DisplayName(best);
+			const auto base = At<std::uintptr_t>(best, 0x98);
+			logger::Write("%s: blocked %.1f m ahead by %08X '%s' (base %08X, %s, %s, layer %u, body %u)", Who(idx), h.distance, At<std::uint32_t>(best, off::kFormId),
+				name ? name : "", base ? At<std::uint32_t>(base, off::kFormId) : 0, modscene::RttiName(best), bestD == 0.0 ? "exact" : "nearest to the hit", h.layer,
+				h.bodyId);
+		}
+
 		void AskCorridors(int idx, const game::Vec3& pos, double heading, double speed)
 		{
 			State& g = g_gs[idx];
@@ -1528,6 +1653,11 @@ namespace vehicleflight
 					q.d = dist[k];
 					prefetch::RequestGround(CorridorSlot(idx, c * 3 + k), float(q.x), float(q.y), pos.z + float(kCastAbove), 0.0f, 8000.0f);
 				}
+				const double range = std::max(kRayMin, speed * 1.6);
+				const float from[3] = { float(pos.x + std::sin(hd) * kRayStart), float(pos.y + std::cos(hd) * kRayStart), float(pos.z + kRayLift) };
+				const float to[3] = { float(from[0] + std::sin(hd) * range), float(from[1] + std::cos(hd) * range), from[2] };
+				prefetch::RequestRay(idx * 3 + c, from, to, kSolidLayers);
+				g.rayRange[c] = range;
 			}
 			g.haveCorr = true;
 		}
@@ -1542,6 +1672,16 @@ namespace vehicleflight
 				g.corr[i].valid = prefetch::LatestGround(CorridorSlot(idx, i), h, age) && age <= kProbeMaxAge && h > -1e30f && h != -500.0f;
 				g.corr[i].h = h;
 			}
+			// A hit on the player (their character controller) is where the vehicle is going, not a wall.
+			const std::uintptr_t player = Ptr(addr::kPlayerCharacterPtr);
+			const auto pp = player ? At<game::Vec3>(player, off::kRefPosition) : game::Vec3{};
+			for (int c = 0; c < 3; ++c) {
+				unsigned age = 0;
+				g.rayValid[c] = prefetch::LatestRay(idx * 3 + c, g.ray[c], age) && age <= kProbeMaxAge;
+				auto& h = g.ray[c];
+				if (g.rayValid[c] && h.hit && player && std::hypot(h.x - pp.x, h.y - pp.y) < 2.5 && h.z > pp.z - 1.0 && h.z < pp.z + 3.0) h.hit = false;
+			}
+			if (g.autopilot && g.rayValid[0] && g.ray[0].hit) NameBlocker(idx);
 		}
 
 		// A corridor: 0 clear at the current height, 1 clear with a climb that fits in time, 2 blocked (or unknown).
@@ -1550,6 +1690,11 @@ namespace vehicleflight
 			const State& g = g_gs[idx];
 			int verdict = 0;
 			double need = -1e9;
+			// Something solid straight along this corridor at the vehicle's own height: blocked, whatever the ground says.
+			if (g.autopilot && g.rayValid[c] && g.ray[c].hit && g.ray[c].distance < g.rayRange[c]) {
+				needOut = kAvoidMaxClimb + 1.0;
+				return 2;
+			}
 			for (int k = 0; k < 3; ++k) {
 				const auto& q = g.corr[c * 3 + k];
 				if (!q.valid) continue;  // not loaded yet: unknown, not a wall (the blind speed cap covers it)
@@ -1605,7 +1750,11 @@ namespace vehicleflight
 					logger::Write("Rover auto: stuck; control back to the player");
 				}
 				else {
-					Stop(0, "holding: stuck");
+					// Taxi / hold: keep flying; climb and come at it again.
+					g0.cruiseExtra = std::min(kCruiseExtraMax, g0.cruiseExtra + 12.0);
+					g0.apClimb = true;
+					g0.autopilotSince = GetTickCount64();
+					logger::Write("Rover taxi: stuck; climbing out (+%.0f m), still flying", g0.cruiseExtra);
 				}
 				return;
 			}
@@ -1646,10 +1795,13 @@ namespace vehicleflight
 					b.at = nowMs;
 					const auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
 					if (b.count >= kBumpLimit) {
+						// Cramped: climb out over it and keep flying (contacts never end a flight; the stuck check, which
+						// watches actual progress, is what moves a vehicle that truly cannot get through).
 						b.count = 0;
-						logger::Write("%s: %d contacts in %.0f s (cramped); moving it to the target", wc, kBumpLimit, kBumpWindowMs / 1000.0);
-						EscapeMove(idx, vehicle, goal);
-						return;
+						g.cruiseExtra = std::min(kCruiseExtraMax, g.cruiseExtra + 6.0);
+						g.apClimb = true;
+						g.autopilotSince = nowMs;
+						logger::Write("%s: %d contacts in %.0f s (cramped); climbing out (+%.0f m), still flying", wc, kBumpLimit, kBumpWindowMs / 1000.0, g.cruiseExtra);
 					}
 					if (up) {
 						g.floorZ = pos.z;
@@ -1675,19 +1827,24 @@ namespace vehicleflight
 					if (nowMs - g.startedAt < kContactGraceMs || (g.liftoff && nowMs - g.startedAt < 3 * kContactGraceMs)) {
 						if (g.contactsIgnored++ < 3) logger::Write("%s: contact %.0f m/s %s ignored (lift-off)", wf, delta, up ? "up" : "side");
 					}
+					else if (nowMs < g.contactGraceUntil) {
+						// 20:41:52: a 120 m/s push up, then 18 ms later the step after it read as "83 m/s knocked off".
+						if (g.contactsIgnored++ < 6) logger::Write("%s: contact %.0f m/s %s ignored (just pushed up)", wf, delta, up ? "up" : "side");
+					}
 					else if (up) {
 						g.floorZ = pos.z;
 						g.floorUntil = nowMs + kFloorMs;
+						g.contactGraceUntil = nowMs + kPushGraceMs;
 						logger::Write("%s: contact %.0f m/s up at z %.1f: ground under it; holding above it", wf, delta, pos.z);
 					}
 					else if (delta < kCrashDelta) {
 						logger::Write("%s: bump %.0f m/s (side); still flying", wf, delta);
 					}
 					else {
-						char why[64];
-						std::snprintf(why, sizeof(why), "collision, %.0f m/s knocked off", delta);
-						Stop(idx, why);
-						return;
+						// A hard hit no longer ends the flight (the user, 2026-10-17: the recovery handles it): the hover keeps
+						// flying; the next half second of contacts is the same hit settling, not new crashes.
+						g.contactGraceUntil = nowMs + kHitGraceMs;
+						logger::Write("%s: hard hit %.0f m/s (side); still flying", wf, delta);
 					}
 				}
 			}
@@ -1844,15 +2001,36 @@ namespace vehicleflight
 						apSteer = false;
 					}
 				}
-				// Not closing on the target (lost behind terrain, circling): moved next to it.
-				if (dist < g.bestDist - kLostGain || !g.bestAt) {
-					g.bestDist = dist;
-					g.bestAt = GetTickCount64();
-				}
-				else if (!goal.cruise && !goal.hold && dist > kLostFar && GetTickCount64() - g.bestAt > kLostMs) {
-					logger::Write("%s: not closing in (%.0f m, best %.0f m in %.0f s); moving it to the target", wc, dist, g.bestDist, kLostMs / 1000.0);
-					EscapeMove(idx, vehicle, goal);
-					return;
+				// Lost (behind terrain, circling in a pocket): moved next to the target. Judged per kLostMs window, against
+				// where the window started, never against the best distance ever: a moving target (the player flying off,
+				// a pursuit orbit) made "60 m now, best 5 m" read as lost while the vehicle was flying fine and chasing
+				// (20:59-21:02: the rover and NPC rover 1 teleported 4 times in 3 minutes). A vehicle that covered
+				// kLostMove in the window is chasing, not lost, however far behind it is.
+				{
+					const ULONGLONG tNow = GetTickCount64();
+					if (!g.bestAt) {
+						g.bestAt = tNow;
+						g.bestDist = dist;
+						g.lostX = pos.x;
+						g.lostY = pos.y;
+					}
+					else if (tNow - g.bestAt >= kLostMs) {
+						const double gained = g.bestDist - dist;
+						const double moved = std::hypot(pos.x - g.lostX, pos.y - g.lostY);
+						const bool lost = !goal.cruise && !goal.hold && dist > kLostFar && gained < kLostGain && moved < kLostMove;
+						if (lost) {
+							logger::Write("%s: lost (%.0f m from the target, %.0f m closer and %.0f m moved in %.0f s); moving it to the target", wc, dist, gained, moved,
+								kLostMs / 1000.0);
+						}
+						g.bestAt = tNow;
+						g.bestDist = dist;
+						g.lostX = pos.x;
+						g.lostY = pos.y;
+						if (lost) {
+							EscapeMove(idx, vehicle, goal);
+							return;
+						}
+					}
 				}
 				if (!goal.keepGoing && dist <= goal.stop + 1.0 && sp < 1.5) {
 					logger::Write("%s: arrived %.1f m from the target", wc, dist);
@@ -1873,7 +2051,10 @@ namespace vehicleflight
 					if (!lt || nowMs - g.autopilotSince < 100) { lx = pos.x; ly = pos.y; lt = nowMs; stuck = 0; }
 					else if (nowMs - lt >= 3000) {
 						const double moved = std::hypot(pos.x - lx, pos.y - ly);
-						stuck = (!g.apClimb && boosting && moved < 1.0) ? stuck + 1 : 0;
+						// Holding a spot (Taxi waiting for a marker, or holding over it) is meant to stand still: never "stuck"
+						// (21:05:01: Auto waiting with no marker backed out and climbed).
+						const bool holdingStill = goal.hold && std::hypot(goal.x - pos.x, goal.y - pos.y) < 8.0;
+						stuck = (!g.apClimb && boosting && moved < 1.0 && !holdingStill) ? stuck + 1 : 0;
 						lx = pos.x; ly = pos.y; lt = nowMs;
 						if (stuck >= 2) {
 							auto& e = g_escape[idx];
@@ -2257,7 +2438,9 @@ namespace vehicleflight
 			}
 			if (ms - g.lastHud >= 1000) {
 				g.lastHud = ms;
-				if (!idx) notify::Log("HOVER %.0f m/s%s | %.1f m | gear %d | assist %d | pitch %+.0f deg", sp, !aheadLoaded ? " (slowed: ground ahead loading)" : "", above,
+				// (not in the first 1.5 s: every start read "rays [000]" before the first samples came back)
+				const bool loadingShown = !aheadLoaded && ms - g.startedAt > 1500;
+				if (!idx) notify::Log("HOVER %.0f m/s%s | %.1f m | gear %d | assist %d | pitch %+.0f deg", sp, loadingShown ? " (slowed: ground ahead loading)" : "", above,
 					g.gear, g.avoid, bodyPitch * 57.2958);
 			}
 		}
@@ -2340,9 +2523,11 @@ namespace vehicleflight
 					if (!wasHovering) Start(driven);
 					g.autopilot = true;
 					g.playerAuto = true;
+					g.taxiWait = false;
+					g.taxiMarker = 0;
 					g.apClimb = !wasHovering;
 					g.autopilotSince = GetTickCount64();
-					notify::Log("Auto on - look where to go; W/A/S/D takes over");
+					notify::Log("Auto on - place a map marker to go; W/A/S/D takes over");
 					logger::Write("Rover auto: on (%s)", wasHovering ? "already hovering" : "lifting off");
 				}
 			}
@@ -2518,7 +2703,11 @@ namespace vehicleflight
 			const std::string useKey = controlmap::KeyName(controlmap::KeyFor("MainGameplay", "Activate", 'E'));
 			hoverui::SetFoot(!driven && g_roverId != 0, rover && !driven && !g.autopilot && toRover <= kNearBoard, callKey.c_str(), followKey.c_str(), useKey.c_str(), status);
 			char line[64] = "";
-			if (driven && g.playerAuto) std::snprintf(line, sizeof(line), "AUTO  GEAR %d", std::clamp(g.gear, 1, 4));
+			if (driven && g.playerAuto) {
+				if (g.taxiMarker && g.taxiArrived) std::snprintf(line, sizeof(line), "ARRIVED");
+				else if (g.taxiMarker) std::snprintf(line, sizeof(line), "TO MARKER  %.0f m", std::min(g.taxiLeft, 99999.0));
+				else std::snprintf(line, sizeof(line), "SET A MARKER");
+			}
 			const std::string autoKey = g_keys.autoKey ? controlmap::KeyName(g_keys.autoKey) : std::string();
 			hoverui::SetAuto(autoKey.c_str(), driven && g.playerAuto, line);
 			hoverui::SetFollow(g_follow);
@@ -2618,13 +2807,45 @@ namespace vehicleflight
 				goal.hold = true;
 			}
 			else {
-				double view = 0;
-				if (!CameraHeading(view)) view = At<game::Vec3>(vehicle, off::kRefRotation).z;
-				goal.x = pos.x + std::sin(view) * kCruiseAhead;
-				goal.y = pos.y + std::cos(view) * kCruiseAhead;
-				goal.stop = 1.0;
-				goal.cruise = true;
-				goal.cruiseSpeed = kAiGearTop[std::clamp(g.gear, 1, 4)];
+				// Taxi test: Auto never moves on its own; only the player's custom map marker gives it somewhere to go.
+				double mx = 0, my = 0;
+				std::uint32_t mid = 0;
+				if (TaxiMarker(player, vehicle, mid, mx, my)) {
+					if (mid != g.taxiMarker || std::hypot(mx - g.taxiMx, my - g.taxiMy) > 2.0) {
+						g.taxiMarker = mid;
+						g.taxiMx = mx;
+						g.taxiMy = my;
+						g.taxiArrived = false;
+						notify::Log("Auto: flying to your marker (%.0f m)", std::hypot(mx - pos.x, my - pos.y));
+						logger::Write("Rover taxi: marker %08X at (%.0f, %.0f), %.0f m away", mid, mx, my, std::hypot(mx - pos.x, my - pos.y));
+					}
+					g.taxiWait = false;
+					g.taxiLeft = std::hypot(mx - pos.x, my - pos.y);
+					goal.x = mx;
+					goal.y = my;
+					goal.stop = kTaxiStop;
+					if (!g.taxiArrived && g.taxiLeft <= kTaxiStop + 4.0) {
+						g.taxiArrived = true;
+						notify::Log("Auto: arrived");
+						logger::Write("Rover taxi: arrived at marker %08X", mid);
+					}
+				}
+				else {
+					if (!g.taxiWait) {
+						g.taxiWait = true;
+						g.taxiWaitX = pos.x;
+						g.taxiWaitY = pos.y;
+						if (g.taxiMarker) logger::Write("Rover taxi: marker gone; holding at (%.0f, %.0f)", pos.x, pos.y);
+						notify::Log("Auto: place a map marker to go");
+					}
+					g.taxiMarker = 0;
+					g.taxiArrived = false;
+					g.taxiLeft = 0;
+					goal.x = g.taxiWaitX;
+					goal.y = g.taxiWaitY;
+					goal.stop = 1.5;
+				}
+				goal.hold = true;
 			}
 		}
 		else if (g.autopilot) {
@@ -2739,6 +2960,16 @@ namespace vehicleflight
 	}
 
 	bool PilotActive(int pilot) { return pilot >= 1 && pilot < kPilots && g_gs[pilot].active; }
+
+	bool ViewHeading(double& yaw) { return CameraHeading(yaw); }
+
+	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y)
+	{
+		const auto player = Ptr(addr::kPlayerCharacterPtr);
+		if (!player || !vehicle) return false;
+		std::uint32_t id = 0;
+		return TaxiMarker(player, vehicle, id, x, y);
+	}
 
 	namespace
 	{

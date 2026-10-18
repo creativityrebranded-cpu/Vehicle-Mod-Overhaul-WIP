@@ -130,11 +130,11 @@ namespace hoverui
 		constexpr int kFootEls = 5, kCarEls = 3;
 		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang" };
 		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh" };
-		constexpr double kDefOff[kButtons][2] = { { 0.0, -31.0 }, { -23.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 0.0 } };
+		constexpr double kDefOff[kButtons][2] = { { 0.0, -31.0 }, { -23.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 0.0 }, { -2.0, 0.0 } };
 		struct Layout_t
 		{
 			std::mutex lock;
-			// Minted from the player's hoverui.ini of 2026-10-17 19:55 (every element); F7 still edits, and hoverui.ini overrides.
+			// Minted from the player's hoverui.ini of 2026-10-17 20:4x (every element); F7 still edits, and hoverui.ini overrides.
 			double cx = 236.0, cy = -170.0, d = 60.0;  // d <= 0: measured once (W's key + label clear the S row)
 			bool labelsAbove = false;  // unused: Accelerate's label is above W, the others under their keys
 			double colRight = 650.0, colTop = -246.0, colStep = 54.5;
@@ -147,14 +147,14 @@ namespace hoverui
 			// coordinates (Summon's key centre; measured from the rover widget once), and the in-vehicle extras' offset.
 			double fpx = -268.4, fpy = -160.4;
 			bool haveFoot = true;
-			double eox = -400.0, eoy = -127.0;
+			double eox = -650.0, eoy = -205.0;
 			bool scannerOld = false;          // read as the earlier top-left corner: converted once the button exists
 			bool haveCluster = true, haveColumn = true, haveGearBox = true;
 			bool oldRows = false;      // only the earlier per-row positions are known: derive the column from them
 			double oldX[3] = {}, oldY[3] = {};  // Gear+, Gear-, Hover (the earlier order)
-			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
+			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] }, { kDefOff[4][0], kDefOff[4][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
 			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang)
-			double carOff[kCarEls][2] = { { 3.0, 2.0 }, { 531.0, 297.0 }, { 342.0, 289.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang)
+			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang)
 			// The rover widget's own clips (found by name when the widget is first seen) and their nudges.
 			std::vector<std::string> natNames;
 			std::map<std::string, std::pair<double, double>> natOff;

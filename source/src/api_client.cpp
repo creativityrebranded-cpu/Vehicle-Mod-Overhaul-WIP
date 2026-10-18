@@ -62,6 +62,14 @@ namespace prefetch
 	{
 		if (A()) A()->SetProbeAnchor(ref);
 	}
+	void RequestRay(int slot, const float from[3], const float to[3], std::uint64_t mask)
+	{
+		if (!A()) vehicle_probe::RequestRay(slot, from, to, mask);
+	}
+	bool LatestRay(int slot, RayHit& out, unsigned& age)
+	{
+		return !A() && vehicle_probe::LatestRay(slot, out, age);
+	}
 }
 
 namespace rebase

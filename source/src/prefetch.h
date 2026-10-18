@@ -41,6 +41,22 @@ namespace prefetch
 	// A world shift or save load changes the local coordinate frame. No cached
 	// ray result may be consumed in the next frame under its old coordinates.
 	void ResetProbes();
+	// Forward obstacle rays (2026-10-17): a straight ray from -> to through the game's own hknpBSWorld::CastRay
+	// (the query the vertical ground ray builds, FUN_140583CB0, with our own end points), on `mask`'s collision layers
+	// (64-bit, bit n = layer n). Queued and run like the ground probes; the nearest hit comes back next frame.
+	enum { kRaySlots = 24 };  // pilot * 3 + corridor (pilots 0..6, straight / left / right), and 3 spare
+	struct RayHit
+	{
+		bool hit = false;
+		float distance = 0;          // metres from `from`
+		float x = 0, y = 0, z = 0;   // the hit point
+		std::uint32_t raw[28] = {};  // the hit record (0x70 bytes, hknpCollisionResult) for layout research
+		std::uint32_t bodyId = 0;    // hit record +0x48 (fork research, 2026-10-17; unconfirmed)
+		std::uint32_t layer = 0;     // hit record +0x5C & 0x7F
+		std::uint32_t formId = 0;    // the reference that owns the hit body (the game's own body -> ref path), 0 unknown
+	};
+	void RequestRay(int slot, const float from[3], const float to[3], std::uint64_t mask);
+	bool LatestRay(int slot, RayHit& out, unsigned& age);
 	// Load-ahead lead time in seconds (the grid is centred this far ahead along the velocity, capped by the grid size).
 	void SetLeadSeconds(float seconds);
 }

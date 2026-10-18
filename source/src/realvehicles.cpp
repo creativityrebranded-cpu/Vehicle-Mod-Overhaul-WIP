@@ -259,7 +259,7 @@ namespace realvehicles
 				logger::Write("Real vehicles: %zu vehicle forms in the game (form type %02X, list at data handler+0x%X):", g.vehicles.size(), type, start);
 			}
 			for (const auto& v : g.vehicles) {
-				logger::Write("Real vehicles:   %08X %s%s", v.id, v.name.empty() ? "(no name or model found)" : v.name.c_str(), v.form == base ? "  <- player default" : "");
+				// (the whole furniture list -- chairs, beds, markers -- is no longer logged; the pool lines below are the vehicles)
 				if (!g.deimog && v.name.find("deimog") != std::string::npos) g.deimog = v.form;
 				if (!g.moonJumper && (v.name.find("moonjump") != std::string::npos || v.name.find("moon_jump") != std::string::npos ||
 										  v.name.find("moon jump") != std::string::npos)) g.moonJumper = v.form;
@@ -361,13 +361,14 @@ namespace realvehicles
 			return ref;
 		}
 
+		// A real vehicle base: one carrying the vehicle keyword (the pool). Vehicles are furniture (form type 0x2F), so
+		// the whole form list also holds every chair, bed and marker (2026-10-17 20:13: 1054 forms, 827 "vehicles"
+		// registered; in New Atlantis a bench near a parked spot counted as that spot's vehicle, so no vehicle came).
 		bool IsVehicleBase(uptr base)
 		{
 			if (!base) return false;
-			for (const auto& v : g.vehicles) {
-				if (v.form == base) return true;
-			}
-			return base == g.rev8;
+			if (!g.pool.empty()) return std::find(g.pool.begin(), g.pool.end(), base) != g.pool.end();
+			return base == g.rev8 || base == g.deimog || base == g.moonJumper;
 		}
 
 		void Disable(uptr ref);
@@ -550,8 +551,53 @@ namespace realvehicles
 			std::fclose(f);
 		}
 
-		// Records every real vehicle in the cell; never creates one. Duplicates an older build created at a parked
-		// spot are still cleared once (one kept).
+		// Co-located parked vehicles (2026-10-17 20:58: REV-8 FF013B99 from Vehicles - Real.esm and V-47 FF019056 from the
+		// earlier run-time swap, both at (657, 635, 17)): the swap's vehicles live in the save and the props that used to
+		// trigger the duplicate check are gone. Two parked, unprotected vehicles within kDupRadius are one spot: the one
+		// with the spot's own type (REV-8 / Deimog / Moon Jumper, what the patch places) is kept, else the lowest id; the
+		// other created ones (FF ids) are disabled. kDupRadius is tight so neighbouring real spots are never touched.
+		constexpr float kDupRadius = 2.5f;
+		void ClearStacked(const std::vector<uptr>& parked)
+		{
+			auto spotType = [](uptr r) {
+				const uptr b = At<uptr>(r, 0x98);
+				return b && (b == g.rev8 || b == g.deimog || b == g.moonJumper);
+			};
+			std::vector<bool> gone(parked.size(), false);
+			for (std::size_t i = 0; i < parked.size(); ++i) {
+				if (gone[i]) continue;
+				const auto p = At<game::Vec3>(parked[i], off::kRefPosition);
+				std::vector<std::size_t> here{ i };
+				for (std::size_t j = i + 1; j < parked.size(); ++j) {
+					if (gone[j]) continue;
+					const auto q = At<game::Vec3>(parked[j], off::kRefPosition);
+					if (std::fabs(q.x - p.x) < kDupRadius && std::fabs(q.y - p.y) < kDupRadius && std::fabs(q.z - p.z) < kDupRadius) here.push_back(j);
+				}
+				if (here.size() < 2) continue;
+				std::size_t keep = here[0];
+				for (const std::size_t k : here) {
+					const bool better = spotType(parked[k]) && !spotType(parked[keep]);
+					const bool same = spotType(parked[k]) == spotType(parked[keep]);
+					if (better || (same && At<std::uint32_t>(parked[k], 0x28) < At<std::uint32_t>(parked[keep], 0x28))) keep = k;
+				}
+				for (const std::size_t k : here) {
+					const uptr r = parked[k];
+					const std::uint32_t id = At<std::uint32_t>(r, 0x28);
+					if (k == keep || (id >> 24) != 0xFF || Protected(r)) continue;
+					Disable(r);
+					gone[k] = true;
+					g.registry.erase(id);
+					g.dirty = true;
+					logger::Write("Real vehicles: stacked vehicle %08X (base %08X) at (%.0f, %.0f, %.0f) removed; kept %08X (base %08X)", id,
+						At<std::uint32_t>(At<uptr>(r, 0x98), 0x28), p.x, p.y, p.z, At<std::uint32_t>(parked[keep], 0x28),
+						At<std::uint32_t>(At<uptr>(parked[keep], 0x98), 0x28));
+				}
+			}
+		}
+
+		// Records every real vehicle in the cell; never creates one (the user, 2026-10-17 20:2x: no swapping at run time;
+		// the props become real vehicles in Vehicles.esm itself). Duplicates an older build created at a parked spot are
+		// still cleared once (one kept).
 		void ScanCell(uptr cell, int& budget)
 		{
 			(void)budget;
@@ -559,13 +605,17 @@ namespace realvehicles
 			std::uint32_t count = 0;
 			if (!CellRefs(cell, refs, count)) return;
 			const std::uint32_t hi = g.modIndex >= 0 ? std::uint32_t(g.modIndex) << 24 : 0xFFFFFFFFu;
+			std::vector<uptr> parked;
 			for (std::uint32_t i = 0; i < count && i < 8192; ++i) {
 				const uptr r = refs[i];
 				if (!r || !Readable(r, 0xD0)) continue;
 				const uptr base = At<uptr>(r, 0x98);
 				if (!base) continue;
 				if (IsVehicleBase(base)) {
-					if (!(At<std::uint32_t>(r, 0x20) & 0x800)) Register(r, cell);
+					if (!(At<std::uint32_t>(r, 0x20) & 0x800)) {
+						Register(r, cell);
+						if (g.modIndex >= 0 && !Protected(r) && std::strcmp(StateOf(r), "parked") == 0) parked.push_back(r);
+					}
 					continue;
 				}
 				const std::uint32_t id = At<std::uint32_t>(base, 0x28);
@@ -573,7 +623,7 @@ namespace realvehicles
 				const std::uint32_t lo = id & 0xFFFFFF;
 				if (lo != kStaticRev8 && lo != kStaticDeimog && lo != kStaticMoonJumper) continue;
 				const std::uint32_t pid = At<std::uint32_t>(r, 0x28);
-				if (g.done.count(pid)) continue;
+				if (g.done.count(pid) || (At<std::uint32_t>(r, 0x20) & 0x800)) continue;
 				g.done.insert(pid);
 				VehicleAtSpot(At<game::Vec3>(r, off::kRefPosition), refs, count);  // clears old duplicates only
 			}
@@ -610,6 +660,34 @@ namespace realvehicles
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 			logger::Write("Real vehicles: exception while scanning cells");
+		}
+	}
+
+	void ForEachLoaded(void (*fn)(std::uintptr_t ref, void* ctx), void* ctx)
+	{
+		const uptr tes = Ptr(addr::kTESPtr);
+		if (!tes || !g.haveVehicles) return;
+		__try {
+			const auto entries = At<uptr*>(tes, off::kTESGridCells);
+			const auto n = std::min(At<std::uint32_t>(tes, off::kTESGridCount), 64u);
+			for (std::uint32_t i = 0; entries && i < n; ++i) {
+				const uptr e = entries[i];
+				if (!e) continue;
+				const auto state = At<std::uint32_t>(e, off::kGridEntryState);
+				if ((((state & 0x70000000u) + 0xD0000000u) & 0xEFFFFFFFu) != 0) continue;
+				const uptr cell = At<uptr>(e, off::kGridEntryCell);
+				if (!cell || At<std::uint8_t>(cell, off::kCellState) != 10) continue;
+				uptr* refs = nullptr;
+				std::uint32_t count = 0;
+				if (!CellRefs(cell, refs, count)) continue;
+				for (std::uint32_t k = 0; k < count && k < 8192; ++k) {
+					const uptr r = refs[k];
+					if (!r || !Readable(r, 0xD0) || (At<std::uint32_t>(r, 0x20) & 0x800)) continue;
+					if (IsVehicleBase(At<uptr>(r, 0x98))) fn(r, ctx);
+				}
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
 		}
 	}
 
