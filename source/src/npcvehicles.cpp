@@ -97,6 +97,7 @@ namespace npcvehicles
 			bool gang = false;                 // started by the gang (mirrors the player), not by the force key
 			bool cmd = false;                  // sent with the game's own follower command (Walk key): no instant-seat fallback
 			ULONGLONG cmdLog = 0;
+			bool cmdEntered = false;            // the get-in was asked once the NPC arrived
 			bool driving = false;              // drive mode controls are being submitted
 			bool firing = false;               // the vehicle weapon's fire input is held
 			ULONGLONG fireAt = 0;              // when the current burst / gap started
@@ -814,6 +815,12 @@ namespace npcvehicles
 					j.cmdLog = now;
 					LogCmdState(j, npc, vehicle);
 				}
+				if (j.cmd && !j.cmdEntered && !aboard && Dist(npc, vehicle) < 4.0) {
+					// Arrived (the walk is done): the entry animation, the get-in the player uses; seated -> the handoff below.
+					j.cmdEntered = true;
+					const int r = Mount(npc, vehicle);
+					logger::Write("NPC vehicles: [%d] arrived (%.1f m): get-in -> %d (1 walking, 2 standing up, 3 seated, 0 refused)", j.pilot, j.npc ? Dist(npc, vehicle) : 0.0, r);
+				}
 				if (aboard) {
 					logger::Write("NPC vehicles: [%d] NPC %08X aboard after %.1f s", j.pilot, j.npc, (now - j.since) / 1000.0);
 					double fx, fy;
@@ -827,7 +834,7 @@ namespace npcvehicles
 						Leave(j, npc, "pilot refused");
 					}
 				}
-				else if (!j.pkgSampled && now - j.since > 1000) {
+				else if (!j.cmd && !j.pkgSampled && now - j.since > 1000) {
 					// 20:45 / 20:47: "walking to it", then 15 m -> 15 m in 5 s and the fallback seated it (the "teleport").
 					// Is the get-in package (type 0x29) still the current one, and is the NPC fighting?
 					j.pkgSampled = true;
@@ -1231,6 +1238,20 @@ namespace npcvehicles
 		constexpr std::uint32_t kCmdSelectActor = 0x0194D150, kCmdIssue = 0x01A35DB0, kCmdSelect = 0x01A5E990, kCmdSelected = 0x01A5E910;
 		constexpr std::uint32_t kPlayerCmdTarget = 0xF90, kPlayerCmdType = 0xFA0, kCmdTypeUse = 5;
 
+		// Actor.PathToReference (native core FUN_141FC8ED0 -> FUN_141951100(actor, target, speed, minDistance, wait, run)): builds a
+		// walking path to the reference and starts it; returns the path request id, -1 when no path can be built ("Could not
+		// build path"), -2 on a fault. The walking piece of the Walk key.
+		constexpr std::uint32_t kPathToRef = 0x01951100;
+		int PathTo(uptr npc, uptr target)
+		{
+			__try {
+				return EngineFn<int (*)(uptr, uptr, float, float, float, char)>(kPathToRef)(npc, target, 1.0f, 2.0f, 0.0f, 0);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return -2;
+			}
+		}
+
 		bool CommandUse(uptr npc, uptr vehicle)
 		{
 			const uptr player = Ptr(addr::kPlayerCharacterPtr);
@@ -1398,6 +1419,9 @@ namespace npcvehicles
 					notify::Show("The command failed");
 					return;
 				}
+				const int pathId = PathTo(npc, vehicle);
+				logger::Write("NPC vehicles: walk: path to vehicle %08X for NPC %08X -> request %d (%s)", At<std::uint32_t>(vehicle, off::kFormId), At<std::uint32_t>(npc, off::kFormId), pathId,
+					pathId == -1 ? "NO PATH could be built" : pathId == -2 ? "faulted" : "walking");
 				slot->npc = At<std::uint32_t>(npc, off::kFormId);
 				slot->vehicle = At<std::uint32_t>(vehicle, off::kFormId);
 				slot->gang = false;

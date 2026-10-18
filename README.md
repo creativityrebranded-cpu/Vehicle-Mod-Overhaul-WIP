@@ -158,6 +158,9 @@ Built from the game's own pieces (from its console command `CommandedActivate`, 
 | **Enter** (the first free of `]` `\` `-`) | That NPC does the **get-in now**: the entry animation the player uses, wherever it stands. |
 | *(trigger)* | The moment the game reports the NPC seated, control is handed to the autopilot (escort / pursuit) as before. |
 
+The Walk key also asks the game for a walking path to the vehicle (the engine call behind `Actor.PathToReference`; the log says
+`walk: path … -> request N`, or `NO PATH could be built`), and when the NPC is within 4 m it does the get-in by itself.
+
 The older `,` key (send, with a fallback that seats the NPC after 5 s) still works.
 
 ## Getting into an occupied vehicle
