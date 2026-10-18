@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include <cstdint>
 
 // Planetary flight on the REV-8 rover (user, 2026-10-14; design: notes/plan-vehicle-flight.md). While driving, H
@@ -17,8 +19,10 @@ namespace vehicleflight
 	// NPC pilots 1..3 (the "pursuit" side; pilot 0 is the player's escort autopilot): the same flight model, terrain
 	// assist and avoidance, flying `vehicle` to (x, y) and settling `stop` metres short. Called again while flying it
 	// only changes the target. keepGoing: arriving does not end the flight (it holds `stop` metres off; no timeout).
+	// z: the world height to fly at (NaN: skim the terrain); never under the terrain clearance.
 	// False: not allowed (the player's rover, or another pilot has this vehicle).
-	bool PilotFly(int pilot, std::uintptr_t vehicle, double x, double y, double stop, unsigned timeoutMs, bool keepGoing = false);
+	bool PilotFly(int pilot, std::uintptr_t vehicle, double x, double y, double stop, unsigned timeoutMs, bool keepGoing = false,
+		double z = std::numeric_limits<double>::quiet_NaN());
 	bool PilotActive(int pilot);
 	const char* PilotEndReason(int pilot);  // why the pilot last stopped ("arrived", "stuck", ...)
 	void PilotStop(int pilot, const char* why);

@@ -21,11 +21,21 @@ namespace hoverui
 	void SetStatus(int state);
 	// Main thread: the follow key's name (the scanner's Follow button).
 	void SetFollowKey(const char* key);
+	// Main thread, every frame: the contextual HUD. On foot (only when the player owns a vehicle): Summon and Follow
+	// with their keys, Get in (the game's Activate key) when near the own vehicle, and a status box (e.g. "FOLLOWING 42 m";
+	// empty: hidden).
+	void SetFoot(bool own, bool nearOwn, const char* summonKey, const char* followKey, const char* useKey, const char* status);
+	// Main thread: in the vehicle, the Auto button (its key; empty: hidden), whether Auto flies, and its status line.
+	void SetAuto(const char* key, bool on, const char* line);
+	// Main thread: the gang line (NPC vehicles following: count, profile, the profile key); count 0 hides it.
+	void SetGang(int count, const char* profile, const char* key);
 	// A save load or reload: forget the button objects (the HUD movie is rebuilt).
 	void Reset();
-	// Main thread, every frame: layout editor (only in the rover). F7 on / off (saves). Page Up / Page Down pick W, A, S,
-	// D, Gear-, Gear+, Hover, the gear box, the WASD cluster, the column or all (picked ones blink); arrows move
-	// (Ctrl: x10); Home / End push the WASD keys apart / together at equal distance (or space the column's rows). Saved to SFSE\Logs\SeamlessVehicle\hoverui.ini.
-	// In the scanner, F7 and the arrows move the scanner's call button.
+	// Main thread, every frame: layout editor. F7 on / off (saves). In the vehicle, Page Up / Page Down pick one element
+	// (W, A, S, D, Gear-, Gear+, Hover, Gear box, Auto, Auto line, Gang, each of the rover widget's own clips such as the
+	// Exit button) or a group (WASD, Column, Extras, All); the pick is named in a notification and blinks. On foot they pick
+	// Summon, Follow, Get in, Status, Gang or the whole panel. Arrows move (Ctrl: x10); Delete puts the pick back to its
+	// default; Home / End space the WASD keys or the column's rows. While editing every element shows (sample text where
+	// empty). Saved to SFSE\Logs\SeamlessVehicle\hoverui.ini.
 	void EditTick(bool focused);
 }

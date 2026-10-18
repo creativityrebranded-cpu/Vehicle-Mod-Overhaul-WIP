@@ -4,6 +4,7 @@
 #include "controlmap.h"
 #include "game.h"
 #include "hook.h"
+#include "hoverui.h"
 #include "log.h"
 #include "modscene.h"
 #include "notify.h"
@@ -91,7 +92,7 @@ namespace npcvehicles
 			bool firing = false;               // the vehicle weapon's fire input is held
 			ULONGLONG fireAt = 0;              // when the current burst / gap started
 			unsigned bursts = 0;
-			double aimX = 0, aimY = 0, aimVx = 0, aimVy = 0;  // the player's last position and smoothed velocity (aim lead)
+			double aimX = 0, aimY = 0, aimZ = 0, aimVx = 0, aimVy = 0, aimVz = 0;  // the player's last position and smoothed velocity (aim lead)
 			ULONGLONG aimAt = 0;
 			ULONGLONG tAt = 0;
 		} g_jobs[kJobs];
@@ -122,6 +123,7 @@ namespace npcvehicles
 			{ "pursuit", false, true, true, true },
 		};
 		constexpr double kAttackRadius = 30.0;     // m: the orbit around the player
+		constexpr double kAttackAbove = 6.0;       // m: attackers fly this far over the player's height
 		constexpr double kAttackRun = 70.0;        // m: closer than this the attack controls take over from the autopilot
 		constexpr ULONGLONG kReaggroMs = 5000;     // combat re-asked this often while out of combat
 		bool g_allowDismount = false;              // only our own Leave() takes a job's NPC out of its vehicle
@@ -425,6 +427,13 @@ namespace npcvehicles
 			return loaded && At<uptr>(loaded, 0x08);
 		}
 		bool Disabled(uptr r) { return (At<std::uint32_t>(r, 0x20) & 0x800) != 0; }
+		double Dist3(uptr a, uptr b)
+		{
+			const auto p = At<game::Vec3>(a, off::kRefPosition), q = At<game::Vec3>(b, off::kRefPosition);
+			const double dx = double(p.x) - q.x, dy = double(p.y) - q.y, dz = double(p.z) - q.z;
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		}
+
 		double Dist(uptr a, uptr b)
 		{
 			const auto p = At<game::Vec3>(a, off::kRefPosition), q = At<game::Vec3>(b, off::kRefPosition);
@@ -609,6 +618,14 @@ namespace npcvehicles
 			y = pp.y + std::cos(ang) * kAttackRadius;
 		}
 
+		// The height a pilot flies at (2026-10-17: they skimmed the ground while the player flew high): the player's own
+		// height, led by their climb or dive; attacking, kAttackAbove over it (shots angle down, clear of ground clutter).
+		double GoalZ(const Job& j, uptr player, bool attack)
+		{
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			return pp.z + std::clamp(j.aimVz * 1.5, -15.0, 15.0) + (attack ? kAttackAbove : 0.0);
+		}
+
 		// The aim point: the player led by their velocity over the shot's flight time, at chest height.
 		void AimPoint(Job& j, uptr player, uptr vehicle, double& ax, double& ay, double& az)
 		{
@@ -617,22 +634,24 @@ namespace npcvehicles
 			const ULONGLONG now = GetTickCount64();
 			if (j.aimAt && now > j.aimAt) {
 				const double dt = (now - j.aimAt) / 1000.0;
-				const double ix = (pp.x - j.aimX) / dt, iy = (pp.y - j.aimY) / dt;
-				if (dt < 1.0 && std::hypot(ix, iy) < 150.0) {
+				const double ix = (pp.x - j.aimX) / dt, iy = (pp.y - j.aimY) / dt, iz = (pp.z - j.aimZ) / dt;
+				if (dt < 1.0 && std::sqrt(ix * ix + iy * iy + iz * iz) < 150.0) {
 					const double a = std::min(1.0, dt * 4.0);
 					j.aimVx += (ix - j.aimVx) * a;
 					j.aimVy += (iy - j.aimVy) * a;
+					j.aimVz += (iz - j.aimVz) * a;
 				}
 				else {
-					j.aimVx = j.aimVy = 0;
+					j.aimVx = j.aimVy = j.aimVz = 0;
 				}
 			}
-			j.aimX = pp.x; j.aimY = pp.y; j.aimAt = now;
-			const double dist = std::hypot(double(pp.x) - vp.x, double(pp.y) - vp.y);
+			j.aimX = pp.x; j.aimY = pp.y; j.aimZ = pp.z; j.aimAt = now;
+			const double dz = double(pp.z) + kAimHeight - vp.z;
+			const double dist = std::sqrt(std::pow(double(pp.x) - vp.x, 2) + std::pow(double(pp.y) - vp.y, 2) + dz * dz);
 			const double t = dist / kShotSpeed;
 			ax = pp.x + j.aimVx * t;
 			ay = pp.y + j.aimVy * t;
-			az = pp.z + kAimHeight;
+			az = pp.z + kAimHeight + j.aimVz * t;
 		}
 
 		// Attack run (close): every control channel: nose on the aim point (yaw and pitch), circle the player (strafe;
@@ -652,7 +671,7 @@ namespace npcvehicles
 			c.yawRate = std::clamp((j.firing ? 2.5 : 1.6) * WrapAngle(std::atan2(dx, dy) - heading), -1.2, 1.2);
 			c.strafe = ((j.pilot % 2) ? 1.0 : -1.0) * (j.firing ? 0.3 : 0.6);
 			c.throttle = std::clamp((dist - kAttackRadius) / 20.0, -0.6, 0.6);
-			c.pitch = std::clamp(std::atan2(double(pp.z) - vp.z, std::max(dist, 5.0)), -0.3, 0.3);
+			c.pitch = std::clamp(std::atan2(double(pp.z) - vp.z, std::max(dist, 5.0)), -0.6, 0.6);
 			c.gear = 2;
 			c.holdMs = 300;
 			vehicleflight::PilotCommand(j.pilot, c);
@@ -677,6 +696,16 @@ namespace npcvehicles
 				Set(j, Phase::Idle);
 				return;
 			}
+			// Life is the driver's licence: a dead NPC's vehicle stops firing and flying (its hover ends and it comes
+			// down); the job ends, so a passenger player is let out and the vehicle is free again.
+			if (Dead(npc)) {
+				if (j.firing) SubmitFire(j.pilot - 1, j.vehicle, false);
+				j.firing = false;
+				vehicleflight::PilotStop(j.pilot, "driver died");
+				logger::Write("NPC vehicles: [%d] NPC %08X died; vehicle %08X stopped", j.pilot, j.npc, j.vehicle);
+				Set(j, Phase::Idle);
+				return;
+			}
 			const bool aboard = InVehicle(npc) == vehicle;
 			const double toPlayer = Dist(vehicle, player);
 			if (j.phase == Phase::Following) vehicleflight::WatchFlip(vehicle, "NPC vehicles");
@@ -686,7 +715,7 @@ namespace npcvehicles
 					logger::Write("NPC vehicles: [%d] NPC %08X aboard after %.1f s", j.pilot, j.npc, (now - j.since) / 1000.0);
 					double fx, fy;
 					FollowPoint(j, player, vehicle, fx, fy);
-					if (vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true)) {
+					if (vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true, GoalZ(j, player, false))) {
 						if (!g_told) notify::Show("An NPC is following you in a vehicle");
 						g_told = true;
 						Set(j, Phase::Following);
@@ -757,20 +786,25 @@ namespace npcvehicles
 					}
 					double fx, fy;
 					AttackPoint(j, player, vehicle, fx, fy);
-					vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true);
+					vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true, GoalZ(j, player, true));
 					if (toPlayer < kAttackRun) AttackRun(j, player, vehicle);
 					// Vehicle weapon: bursts with the nose on the player and in range.
 					double axp = 0, ayp = 0, azp = 0;
 					if (toPlayer >= kAttackRun) AimPoint(j, player, vehicle, axp, ayp, azp);  // (inside, AttackRun updated it)
 					else {
-						const double t = toPlayer / kShotSpeed;
 						const auto ppl = At<game::Vec3>(player, off::kRefPosition);
-						axp = ppl.x + j.aimVx * t; ayp = ppl.y + j.aimVy * t;
+						const double t = Dist3(vehicle, player) / kShotSpeed;
+						axp = ppl.x + j.aimVx * t; ayp = ppl.y + j.aimVy * t; azp = ppl.z + kAimHeight + j.aimVz * t;
 					}
 					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
-					const double aimErr = std::fabs(WrapAngle(std::atan2(axp - vp.x, ayp - vp.y) - At<game::Vec3>(vehicle, off::kRefRotation).z));
-					(void)kFireCone;
-					const bool canFire = kProfiles[int(j.profile)].fire && toPlayer < kFireRange;  // shots are aimed at the player, any direction
+					const auto vr = At<game::Vec3>(vehicle, off::kRefRotation);
+					const double aimErr = std::fabs(WrapAngle(std::atan2(axp - vp.x, ayp - vp.y) - vr.z));
+					// The weapon fires along the nose (the projectile turn never took: 19:58 run, 0 aimed): yaw and pitch
+					// both on the led aim point, in 3D range. Rotation x is nose down +.
+					const double pitchWant = std::atan2(azp - vp.z, std::max(1.0, std::hypot(axp - vp.x, ayp - vp.y)));
+					const double pitchErr = std::fabs(pitchWant + vr.x);
+					const bool onTarget = aimErr < kFireCone && pitchErr < kFireCone * 1.5;
+					const bool canFire = kProfiles[int(j.profile)].fire && Dist3(vehicle, player) < kFireRange && onTarget;
 					const int slot = j.pilot - 1;
 					if (j.firing) {
 						if (!canFire || now - j.fireAt >= kBurstMs) {
@@ -787,7 +821,7 @@ namespace npcvehicles
 						j.firing = true;
 						j.fireAt = now;
 						if (j.bursts++ % 10 == 0) {
-							logger::Write("NPC vehicles: [%d] vehicle %08X weapon burst %u (%.0f m, aim off %.0f deg) -> %s", j.pilot, j.vehicle, j.bursts, toPlayer, aimErr * 57.2958,
+							logger::Write("NPC vehicles: [%d] vehicle %08X weapon burst %u (%.0f m, aim off %.0f deg, pitch off %.0f deg) -> %s", j.pilot, j.vehicle, j.bursts, toPlayer, aimErr * 57.2958, pitchErr * 57.2958,
 								ok ? "input sent" : "input FAILED");
 						}
 					}
@@ -801,7 +835,7 @@ namespace npcvehicles
 					else {
 						double fx, fy;
 						FollowPoint(j, player, vehicle, fx, fy);
-						vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true);
+						vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true, GoalZ(j, player, false));
 					}
 				}
 				else {
@@ -817,7 +851,7 @@ namespace npcvehicles
 						double fx, fy;
 						if (orbit) AttackPoint(j, player, vehicle, fx, fy);
 						else FollowPoint(j, player, vehicle, fx, fy);
-						if (vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true)) {
+						if (vehicleflight::PilotFly(j.pilot, vehicle, fx, fy, kFollowStop, 0, true, GoalZ(j, player, orbit))) {
 							logger::Write("NPC vehicles: [%d] following again (%.0f m from you)", j.pilot, toPlayer);
 							j.parked = false;
 							j.relaunchAt = 0;
@@ -1520,6 +1554,22 @@ namespace npcvehicles
 	{
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player) return;
+		// The player died: NPC vehicles stop firing and flying (they stay where they are, the NPCs aboard).
+		static bool deadDone = false;
+		if (Dead(player)) {
+			if (!deadDone) {
+				deadDone = true;
+				for (auto& j : g_jobs) {
+					if (j.phase == Phase::Idle) continue;
+					if (j.firing) SubmitFire(j.pilot - 1, j.vehicle, false);
+					j.firing = false;
+					vehicleflight::PilotStop(j.pilot, "you died");
+				}
+				logger::Write("NPC vehicles: you died; NPC vehicles stopped");
+			}
+			return;
+		}
+		deadDone = false;
 		ChooseKey();
 		const bool fdown = g_forceKey && Focused() && (GetAsyncKeyState(g_forceKey) & 0x8000) != 0;
 		if (fdown && !g_forceDown) Force(player);
@@ -1558,6 +1608,15 @@ namespace npcvehicles
 			g_jobs[i].pilot = i + 1;
 			if (g_jobs[i].phase != Phase::Idle) Update(g_jobs[i], player);
 		}
+		// The HUD's gang line: NPC vehicles following, and their profile (the period key switches it).
+		int n = 0;
+		const char* prof = "";
+		for (const auto& j : g_jobs) {
+			if (j.phase != Phase::Following) continue;
+			if (!n) prof = kProfiles[int(j.profile)].name;
+			++n;
+		}
+		hoverui::SetGang(n, prof, ".");
 	}
 
 	namespace

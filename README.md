@@ -73,7 +73,7 @@ Only your own vehicle (the one the game links to you) can be summoned or set to 
 | **Shift + W / Shift + S** | Gear up / down (gears 1–4). Shift alone does nothing. **1–4** pick a gear directly. |
 | **A / D** | Turn / roll. Mouse aims (yaw and pitch). |
 | **Q / Z** | Up / down. **Shift + Space**: down. |
-| **F7** | Edit the on-screen button layout (saved to `Logs\SeamlessVehicle\hoverui.ini`). |
+| **F7** | Edit the on-screen layout: Page Up / Page Down pick any item (each button, the game's own vehicle HUD parts, or a group), arrows move it (Ctrl: x10), Delete resets it. Saved to `Logs\SeamlessVehicle\hoverui.ini`. |
 
 Driving on the ground, the gears cap speed at 25 / 50 / 75 / 100 %. Movement keys follow your Vehicle bindings.
 
@@ -157,7 +157,9 @@ following with trail navigation and the gear system.
 
 Built, **not yet tested in game**: gang vehicles (boarding with you, formation, landing with you, 6 NPC
 vehicles), NPC vehicle weapon fire (Pursuit), aiming shots at the player, the tight-space handling, flip recovery,
-the vehicle registry and duplicate cleanup.
+the vehicle registry and duplicate cleanup. Also new (2026-10-17 evening): NPC vehicles fly at your height (attackers
+6 m above you) and fire only with the nose on you; no driver, no flight (you or an NPC driver dying stops that
+vehicle); ground contact no longer cuts the hover at low height; every HUD item moves on its own in the F7 editor.
 
 Planned next: autopilot for your own vehicle (**B**), a contextual on-foot panel (Summon / Follow / Get in, no scanner),
 summon teleport rules, and gang combat against enemies (vehicle vs vehicle, passengers, getting out to fight).
