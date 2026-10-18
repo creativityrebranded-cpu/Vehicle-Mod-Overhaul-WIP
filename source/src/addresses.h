@@ -310,7 +310,7 @@ namespace off
 	inline constexpr std::uint32_t kRefPosition = 0x8C;    // NiPoint3, metres
 	inline constexpr std::uint32_t kRefParentCell = 0xB0;  // TESObjectCELL*
 
-	inline constexpr std::uint32_t kPlayerCustomMarker = 0xE40;      // uint32 form id of the custom map marker
+	inline constexpr std::uint32_t kPlayerCustomMarker = 0xE40;      // uint32 reference HANDLE of the custom map marker (not a form id)
 	inline constexpr std::uint32_t kPlayerCustomMarkerData = 0xE48;
 	inline constexpr std::uint32_t kMgrMarkerWorld = 0x78;           // **(mgr+0x78) -> +0x98 = worldspace used for markers
 	inline constexpr std::uint32_t kRefLoadedData = 0xB8;  // LOADED_REF_DATA* (+0x08 = root scene node)

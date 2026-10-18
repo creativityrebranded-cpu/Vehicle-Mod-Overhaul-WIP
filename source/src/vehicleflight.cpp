@@ -1295,6 +1295,27 @@ namespace vehicleflight
 		// vehicle's world: none, not loaded, another worldspace or absurdly far counts as no marker.
 		constexpr double kTaxiStop = 6.0;          // m: the taxi holds this close over the marker
 		constexpr double kTaxiMaxRange = 30000.0;  // m
+		// player +0xE40 is a reference HANDLE, not a form id (2026-10-17 21:21: "marker id 00107C37 does not resolve to a
+		// loaded reference" with the form-id lookup; the game reads it with FUN_1428CCC40(handle table, handle, functor)
+		// and clears it to the invalid handle, FUN_141A43760). Returns the reference with one reference held (release it).
+		std::uintptr_t MarkerFromHandle(std::uint32_t handle)
+		{
+			std::uintptr_t ref = 0;
+			std::uintptr_t* out = &ref;
+			struct
+			{
+				std::uintptr_t vtbl;
+				std::uintptr_t** capture;
+			} lookup{ game::Base() + addr::kHandleToRefFunctorVtbl, &out };
+			__try {
+				EngineFn<void (*)(std::uintptr_t, std::uint32_t, void*)>(addr::kHandleLookup)(Ptr(addr::kRefHandleTablePtr), handle, &lookup);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				ref = 0;
+			}
+			return ref;
+		}
+
 		bool TaxiMarker(std::uintptr_t player, std::uintptr_t vehicle, std::uint32_t& id, double& x, double& y)
 		{
 			id = At<std::uint32_t>(player, off::kPlayerCustomMarker);
@@ -1307,14 +1328,21 @@ namespace vehicleflight
 				if (say) logger::Write("Rover taxi: waiting; no custom marker (player +0xE40 is 0)");
 				return false;
 			}
-			const std::uintptr_t m = RefById(id);
+			const std::uintptr_t m = MarkerFromHandle(id);
 			if (!m) {
-				if (say) logger::Write("Rover taxi: waiting; marker id %08X does not resolve to a loaded reference", id);
+				if (say) logger::Write("Rover taxi: waiting; marker handle %08X does not resolve to a reference", id);
 				return false;
 			}
 			const auto mc = At<std::uintptr_t>(m, off::kRefParentCell), vc = At<std::uintptr_t>(vehicle, off::kRefParentCell);
 			const auto mws = mc ? At<std::uintptr_t>(mc, off::kCellWorldspace) : 0, vws = vc ? At<std::uintptr_t>(vc, off::kCellWorldspace) : 0;
 			const auto mp = At<game::Vec3>(m, off::kRefPosition), vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			EngineFn<void (*)(std::uintptr_t)>(addr::kRefRelease)(m);
+			static std::uint32_t loggedHandle = 0;
+			if (loggedHandle != id) {
+				loggedHandle = id;
+				logger::Write("Rover taxi: marker handle %08X -> reference at (%.0f, %.0f, %.0f), %.0f m from the vehicle", id, mp.x, mp.y, mp.z,
+					std::hypot(double(mp.x) - vp.x, double(mp.y) - vp.y));
+			}
 			if (mws && vws && mws != vws) {
 				if (say) logger::Write("Rover taxi: waiting; marker %08X at (%.0f, %.0f, %.0f) is in another worldspace (%p vs %p)", id, mp.x, mp.y, mp.z,
 					reinterpret_cast<void*>(mws), reinterpret_cast<void*>(vws));
