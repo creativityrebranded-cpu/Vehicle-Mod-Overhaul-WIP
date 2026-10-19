@@ -2640,17 +2640,17 @@ namespace vehicleflight
 						accel = 1.0;
 						brake = 0.0;
 					}
-					const bool boost = fwdBoost || (vert && accel > 0.4);
+					const bool driveBoost = fwdBoost || (vert && accel > 0.4);  // (named so it no longer hides the booster-visuals `boost` above)
 					g.drvSteer = steer;
 					g_driveOut[idx].steer.store(float(steer * g.steerSign));
 					g_driveOut[idx].accel.store(float(accel));
 					g_driveOut[idx].brake.store(float(brake));
-					g_driveOut[idx].boost.store(boost);
+					g_driveOut[idx].boost.store(driveBoost);
 					g_driveOut[idx].vert.store(vert);
 					if (tNow - g.drvLog >= 2000) {
 						g.drvLog = tNow;
 						logger::Write("%s: drive: speed %.1f (want %.0f), steer %+.2f accel %.2f brake %.2f boost %d up %d; ahead %d need %.1f m, left %d right %d; %.1f m above ground",
-							wc, spD, tgt, steer * g.steerSign, accel, brake, boost ? 1 : 0, vert ? 1 : 0, g.lastF, g.lastNeed, g.lastL, g.lastR, above);
+							wc, spD, tgt, steer * g.steerSign, accel, brake, driveBoost ? 1 : 0, vert ? 1 : 0, g.lastF, g.lastNeed, g.lastL, g.lastR, above);
 					}
 					AskSamples(idx, pos, heading, std::sin(heading) * spD, std::cos(heading) * spD);
 					AskCorridors(idx, pos, apBearing, std::max(spD, 10.0));

@@ -70,6 +70,17 @@ namespace crash
 			if (faulting == g_self && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
+			// The same goes for the other plugins of this mod set (each guards its own reads and ignores its own faults above): two of them in one game must not report each
+			// other's guarded faults (the 2026-10-18 launch logged two at load and used up the three-report cap).
+			if (faulting && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+				char path[MAX_PATH] = {};
+				GetModuleFileNameA(faulting, path, MAX_PATH);
+				const char* name = path;
+				for (const char* p = path; *p; ++p) {
+					if (*p == '\\' || *p == '/') name = p + 1;
+				}
+				if (_strnicmp(name, "Seamless", 8) == 0 || _strnicmp(name, "Gravspace", 9) == 0) return EXCEPTION_CONTINUE_SEARCH;
+			}
 			if (g_reported.fetch_add(1) >= 3) {
 				return EXCEPTION_CONTINUE_SEARCH;  // only the first few (the game may catch some itself)
 			}

@@ -4,11 +4,12 @@
 
 #include "vcontract.h"
 
-// NPCs getting into vehicles (notes/NPC_VEHICLE_STAGE1_RESEARCH_20261017.md). Nothing automatic and nothing
-// combat-related (removed 2026-10-17 at the user's request): the force key ',' sends the NPC the player faces into the
-// nearest free vehicle (the game's get-in package; the vehicle's driver-seat keyword given when the seat refuses), and
-// aboard it follows the player like the rover follow. The game's put-the-player-in call seats that NPC instead of the
-// player for vehicles an NPC job uses.
+// NPCs getting into vehicles (notes/NPC_VEHICLE_ENTRY_RESEARCH_20261018.md, notes/MINTING_STATUS_20261018.md). The BOARD key (;) sends the
+// NPC the player faces to the nearest free vehicle: the SeamlessPilots.esm quest package walks it there (running in combat or when the vehicle
+// is over 40 m away), the seat keyword is given, and the instant seat puts it in (the animated entry is paused: kAnimatedEntry = false);
+// aboard it follows the player. The EXIT key (Insert) and RequestExit take NPCs out (the game's dismount, then the instant exit). The context
+// engine (context.cpp) can also board fighters by itself. The game's put-the-player-in call seats the NPC instead of the player for
+// vehicles an NPC job uses.
 namespace npcvehicles
 {
 	void Install(); // hooks the game's put-the-player-in-this-vehicle call (seats the NPC instead)

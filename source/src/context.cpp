@@ -46,7 +46,7 @@ namespace context
 			g_iniAt = now;
 			PWSTR docs = nullptr;
 			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return;
-			const std::wstring ini = std::wstring(docs) + L"\My Games\Starfield\SFSE\Logs\SeamlessVehicle\seamless.ini";
+			const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
 			CoTaskMemFree(docs);
 			const bool on = GetPrivateProfileIntW(L"context", L"enabled", 1, ini.c_str()) != 0;
 			if (on != g_enabled) logger::Write("Context: %s", on ? "enabled" : "disabled (seamless.ini [context] enabled=0)");

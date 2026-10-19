@@ -61,7 +61,7 @@ namespace viewdist
 			g_readAt = now;
 			PWSTR docs = nullptr;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = std::wstring(docs) + L"\My Games\Starfield\SFSE\Logs\SeamlessVehicle\seamless.ini";
+				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
 				CoTaskMemFree(docs);
 				const float o = ReadFloat(ini, L"objectFade", kDefaultObjects), a = ReadFloat(ini, L"actorFade", 1.0f);
 				if (o != g_wantObjects || a != g_wantActors) {

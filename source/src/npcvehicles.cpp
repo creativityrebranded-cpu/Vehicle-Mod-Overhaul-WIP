@@ -2620,7 +2620,7 @@ namespace npcvehicles
 		return n;
 	}
 
-	// board(actor, vehicle, asDriver): the NPC walks to the vehicle (running when in combat), gets in (animated first, the instant seat after kAnimWaitMs) and
+	// board(actor, vehicle, asDriver): the NPC walks to the vehicle (running when in combat), gets in (the instant seat; the animated entry is paused, kAnimatedEntry) and
 	// then follows like a job. false: refused (not a driver request, no free slot, the vehicle or the actor is busy / dead, no vehicle seat for it).
 	bool BoardNpc(std::uintptr_t actor, std::uintptr_t vehicle, bool asDriver)
 	{
