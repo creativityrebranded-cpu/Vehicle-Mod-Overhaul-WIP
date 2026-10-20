@@ -56,4 +56,5 @@ namespace hoverui
 	// The text of the scanner screen's status box (the distance to what you look at); empty hides it. The box is movable with the F7 editor while the scanner is open.
 	void SetScan(const char* text);
 	void SetRoute(const char* text); // named route panel on HUD and scanner; empty hides it
+	void SetTest(const char* testKey,const char* cycleKey,const char* text,bool recording,bool visible);
 }
