@@ -30,6 +30,7 @@ namespace navmap
 		constexpr ULONGLONG kObjLifeMs = 8000;        // an object band not refreshed by the scan this long is gone (the scan runs every ~2 s)
 		constexpr double kObjVehTop = 2.0;            // m: the vehicle's height over its origin (a band meeting [z - 0.5, z + this] blocks it)
 		constexpr int kObjMaxCells = 1600;            // cells one object may mark (a 160 m square)
+		constexpr ULONGLONG kObjFreeTrustMs = 60000;  // a ray's free pass overrules an object box for this long
 		double g_seedX = 0, g_seedY = 0, g_seedR = 0;
 		ULONGLONG g_seedAt = 0;
 
@@ -222,6 +223,13 @@ namespace navmap
 		if (now - c->contactAt < kContactLifeMs) s.contacts = c->contacts;
 		for (int b = 0; b < 2; ++b) {  // a solid object's band where the vehicle would be
 			if (Valid(c->objLo[b]) && now - c->objAt[b] < kObjLifeMs && z + kObjVehTop >= c->objLo[b] - 0.5 && z - 0.5 <= c->objHi[b]) s.objBlocked = true;
+		}
+		// The two sources combined (2026-10-20, the user: "a combination of the data"): an object's box is the prior, the rays are the evidence.
+		// A ray that recently flew through this cell at this height proves the box wrong here (an arch's opening, an L-shape's gap): open. A ray
+		// hit stays solid (s.blocked) whatever the boxes say; a box nobody has probed stays solid (the early warning).
+		if (s.objBlocked && Valid(c->freeLo) && now - c->freeAt < kObjFreeTrustMs && z >= c->freeLo - 1.0 && z <= c->freeHi + 1.0) {
+			s.objBlocked = false;
+			s.objOverruled = true;
 		}
 		s.known = s.haveGround || s.blocked || s.objBlocked || s.free || s.contacts > 0 || seeded;
 		return s;

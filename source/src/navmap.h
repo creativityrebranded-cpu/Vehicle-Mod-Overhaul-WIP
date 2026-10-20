@@ -41,6 +41,7 @@ namespace navmap
 		float ground = 0;       // highest surface remembered (ground or learned floor)
 		bool blocked = false;   // a solid static hit near height z
 		bool objBlocked = false;  // a game collision object's box (navseed) covers height z here (kept apart: a box can be a poor fit)
+		bool objOverruled = false;  // a box covered it, but a ray flew through here at this height recently: open (the box was wrong here)
 		bool free = false;      // a ray passed through this height
 		int contacts = 0;
 	};

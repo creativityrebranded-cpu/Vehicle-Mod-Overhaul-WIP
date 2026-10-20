@@ -138,7 +138,9 @@ Buttons only show when they can be used:
 - **Knows the area up front:** every couple of seconds the mod reads the game's own list of loaded objects that have collision
   (buildings, walls, rocks, bridge decks…) within 250 m and writes each one's box (its size, position and heading) into the map the
   planner uses, as a height band, so open space under a deck stays open. The planner no longer has to discover walls by bumping its
-  rays into them. Very large objects (over 120 m across) are left to the rays, and where the vehicle is inside an object's box (a
+  rays into them. The boxes are the starting picture and the rays have the last word: where a ray has recently flown through a box
+  (an arch's opening, the gap in an L-shaped building), that spot counts as open; where a ray hit something, it is solid whatever
+  the boxes say. Very large objects (over 120 m across) are left to the rays, and where the vehicle is inside an object's box (a
   big composite structure) the planner trusts the rays instead.
 - **Cheap escapes:** if every path is blocked, the older rules take over (turn away in steps, follow **your trail**, climb as a last
   resort). If it barely moves for 6 s while still far from its target, it escapes for 3 s: along your trail when there is one,
