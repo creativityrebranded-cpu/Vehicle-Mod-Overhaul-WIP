@@ -11,7 +11,6 @@
 #include "navmap.h"
 #include "navfield.h"
 #include "environment.h"
-#include "livetest.h"
 #include "npcvehicles.h"
 #include "passenger.h"
 #include "traffic.h"
@@ -53,7 +52,6 @@ namespace
 
 	void Reset()
 	{
-		livetest::Reset();
 		vehicleflight::LoadReset();
 		shipvehicle::Reset();
 		shipmodel::Reset();
@@ -95,7 +93,6 @@ namespace
 		context::Tick();
 		viewdist::Tick();
 		profiles::Tick();
-		livetest::Tick();
 	}
 
 	class FrameTask final : public SFSETaskInterface::ITaskDelegate

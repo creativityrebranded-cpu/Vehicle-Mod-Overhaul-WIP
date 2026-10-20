@@ -33,7 +33,6 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Shared 3D navigation** | Altitude cost fields guide local trajectory plans; bounded recovery holds failed trips with Retry / Skip / Clear controls | Untested in game; offline checks pass |
 | **Environment-aware traffic and combat** | Traffic detours check the world map; combat positions consider cover and automated fire requires a clear-shot probe | Untested in game; offline checks pass |
 | **Checked boarding and drop-off** | Vehicle footprint, slope, water, headroom, standing space, and stopped arrival are checked before boarding or exit | Untested in game; offline checks pass |
-| **Live test controls** | Test starts/finishes a recording; Test Cycle selects among 42 scenarios with location, setup, actions and expected results on the HUD/scanner | Built; live verification pending |
 | **Flies under things** | Overhangs and bridges are flown under; ceilings cap the height | Untested |
 | **Knows the area up front** | The game's own collision objects are read into the vehicles' map, so planning starts with the walls already known | Untested |
 | **Night and weather** | Autopilots slow down and fly a little higher at night and in rain, snow or dust | Untested |
@@ -83,8 +82,6 @@ before installing or upgrading.
 ---
 
 ## Controls
-
-For live testing, use **Test** (prefers F6) and **Test Cycle** (prefers F8); the actual free keys appear on the native HUD prompts. Shift + Test Cycle goes backward. The [42-case live checklist](docs/LIVE_TESTS.md) gives the location and conditions for every behavior. Navigation cases start normal Auto after setup checks; other cases record the real actions you perform. Runs are logged for review and are not automatically marked passed.
 
 The plugin only takes keys the game leaves free, so it never clashes with your bindings. The keys it picked are written to the
 log at start-up (lines such as `Rover call key: …`, `Scanner marker: Auto behaviour key …`, `Passenger: key …`). Defaults on a

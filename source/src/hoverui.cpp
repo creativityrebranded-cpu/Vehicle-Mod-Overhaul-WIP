@@ -794,7 +794,6 @@ namespace hoverui
 		}
 
 		void RenderRoute(uptr menu, uptr movie, bool scanner);
-		void RenderTest(uptr menu, uptr movie, bool scanner);
 
 		void Work(uptr menu)
 		{
@@ -819,7 +818,6 @@ namespace hoverui
 				}
 				if (!movie || g_ui.failed) return;
 				RenderRoute(menu, movie, false);
-				RenderTest(menu, movie, false);
 				WorkExtras(menu, movie);
 				if (!g_ui.built && !(g_inVehicle.load() && Build(menu))) {
 					if (g_inVehicle.load()) g_ui.failed = !g_ui.built;
@@ -854,8 +852,6 @@ namespace hoverui
 		ULONGLONG g_placeAt = 0;
 		double g_placeDistance = 0;
 		std::string g_routeText;
-		std::string g_testText,g_testKey,g_testCycleKey;
-		bool g_testVisible=false,g_testRecording=false;
 		std::string g_scanText;  // the scanner screen status box text
 		struct MonoEl;
 		std::uint64_t MonoMessageDetour(uptr menu, void* msg)
@@ -975,43 +971,6 @@ namespace hoverui
 			Release(ct);
 			Release(tr);
 			Release(pc);
-		}
-
-		struct TestView {uptr movie=0,menu=0;Value field;MonoEl test,cycle;std::string last;};
-		TestView g_testViews[2];
-		void RenderTest(uptr menu,uptr movie,bool scanner)
-		{
-			auto&v=g_testViews[scanner?1:0];
-			if(v.movie!=movie||v.menu!=menu){v=TestView{};v.movie=movie;v.menu=menu;}
-			std::string text,testKey,cycleKey;bool visible,recording;
-			{std::lock_guard lk(g_scanLock);text=g_testText;testKey=g_testKey;cycleKey=g_testCycleKey;visible=g_testVisible;recording=g_testRecording;}
-			visible=visible&&(!ScannerOpen()||scanner);
-			const auto&root=*reinterpret_cast<const Value*>(menu+0x58);if(!IsObject(root))return;
-			if(visible&&!IsObject(v.field)){
-				if(!CreateObject(movie,&v.field,"flash.text.TextField",nullptr,0))return;
-				SetMember(v.field,"name",Str("SeamlessLiveTestPanel"));
-				SetMember(v.field,"x",Num(42));SetMember(v.field,"y",Num(485));
-				SetMember(v.field,"width",Num(620));SetMember(v.field,"height",Num(310));
-				SetMember(v.field,"multiline",Bool(true));SetMember(v.field,"wordWrap",Bool(true));
-				SetMember(v.field,"selectable",Bool(false));SetMember(v.field,"mouseEnabled",Bool(false));
-				SetMember(v.field,"background",Bool(true));SetMember(v.field,"backgroundColor",Num(0x101820));
-				SetMember(v.field,"textColor",Num(0xDDEEFF));
-				Value format;const Value args[]={Str("$MAIN_Font"),Num(15),Num(0xDDEEFF)};
-				if(CreateObject(movie,&format,"flash.text.TextFormat",args,3))SetMember(v.field,"defaultTextFormat",Arg(format));Release(format);
-				const Value child[]={Arg(v.field)};Invoke(root,"addChild",child,1);
-			}
-			if(IsObject(v.field)){SetMember(v.field,"visible",Bool(visible));if(v.last!=text){SetMember(v.field,"text",Str(text.c_str()));v.last=text;}}
-			for(auto*e:{&v.test,&v.cycle}){
-				if(visible&&!IsObject(e->button)){
-					if(!CreateObject(movie,&e->button,"BasicButton",nullptr,0))continue;
-					SetMember(e->button,"scaleX",Num(0.8));SetMember(e->button,"scaleY",Num(0.8));
-					SetMember(e->button,"visible",Bool(false));const Value child[]={Arg(e->button)};Invoke(root,"addChild",child,1);
-				}
-				MonoShow(*e,visible);
-			}
-			if(!visible)return;
-			if(IsObject(v.test.button)){MonoSetData(movie,v.test,"Test");MonoSetKey(v.test,testKey);MonoTint(movie,v.test,recording);PlaceButtonKey(v.test.button,80,825,false,0.8);}
-			if(IsObject(v.cycle.button)){MonoSetData(movie,v.cycle,"Test Cycle");MonoSetKey(v.cycle,cycleKey);PlaceButtonKey(v.cycle.button,290,825,false,0.8);}
 		}
 
 		// ---- The contextual HUD: on-foot panel and in-vehicle extras (in the HUD movie) ----
@@ -1248,7 +1207,6 @@ namespace hoverui
 				const auto& root = *reinterpret_cast<const Value*>(menu + 0x58);
 				if (IsObject(root)) CaptureScannerDestination(root);
 				RenderRoute(menu, movie, true);
-				RenderTest(menu, movie, true);
 			}
 			if (!movie || g_mono.failed) return;
 			if (!g_mono.built) {
@@ -1339,7 +1297,6 @@ namespace hoverui
 			}
 			void* r = g_movieDtorOriginal(movie, flags);
 			for(auto& view:g_routeViews) if(view.movie==movie) view=RouteView{};
-			for(auto& view:g_testViews) if(view.movie==movie) view=TestView{};
 			// After the movie unlinked its values (they live in our memory): forget them, never release.
 			if (hud) {
 				Drop(false);
@@ -1419,11 +1376,6 @@ namespace hoverui
 	{
 		std::lock_guard lk(g_scanLock);
 		g_routeText=text ? text : "";
-	}
-	void SetTest(const char* testKey,const char* cycleKey,const char* text,bool recording,bool visible)
-	{
-		std::lock_guard lk(g_scanLock);g_testKey=testKey?testKey:"";g_testCycleKey=cycleKey?cycleKey:"";
-		g_testText=text?text:"";g_testRecording=recording;g_testVisible=visible;
 	}
 
 	void SetScan(const char* text)
@@ -1525,7 +1477,6 @@ namespace hoverui
 		std::lock_guard lk(g_scanLock);
 		g_placeName.clear(); g_placeAt = 0;
 		g_routeText.clear();
-		g_testVisible=false;g_testText.clear();
 	}
 
 	namespace

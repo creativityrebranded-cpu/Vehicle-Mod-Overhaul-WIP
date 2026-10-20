@@ -1,7 +1,5 @@
 # Testing
 
-Use the two in-game **Test** / **Test Cycle** prompts and the [42-case live behavior guide](LIVE_TESTS.md) for the current test pass. Test begins/finishes recording; Test Cycle selects the next case (Shift selects the previous). The panel shows each case's location, preparation, actions and expected observation. The live-test harness adds 16 offline checks, bringing the total to **85**; gameplay outcomes still require observation.
-
 Set `Logs\SeamlessVehicle\seamless.ini` `[log] verbose=1` for the chatty lines, and copy `SeamlessVehicle.log` BEFORE relaunching (only one `.prev.log` is kept).
 The log timestamps every line; a crash prints `CRASH?` with the stack and the plugin's breadcrumbs.
 
