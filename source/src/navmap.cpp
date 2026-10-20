@@ -31,6 +31,7 @@ namespace navmap
 		constexpr double kObjVehTop = 2.0;            // m: the vehicle's height over its origin (a band meeting [z - 0.5, z + this] blocks it)
 		constexpr int kObjMaxCells = 1600;            // cells one object may mark (a 160 m square)
 		constexpr ULONGLONG kObjFreeTrustMs = 60000;  // a ray's free pass overrules an object box for this long
+		constexpr ULONGLONG kBlockedStaleMs = 2000;   // a ray hit older than this is forgotten when a later ray flies through it
 		double g_seedX = 0, g_seedY = 0, g_seedR = 0;
 		ULONGLONG g_seedAt = 0;
 
@@ -52,7 +53,7 @@ namespace navmap
 
 		struct Counters
 		{
-			unsigned ground = 0, rays = 0, contacts = 0, hits = 0, normals = 0, sampUsed = 0, sampFallback = 0,
+			unsigned ground = 0, rays = 0, contacts = 0, hits = 0, normals = 0, sampUsed = 0, sampFallback = 0, cleared = 0,
 				sweeps = 0, hullBoth = 0, hullOnly = 0, rayOnly = 0;
 		} g_n;
 
@@ -127,6 +128,19 @@ namespace navmap
 		}
 	}
 
+	double KnownAhead(double x, double y, double heading)
+	{
+		const ULONGLONG now = GetTickCount64();
+		if (!g_seedAt || now - g_seedAt >= kObjLifeMs) return 0.0;
+		// From (x, y) along the heading to the edge of the scanned circle.
+		const double ux = std::sin(heading), uy = std::cos(heading);
+		const double ox = x - g_seedX, oy = y - g_seedY;
+		const double b = ox * ux + oy * uy, c = ox * ox + oy * oy - g_seedR * g_seedR;
+		const double disc = b * b - c;
+		if (disc <= 0.0) return 0.0;
+		return std::max(0.0, -b + std::sqrt(disc));
+	}
+
 	void NoteSeeded(double cx, double cy, double radius)
 	{
 		g_seedX = cx;
@@ -158,7 +172,15 @@ namespace navmap
 		const double freeLen = std::max(0.0, len - (usable ? 1.0 : 0.0));
 		for (double s = 0.0; s <= freeLen; s += kCell * 0.75) {
 			const double t = len > 1e-6 ? s / len : 0.0;
-			MarkFree(Make(from[0] + dx * t, from[1] + dy * t), float(from[2] + dz * t), now);
+			Cell& c = Make(from[0] + dx * t, from[1] + dy * t);
+			const float z = float(from[2] + dz * t);
+			MarkFree(c, z, now);
+			// A remembered hit this ray now flies through (at its height, more than a cell short of the ray's own end, the hit over 2 s old) was
+			// a door since opened or an object since moved: forgotten (2026-10-20). A fresh hit is kept, so a thin pole in the cell is not lost.
+			if (s <= freeLen - kCell && Valid(c.blockedZ) && now - c.blockedAt > kBlockedStaleMs && std::fabs(z - c.blockedZ) <= kBlockedBand * 0.6) {
+				c.blockedZ = kNaN;
+				++g_n.cleared;
+			}
 		}
 		if (usable) {
 			++g_n.hits;

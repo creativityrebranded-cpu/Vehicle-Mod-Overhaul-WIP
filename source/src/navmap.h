@@ -32,6 +32,8 @@ namespace navmap
 	// every few seconds by the scan; NoteSeeded says which area the last full scan covered (cells there count as known).
 	void NoteObject(double cx, double cy, double yaw, double hx, double hy, double zlo, double zhi);
 	void NoteSeeded(double cx, double cy, double radius);
+	// How far the scanned (known) area reaches from (x, y) along `heading` (0 outside it or before the first scan).
+	double KnownAhead(double x, double y, double heading);
 
 	// ---- Questions ----
 	struct Sample

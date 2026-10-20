@@ -142,6 +142,9 @@ Buttons only show when they can be used:
   (an arch's opening, the gap in an L-shaped building), that spot counts as open; where a ray hit something, it is solid whatever
   the boxes say. Very large objects (over 120 m across) are left to the rays, and where the vehicle is inside an object's box (a
   big composite structure) the planner trusts the rays instead.
+- **Stays inside what it knows:** the autopilot never flies faster than it could stop within the mapped area ahead (about 85 m/s
+  with 250 m mapped). It plans with the flown vehicle's own size, and a spot a ray once hit is forgotten when a later ray flies
+  straight through it (an opened door, a moved object).
 - **Cheap escapes:** if every path is blocked, the older rules take over (turn away in steps, follow **your trail**, climb as a last
   resort). If it barely moves for 6 s while still far from its target, it escapes for 3 s: along your trail when there is one,
   otherwise away from the spot where it got stuck.

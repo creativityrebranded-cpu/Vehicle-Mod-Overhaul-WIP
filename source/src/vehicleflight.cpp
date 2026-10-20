@@ -2321,11 +2321,12 @@ namespace vehicleflight
 		constexpr double kMpcFactors[3] = { 1.0, 0.6, 0.3 };
 		constexpr double kMpcAccel = 6.0, kMpcDecel = 10.0, kMpcHalfWidth = 2.5;
 		constexpr double kMpcClimb = 5.0;   // m/s of climb the height hold makes while it flies toward rising ground
+		constexpr double kKnownDecel = 15.0;  // m/s^2: the speed cap plans to stop within the mapped area ahead at this
 		struct MpcOut { bool ok = false, escape = false; double omega = 0, speed = 0, cost = 0; unsigned invalid = 0, total = 0; };
 
 		// One rollout: its cost, or a negative value when it collides.
 		double MpcRollout(int idx, const game::Vec3& pos, double heading, double v0, double vmax, double omega, double factor, bool turnFirstOnly,
-			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self, bool useObjects)
+			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self, bool useObjects, double halfWidth, double selfRadius)
 		{
 			const State& g = g_gs[idx];
 			double x = pos.x, y = pos.y, h = heading, v = v0, cost = 0;
@@ -2338,7 +2339,7 @@ namespace vehicleflight
 				x += std::sin(h) * v * kMpcDt;
 				y += std::cos(h) * v * kMpcDt;
 				// The map: the centre and both sides of the hull.
-				const double rx = std::cos(h) * kMpcHalfWidth, ry = -std::sin(h) * kMpcHalfWidth;
+				const double rx = std::cos(h) * halfWidth, ry = -std::sin(h) * halfWidth;
 				for (int sdx = -1; sdx <= 1; ++sdx) {
 					const auto m = navmap::At(x + rx * sdx, y + ry * sdx, pos.z);
 					if (m.blocked || (useObjects && m.objBlocked)) return -1.0;  // a solid hit, or a game collision object's box
@@ -2354,7 +2355,7 @@ namespace vehicleflight
 						if (!o.formId || o.formId == self) continue;
 						if (std::fabs(double(o.pos[2]) - pos.z) > 2.0 * (VehHalfZ(o) + 2.0)) continue;
 						const double ox = o.pos[0] + o.vel[0] * t, oy = o.pos[1] + o.vel[1] * t;
-						const double gap = std::hypot(x - ox, y - oy) - VehRadius(o) - kMpcHalfWidth;
+						const double gap = std::hypot(x - ox, y - oy) - VehRadius(o) - selfRadius;
 						if (gap < 0.5 && k > 1) return -1.0;
 						if (gap < 8.0) cost += (8.0 - gap) * 15.0;
 					}
@@ -2404,11 +2405,19 @@ namespace vehicleflight
 			// The game's object boxes (navseed) count, unless the vehicle itself sits inside one: then that box is a poor fit (a big composite
 			// object around open space) and only the probes' map is trusted for this plan.
 			const bool useObjects = !navmap::At(pos.x, pos.y, pos.z).objBlocked;
+			// The flown vehicle's own size (2026-10-20): its half-width (plus a margin) for the map, its footprint radius against other
+			// vehicles, from the world list's bounds; the old fixed 2.5 m when it is not listed.
+			double halfWidth = kMpcHalfWidth, selfRadius = kMpcHalfWidth;
+			for (std::uint32_t i = 0; g_vsnapOk && i < g_vsnap.count && i < 64; ++i) {
+				if (g_vsnap.v[i].formId != self) continue;
+				halfWidth = std::clamp(double(g_vsnap.v[i].half[0]) + 0.5, 1.0, 6.0);
+				selfRadius = VehRadius(g_vsnap.v[i]);
+			}
 			double best = 1e18, bestW = 0, bestF = 1.0;
 			unsigned invalid = 0, total = 0;
 			auto consider = [&](double w, double f, bool firstOnly) {
 				++total;
-				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self, useObjects);
+				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self, useObjects, halfWidth, selfRadius);
 				if (c <= 0.0) { ++invalid; return; }
 				if (c < best) { best = c; bestW = w; bestF = f; }
 			};
@@ -2998,6 +3007,11 @@ namespace vehicleflight
 						const double tdist = g.trailOn && TrailHas(g.trailSeq) ? std::hypot(TrailAt(g.trailSeq).x - pos.x, TrailAt(g.trailSeq).y - pos.y)
 							: std::hypot(goal.x - pos.x, goal.y - pos.y);
 						const double reach = std::max(tdist, 20.0);
+						// Plans stay inside what is mapped (2026-10-20): a speed that can stop within the known area ahead (the object scan's circle,
+						// at least the forward ray's reach). At gear 4 this caps about 85 m/s with 250 m mapped ahead.
+						const double known = std::max(navmap::KnownAhead(pos.x, pos.y, bodyHeading), g.rayRange[0]);
+						const double knownCap = std::max(15.0, std::sqrt(2.0 * kKnownDecel * known));
+						if (top > knownCap) top = knownCap;
 						mo = MpcPlan(idx, vehicle, pos, bodyHeading, sp, std::max(top, 5.0), pos.x + tdx * reach, pos.y + tdy * reach, wc);
 						// Escape with the player's trail available: follow it (the second cheap escape).
 						if (mo.escape && !g.trailOn && goal.keepGoing && !goal.cruise && !goal.hold && g_trailCount > 3) {
