@@ -39,6 +39,10 @@ namespace vehicleflight
 	struct DriveInput { float steer = 0, accel = 0, brake = 0; bool boost = false, vert = false; };  // steer + is right
 	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out);
 	// The player's custom map marker as a point in `vehicle`'s world (false: none, not loaded, another worldspace, too far).
+	bool Ramming(std::uint32_t vehicleId);
+	bool RequestRam(std::uintptr_t actor); // explicit scanner highlight in combat
+	void FreshScannerTarget(); // explicit selection can reuse the same marker coordinates
+	void EndTargetSession(std::uintptr_t vehicle);
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y, double* z = nullptr);
 	// The scanner marker button (scantarget): the player's own vehicle is summoned (as the call key does), and when the player gets in, Auto flies it to the
 	// marker. Driving already: Auto starts at once. Main thread.

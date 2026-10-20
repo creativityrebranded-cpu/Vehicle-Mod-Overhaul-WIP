@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Your REV-8 becomes a hover vehicle with gears, terrain following and a real autopilot. Call it, let it follow you, send it to a
+Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it follow you, send it to a
 map marker, or let a follower drive it. Followers jump into vehicles to defend you, enemies take vehicles to hunt you down, and
 outside a fight the people around you drive, patrol and run errands on their own.
 
@@ -19,7 +19,6 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Hover flight** | Double-tap Space to hover; gears, boost, climb and descend, terrain assist | Tested |
 | **Summon and Follow** | Call your vehicle to you, or let it trail you and park when you stop | Tested |
 | **Auto to the map marker** | The autopilot flies you to your marker; any movement key takes over | Untested |
-| **Auto behaviours** | At the marker: **Stop**, **Orbit** it, or **Patrol** a chain of markers; an on-screen button shows which | Untested |
 | **Scanner markers** | Mark what you look at up to ~1 km away; **chain** several markers into a route | Untested |
 | **Catch from below** | Jump or fall from a height and your following vehicle flies under you to catch you | Untested |
 | **Follower drivers** | With a follower nearby, Summon / Follow / a marker sends the follower to drive your vehicle for you | Untested |
@@ -38,7 +37,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Night and weather** | Autopilots slow down and fly a little higher at night and in rain, snow or dust | Untested |
 | **Bystanders react** | People near a crash flee or cower | Untested |
 | **Passenger, taxi, take the wheel** | Ride with an NPC driver, let them taxi you, or take over | Untested |
-| **Unlimited boost, view distance** | Boost never runs out on vehicles in use; vehicles stay visible farther away | Untested |
+| **Metered boost, view distance** | Hold Left Shift for a 1.75x boost in any gear using the native boost meter; vehicles stay visible farther away | Untested in game; offline checks pass |
 
 ---
 
@@ -95,7 +94,6 @@ standard layout:
 | **U** | **Follow** on / off: it trails you, parks when you stand still, lifts off when you move on, catches you when you fall. |
 | **Hold U (1 s)** | **Recall**: every follower vehicle drops the fight and comes back into formation for 15 s. |
 | **E** (Activate) | **Get in** (shown within 6 m of your vehicle). At an occupied vehicle: tap = passenger seat, hold = take the wheel / pull the driver out. |
-| **Auto behaviour key** (first free of `]` `J` `K` `N`) | Cycles what Auto does at the marker: **Stop → Orbit → Patrol**. With a follower free and a marker set, a follower drives your vehicle there. |
 
 ### Hand scanner open
 
@@ -105,7 +103,7 @@ standard layout:
 | **T** (hold 0.8 s) | Throws the chain away and sets just this point. |
 
 Chained markers swap automatically: about 4 s before your vehicle reaches the current marker, the next one takes its place and
-the vehicle flies on without stopping. With **Auto: Patrol**, the chain loops for ever.
+the vehicle flies on without stopping. The final point keeps normal arrival braking.
 
 ### In the vehicle
 
@@ -113,25 +111,39 @@ the vehicle flies on without stopping. With **Auto: Patrol**, the chain loops fo
 |---|---|
 | **Space ×2** | Hover on / off |
 | **W / S** | Accelerate / brake (double-tap W: keep accelerating) |
+| **Left Shift** (hold) | 1.75x boost in the selected gear. Uses the game's boost meter and the vehicle's own burn/recharge timings; release to recover after depletion. |
 | **Shift + W / Shift + S**, **1–4** | Gear up / down, or pick a gear |
 | **A / D**, mouse | Turn / roll; the mouse aims |
-| **Q / Z**, **Shift + Space** | Up / down |
+| **Q / Z**, **Right Shift + Space** | Up / down |
 | **T** | **Auto** on / off: the autopilot flies you to your map marker. Any of W / A / S / D takes control back. |
 | **]** (when free) | While Auto is on: **Cruise** (fly where you look at your gear's speed) |
-| *Get out with Auto on* | The vehicle holds where it is until you Summon, Follow or get back in. |
+| *Leave the vehicle* | The old destination and queued route are discarded. Set a fresh target for the next trip; an unattended Auto vehicle holds position. |
 | **F7** | Move any on-screen button (Page Up / Down pick, arrows move, Ctrl ×10, Delete resets). Saved to `hoverui.ini`. |
 
 ### On-screen buttons
 
+Added prompts use the game's native BasicButton style at a uniform 75% scale. The Auto destination-mode UI is removed. Ambient NPC notices and rows are suppressed; only your followers appear.
+
 Buttons only show when they can be used:
-- **On foot** (if you own a vehicle): Summon, Follow, Get in (near your vehicle), the **Auto: Stop / Orbit / Patrol** button, a
-  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*…), and when NPC vehicles are active, who is in them (*Sarah, Barrett +1*) and a line
-  per NPC (*Sarah  escort  42 m*).
-- **In the vehicle:** W / A / S / D, Gear− / Gear+ / Hover, the gear box, **Auto**, the **Auto behaviour** button (flashes blue when
-  you press its key) and the NPC vehicle lines.
+- **On foot** (if you own a vehicle): Summon, Follow, Get in (near your vehicle), a
+  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*…), and when your followers use vehicles, who is in them (*Sarah, Barrett +1*) and a line
+  per follower (*Sarah  escort  42 m*).
+- **In the vehicle:** W / A / S / D, Gear− / Gear+ / Hover, the gear box, **Auto**, and follower vehicle lines.
 - **Route display on the HUD/scanner:** native status boxes for the destination and queued stops, with native **Retry / Skip / Clear** key prompts. Select **Route** in the F7 editor to move the group.
 
 ---
+
+## Current fixes and controls (0.61.0)
+
+- Hover and ground-gear forces bind to the native chassis only after its full body ID matches a collision body owned by that reference. Nearby parked vehicles never inherit your controller. Collision recovery uses signed world-up attitude, without learning reversed controls from impacts. First-person rover pitch is measured relative to the chassis, with separate camera baselines.
+- Flight rates, acceleration, braking distance and swept clearance use each vehicle's width, length, height and live scale. Long hulls turn/pitch more slowly; wide hulls roll more slowly; faster turns are limited by lateral acceleration. Valid large bounds are retained. This applies to compatible native vehicles without a model-name list; missing bounds use a conservative fallback.
+- Only your own vehicle follows you. Other NPC vehicles keep their schedule/combat behavior and hold their own position between fights instead of forming up behind you.
+- Traffic checks the actor's native path before boarding: interior points, changes of worldspace, paths near doors, short walks, and unresolved path context stay on foot.
+- In combat, **T while the scanner highlights an actor** orders your driven vehicle, or your own vehicle, to ram that exact actor. It reads the scanner's selected reference handle rather than guessing from a viewing cone. The order tracks the actor, exempts only the selected target from avoidance, and ends on impact, target loss, combat end or a 15-second timeout. Ground approach is used for an actor on foot nearby; terrain and unrelated traffic remain obstacles. Movement controls take over as usual.
+- Scanner target range reads m/km and includes elevation; a selected place uses the number displayed by the scanner. Exiting a driver/passenger seat clears the route and consumes the previous target until a new selection is made.
+- Native NPC dismount requests are allowed. Repeated requests preserve their first timeout; unsafe or failed exits release mod control instead of retrying forever. The near-goal trail escape loop found in the organic-play log is also corrected.
+
+Release builds and offline regression checks pass. These fixes have not yet been verified in a running game. Persistence remains paused, and no in-game test controls are added.
 
 ## Your vehicle
 
@@ -198,7 +210,7 @@ behaviour** key, your vehicle is brought to you and **the follower gets in and d
 | You press | The follower… |
 |---|---|
 | Summon / Follow | drives your vehicle after you, defends you in a fight, picks up other followers as passengers |
-| Scanner marker / Auto behaviour key | drives to your marker and does the Auto behaviour there (stop, orbit, patrol the chain) |
+| Scanner marker | drives to your marker and stops there |
 | Follow again | gets out |
 
 No follower free? The buttons work as before. Your vehicle's own autopilot leaves it alone while a follower drives.
@@ -244,7 +256,7 @@ turn on you when the fight starts.
 ### The hit counter
 Vehicles have no health in the game, so the mod follows every shot. A shot that passes through a vehicle counts as a hit
 (15 by default). When a vehicle has taken about as much as **you** could (your own health), its **autopilot shuts down for 30 s** and it
-comes down. Friendly fire is not counted. It heals after 15 s without hits.
+comes down. Friendly fire does not add to the damage counter, but shooting another person's vehicle still counts as aggression toward its occupants/owner. It heals after 15 s without hits.
 
 ---
 
@@ -258,7 +270,7 @@ When nobody near you is fighting, NPCs within 200 m use vehicles on their own (a
 | **Shift change** | When an NPC's daily schedule moves them on to a far place, they set off by vehicle straight away |
 | **Shared ride** | Another NPC going the same way rides along |
 | **Offer a ride** | A driver passing you on foot stops for 10 s - tap the vehicle to ride along |
-| **Outpost patrol** | An owner by their parked vehicle drives two laps round the outpost and parks again |
+| **Outpost patrol** | An owner with a suitable outdoor path may drive two laps round the outpost and park again |
 | **Supply run** | Sometimes the owner drives to the next settlement or outpost (200 m - 1 km), waits, and comes back |
 | **Return home** | After a fight, non-followers fly the vehicle back to where they took it before getting out |
 | **Parking** | Every trip ends in a clear spot, not on top of or right next to another vehicle |
@@ -302,12 +314,12 @@ All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 
 ## Status
 
-**Tested in game:** hover flight, gears, the HUD buttons, summon / follow, NPC vehicles following with trail navigation, the gears.
+**Previously tested in game:** older hover flight, gears, HUD buttons and summon/follow builds. The current changes below still need organic gameplay verification.
 
-**Built, not yet tested in game** (everything else), including: Auto and Cruise, the Auto behaviours and their button, scanner markers
+**Built, not yet tested in game** (everything else), including: Auto and Cruise, scanner markers
 and chains, catch from below, follower drivers, every escort and enemy behaviour, the hit counter, everyday traffic, vehicle-to-vehicle
 right of way, the wall warning, night and weather, bystander reactions, passenger / taxi / take the wheel, the seat rules and forced
-exits, drive mode, unlimited boost, view distance and the vehicle registry.
+exits, drive mode, metered boost, view distance and the vehicle registry.
 
 **Known risks:**
 - Reading your health (rescue, the hit limit, picking up the wounded) is not proven yet. The log line `Vehicle hits: your health reads …`

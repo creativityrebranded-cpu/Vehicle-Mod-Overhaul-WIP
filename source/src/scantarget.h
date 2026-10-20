@@ -7,5 +7,6 @@
 namespace scantarget
 {
 	void Tick();   // main thread, every frame
+	void EndRide(); // the driver exited: discard route and selected-target context
 	void Reset();  // a save load
 }

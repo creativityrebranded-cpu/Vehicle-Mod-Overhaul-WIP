@@ -5,6 +5,7 @@
 #include "game.h"
 #include "mappoints.h"
 #include "scannercontext.h"
+#include "ramlogic.h"
 #include "npcvehicles.h"
 #include "hoverui.h"
 #include "log.h"
@@ -71,9 +72,6 @@ namespace scantarget
 		std::uint32_t g_lastVeh = 0;
 		Point g_current{};               // the point the game's marker was last moved to by us
 		bool g_haveCurrent = false;
-		// The Auto behaviour key (stop / orbit / patrol): the first free of these, claimed once.
-		int g_modeKey = -1;
-		bool g_modeDown = false;
 		int g_skipKey=-1, g_clearKey=-1, g_retryKey=-1;
 		bool g_retryDown=false, g_skipDown=false, g_clearDown=false, g_routeCleared=false;
 		ULONGLONG g_clearedAt=0;
@@ -111,6 +109,17 @@ namespace scantarget
 			}
 		}
 
+		uptr HighlightedActor() {
+			const auto pick=hoverui::ScannerPickContext();uptr ref=0;
+			if(pick.handle) {
+				uptr*out=&ref;struct Lookup{uptr vtbl;uptr**capture;}lookup{game::Base()+addr::kHandleToRefFunctorVtbl,&out};
+				reinterpret_cast<void(*)(uptr,std::uint32_t,void*)>(game::Base()+addr::kHandleLookup)(
+					*reinterpret_cast<uptr*>(game::Base()+addr::kRefHandleTablePtr),pick.handle,&lookup);
+				if(ref)reinterpret_cast<void(*)(uptr)>(game::Base()+addr::kRefRelease)(ref);
+			}
+			if(!ref)ref=RefById(pick.form);
+			return ref&&npcvehicles::LooksLikeActor(ref)&&!npcvehicles::IsDead(ref)?ref:0;
+		}
 		// The game's own map points (outposts, landmarks, markers) of this planet, as world points near the player; refreshed every few seconds and when the player has moved far.
 		std::vector<mappoints::Point> g_pois;
 		ULONGLONG g_poiAt = 0;
@@ -252,7 +261,10 @@ namespace scantarget
 				}
 			}
 			SnapToMapPoint(t, pp, dx, dy, now, selected);
-			if (t.valid) t.dist = float(std::hypot(double(t.x) - pp.x, double(t.y) - pp.y));
+			if (t.valid) {
+				t.dist = selected.distance > 0 && !selected.name.empty() ? float(selected.distance) :
+					float(scannercontext::Range3D(double(t.x)-pp.x,double(t.y)-pp.y,double(t.z)-pp.z));
+			}
 			return t;
 		}
 
@@ -306,46 +318,12 @@ namespace scantarget
 			const bool ok = readout::SetPlayerMarker(pos);
 			logger::Write("Scanner marker: %s [%s] (%.0f, %.0f, %.0f) -> %s; %zu more queued", why, q.name.c_str(), q.x, q.y, q.z, ok ? "marker placed" : "FAILED", g_chain.size());
 			if (ok) {
+				vehicleflight::FreshScannerTarget();
 				g_current = q;
 				g_haveCurrent = true;
 				g_routeCleared = false;
 			}
 			return ok;
-		}
-
-		// The Auto behaviour key: stop -> orbit -> patrol -> stop.
-		void ModeKey()
-		{
-			if (g_modeKey < 0) {
-				g_modeKey = controlmap::ClaimFirst("scanner", "Auto behaviour (stop / orbit / patrol)", { VK_OEM_6, 'J', 'K', 'N' });
-				logger::Write("Scanner marker: Auto behaviour key %s", g_modeKey ? controlmap::KeyName(g_modeKey).c_str() : "none free");
-			}
-			if (!g_modeKey) {
-				hoverui::SetAutoMode("", "", false);
-				return;
-			}
-			const bool down = Focused() && (GetAsyncKeyState(g_modeKey) & 0x8000) != 0;
-			const bool pressed = down && !g_modeDown;
-			if (pressed) {
-				const int next = (int(vehicleflight::GetAutoMode()) + 1) % 3;
-				vehicleflight::SetAutoMode(vehicleflight::AutoMode(next));
-				notify::Show(next == 1 ? "Auto: orbit the marker" : next == 2 ? "Auto: patrol the marker chain (loops)" : "Auto: stop at the marker");
-				// On foot with a follower free (or one already driving) and a marker set: the follower takes the vehicle there with this behaviour.
-				const uptr player = *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr);
-				const uptr rover = RefById(vehicleflight::OwnRoverId());
-				double mx = 0, my = 0;
-				if (player && rover && !reinterpret_cast<uptr (*)(uptr)>(game::Base() + addr::kPlayerVehicle)(player) && vehicleflight::MarkerPoint(rover, mx, my)) {
-					const auto pp = At<game::Vec3>(player, off::kRefPosition);
-					const bool crew = npcvehicles::CrewOrderOf(vehicleflight::OwnRoverId()) != npcvehicles::CrewOrder::None;
-					if (crew || npcvehicles::FreeFollower(player, pp.x, pp.y, 60.0)) vehicleflight::RequestScannerTrip();
-				}
-			}
-			g_modeDown = down;
-			// The HUD button: the behaviour now, with the key (it flashes blue on a press).
-			static std::string keyName;
-			if (keyName.empty()) keyName = controlmap::KeyName(g_modeKey);
-			const auto m = vehicleflight::GetAutoMode();
-			hoverui::SetAutoMode(keyName.c_str(), m == vehicleflight::AutoMode::Orbit ? "Auto: Orbit" : m == vehicleflight::AutoMode::Patrol ? "Auto: Patrol" : "Auto: Stop", pressed);
 		}
 
 		bool AdvanceStop(bool skipped)
@@ -460,7 +438,6 @@ namespace scantarget
 		const uptr player = *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr);
 		if (!player) return;
 		const ULONGLONG now = GetTickCount64();
-		ModeKey();
 		RouteTick(now);
 		ChainTick(now);
 		if (!hoverui::IsScannerOpen()) {
@@ -475,6 +452,12 @@ namespace scantarget
 		const bool release = !down && g_keyDown;
 		g_keyDown = down;
 		if (press) {
+			if(const auto actor=HighlightedActor();actor&&npcvehicles::IsInCombat(player)) {
+				g_held=true;g_downAt=0;
+				if(vehicleflight::RequestRam(actor))notify::Show("Ram order set");
+				else notify::Show("Ram order unavailable");
+				return;
+			}
 			g_downAt = now;
 			g_held = false;
 		}
@@ -547,6 +530,13 @@ namespace scantarget
 		}
 	}
 
+	void EndRide()
+	{
+		g_chain.clear(); g_haveCurrent=false; g_setAt=0; g_setName.clear();
+		g_routeCleared=false; g_lastAt=0; g_lastVeh=0; g_lostSince=0;
+		hoverui::SetRoute(""); hoverui::SetScan("");
+	}
+
 	void Reset()
 	{
 		g_keyDown = false;
@@ -556,7 +546,6 @@ namespace scantarget
 		g_lastAt = 0;
 		g_downAt = 0;
 		g_haveCurrent = false;
-		g_modeDown = false;
 		g_retryDown=false; g_skipDown=false; g_clearDown=false; g_routeCleared=false; g_lostSince=0;
 		hoverui::SetRoute("");
 		g_pois.clear();

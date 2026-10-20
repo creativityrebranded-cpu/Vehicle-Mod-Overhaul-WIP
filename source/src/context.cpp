@@ -142,7 +142,7 @@ namespace context
 				if (t != g_civilTried.end() && now - t->second < kCivilRetryMs) continue;
 				if (!npcvehicles::ActorFree(r)) continue;
 				traffic::Destination d;
-				if (!traffic::DestinationOf(r, d)) continue;
+				if (!traffic::DestinationOf(r, d) || !d.vehicleSuitable) continue;
 				const auto np = PosOf(r);
 				if (std::hypot(d.x - np.x, d.y - np.y) < kTransitMin) continue;
 				g_civilTried[id] = now;
@@ -157,7 +157,7 @@ namespace context
 						const auto p2 = PosOf(r2);
 						if (std::hypot(p2.x - np.x, p2.y - np.y) > kShareNear) continue;
 						traffic::Destination d2;
-						if (!traffic::DestinationOf(r2, d2) || std::hypot(d2.x - d.x, d2.y - d.y) > kShareGoal) continue;
+						if (!traffic::DestinationOf(r2, d2) || !d2.vehicleSuitable || std::hypot(d2.x - d.x, d2.y - d.y) > kShareGoal) continue;
 						const bool rideOk = npcvehicles::BoardNpc(r2, v->ref, false);
 						logger::Write("Context: shared ride: NPC %08X goes the same way -> %s", *reinterpret_cast<std::uint32_t*>(r2 + off::kFormId), rideOk ? "boarding as a passenger" : "refused");
 						break;
@@ -177,6 +177,8 @@ namespace context
 					const auto np = PosOf(r);
 					if (std::hypot(double(v.pos[0]) - np.x, double(v.pos[1]) - np.y) > kPatrolNear) continue;
 					if (!npcvehicles::ActorFree(r) || !npcvehicles::MayUse(r, v.ref)) continue;
+					traffic::Destination scheduled;
+					if(!traffic::DestinationOf(r,scheduled)||!scheduled.vehicleSuitable)continue;
 					g_patrolledAt[v.formId] = now;
 					// Some of these become supply runs to the nearest settlement / outpost in reach.
 					if (int(now / 1000 % 10) < kSupplyChance) {

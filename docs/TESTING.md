@@ -7,7 +7,7 @@ The log timestamps every line; a crash prints `CRASH?` with the stack and the pl
 
 ### Shared-system update (2026-10-20)
 
-The current Release DLL builds successfully. Six offline executables pass 69 assertions: `navfield_test` (15), `environment_test` (14), `recovery_test` (12), `triplogic_test` (17), `scannercontext_test` (6), and `routeplan_test` (5). They cover U-shaped routes, altitude/deck/unknown-column routing, atomic field publication, site support/water/edges/headroom, blocked boarding sides, firing visibility, bounded recovery, route controls, selected names, and traffic detours constrained by the environment.
+The current Release DLL (0.61.0) builds successfully. Seven offline executables cover navigation, environmental traffic/fire, route lifecycle and the current bug fixes: `navfield_test`, `environment_test`, `recovery_test`, `triplogic_test`, `scannercontext_test`, `routeplan_test`, and `vehiclelogic_test`. 130 assertions pass in the latest run; assertions include exact full body ownership/generation, chassis discovery beyond the first scene body, roll beyond 90 degrees, attached-camera pitch, marker consumption, outdoor-path eligibility, hull-dependent limits, precise projectile hull intersections, native boost timing, and explicit ram selection/termination.
 
 These changes have **not been tested in game**. The older gameplay results below apply to older builds. Persistence is paused; no save continuity is added. See [the integration audit](SHARED_SYSTEMS_AUDIT.md) for ownership and limits.
 
@@ -25,7 +25,7 @@ Live cases still needed: Auto into/out of a U-shaped pocket; a rooftop marker; c
 | 600 m leash | Not tested |
 | HUD gang line and vehicles box, F7 editor entry "Vehicles" | Not seen in game after the redraw |
 | View distance (`[view] objectFade`, default 3) | Not tested; watch the frame rate |
-| Unlimited boost only for vehicles in use | Not tested; may or may not stop hopping parked vehicles |
+| Metered Left Shift boost | Offline meter depletion/recharge checks pass; native meter animation needs a game check |
 | Lane planner, drive mode, flip recovery, registry | Tested in earlier versions, not re-run |
 
 ## In-game checklist
@@ -48,3 +48,9 @@ Live cases still needed: Auto into/out of a U-shaped pocket; a rooftop marker; c
 
 ## Standalone test
 `source/tests/navmap_test.cpp` checks the map and the heading sampler against a simulated world, no game needed (build line in `source/tests/NAVMAP_TEST.md`).
+
+## Organic reports addressed in 0.61.0
+
+The supplied log repeatedly refused a native dismount for NPC `0018B2B7` for several minutes, and repeatedly enabled/disabled a trail near its endpoint. Both loops are fixed in source. The same log contains first-chance exceptions attributed to CassiopeiaPapyrusExtender; this does not establish their cause or a crash in this plugin.
+
+Live verification remains needed for first/third-person switching, hover beside a parked vehicle, recovering from a side impact, normal NPC exits, scanner selected-reference access, native boost-meter animation, and different modded hulls. These are organic gameplay checks: no Test/Test Cycle buttons or save-writing automation is installed.

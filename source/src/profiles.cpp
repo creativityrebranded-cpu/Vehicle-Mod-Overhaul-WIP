@@ -10,6 +10,7 @@
 #include "vehicleflight.h"
 #include "vehicleworld.h"
 #include "environment.h"
+#include "targetsession.h"
 
 #include <Windows.h>
 
@@ -211,6 +212,10 @@ namespace profiles
 		bool EscortGoal(Context& c, Goal& g)
 		{
 			if (!c.player || !c.vehicle || c.pilot < 1 || c.pilot >= kTracks) return false;
+			// Other allied vehicles defend in combat, then hold their original position.
+			if(!targetsession::CanFollow(c.vehicleId,vehicleflight::OwnRoverId())) {
+				g.x=c.homeX;g.y=c.homeY;g.hold=true;g.stop=3.0;return true;
+			}
 			Track& t = g_track[c.pilot];
 			const auto pl = PosOf(c.player);
 			TrackPlayer(t, pl);
@@ -333,7 +338,7 @@ namespace profiles
 					++n;
 				}
 			}
-			notify::Show(n ? (p ? p->name : "NPC vehicles: default") : "No NPC vehicles following");
+			logger::Write("NPC profile change: %d vehicles",n);
 			logger::Write("Profiles: NPC vehicles (%d) -> %s", n, p ? p->name : "default");
 		}
 

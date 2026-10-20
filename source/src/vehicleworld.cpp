@@ -89,8 +89,8 @@ namespace world
 			bool ok = true;
 			for (int i = 0; i < 3; ++i) {
 				const float h = 0.5f * (mx[i] - mn[i]);
-				if (!std::isfinite(h) || h < 0.25f || h > 10.0f) ok = false;
-				half[i] = std::clamp(h, 0.5f, 5.0f);
+				if (!std::isfinite(h) || h < 0.25f || h > 100000.0f) ok = false;
+				half[i] = std::max(h, 0.25f);
 			}
 			if (!ok) {
 				half[0] = 1.25f; half[1] = 2.3f; half[2] = 1.0f;
@@ -110,29 +110,25 @@ namespace world
 
 		uptr VCall(uptr obj, std::uint32_t slot) { return reinterpret_cast<uptr (*)(uptr)>((*reinterpret_cast<void***>(obj))[slot / 8])(obj); }
 
-		// The first physics body in the 3D tree (depth-first, the chassis comes first in the vehicles seen so far).
-		std::uint32_t BodyIn(uptr obj, int depth)
+		// Enumerate owned collision bodies; the native vehicle callback selects its chassis from this set.
+		void BodiesIn(uptr obj,int depth,std::uint32_t ids[16],std::uint32_t&count,unsigned&visited)
 		{
-			if (!obj || depth > 12) return 0;
-			if (const uptr col = At<uptr>(obj, kCollision)) {
-				if (VCall(col, kVAsNP)) {
-					std::uint32_t id = kNoBody;
-					EngineFn<std::uint32_t* (*)(uptr, std::uint32_t*)>(kBodyIdOf)(col, &id);
-					if ((id & 0xFFFFFF) != kNoBody) return id;
+			if(!obj||depth>16||count>=16||++visited>512)return;
+			if(const auto col=At<uptr>(obj,kCollision);col&&VCall(col,kVAsNP)) {
+				std::uint32_t id=kNoBody;EngineFn<std::uint32_t*(*)(uptr,std::uint32_t*)>(kBodyIdOf)(col,&id);
+				if(id && (id&0xFFFFFF)!=kNoBody) {
+					bool duplicate=false;for(unsigned i=0;i<count;++i)duplicate=duplicate||ids[i]==id;
+					if(!duplicate)ids[count++]=id;
 				}
 			}
-			if (const uptr node = VCall(obj, kVIsNode)) {
-				const auto n = At<std::uint16_t>(node, kChildCount);
-				const auto kids = At<uptr*>(node, kChildren);
-				for (unsigned i = 0; kids && i < n && i < 64; ++i) {
-					if (const std::uint32_t id = BodyIn(kids[i], depth + 1)) return id;
-				}
+			if(const auto node=VCall(obj,kVIsNode)) {
+				const auto n=At<std::uint16_t>(node,kChildCount);const auto kids=At<uptr*>(node,kChildren);
+				for(unsigned i=0;kids&&i<n&&i<128&&count<16&&visited<512;++i)BodiesIn(kids[i],depth+1,ids,count,visited);
 			}
-			return 0;
 		}
 
 		// Rotation, bound radius and body id from the ref's 3D; false when it is not loaded or reading faults.
-		bool FromScene(uptr ref, float rot[9], float& radius, std::uint32_t& body)
+		bool FromScene(uptr ref, float rot[9], float& radius, std::uint32_t& body, std::uint32_t ids[16],std::uint32_t&count,float&scale)
 		{
 			__try {
 				const uptr root = Root(ref);
@@ -141,7 +137,9 @@ namespace world
 				for (int r = 0; r < 3; ++r)
 					for (int c = 0; c < 3; ++c) rot[r * 3 + c] = m[r * 4 + c];
 				radius = At<float>(root, kWorldBound + 0x0C);
-				body = BodyIn(root, 0);
+				scale=std::fabs(At<float>(root,0xBC)); // NiTransform world scale
+				if(!std::isfinite(scale)||scale<0.001f||scale>100000.0f)scale=1;
+				unsigned visited=0;BodiesIn(root,0,ids,count,visited);body=count?ids[0]:0;
 				return true;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -193,13 +191,14 @@ namespace world
 			const float rot[9] = { cs, -sn, 0, sn, cs, 0, 0, 0, 1 };  // right, forward, up (heading only)
 			std::memcpy(v.rot, rot, sizeof(rot));
 			Bounds(base, v.half);
-			float sceneRot[9], radius = 0;
+			float sceneRot[9], radius = 0,sceneScale=1;
 			std::uint32_t body = 0;
-			if (FromScene(r, sceneRot, radius, body)) {
+			if (FromScene(r, sceneRot, radius, body,v.bodyIds,v.bodyCount,sceneScale)) {
 				std::memcpy(v.rot, sceneRot, sizeof(sceneRot));  // the 3D's world rotation (pitch and roll too)
 				v.bodyId = body;
+				for(auto&half:v.half)half*=sceneScale;
 				// the live bound sphere caps the box (a mod's bogus bounds cannot make it larger than the model)
-				if (std::isfinite(radius) && radius > 0.5f && radius < 20.0f) {
+				if (std::isfinite(radius) && radius > 0.5f && radius < 100000.0f) {
 					for (int k = 0; k < 3; ++k) v.half[k] = std::min(v.half[k], radius);
 				}
 			}

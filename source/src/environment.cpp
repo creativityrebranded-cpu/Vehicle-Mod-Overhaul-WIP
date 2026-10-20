@@ -72,7 +72,7 @@ void Tick(){
 }
 Site CheckSite(std::uint32_t self,double x,double y,double z,double yaw){
  Site out;const auto v=Vehicle(self);if(!v.formId){out.reason="Vehicle bounds unavailable";return out;}
- const double w=std::clamp(double(v.half[0])+0.5,1.5,6.0),l=std::clamp(double(v.half[1])+0.5,2.0,8.0);
+ const double w=std::max(double(v.half[0])+0.5,1.5),l=std::max(double(v.half[1])+0.5,2.0);
  const double rx=std::cos(yaw),ry=-std::sin(yaw),fx=std::sin(yaw),fy=std::cos(yaw);
  std::array<double,9> heights;int index=0;bool pending=false;
  for(int j=-1;j<=1;++j)for(int i=-1;i<=1;++i){

@@ -8,7 +8,7 @@ Captured planet map records include their copied names. Matching uses name, view
 
 If planet map coordinates are unavailable (for example, before opening the star map), the game scanner range projects an estimated position along the camera view. Estimated positions retain the `~` indicator, including after marker placement. This projection is not an exact reference position.
 
-Validation: release DLL build and six offline destination-selection cases. Live scanner display and travel still require an in-game check.
+Validation: release DLL build and twelve offline destination-selection/range cases. Live scanner display and travel still require an in-game check.
 
 ## Route panel and trip controls
 
@@ -23,3 +23,9 @@ Arrival requires fresh terrain and physics, no initial climb in progress, horizo
 Statuses include Travelling, Waiting for terrain, Blocked, Finding another way, Adjusting height, Arrived, Orbiting, and Waiting for driver. ETA appears only while moving toward the current destination. Route metadata clears on save load and when an externally replaced marker invalidates the route.
 
 Validation: release build and 17 offline arrival, status, and queue-transition tests. Live HUD placement, bindings, and vehicle hold behavior still require an in-game check.
+
+## Current selection rules
+
+Native range text is parsed with its m/km unit and grouping separators. Selected places display the scanner's own range; ordinary hit distances include height. Exiting a seat clears queued names and invalidates the old marker for travel, while leaving the game's map marker itself available for reference. Explicitly selecting it again re-arms the destination.
+
+The scanner also publishes `CurrentPickRefHandle`/`CurrentFormID`. In combat, T on a live actor issues an explicit, bounded ram order; places continue to create destinations. The actor must resolve from the actual highlighted reference, never a nearby-actor search. All added prompts use native widgets at 75% scale; the Auto: Stop/Orbit/Patrol UI control is removed.

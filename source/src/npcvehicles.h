@@ -81,6 +81,7 @@ namespace npcvehicles
 	void Recall(unsigned ms);
 	// Witness reactions (2026-10-20, notes/VEHICLE_BEHAVIOUR_RESEARCH_20261020.md): a crash at (x, y, z) -> calm bystanders within 10 m flee
 	// (ActionFleeStart), within 25 m cower (ActionCower). Never followers, quest NPCs, anyone fighting or in a vehicle. Seamless.ini [witness] enabled=0 off.
+	void VehicleAggression(std::uintptr_t vehicle, std::uint32_t shooterId);
 	void WitnessCrash(double x, double y, double z, const char* why);
 	// The actor's current AI package (FUN_1418ddb70), 0 when none: a change is a schedule switch (shift change).
 	std::uintptr_t CurrentPackage(std::uintptr_t actor);

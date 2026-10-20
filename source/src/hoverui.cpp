@@ -4,6 +4,7 @@
 #include "game.h"
 #include "log.h"
 #include "notify.h"
+#include "scannercontext.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -128,10 +129,11 @@ namespace hoverui
 		enum { kW, kA, kS, kD, kGearDown, kGearUp, kHover, kGear, kButtons };
 		// Editor selections: each element (W, A, S, D, Gear-, Gear+, Hover, Gear box, Auto, Auto line, Gang), each of the
 		// rover widget's own clips (kSelNative + i, e.g. the Exit button), then the groups.
-		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelRows, kSelMode, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelRoute = 90, kSelNative = 100 };
-		constexpr int kFootEls = 9, kCarEls = 5;
-		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject", "vehicles", "automode" };
-		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh", "vehiclesinveh", "automodeinveh" };
+		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelRoute = 90, kSelNative = 100 };
+		constexpr int kFootEls = 8, kCarEls = 4;
+		constexpr double kOverlayScale = 0.75;
+		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject", "vehicles" };
+		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh", "vehiclesinveh" };
 		constexpr double kDefOff[kButtons][2] = { { 0.0, -31.0 }, { -23.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 0.0 }, { -2.0, 0.0 } };
 		struct Layout_t
 		{
@@ -156,8 +158,8 @@ namespace hoverui
 			bool oldRows = false;      // only the earlier per-row positions are known: derive the column from them
 			double oldX[3] = {}, oldY[3] = {};  // Gear+, Gear-, Hover (the earlier order)
 			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] }, { kDefOff[4][0], kDefOff[4][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
-			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 }, { 0.0, -40.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang, Passenger, Eject, vehicles, Auto mode)
-			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 }, { 342.0, 226.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang, vehicles, Auto mode)
+			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang, Passenger, Eject, vehicles, Auto mode)
+			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang, vehicles, Auto mode)
 			// The rover widget's own clips (found by name when the widget is first seen) and their nudges.
 			std::vector<std::string> natNames;
 			std::map<std::string, std::pair<double, double>> natOff;
@@ -305,9 +307,7 @@ namespace hoverui
 			bool own = false, nearOwn = false, autoOn = false, occupied = false;
 			std::string occKey;
 			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey;
-			std::string modeKey, modeLabel;
-			ULONGLONG modeFlashUntil = 0;
-			int gang = 0;
+						int gang = 0;
 			std::string rows[kMaxRows];
 			int rowCount = 0;
 		} g_ctx;
@@ -396,7 +396,7 @@ namespace hoverui
 		{
 			if (std::strcmp(g_ui.text[i], label) == 0 && IsObject(g_ui.data[i])) return true;
 			Value ued;
-			const Value uedArgs[1] = { Str(kEvents[i]) };
+			const Value uedArgs[1] = { Str(i==kGear||i==kGearDown||i==kGearUp?"":kEvents[i]) };
 			if (!CreateObject(g_ui.movie, &ued, "Shared.Components.ButtonControls.ButtonData.UserEventData", uedArgs, 1)) {
 				logger::Write("Hover UI: could not create UserEventData (%s)", kEvents[i]);
 				return false;
@@ -442,7 +442,7 @@ namespace hoverui
 		// Re-asserted every 60 frames: the button rewrites its key text when the control map changes.
 		void SetGearText(int gear)
 		{
-			if (gear == g_ui.gearShown && ++g_ui.gearFrames % 60 != 0) return;
+			// Custom gear text must win over native binding refreshes every frame.
 			const Value& btn = g_ui.buttons[kGear];
 			if (!IsObject(btn)) return;
 			char t[16];
@@ -451,6 +451,7 @@ namespace hoverui
 			Value pc, inst;
 			bool ok = false;
 			if (GetMember(btn, "PCButton_mc", &pc) && IsObject(pc) && GetMember(pc, "ButtonInstance_mc", &inst) && IsObject(inst)) {
+				SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));
 				ok = Invoke(inst, "SetText", args, 1);
 			}
 			Release(inst);
@@ -586,7 +587,11 @@ namespace hoverui
 			SetButton(kHover, hovering ? "Land" : "Hover");
 			TintHover(hovering);
 			if (std::strcmp(g_ui.text[kGear], " ") != 0) g_ui.gearShown = -1;  // new data: its key text is the key again
-			SetButton(kGear, " ");  // no label: "GEAR n" is all inside the key box
+			SetButton(kGear, " ");
+			for(const int i:{kGearDown,kGearUp}){Value pc,inst;
+				if(GetMember(g_ui.buttons[i],"PCButton_mc",&pc)&&GetMember(pc,"ButtonInstance_mc",&inst)){SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));const Value args[]={Str("RShift")};Invoke(inst,"SetText",args,1);}
+				Release(inst);Release(pc);
+			} // no label: "GEAR n" is all inside the key box
 			for (int i = 0; i < kButtons; ++i) Show(i, true);
 			SetGearText(g_gear.load());
 		}
@@ -621,7 +626,7 @@ namespace hoverui
 		// Places a key button so that its key box is centred on (x, y), with its label centred under (or above) the key,
 		// 3 px away, measured from the label's rendered bounds (MinimalButton's public Label_mc; the button's own
 		// alignment only moves LabelInstance_mc inside it, so moving Label_mc sticks).
-		void PlaceButtonKey(const Value& b, double x, double y, bool above, double scale = 1.0);
+		void PlaceButtonKey(const Value& b, double x, double y, bool above, double scale = kOverlayScale);
 		void PlaceKey(int i, double x, double y, bool above) { PlaceButtonKey(g_ui.buttons[i], x, y, above); }
 
 		void PlaceButtonKey(const Value& b, double x, double y, bool above, double scale)
@@ -629,6 +634,8 @@ namespace hoverui
 			double px, py, pw, ph;
 			KeyBox(b, px, py, pw, ph);
 			// the key box is measured in the button's own (unscaled) space; a scaled button lands it at scale * that
+			SetMember(b, "scaleX", Num(scale));
+			SetMember(b, "scaleY", Num(scale));
 			SetMember(b, "x", Num(x - scale * (px + pw / 2.0)));
 			SetMember(b, "y", Num(y - scale * (py + ph / 2.0)));
 			Value lab;
@@ -854,6 +861,7 @@ namespace hoverui
 		std::string g_placeName;
 		ULONGLONG g_placeAt = 0;
 		double g_placeDistance = 0;
+		ScannerPick g_pick;
 		std::string g_routeText;
 		std::string g_routeSkipKey,g_routeClearKey,g_routeRetryKey;
 		std::string g_scanText;  // the scanner screen status box text
@@ -873,7 +881,7 @@ namespace hoverui
 		struct MonoEl
 		{
 			Value button, data;
-			double scale = 1.0;       // 0.5: the Passenger / Eject prompts are half size
+			double scale = kOverlayScale;
 			std::string label, key;
 			bool shown = false;
 			int tint = -1;
@@ -892,7 +900,7 @@ namespace hoverui
 			if (e.label == label && IsObject(e.data)) return true;
 			Release(e.data);
 			Value ued;
-			const Value uedArgs[1] = { Str("Vehicle:VehicleBoost") };  // any event: the key text is set by MonoSetKey
+			const Value uedArgs[1] = { Str("") };  // custom display only: never bind the native boost/Shift event
 			bool ok = false;
 			if (CreateObject(movie, &ued, "Shared.Components.ButtonControls.ButtonData.UserEventData", uedArgs, 1)) {
 				const Value dataArgs[2] = { Str(label), Arg(ued) };
@@ -910,10 +918,11 @@ namespace hoverui
 
 		void MonoSetKey(MonoEl& e, const std::string& key)
 		{
-			// Re-asserted every 60 frames: the button rewrites its key text when the control map changes.
-			if (key == e.key && ++e.frames % 60 != 0) return;
+			// The native widget can refresh its glyph after SetButtonData or a device change.
+			// Reassert after every movie advance so its fallback never flashes on screen.
 			Value pc, inst;
 			if (GetMember(e.button, "PCButton_mc", &pc) && IsObject(pc) && GetMember(pc, "ButtonInstance_mc", &inst) && IsObject(inst)) {
+				SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));
 				const Value args[1] = { Str(key.c_str()) };
 				Invoke(inst, "SetText", args, 1);
 			}
@@ -970,7 +979,9 @@ namespace hoverui
 					SetMember(e.button,"visible",Bool(false));const Value child[]={Arg(e.button)};Invoke(root,"addChild",child,1);
 				}
 				MonoShow(e,!value.empty());if(value.empty())return false;
-				if(!MonoSetData(movie,e,label))return false;MonoSetKey(e,value);SetMember(e.button,"alpha",Num(alpha));return true;
+				if(!MonoSetData(movie,e,label))return false;MonoSetKey(e,value);
+				SetMember(e.button,"scaleX",Num(kOverlayScale));SetMember(e.button,"scaleY",Num(kOverlayScale));
+				SetMember(e.button,"alpha",Num(alpha));return true;
 			};
 			std::size_t from=0;
 			for(auto&e:view.rows){
@@ -978,13 +989,13 @@ namespace hoverui
 				if(from<text.size()){const auto end=text.find('\n',from);line=text.substr(from,end==std::string::npos?end:end-from);from=end==std::string::npos?text.size():end+1;}
 				if(!show(e,line," "))continue;
 				double px=0,py=0,w=0,h=0;KeyBox(e.button,px,py,w,h);
-				SetMember(e.button,"x",Num(x-px));SetMember(e.button,"y",Num(y-py));y+=std::max(h,32.0)+8;
+				SetMember(e.button,"x",Num(x-kOverlayScale*px));SetMember(e.button,"y",Num(y-kOverlayScale*py));y+=kOverlayScale*std::max(h,32.0)+8;
 			}
 			const bool visible=!text.empty();
 			MonoEl*actions[]={&view.retry,&view.skip,&view.clear};
 			const std::string keys[]={visible?retryKey:"",visible?skipKey:"",visible?clearKey:""};
 			const char*labels[]={"Retry trip","Skip stop","Clear route"};int shown=0;
-			for(int i=0;i<3;++i)if(show(*actions[i],keys[i],labels[i]))PlaceButtonKey(actions[i]->button,x+58+160*shown++,y+30,false);
+			for(int i=0;i<3;++i)if(show(*actions[i],keys[i],labels[i]))PlaceButtonKey(actions[i]->button,x+44+140*shown++,y+24,false,kOverlayScale);
 		}
 
 		// ---- The contextual HUD: on-foot panel and in-vehicle extras (in the HUD movie) ----
@@ -992,13 +1003,13 @@ namespace hoverui
 		{
 			uptr movie = 0;
 			Value meters, widget;          // RightMeters_mc (on foot) and HUDVehicle_mc (in the vehicle)
-			MonoEl fSummon, fFollow, fGetIn, fStatus, fGang, fPass, fEject, fRows, fMode;
-			MonoEl vAuto, vLine, vGang, vRows, vMode;  // fRows / vRows: the per-vehicle line (one box, movable in the F7 editor)
+			MonoEl fSummon, fFollow, fGetIn, fStatus, fGang, fPass, fEject, fRows;
+			MonoEl vAuto, vLine, vGang, vRows;  // fRows / vRows: the per-vehicle line (one box, movable in the F7 editor)
 			bool built = false, failed = false;
 		} g_ex;
 
-		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fGang, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows, &g_ex.fMode };
-		MonoEl* CarEls[kCarEls] = { &g_ex.vAuto, &g_ex.vLine, &g_ex.vGang, &g_ex.vRows, &g_ex.vMode };
+		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fGang, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows };
+		MonoEl* CarEls[kCarEls] = { &g_ex.vAuto, &g_ex.vLine, &g_ex.vGang, &g_ex.vRows };
 
 		bool IsOurExtra(void* object)
 		{
@@ -1052,11 +1063,9 @@ namespace hoverui
 			bool own, nearOwn, autoOn, occupied;
 			int gang, rowCount = 0;
 			std::string rows[kMaxRows];
-			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey, occKey, modeKey, modeLabel;
-			bool modeFlash = false;
+			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey, occKey;
 			{
 				std::lock_guard lk(g_ctx.lock);
-				modeKey = g_ctx.modeKey; modeLabel = g_ctx.modeLabel; modeFlash = GetTickCount64() < g_ctx.modeFlashUntil;
 				own = g_ctx.own; nearOwn = g_ctx.nearOwn; autoOn = g_ctx.autoOn; gang = g_ctx.gang;
 				occupied = g_ctx.occupied; occKey = g_ctx.occKey;
 				summonKey = g_ctx.summonKey; followKey = g_ctx.followKey; useKey = g_ctx.useKey; status = g_ctx.status;
@@ -1078,8 +1087,6 @@ namespace hoverui
 				if (autoLine.empty()) autoLine = "AUTO 120 m";
 				if (gangText.empty() || gang <= 0) { gangText = "Gang 2"; gangKey = "."; }
 				if (autoKey.empty()) autoKey = " ";
-				if (modeKey.empty()) modeKey = " ";
-				if (modeLabel.empty()) modeLabel = "Auto: Stop";
 			}
 			ElSet(g_ex.fSummon, foot && !summonKey.empty(), "Summon", summonKey);
 			ElSet(g_ex.fFollow, foot && !followKey.empty(), g_followOn.load() ? "Stop follow" : "Follow", followKey);
@@ -1097,15 +1104,10 @@ namespace hoverui
 			ElSet(g_ex.fGang, !inVehicle && (gang > 0 || (ed && foot)), " ", gangBox);
 			ElSet(g_ex.fRows, !inVehicle && (gang > 0 || (ed && foot)) && !rowsBox.empty(), " ", rowsBox);
 			// Facing an occupied vehicle on foot: tap = the passenger seat, hold = eject the driver (half-size prompts).
-			g_ex.fPass.scale = g_ex.fEject.scale = 0.5;
+			g_ex.fPass.scale = g_ex.fEject.scale = kOverlayScale;
 			const bool occShow = !inVehicle && (occupied || (ed && foot));
 			ElSet(g_ex.fPass, occShow, "Passenger", occKey);
 			ElSet(g_ex.fEject, occShow, "Double tap: eject", occKey);
-			// The Auto behaviour button: on foot (with a vehicle of your own) and in the vehicle; blue for a moment after a press.
-			ElSet(g_ex.fMode, foot && !modeKey.empty(), modeLabel.c_str(), modeKey);
-			MonoTint(g_ex.movie, g_ex.fMode, modeFlash);
-			ElSet(g_ex.vMode, inVehicle && !modeKey.empty(), modeLabel.c_str(), modeKey);
-			MonoTint(g_ex.movie, g_ex.vMode, modeFlash);
 			ElSet(g_ex.vAuto, inVehicle && !autoKey.empty(), autoOn ? "Auto on" : "Auto", autoKey);
 			MonoTint(g_ex.movie, g_ex.vAuto, autoOn);
 			ElSet(g_ex.vLine, inVehicle && (autoOn || ed) && !autoLine.empty(), " ", autoLine);
@@ -1140,7 +1142,7 @@ namespace hoverui
 			}
 			const bool blinkOff = edit && (GetTickCount64() / 300) % 2 == 0;
 			if (foot || gang > 0 || occupied) {
-				const double at[kFootEls][2] = { { fx, fy }, { fx + 120.0, fy }, { fx + 240.0, fy }, { fx + 80.0, fy + 52.0 }, { fx + 80.0, fy + 98.0 }, { fx + 240.0, fy + 52.0 }, { fx + 240.0, fy + 98.0 }, { fx + 80.0, fy + 98.0 }, { fx + 360.0, fy } };
+				const double at[kFootEls][2] = { { fx, fy }, { fx + 120.0, fy }, { fx + 240.0, fy }, { fx + 80.0, fy + 52.0 }, { fx + 80.0, fy + 98.0 }, { fx + 240.0, fy + 52.0 }, { fx + 240.0, fy + 98.0 }, { fx + 80.0, fy + 98.0 } };
 				for (int i = 0; i < kFootEls; ++i) {
 					if (!FootEls[i]->shown) continue;
 					if (FootEls[i]->scale != 1.0) {
@@ -1153,10 +1155,12 @@ namespace hoverui
 				}
 			}
 			if (inVehicle) {
-				const double at[kCarEls][2] = { { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey }, { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey } };
+				const double at[kCarEls][2] = { { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey }, { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { cx + ex, cy + 1.7 * d + ey } };
 				for (int i = 0; i < kCarEls; ++i) {
 					if (!CarEls[i]->shown) continue;
-					PlaceButtonKey(CarEls[i]->button, at[i][0] + co[i][0], at[i][1] + co[i][1], false);
+					SetMember(CarEls[i]->button, "scaleX", Num(kOverlayScale));
+					SetMember(CarEls[i]->button, "scaleY", Num(kOverlayScale));
+					PlaceButtonKey(CarEls[i]->button, at[i][0] + co[i][0], at[i][1] + co[i][1], false, kOverlayScale);
 					const bool picked = sel == kSelExtras || sel == kSelAll || sel == kSelAuto + i;
 					SetMember(CarEls[i]->button, "alpha", Num(blinkOff && picked ? 0.35 : 1.0));
 				}
@@ -1180,6 +1184,8 @@ namespace hoverui
 		void CaptureScannerDestination(const Value& root)
 		{
 			std::string name;
+			double pickForm=0,pickHandle=0;
+			GetNumber(root,"CurrentFormID",pickForm);GetNumber(root,"CurrentPickRefHandle",pickHandle);
 			Value panel, marker, description, text, range, rangeText;
 			double distance = 0;
 			if (GetMember(root, "RightInfoDisplay_mc", &panel) && IsObject(panel) &&
@@ -1197,13 +1203,14 @@ namespace hoverui
 				if (GetMember(root, "range_mc", &range) && IsObject(range) &&
 					GetMember(range, "range_tf", &rangeText) && IsObject(rangeText)) {
 					const auto shown = GetString(rangeText, "text");
-					distance = std::strtod(shown.c_str(), nullptr);
+					distance = scannercontext::RangeMeters(shown);
 					if (!std::isfinite(distance) || distance <= 0 || distance > 100000) distance = 0;
 				}
 			}
 			Release(rangeText); Release(range);
 			Release(text); Release(description); Release(marker); Release(panel);
 			std::lock_guard lk(g_scanLock);
+			g_pick={std::uint32_t(pickForm),std::uint32_t(pickHandle)};
 			g_placeName = name;
 			g_placeDistance = distance;
 			g_placeAt = GetTickCount64();
@@ -1265,7 +1272,9 @@ namespace hoverui
 			MonoSetKey(g_mono.status, scan);
 			MonoTint(movie, g_mono.status, true);
 			const bool blinkOff = edit && (GetTickCount64() / 300) % 2 == 0;
-			PlaceButtonKey(g_mono.status.button, x, y, false);
+			SetMember(g_mono.status.button, "scaleX", Num(kOverlayScale));
+			SetMember(g_mono.status.button, "scaleY", Num(kOverlayScale));
+			PlaceButtonKey(g_mono.status.button, x, y, false, kOverlayScale);
 			SetMember(g_mono.status.button, "alpha", Num(blinkOff && (sel == 3 || sel == 2) ? 0.35 : 1.0));
 		}
 
@@ -1380,6 +1389,11 @@ namespace hoverui
 	}
 
 	bool IsScannerOpen() { return ScannerOpen(); }
+	ScannerPick ScannerPickContext(){
+		std::lock_guard lk(g_scanLock);
+		return ScannerOpen()&&GetTickCount64()-g_placeAt<200?g_pick:ScannerPick{};
+	}
+
 	ScannerDestination ScannerDestinationContext()
 	{
 		std::lock_guard lk(g_scanLock);
@@ -1457,14 +1471,6 @@ namespace hoverui
 		if (g_ctx.autoLine != line) g_ctx.autoLine = line;
 	}
 
-	void SetAutoMode(const char* key, const char* label, bool pressed)
-	{
-		std::lock_guard lk(g_ctx.lock);
-		if (g_ctx.modeKey != key) g_ctx.modeKey = key;
-		if (g_ctx.modeLabel != label) g_ctx.modeLabel = label;
-		if (pressed) g_ctx.modeFlashUntil = GetTickCount64() + 450;
-	}
-
 	void SetGang(int count, const char* profile, const char* key)
 	{
 		// (2026-10-20, the user: the NPCs' names instead of "Gang n"): the caller's text is the names; no text = the count as before.
@@ -1501,7 +1507,7 @@ namespace hoverui
 		std::vector<int> SelOrder()
 		{
 			std::vector<int> o;
-			for (int i = 0; i <= kSelMode; ++i) o.push_back(i);
+			for (int i = 0; i <= kSelRows; ++i) o.push_back(i);
 			o.push_back(kSelRoute);
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) o.push_back(kSelNative + i);
 			for (int i : { int(kSelCluster), int(kSelColumn), int(kSelExtras), int(kSelAll) }) o.push_back(i);
@@ -1512,12 +1518,12 @@ namespace hoverui
 		std::string SelName(bool inVehicle)
 		{
 			if (!inVehicle) {
-				const char* foot[kFootEls + 2] = { "Summon", "Follow", "Get in", "Status", "Gang", "Passenger", "Eject", "Vehicles", "Auto mode", "Panel", "Route" };
+				const char* foot[kFootEls + 2] = { "Summon", "Follow", "Get in", "Status", "Gang", "Passenger", "Eject", "Vehicles", "Panel", "Route" };
 				return foot[std::clamp(g_lay.fsel, 0, kFootEls+1)];
 			}
 			const int s = g_lay.sel;
 			if(s==kSelRoute)return "Route";
-			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Gear-", "Gear+", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "Auto mode", "WASD", "Column", "Extras",
+			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Gear-", "Gear+", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "WASD", "Column", "Extras",
 				"All" };
 			if (s >= 0 && s <= kSelAll) return names[s];
 			if (s >= kSelNative && s - kSelNative < int(g_lay.natNames.size())) return g_lay.natNames[s - kSelNative];
@@ -1613,7 +1619,7 @@ namespace hoverui
 			if (all || sel == kSelExtras) { g_lay.eox += dx; g_lay.eoy += dy; }
 			if(all){g_lay.routeX+=dx;g_lay.routeY+=dy;}
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] += dx; g_lay.off[sel][1] += dy; }
-			if (sel >= kSelAuto && sel <= kSelMode) { g_lay.carOff[sel - kSelAuto][0] += dx; g_lay.carOff[sel - kSelAuto][1] += dy; }
+			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] += dx; g_lay.carOff[sel - kSelAuto][1] += dy; }
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) {
 				if (all || sel == kSelNative + i) {
 					auto& o = g_lay.natOff[g_lay.natNames[i]];
@@ -1626,7 +1632,7 @@ namespace hoverui
 		if (press[9]) {
 			// Delete: the picked element back to its default place.
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] = kDefOff[sel][0]; g_lay.off[sel][1] = kDefOff[sel][1]; changed = true; }
-			if (sel >= kSelAuto && sel <= kSelMode) { g_lay.carOff[sel - kSelAuto][0] = g_lay.carOff[sel - kSelAuto][1] = 0.0; changed = true; }
+			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] = g_lay.carOff[sel - kSelAuto][1] = 0.0; changed = true; }
 			if (sel >= kSelNative && sel - kSelNative < int(g_lay.natNames.size())) { g_lay.natOff.erase(g_lay.natNames[sel - kSelNative]); changed = true; }
 		}
 		if (dd != 0.0) {

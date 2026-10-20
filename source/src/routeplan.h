@@ -17,6 +17,7 @@ namespace routeplan
 {
 	struct Query
 	{
+		std::uint32_t ignoreId=0; // only an explicitly ordered ram target
 		std::uint32_t selfId = 0;  // the vehicle's form id
 		int priority = 60;         // higher passes first
 		float pos[3] = {};         // current position

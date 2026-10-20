@@ -13,7 +13,7 @@ routeplan::Frame()        the lane planner's copy of that list
 vehicleflight::Tick()     your vehicle: hover, autopilot, summon / follow, avoidance
 navmap::Tick()            shared map: eviction, 10 s stats line
 shipvehicle / realvehicles::Tick()
-npcvehicles::Tick()       NPC jobs (boarding, following, exit), riders, HUD gang rows
+npcvehicles::Tick()       NPC jobs (boarding, driving, exit), riders, follower HUD rows
 passenger::Tick()         riding as a passenger / taxi / take the wheel
 traffic::Tick()           destination probe
 profiles::Tick()          profile keys
@@ -29,7 +29,7 @@ passed through small locked structs or atomics (see `prefetch.h`).
 
 | Module | Owns |
 |---|---|
-| `vehicleflight.*` | Hover flight model, autopilot (`Fly`), terrain assist / avoidance corridors, summon / follow / Auto, drive mode, flip recovery, boost pin, `PilotFly(pilot, vehicle, Goal)` |
+| `vehicleflight.*` | Hover flight model, autopilot (`Fly`), terrain assist / avoidance corridors, summon / follow / Auto, drive mode, flip recovery, native-meter boost, `PilotFly(pilot, vehicle, Goal)` |
 | `npcvehicles.*` | NPC jobs: walk to a vehicle (quest package), instant seat, follow / orbit actions, park / relaunch, attack run and vehicle weapon, exit service, riders (passengers), leash, occupied-vehicle rules (tap / hold E), forced exits |
 | `context.*` | The rules engine: who boards what, which profile, when to get out |
 | `vcontract.*` | The contract between profile code and the owners: `Goal`, `Profile`, assignment per vehicle, `SeatProvider`, `ExitRequest` |
@@ -98,3 +98,13 @@ do not meet. Known gap: the assist and the autopilot still react to each other f
 `Vehicles - Real.esm` (`tools/make_vehicles_real.py`): overrides Parked Vehicles so each prop becomes the real vehicle.
 `SeamlessPilots.esm` (`tools/make_pilots_esm.py`): one quest with 6 pilot aliases, 6 vehicle aliases and 6 "activate the vehicle alias" packages;
 the plugin fills the aliases with the engine's own `ForceRefTo`.
+
+## 0.61.0 integration
+
+Physics callbacks have no default player owner. Each controller receives a bounded set of collision body IDs from its vehicle's scene; a matching native callback claims the chassis, and all subsequent force writes check the full generation-bearing ID. Chassis origin offsets and decorative collision bodies do not permit proximity-based ownership.
+
+`hulllogic` derives attitude rates, lateral acceleration, thrust scale and braking distance from validated hull dimensions. MPC sweeps both length and width and limits candidate turns to achievable rates. `boostlogic` updates the actual native charge/delay fields using vehicle configuration timings while hover supplies its own force. Left Shift buys a 1.75x boost; Right Shift is the gear modifier.
+
+`traffic::Destination` carries a conservative vehicle-suitability decision from the counted native path: every point must resolve to the current exterior world, without a nearby door. Context and the transit entry point both enforce it. Vehicle projectile intersections notify native driver/owner combat and interrupt civil tasks, with only the explicit aggressor prioritized for retaliation. Ambient behavior is logged; HUD notices/rows require an actual follower.
+
+`targetsession` invalidates consumed marker coordinates/handles at seat exit; new scanner selection re-arms them. Scanner-selected actor handles feed bounded ram orders. A ram exempts its chosen vehicle only, preserving environmental and other-traffic checks. Native exits are forwarded and queued for bounded cleanup; polling cannot restart a deadline.

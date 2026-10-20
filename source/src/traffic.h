@@ -14,6 +14,8 @@ namespace traffic
 		Kind kind = Kind::None;
 		float x = 0, y = 0, z = 0;   // the path's goal (world)
 		float remaining = 0;          // metres left along the path (0 when unknown)
+		bool vehicleSuitable=false; // every path point stays in this exterior world, without a door transition
+		bool interior=false, changesSpace=false, usesDoor=false, contextKnown=false;
 		unsigned points = 0;          // path points
 		int packageType = -1;         // the current package's type (TESPackage + 0x3C), -1 unknown
 	};

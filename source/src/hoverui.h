@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <cstdint>
 
 // Native hover buttons on the HUD's rover widget (hudmenu.swf: root.RightMeters_mc.HUDVehicle_mc, the widget that
 // shows "hold [E] Exit vehicle"). The buttons are the game's own BasicButton (ButtonClips.swf) with ButtonBaseData +
@@ -26,14 +27,11 @@ namespace hoverui
 	// with their keys, Get in (the game's Activate key) when near the own vehicle, and a status box (e.g. "FOLLOWING 42 m";
 	// empty: hidden).
 	void SetFoot(bool own, bool nearOwn, const char* summonKey, const char* followKey, const char* useKey, const char* status);
-	// Main thread: facing an occupied vehicle on foot: the Passenger (tap) and Hold: eject prompts show, at half size,
+	// Main thread: facing an occupied vehicle on foot: the Passenger (tap) and Hold: eject prompts show, at the shared 75% scale,
 	// with the Activate key's name.
 	void SetOccupied(bool facing, const char* key);
 	// Main thread: in the vehicle, the Auto button (its key; empty: hidden), whether Auto flies, and its status line.
 	void SetAuto(const char* key, bool on, const char* line);
-	// Main thread: the Auto behaviour button (in the vehicle and on foot): its key (empty: hidden), its label ("Auto: Orbit") and a press
-	// (the button flashes blue for a moment).
-	void SetAutoMode(const char* key, const char* label, bool pressed);
 	// Main thread: the gang line (NPC vehicles following: count, profile, the profile key); count 0 hides it.
 	void SetGang(int count, const char* profile, const char* key);
 	// Main thread: one line per NPC vehicle / rider under the gang line (at most kMaxRows; count 0 hides them). Placed relative to the gang element.
@@ -53,6 +51,8 @@ namespace hoverui
 	// Copied on the scanner movie thread. Empty unless the selected map-marker panel is active.
 	struct ScannerDestination { std::string name; double distance = 0; };
 	ScannerDestination ScannerDestinationContext();
+	struct ScannerPick {std::uint32_t form=0,handle=0;};
+	ScannerPick ScannerPickContext();
 	// The text of the scanner screen's status box (the distance to what you look at); empty hides it. The box is movable with the F7 editor while the scanner is open.
 	void SetScan(const char* text);
 	// Native status rows and BasicButton action prompts; empty text hides the route group.

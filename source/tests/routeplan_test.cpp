@@ -25,5 +25,7 @@ int main(){
  auto unknown=plan(3);check(unknown.laneZ==0&&unknown.yawOffset==0&&unknown.speedCap>=0,"unknown space cannot authorize a traffic lane change");
  mode=0;routeplan::Reset();routeplan::Frame();routeplan::Update(1,q);mode=2;
  auto changed=routeplan::Update(1,q);check(changed.laneZ==0&&changed.yawOffset==0&&changed.speedCap==0,"new obstruction cancels an already held traffic lane");
+ q.ignoreId=2;auto ram=plan(0);check(ram.laneZ==0&&ram.yawOffset==0&&ram.speedCap<0,"explicit ram target does not trigger an avoidance lane");
+ q.ignoreId=99;auto other=plan(0);check(other.laneZ>0,"ram exemption never disables avoidance of unrelated vehicles");
  return failures?1:0;
 }

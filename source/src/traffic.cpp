@@ -3,6 +3,9 @@
 #include "addresses.h"
 #include "game.h"
 #include "log.h"
+#include "modscene.h"
+#include "travellogic.h"
+#include <vector>
 
 #include <Windows.h>
 
@@ -69,8 +72,33 @@ namespace traffic
 			}
 		}
 
+		std::vector<game::Vec3> g_doors;ULONGLONG g_doorsAt=0;
+		void RefreshDoors(uptr world) {
+			const auto now=GetTickCount64();if(now-g_doorsAt<2000)return;g_doorsAt=now;g_doors.clear();
+			for(const auto r:modscene::LoadedRefs(8000)) {
+				const auto base=At<uptr>(r,0x98),cell=At<uptr>(r,off::kRefParentCell);
+				if(base && At<std::uint8_t>(base,0x2E)==0x25 && cell && At<uptr>(cell,off::kCellWorldspace)==world)
+					g_doors.push_back(At<game::Vec3>(r,off::kRefPosition));
+			}
+		}
+		uptr PointWorld(uptr point,bool& known,bool& interior) {
+			// The location holds counted PathingCell/PathingSpace pointers at +0x10/+0x18.
+			// FUN_140E7F6E0 constructs PathingSpace: +0x1C=0 is an interior cell, 1 an exterior world.
+			for(const auto offset:{0x10u,0x18u}) {
+				const auto space=At<uptr>(point,offset);if(!space||!Readable(space,0x20))continue;
+				if(At<uptr>(space,0)==game::Base()+0x04C1ABC8) {
+					const auto kind=At<std::int32_t>(space,0x1C);
+					if(kind==0){known=true;interior=true;return 0;}
+					if(kind==1){const auto form=At<uptr>(space,0x10);if(form&&At<std::uint8_t>(form,0x2E)==0x56){known=true;return form;}}
+				}
+			}
+			return 0;
+		}
 		bool ReadPath(uptr actor, Destination& out)
 		{
+			const auto actorCell=At<uptr>(actor,off::kRefParentCell);
+			const auto actorWorld=actorCell?At<uptr>(actorCell,off::kCellWorldspace):0;
+			out.interior=!actorWorld;RefreshDoors(actorWorld);
 			const uptr mc = EngineFn<uptr (*)(uptr)>(kMovementController)(actor);
 			if (!mc) return false;
 			const uptr mc8 = At<uptr>(mc, 8);
@@ -80,6 +108,7 @@ namespace traffic
 			_InterlockedIncrement(reinterpret_cast<volatile long*>(q + 0xA8));
 			bool ok = false;
 			uptr path = 0;
+			__try {
 			const uptr q9 = At<uptr>(q, 0x48);
 			if (q9) {
 				const uptr iface = EngineFn<uptr (*)(uptr, uptr)>(kQueryInterface)(q9, game::Base() + kPathFollowerId);
@@ -101,14 +130,27 @@ namespace traffic
 							}
 							out.x = x; out.y = y; out.z = z;
 							out.points = unsigned(n);
+							out.contextKnown=n<=2048;
+							for(int i=0;i<n&&i<2048;++i) {
+								const auto point=pts+std::uint64_t(i)*0x58;bool known=false,inside=false;
+								const auto world=PointWorld(point,known,inside);
+								out.contextKnown=out.contextKnown&&known;out.interior=out.interior||inside;
+								if(known&&!inside&&world!=actorWorld)out.changesSpace=true;
+								float px=At<float>(point,0),py=At<float>(point,4),pz=At<float>(point,8);
+								const auto index=At<std::uint32_t>(point,0xC);
+								if(index<count&&table){px+=At<float>(table,index*12);py+=At<float>(table,index*12+4);pz+=At<float>(table,index*12+8);}
+								for(const auto&door:g_doors)if(std::hypot(px-door.x,py-door.y)<5.0&&std::fabs(pz-door.z)<4.0){out.usesDoor=true;break;}
+							}
 							out.remaining = EngineFn<float (*)(uptr, float, float, char)>(kPathLength)(path, 0.0f, -1.0f, 0);
 							ok = std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
 						}
 					}
 				}
 			}
+			} __finally {
 			ReleasePath(path);
 			ReleaseHolder(q);
+			}
 			return ok;
 		}
 
@@ -204,7 +246,9 @@ namespace traffic
 		}
 		if (!have) return false;
 		const auto ap = At<game::Vec3>(actor, off::kRefPosition);
-		out.kind = std::hypot(out.x - ap.x, out.y - ap.y) >= kTripMetres ? Kind::Trip : Kind::Short;
+		const double direct=std::hypot(out.x-ap.x,out.y-ap.y);
+		out.kind = direct >= kTripMetres ? Kind::Trip : Kind::Short;
+		out.vehicleSuitable=travellogic::UseVehicle({!out.interior,out.contextKnown,out.changesSpace,out.usesDoor,direct,out.remaining});
 		return true;
 	}
 
@@ -221,5 +265,5 @@ namespace traffic
 		}
 	}
 
-	void Reset() { g_last = 0; }
+	void Reset() { g_last = 0;g_doors.clear();g_doorsAt=0; }
 }

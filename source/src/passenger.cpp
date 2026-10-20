@@ -204,6 +204,7 @@ namespace passenger
 			const std::uint32_t id = g_riding.load();
             const auto checked=RefById(id);
             if(!checked || environment::BoardingSite(checked).verdict!=environment::Verdict::Safe){notify::Show("Waiting for a safe drop-off site");return;}
+            vehicleflight::EndTargetSession(checked);
             g_riding.store(0);
 			const uptr vehicle = RefById(id);
 			const bool out = EndSeat(player);
@@ -380,6 +381,7 @@ namespace passenger
 		if (riding) {
 			const uptr vehicle = RefById(riding);
 			if (!vehicle || VehicleOf(player) != vehicle) {
+				if(vehicle)vehicleflight::EndTargetSession(vehicle);
 				g_riding = 0;
 				logger::Write("Passenger: no longer in %08X (the game ended the seat)", riding);
 				return;

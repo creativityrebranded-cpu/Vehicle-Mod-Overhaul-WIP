@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(SeamlessPlanets VERSION 0.60.0 LANGUAGES CXX)
+project(SeamlessPlanets VERSION 0.61.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,3 +60,6 @@ add_executable(recovery_test tests/recovery_test.cpp)
 sp_options(recovery_test)
 add_executable(routeplan_test tests/routeplan_test.cpp src/routeplan.cpp)
 sp_options(routeplan_test)
+
+add_executable(vehiclelogic_test tests/vehiclelogic_test.cpp)
+sp_options(vehiclelogic_test)

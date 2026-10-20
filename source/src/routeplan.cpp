@@ -67,7 +67,7 @@ namespace routeplan
 				const float pz = q.pos[2] + (rampT > 0.0f ? laneZ * std::min(1.0f, t / rampT) : 0.0f);
 				for (std::uint32_t i = 0; i < g_snap.count; ++i) {
 					const world::VehicleInfo& o = g_snap.v[i];
-					if (o.formId == q.selfId) continue;
+					if (o.formId == q.selfId || (q.ignoreId && o.formId==q.ignoreId)) continue;
 					const float ox = o.pos[0] + o.vel[0] * t, oy = o.pos[1] + o.vel[1] * t, oz = o.pos[2] + o.vel[2] * t;
 					const float R = rSelf + std::hypot(o.half[0], o.half[1]) + kMargin;
 					const float hz = q.half[2] + o.half[2] + kMarginZ;

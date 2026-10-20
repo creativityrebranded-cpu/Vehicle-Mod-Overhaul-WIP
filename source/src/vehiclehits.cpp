@@ -7,6 +7,7 @@
 #include "npcvehicles.h"
 #include "vehicleflight.h"
 #include "vehicleworld.h"
+#include "interactionlogic.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -200,20 +201,6 @@ namespace vehiclehits
 			return 0;
 		}
 
-		// Does the segment a -> b pass through the vehicle's space (a vertical cylinder, 0.5 m of slack)?
-		bool Through(const world::VehicleInfo& v, const float* a, const float* b)
-		{
-			const double r = (std::max(v.half[0], v.half[1]) > 0.4f ? std::max(v.half[0], v.half[1]) : 2.5f) + 0.5;
-			const double hz = v.half[2] > 0.3f ? v.half[2] : 1.5f;
-			const double dx = double(b[0]) - a[0], dy = double(b[1]) - a[1], dz = double(b[2]) - a[2];
-			const double l2 = dx * dx + dy * dy;
-			double t = l2 > 1e-6 ? ((v.pos[0] - a[0]) * dx + (v.pos[1] - a[1]) * dy) / l2 : 0.0;
-			t = std::clamp(t, 0.0, 1.0);
-			const double cx = a[0] + dx * t, cy = a[1] + dy * t, cz = a[2] + dz * t;
-			if (std::hypot(cx - v.pos[0], cy - v.pos[1]) > r) return false;
-			return cz >= v.pos[2] - hz - 0.5 && cz <= v.pos[2] + 2.0 * hz + 0.5;
-		}
-
 		void Hit(const world::VehicleInfo& v, const Proj& pr, ULONGLONG now)
 		{
 			Damage* d = DamageFor(v.formId, true);
@@ -286,18 +273,15 @@ namespace vehiclehits
 					const double dt = std::clamp((now - pr.seenAt) / 1000.0, 0.016, 0.1) * 1.5;
 					for (int k = 0; k < 3; ++k) b[k] = float(pr.p[k] + pr.v[k] * dt);
 				}
-				for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
-					const auto& v = snap.v[k];
-					if (!v.formId || v.formId == pr.shooter || v.formId == pr.shooterVeh) continue;
-					if (Through(v, pr.p, b)) {
-						if (pr.side != 0 && pr.side == VehicleSide(v)) {  // friendly fire: no damage counted (the shot is still used up)
-							done = true;
-							break;
-						}
-						Hit(v, pr, now);
-						done = true;
-						break;
-					}
+				const world::VehicleInfo* struck=nullptr;double nearest=2;
+				for(std::uint32_t k=0;k<snap.count&&k<64;++k){const auto&v=snap.v[k];
+					if(!interactionlogic::OtherVehicle(v.formId,pr.shooter,pr.shooterVeh))continue;
+					double t=0;if(interactionlogic::HullHit(v.pos,v.rot,v.half,pr.p,b,t)&&t<nearest){nearest=t;struck=&v;}
+				}
+				if(struck){
+					npcvehicles::VehicleAggression(struck->ref,pr.shooter);
+					if(pr.side==0||pr.side!=VehicleSide(*struck))Hit(*struck,pr,now);
+					done=true;
 				}
 			}
 			if (alive && !done) {
