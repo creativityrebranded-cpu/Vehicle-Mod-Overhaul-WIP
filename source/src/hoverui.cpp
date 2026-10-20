@@ -589,7 +589,7 @@ namespace hoverui
 			if (std::strcmp(g_ui.text[kGear], " ") != 0) g_ui.gearShown = -1;  // new data: its key text is the key again
 			SetButton(kGear, " ");
 			for(const int i:{kGearDown,kGearUp}){Value pc,inst;
-				if(GetMember(g_ui.buttons[i],"PCButton_mc",&pc)&&GetMember(pc,"ButtonInstance_mc",&inst)){SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));const Value args[]={Str("RShift")};Invoke(inst,"SetText",args,1);}
+				if(GetMember(g_ui.buttons[i],"PCButton_mc",&pc)&&GetMember(pc,"ButtonInstance_mc",&inst)){SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));const Value args[]={Str("Alt")};Invoke(inst,"SetText",args,1);}
 				Release(inst);Release(pc);
 			} // no label: "GEAR n" is all inside the key box
 			for (int i = 0; i < kButtons; ++i) Show(i, true);

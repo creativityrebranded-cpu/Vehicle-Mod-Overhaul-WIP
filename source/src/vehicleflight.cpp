@@ -44,7 +44,7 @@
 //  - On / off: double-tap the game's vertical boost (Space). Also off: settle onto the ground, hit something, or leave
 //    the vehicle.
 //  - Controls (mouse-aim layout): the mouse aims, the nose follows the camera in yaw and pitch. A / D: roll.
-//    W: boost (hold) at the selected gear; S: brake (hold); Shift + W / Shift + S: gear up / down (4 gears, 1-4 pick
+//    W: boost (hold) at the selected gear; S: brake (hold); Alt + W / Alt + S: gear up / down (4 gears, 1-4 pick
 //    one directly); neither: coast. Up / down keys: lift.
 //  - Lift-off: switching on near the ground climbs to a short hover height first.
 //  - Avoidance (terrain assist): three corridors (ahead, left, right) are sampled with ground rays at three distances
@@ -1961,7 +1961,7 @@ namespace vehicleflight
 				return;
 			}
 			logger::Write("Rover flight: on at (%.0f, %.0f, %.0f)", pos.x, pos.y, pos.z);
-			notify::Log("Hover on - [W] boost [S] brake [RShift+W/S] gear [LShift] boost  [%s]/[%s] up/down  [RShift+Space] down  [%s]/[%s] turn  [Space x2] off", controlmap::KeyName(g_keys.up).c_str(),
+			notify::Log("Hover on - [W] boost [S] brake [Alt+W/S] gear [LShift] boost  [%s]/[%s] up/down  [RShift+Space] down  [%s]/[%s] turn  [Space x2] off", controlmap::KeyName(g_keys.up).c_str(),
 				controlmap::KeyName(g_keys.down).c_str(), controlmap::KeyName(g_keys.rollLeft).c_str(), controlmap::KeyName(g_keys.rollRight).c_str());
 			telemetry::Record("rover_flight_on", "\"pos\":[%.0f,%.0f,%.0f]", pos.x, pos.y, pos.z);
 		}
@@ -2739,17 +2739,17 @@ namespace vehicleflight
             }
 
 			// ---- Input ----
-			// Right Shift + W / Right Shift + S: one gear up / down per press (gears 1-4 set the boost strength and top speed; 1-4 keys
+			// Alt + W / Alt + S: one gear up / down per press (gears 1-4 set the boost strength and top speed; 1-4 keys
 			// pick a gear directly). Plain W held: boost at the selected gear. Plain S held: brake. Neither: coast.
 			const bool keysOn = focused && !g.autopilot;  // on autopilot the player's keys do not fly the rover
-			const bool shiftHeld = keysOn && Held(VK_RSHIFT);
+			const bool gearHeld = keysOn && Held(VK_MENU);
 			const bool paidBoost=keysOn && Held(VK_LSHIFT) && g_meterBoost.load() && g_meterVehicle.load()==vehicle;
 			const bool wHeld = keysOn && Held(g_mk.accel), sHeld = keysOn && Held(g_mk.brake);
 			const bool wWasDown = g.wDown, sWasDown = g.sDown;
 			{
 				const int before = g.gear;
-				if (shiftHeld && wHeld && !g.wDown) g.gear = std::min(4, g.gear + 1);
-				if (shiftHeld && sHeld && !g.sDown) g.gear = std::max(1, g.gear - 1);
+				if (gearHeld && wHeld && !g.wDown) g.gear = std::min(4, g.gear + 1);
+				if (gearHeld && sHeld && !g.sDown) g.gear = std::max(1, g.gear - 1);
 				g.wDown = wHeld;
 				g.sDown = sHeld;
 				for (int i = 1; i <= 4; ++i) {
@@ -2762,8 +2762,8 @@ namespace vehicleflight
 			}
 			// W: accelerate while held; double-tap W: accelerate stays on; the next W or S press releases it.
 			{
-				const bool wPress = wHeld && !shiftHeld && !wWasDown;
-				const bool sPress = sHeld && !shiftHeld && !sWasDown;
+				const bool wPress = wHeld && !gearHeld && !wWasDown;
+				const bool sPress = sHeld && !gearHeld && !sWasDown;
 				if (wPress) {
 					const ULONGLONG nowMs = GetTickCount64();
 					if (g.wHold) {
@@ -2783,8 +2783,8 @@ namespace vehicleflight
 					g.wHold = false;
 				}
 			}
-			bool boosting = (wHeld && !shiftHeld) || g.wHold || paidBoost;
-			bool sBrake = sHeld && !shiftHeld;
+			bool boosting = (wHeld && !gearHeld) || g.wHold || paidBoost;
+			bool sBrake = sHeld && !gearHeld;
 			// Autopilot: accelerate while the distance left exceeds the braking distance, then brake; arrive and stop.
 			double apBearing = 0;
 			bool apSteer = false;
@@ -4024,12 +4024,12 @@ namespace vehicleflight
 			Start(vehicle);
 		}
 		if (!g.active) {
-			// Driving: Right Shift + Accelerate / Right Shift + Brake change gear here too; the gear caps the ground speed.
-			const bool shiftHeld = focused && Held(VK_RSHIFT);
+			// Driving: Alt + Accelerate / Alt + Brake change gear here too; the gear caps the ground speed.
+			const bool gearHeld = focused && Held(VK_MENU);
 			const bool wHeld = focused && Held(g_mk.accel), sHeld = focused && Held(g_mk.brake);
 			const int before = g.gear;
-			if (shiftHeld && wHeld && !g.wDown) g.gear = std::min(4, g.gear + 1);
-			if (shiftHeld && sHeld && !g.sDown) g.gear = std::max(1, g.gear - 1);
+			if (gearHeld && wHeld && !g.wDown) g.gear = std::min(4, g.gear + 1);
+			if (gearHeld && sHeld && !g.sDown) g.gear = std::max(1, g.gear - 1);
 			g.wDown = wHeld;
 			g.sDown = sHeld;
 			if (g.gear != before) logger::Write("Rover flight: gear %d -> %d (driving)", before, g.gear);
@@ -4040,7 +4040,7 @@ namespace vehicleflight
 			g_sh.px = gp.x; g_sh.py = gp.y; g_sh.pz = gp.z;
 			g_sh.groundOn = true;
 			g_sh.groundFrac = kGroundShare[std::clamp(g.gear, 0, 4)];
-			g_sh.groundLearn = g.gear == 4 && wHeld && !shiftHeld && !Held(VK_LSHIFT);
+			g_sh.groundLearn = g.gear == 4 && wHeld && !gearHeld && !Held(VK_LSHIFT);
 			return;
 		}
 		{

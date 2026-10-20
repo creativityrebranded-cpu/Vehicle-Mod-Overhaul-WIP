@@ -7,7 +7,7 @@
 // UserEventData of the Vehicle input events, so the key glyphs follow the player's bindings like every native prompt.
 // Layout: a WASD cluster (labels under the keys; A and D level with S,
 // W above S, all at the same key distance), a column of three rows right-aligned on their keys with equal spacing
-// (Gear-, Gear+: Shift with Brake / Accelerate; Hover / Land: Space) and a key box reading "GEAR n". All Scaleform work runs inside the HUD movie's own per-frame Advance, never from the plugin task.
+// (Gear-, Gear+: Alt with Brake / Accelerate; Hover / Land: Space) and a key box reading "GEAR n". All Scaleform work runs inside the HUD movie's own per-frame Advance, never from the plugin task.
 namespace hoverui
 {
 	bool Install();

@@ -112,7 +112,7 @@ the vehicle flies on without stopping. The final point keeps normal arrival brak
 | **Space ×2** | Hover on / off |
 | **W / S** | Accelerate / brake (double-tap W: keep accelerating) |
 | **Left Shift** (hold) | 1.75x boost in the selected gear. Uses the game's boost meter and the vehicle's own burn/recharge timings; release to recover after depletion. |
-| **Shift + W / Shift + S**, **1–4** | Gear up / down, or pick a gear |
+| **Alt + W / Alt + S**, **1–4** | Gear up / down, or pick a gear |
 | **A / D**, mouse | Turn / roll; the mouse aims |
 | **Q / Z**, **Right Shift + Space** | Up / down |
 | **T** | **Auto** on / off: the autopilot flies you to your map marker. Any of W / A / S / D takes control back. |
