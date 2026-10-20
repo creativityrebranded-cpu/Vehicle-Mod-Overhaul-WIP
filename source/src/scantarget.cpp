@@ -428,15 +428,14 @@ namespace scantarget
 			if(eta>0 && eta<3600 && matching && progress.phase==triplogic::Phase::Travelling)
 				std::snprintf(detail,sizeof(detail),"%s | %.0f m | ETA %.0f s",status,std::hypot(mx-pos.x,my-pos.y),eta);
 			else std::snprintf(detail,sizeof(detail),"%s | %.0f m",status,std::hypot(mx-pos.x,my-pos.y));
-			std::string panel="ROUTE\nTo: "+name+"\n"+detail;
+			std::string panel="Route: "+name+"\n"+detail;
 			for(std::size_t i=0;i<g_chain.size() && i<3;++i) {
 				panel+="\n"+std::to_string(i+1)+". "+RouteName(g_chain[i].name,"Map point");
 			}
 			if(g_chain.size()>3) panel+="\n+"+std::to_string(g_chain.size()-3)+" more stops";
-			if(progress.phase==triplogic::Phase::Unreachable) panel+="\n["+(g_retryKey ? controlmap::KeyName(g_retryKey) : "unbound")+"] Retry trip";
-            panel+="\n["+(g_skipKey ? controlmap::KeyName(g_skipKey) : "unbound")+"] Skip stop   ["+
-				(g_clearKey ? controlmap::KeyName(g_clearKey) : "unbound")+"] Clear route";
-			hoverui::SetRoute(panel.c_str());
+			const std::string retryKey=progress.phase==triplogic::Phase::Unreachable?(g_retryKey?controlmap::KeyName(g_retryKey):"unbound"):"";
+			const std::string skipKey=g_skipKey?controlmap::KeyName(g_skipKey):"unbound",clearKey=g_clearKey?controlmap::KeyName(g_clearKey):"unbound";
+			hoverui::SetRoute(panel.c_str(),skipKey.c_str(),clearKey.c_str(),retryKey.c_str());
 		}
 
 		// Intermediate points keep the existing seamless handoff, but only at the destination's height.

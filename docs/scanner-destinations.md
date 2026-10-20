@@ -12,7 +12,9 @@ Validation: release DLL build and six offline destination-selection cases. Live 
 
 ## Route panel and trip controls
 
-The HUD and scanner show the current destination name, travel status, distance, estimated time when making progress, and up to three queued stop names (plus the remaining count). Long names are shortened only in this panel. Full names remain in the queue. The panel uses the upper left area of the 1920-by-1080 HUD layout.
+The HUD and scanner show the current destination name, travel status, distance, estimated time when making progress, and up to three queued stop names (plus the remaining count). Long names are shortened only in this display. Full names remain in the queue. The route group uses the game's native BasicButton components, with single-line status boxes matching the existing Follow and vehicle status boxes, and separate native key/label prompts for Retry, Skip and Clear. No custom text-field background, font or colors are drawn. At most six information rows and three action prompts are visible; Retry appears for an unreachable trip.
+
+The group starts in the upper left of the 1920-by-1080 HUD layout. Use F7, Page Up/Down to select Route, then arrows to move the group (Ctrl moves ten pixels); Delete resets it. F7 saves its shared HUD/scanner position to hoverui.ini. An example appears when the Route group is selected in the editor without an active route.
 
 Skip stop normally uses `[`, and Clear route normally uses `\`. The mod claims free keys from the shared binding registry and shows the actual keys on the panel if those defaults are occupied. Skip advances to the next queued stop; skipping the final stop clears the route. Clear cancels pending scanner dispatch, drops queued stops, and holds an active player or crew-driven vehicle at its present position and height. Hover remains active. Selecting a new scanner destination resumes travel. Patrol automatically requeues completed stops; manually skipped stops are not requeued. A failed marker placement retains the previous destination and queue.
 

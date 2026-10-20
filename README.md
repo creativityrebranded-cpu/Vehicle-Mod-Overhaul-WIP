@@ -129,6 +129,7 @@ Buttons only show when they can be used:
   per NPC (*Sarah  escort  42 m*).
 - **In the vehicle:** W / A / S / D, Gear− / Gear+ / Hover, the gear box, **Auto**, the **Auto behaviour** button (flashes blue when
   you press its key) and the NPC vehicle lines.
+- **Route display on the HUD/scanner:** native status boxes for the destination and queued stops, with native **Retry / Skip / Clear** key prompts. Select **Route** in the F7 editor to move the group.
 
 ---
 
