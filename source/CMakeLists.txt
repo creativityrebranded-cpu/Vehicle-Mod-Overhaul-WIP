@@ -38,9 +38,12 @@ target_link_libraries(SeamlessPlanets PRIVATE sp_common Synchronization)
 
 add_library(SeamlessVehicle SHARED
     src/main_vehicle.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/crash.cpp
-    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/vehiclehits.cpp src/navseed.cpp src/mappoints.cpp
+    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/vehiclehits.cpp src/navseed.cpp src/mappoints.cpp
     src/vehicleflight.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(SeamlessVehicle)
 target_compile_definitions(SeamlessVehicle PRIVATE SP_FEATURE_VEHICLE)
 target_link_libraries(SeamlessVehicle PRIVATE sp_common Synchronization)
+
+add_executable(navfield_test tests/navfield_test.cpp src/navfield.cpp)
+sp_options(navfield_test)

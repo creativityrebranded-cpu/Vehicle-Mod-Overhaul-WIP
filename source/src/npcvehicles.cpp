@@ -1415,12 +1415,11 @@ namespace npcvehicles
 		bool MarkerGoal(Job& j, uptr vehicle, vcontract::Goal& g)
 		{
 			double mx = 0, my = 0;
-			if (!vehicleflight::MarkerPoint(vehicle, mx, my)) return false;
+			if (!vehicleflight::MarkerPoint(vehicle, mx, my, &g.z)) return false;
 			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 			const double left = std::hypot(mx - vp.x, my - vp.y);
 			g.x = mx;
 			g.y = my;
-			g.z = std::numeric_limits<double>::quiet_NaN();
 			g.stop = 6.0;
 			g.hold = true;
 			if (vehicleflight::GetAutoMode() == vehicleflight::AutoMode::Orbit && left < 45.0) {

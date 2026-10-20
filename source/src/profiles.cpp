@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 
 namespace profiles
 {
@@ -78,11 +79,12 @@ namespace profiles
 		// Hauler: home <-> your map marker, waiting kWaitMs at each end; no marker: waits at home.
 		bool HaulerGoal(Context& c, Goal& g)
 		{
-			double mx = 0, my = 0;
-			const bool marker = vehicleflight::MarkerPoint(c.vehicle, mx, my);
+			double mx = 0, my = 0, mz = std::numeric_limits<double>::quiet_NaN();
+			const bool marker = vehicleflight::MarkerPoint(c.vehicle, mx, my, &mz);
 			const bool toMarker = (c.step & 1) == 0 && marker;
 			g.x = toMarker ? mx : c.homeX;
 			g.y = toMarker ? my : c.homeY;
+			g.z = toMarker ? mz : std::numeric_limits<double>::quiet_NaN();
 			g.stop = 6.0;
 			g.nav.speedLimit = 18.0f;   // loaded: steady
 			g.nav.height = vcontract::NavParams::Height::Hug;
@@ -104,10 +106,10 @@ namespace profiles
 			g.nav.priority = 40;
 			g.nav.height = vcontract::NavParams::Height::High;  // fast and over things
 			g.nav.squeeze = true;
-			double mx = 0, my = 0;
+			double mx = 0, my = 0, mz = std::numeric_limits<double>::quiet_NaN();
 			if (c.step == 0) {
-				if (!vehicleflight::MarkerPoint(c.vehicle, mx, my)) return HoldGoal(c, g);  // waits for a marker
-				g.x = mx; g.y = my; g.stop = 6.0;
+				if (!vehicleflight::MarkerPoint(c.vehicle, mx, my, &mz)) return HoldGoal(c, g);  // waits for a marker
+				g.x = mx; g.y = my; g.z = mz; g.stop = 6.0;
 				if (Dist2(c.vehicle, mx, my) < kReach) { g.hold = true; if (Waited(c)) Step(c, 1); }
 				else c.stepAt = GetTickCount64();
 				return true;
@@ -122,10 +124,10 @@ namespace profiles
 		{
 			g.nav.priority = 30;
 			g.nav.height = vcontract::NavParams::Height::High;  // a look-out: up where it can see
-			double mx = 0, my = 0;
+			double mx = 0, my = 0, mz = std::numeric_limits<double>::quiet_NaN();
 			if (c.step == 0) {
-				if (!vehicleflight::MarkerPoint(c.vehicle, mx, my)) { c.done = true; return false; }
-				g.x = mx; g.y = my; g.stop = 6.0;
+				if (!vehicleflight::MarkerPoint(c.vehicle, mx, my, &mz)) { c.done = true; return false; }
+				g.x = mx; g.y = my; g.z = mz; g.stop = 6.0;
 				if (Dist2(c.vehicle, mx, my) < kReach) { g.hold = true; if (GetTickCount64() - c.stepAt >= 3000) Step(c, 1); }
 				else c.stepAt = GetTickCount64();
 				return true;

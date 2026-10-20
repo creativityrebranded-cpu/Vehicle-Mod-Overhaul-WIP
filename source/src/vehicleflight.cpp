@@ -10,6 +10,7 @@
 #include "log.h"
 #include "modscene.h"
 #include "navmap.h"
+#include "navfield.h"
 #include "npcvehicles.h"
 #include "notify.h"
 #include "prefetch.h"
@@ -1776,8 +1777,9 @@ namespace vehicleflight
 			return ref;
 		}
 
-		bool TaxiMarker(std::uintptr_t player, std::uintptr_t vehicle, std::uint32_t& id, double& x, double& y)
+		bool TaxiMarker(std::uintptr_t player, std::uintptr_t vehicle, std::uint32_t& id, double& x, double& y, double* z = nullptr)
 		{
+			if (z) *z = std::numeric_limits<double>::quiet_NaN();
 			id = At<std::uint32_t>(player, off::kPlayerCustomMarker);
 			// 21:03-21:05: Auto waited with no "marker" line at all. Every 3 s while waiting: what the read sees.
 			static ULONGLONG said = 0;
@@ -1810,6 +1812,19 @@ namespace vehicleflight
 			}
 			x = mp.x;
 			y = mp.y;
+            if (z && std::isfinite(mp.z)) {
+                const auto at = navmap::At(x, y, mp.z + 4.0);
+                if (at.known) {
+                    double surface = mp.z;
+                    if (at.haveGround) surface = std::max(surface, double(at.ground));
+                    // Keep embedded markers above the first mapped open height.
+                    for (int n=0; n<50; ++n) {
+                        const auto open=navmap::At(x,y,surface+4.0);
+                        if (!open.blocked && !open.objBlocked) { *z=surface+4.0; break; }
+                        surface+=4.0;
+                    }
+                }
+            }
 			const double d = std::hypot(x - vp.x, y - vp.y);
 			if (d >= kTaxiMaxRange) {
 				if (say) logger::Write("Rover taxi: waiting; marker %08X at (%.0f, %.0f) is %.0f m away (over %.0f m)", id, mp.x, mp.y, d, kTaxiMaxRange);
@@ -2326,7 +2341,7 @@ namespace vehicleflight
 
 		// One rollout: its cost, or a negative value when it collides.
 		double MpcRollout(int idx, const game::Vec3& pos, double heading, double v0, double vmax, double omega, double factor, bool turnFirstOnly,
-			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self, bool useObjects, double halfWidth, double selfRadius)
+			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self, bool useObjects, double halfWidth, double selfRadius, const navfield::Field& field)
 		{
 			const State& g = g_gs[idx];
 			double x = pos.x, y = pos.y, h = heading, v = v0, cost = 0;
@@ -2363,7 +2378,9 @@ namespace vehicleflight
 			}
 			if (escape) cost -= 2.0 * std::hypot(x - sx, y - sy);  // escape: get away from the stuck spot
 			else {
-				cost += std::hypot(tx - x, ty - y);                                          // distance left
+				const double remaining = field.Value(x, y);
+                if (remaining >= 1e12) return -1.0;
+                cost += remaining;                                          // distance left
 				cost += 6.0 * std::fabs(Wrap(std::atan2(tx - x, ty - y) - h));              // facing the target at the end
 			}
 			cost += 12.0 * std::fabs(omega - g.mpcOmega) + 10.0 * (1.0 - factor);       // smooth, and keep the speed
@@ -2413,11 +2430,12 @@ namespace vehicleflight
 				halfWidth = std::clamp(double(g_vsnap.v[i].half[0]) + 0.5, 1.0, 6.0);
 				selfRadius = VehRadius(g_vsnap.v[i]);
 			}
+			const auto& field = navfield::Get(pos.x, pos.y, pos.z, tx, ty, halfWidth, useObjects);
 			double best = 1e18, bestW = 0, bestF = 1.0;
 			unsigned invalid = 0, total = 0;
 			auto consider = [&](double w, double f, bool firstOnly) {
 				++total;
-				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self, useObjects, halfWidth, selfRadius);
+				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self, useObjects, halfWidth, selfRadius, field);
 				if (c <= 0.0) { ++invalid; return; }
 				if (c < best) { best = c; bestW = w; bestF = f; }
 			};
@@ -4022,7 +4040,7 @@ namespace vehicleflight
 				// Taxi test: Auto never moves on its own; only the player's custom map marker gives it somewhere to go.
 				double mx = 0, my = 0;
 				std::uint32_t mid = 0;
-				if (TaxiMarker(player, vehicle, mid, mx, my)) {
+				if (TaxiMarker(player, vehicle, mid, mx, my, &goal.z)) {
 					if (mid != g.taxiMarker || std::hypot(mx - g.taxiMx, my - g.taxiMy) > 2.0) {
 						g.taxiMarker = mid;
 						g.taxiMx = mx;
@@ -4292,12 +4310,12 @@ namespace vehicleflight
 
 	AutoMode GetAutoMode() { return g_autoMode; }
 
-	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y)
+	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y, double* z)
 	{
 		const auto player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player || !vehicle) return false;
 		std::uint32_t id = 0;
-		return TaxiMarker(player, vehicle, id, x, y);
+		return TaxiMarker(player, vehicle, id, x, y, z);
 	}
 
 	namespace

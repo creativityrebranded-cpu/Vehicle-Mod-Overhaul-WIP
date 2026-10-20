@@ -9,6 +9,7 @@
 #include "log.h"
 #include "modscene.h"
 #include "navmap.h"
+#include "navfield.h"
 #include "npcvehicles.h"
 #include "passenger.h"
 #include "traffic.h"
@@ -67,6 +68,7 @@ namespace
 		vehiclehits::Reset();
 		navseed::Reset();
 		navmap::Reset();
+		navfield::Reset();
 	}
 
 	void Frame()
