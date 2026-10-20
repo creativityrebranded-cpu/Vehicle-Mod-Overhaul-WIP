@@ -1,10 +1,39 @@
-# Vehicle Mod Overhaul (WIP) — SeamlessVehicle for Starfield
+# Vehicle Mod Overhaul (WIP)
 
-An SFSE plugin that turns the REV-8 (and other vehicles) into a hover vehicle with gears, terrain assist and an
-autopilot. Your vehicle can be summoned and can follow you. NPCs take free vehicles on their own when a fight starts and escort or chase you; they get out again when things are calm.
+### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-> **Work in progress.** Some features are built but not yet tested in game; they are listed under
-> [Status](#status).
+Your REV-8 becomes a hover vehicle with gears, terrain following and a real autopilot. Call it, let it follow you, send it to a
+map marker, or let a follower drive it. Followers jump into vehicles to defend you, enemies take vehicles to hunt you down, and
+outside a fight the people around you drive, patrol and run errands on their own.
+
+> **Work in progress.** Much of this mod is built but has **not been tested in game yet**. Every feature below is marked
+> **Tested** or **Untested**, and the [Status](#status) section lists exactly what has and has not been tried. Expect bugs, and please
+> send your log when something goes wrong (see [Reporting a problem](#reporting-a-problem)).
+
+---
+
+## Feature overview
+
+| Feature | What you get | State |
+|---|---|---|
+| **Hover flight** | Double-tap Space to hover; gears, boost, climb and descend, terrain assist | Tested |
+| **Summon and Follow** | Call your vehicle to you, or let it trail you and park when you stop | Tested |
+| **Auto to the map marker** | The autopilot flies you to your marker; any movement key takes over | Untested |
+| **Auto behaviours** | At the marker: **Stop**, **Orbit** it, or **Patrol** a chain of markers; an on-screen button shows which | Untested |
+| **Scanner markers** | Mark what you look at up to ~1 km away; **chain** several markers into a route | Untested |
+| **Catch from below** | Jump or fall from a height and your following vehicle flies under you to catch you | Untested |
+| **Follower drivers** | With a follower nearby, Summon / Follow / a marker sends the follower to drive your vehicle for you | Untested |
+| **Escorts defend you** | Followers in vehicles intercept, shield, give overwatch and attack - enemy vehicles first | Untested |
+| **Rescue, scout, wait** | A follower vehicle picks you up when you are hurt, scouts your marker, waits at the door | Untested |
+| **Smarter enemies** | Enemy vehicles flank, intercept, block, hover overhead, retreat when damaged and call for help | Untested |
+| **Vehicle hit counter** | Vehicles take "damage" from shots; at the limit their autopilot shuts down for a while | Untested |
+| **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
+| **Vehicles respect each other** | No more vehicles "magnetised" together; right of way decides who gives way | Untested |
+| **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
+| **Night and weather** | Autopilots slow down and fly a little higher at night and in rain, snow or dust | Untested |
+| **Bystanders react** | People near a crash flee or cower | Untested |
+| **Passenger, taxi, take the wheel** | Ride with an NPC driver, let them taxi you, or take over | Untested |
+| **Unlimited boost, view distance** | Boost never runs out on vehicles in use; vehicles stay visible farther away | Untested |
 
 ---
 
@@ -12,284 +41,268 @@ autopilot. Your vehicle can be summoned and can follow you. NPCs take free vehic
 
 | What | Version | Link |
 |---|---|---|
-| **Starfield (Steam)** | **1.16.244** exactly (the plugin turns itself off on any other build) | Steam |
+| **Starfield (Steam)** | **1.16.244** exactly (the plugin switches itself off on any other build) | Steam |
 | **Starfield Script Extender (SFSE)** | the build for 1.16.244 (0.2.21 or newer: `sfse_1_16_244.dll`) | [sfse.silverlock.org](https://sfse.silverlock.org/) · [Nexus mod 106](https://www.nexusmods.com/starfield/mods/106) |
 
 SFSE works with the **Steam** version only (not Game Pass / Microsoft Store).
 
-### Optional mods (the plugin uses them when they are installed)
+### Recommended (optional)
 
-| Mod | What it adds here | Link |
+| Mod | Why | Link |
 |---|---|---|
-| **Parked Vehicles** (SarthesArai) | Parked REV-8 / Deimog / Moon Jumper props at cities and outposts. The plugin's vehicle registry records vehicles there; it does not create vehicles. | [Nexus mod 13838](https://www.nexusmods.com/starfield/mods/13838) |
-| **The Gang's All Here** (Aurelianis) | Several companions and crew following you at once. In a fight, a follower takes a free vehicle (see [NPC vehicles](#npc-vehicles-automatic)). Works with any followers; this mod just lets you have more. | [Nexus mod 7469](https://www.nexusmods.com/starfield/mods/7469) |
+| **Parked Vehicles** (SarthesArai) | Puts parked vehicles at cities and outposts. Without parked vehicles, NPCs have nothing to drive. | [Nexus mod 13838](https://www.nexusmods.com/starfield/mods/13838) |
+| **The Gang's All Here** (Aurelianis) | More followers at once: more escorts and more crew. | [Nexus mod 7469](https://www.nexusmods.com/starfield/mods/7469) |
 | Deimog (Bethesda, free Creation) | Lets Parked Vehicles show Deimogs. | In-game Creations menu |
 
-Follow each optional mod's own install instructions. For The Gang's All Here, its page says to dismiss followers,
-save and exit before installing or upgrading.
+Follow each optional mod's own install instructions. For The Gang's All Here, its page says to dismiss followers, save and exit
+before installing or upgrading.
 
 ---
 
-## Install
+## Installation
 
-1. Install SFSE: copy `sfse_1_16_244.dll` and `sfse_loader.exe` into the Starfield folder (next to
-   `Starfield.exe`), e.g. `C:\Program Files (x86)\Steam\steamapps\common\Starfield\`.
-2. Copy this repository's **`Data`** folder into the same Starfield folder (merge it), so the plugin ends up at:
+1. Install SFSE: copy `sfse_1_16_244.dll` and `sfse_loader.exe` into the Starfield folder (next to `Starfield.exe`).
+2. Copy this mod's **`Data`** folder into the Starfield folder (merge it). The plugin ends up at
+   `<Starfield>\Data\SFSE\Plugins\SeamlessVehicle.dll`.
+3. Enable the two data plugins that came with it (below Parked Vehicles in your load order):
+   - **`SeamlessPilots.esm`** - lets NPCs walk to a vehicle and get in. **Without it, NPCs never use vehicles.**
+   - **`Vehicles - Real.esm`** - turns the Parked Vehicles props into real, drivable vehicles (needs Parked Vehicles).
+4. Start the game with **`sfse_loader.exe`** (Steam running).
+5. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` starts with `SeamlessVehicle ... loaded`.
 
-   ```
-   <Starfield>\Data\SFSE\Plugins\SeamlessVehicle.dll
-   ```
-3. Enable the two data plugins that came in the same `Data` folder (add them to your plugin list, below Parked Vehicles):
-   - **`Vehicles - Real.esm`**: turns the Parked Vehicles props into real, drivable vehicles (needs Parked Vehicles = `Vehicles.esm`).
-   - **`SeamlessPilots.esm`**: the quest package that makes an NPC walk to a vehicle and get in. Without it NPCs cannot be sent to vehicles.
-   Both are built from the game's own data by the scripts in `tools/` (`make_vehicles_real.py`, `make_pilots_esm.py`).
-4. Start the game with **`sfse_loader.exe`** (Steam running), not the normal launcher.
-5. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` starts with
-   `SeamlessVehicle 0.60.0 loaded`.
-
-To uninstall, delete `Data\SFSE\Plugins\SeamlessVehicle.dll`. Vehicles in your save are kept.
+**Uninstall:** delete `Data\SFSE\Plugins\SeamlessVehicle.dll` (and the two `.esm` files if you like). Vehicles in your save are kept.
 
 ---
 
 ## Controls
 
-Free keys are chosen at start-up so the plugin does not clash with your bindings. The keys it picked are written to
-the log (`Rover call key: …`, `Rover flight keys: …`). The defaults on a standard keyboard layout are:
+The plugin only takes keys the game leaves free, so it never clashes with your bindings. The keys it picked are written to the
+log at start-up (lines such as `Rover call key: …`, `Scanner marker: Auto behaviour key …`, `Passenger: key …`). Defaults on a
+standard layout:
 
 ### On foot
 
 | Key | Action |
 |---|---|
-| **N** | **Summon** your own vehicle. Far away (over 150 m, not loaded or another worldspace): it is moved 12 m behind you, out of view. Close: it flies to you and stops 8 m away. Press again to cancel. |
-| **U** | **Follow** on / off: your vehicle trails you, parks when you stand still and lifts off when you move away. |
-| **E** (the game's Activate) | **Get in**: the HUD shows it when you are within 6 m of your own vehicle. |
+| **N** | **Summon** your vehicle. Far away: it is moved in behind you, out of sight. Close: it flies to you. Press again to cancel. |
+| **U** | **Follow** on / off: it trails you, parks when you stand still, lifts off when you move on, catches you when you fall. |
+| **Hold U (1 s)** | **Recall**: every follower vehicle drops the fight and comes back into formation for 15 s. |
+| **E** (Activate) | **Get in** (shown within 6 m of your vehicle). At an occupied vehicle: tap = passenger seat, hold = take the wheel / pull the driver out. |
+| **Auto behaviour key** (first free of `]` `J` `K` `N`) | Cycles what Auto does at the marker: **Stop → Orbit → Patrol**. With a follower free and a marker set, a follower drives your vehicle there. |
 
-NPC vehicles need no key: see [NPC vehicles](#npc-vehicles-automatic).
+### Hand scanner open
 
-Only your own vehicle (the one the game links to you) can be summoned or set to follow.
+| Key | Action |
+|---|---|
+| **T** (tap) | Puts the game's map marker where you look, up to ~1 km away (past the loaded area the distance is an estimate, shown with `~`). Your vehicle is summoned, and Auto flies you there when you get in. **While a trip is already on, a tap adds the point to a chain** (`+N queued` on screen). |
+| **T** (hold 0.8 s) | Throws the chain away and sets just this point. |
+
+Chained markers swap automatically: about 4 s before your vehicle reaches the current marker, the next one takes its place and
+the vehicle flies on without stopping. With **Auto: Patrol**, the chain loops for ever.
 
 ### In the vehicle
 
 | Key | Action |
 |---|---|
-| **Space ×2** (double-tap) | Hover on / off (lifts off when switched on). |
-| **W** | Accelerate (double-tap W: keep accelerating until W or S). |
-| **S** | Brake. |
-| **Shift + W / Shift + S** | Gear up / down (gears 1–4). Shift alone does nothing. **1–4** pick a gear directly. |
-| **A / D** | Turn / roll. Mouse aims (yaw and pitch). |
-| **Q / Z** | Up / down. **Shift + Space**: down. |
-| **T** | **Auto** on / off: the autopilot flies you to your **map marker** (nothing without a marker), with the same terrain following and obstacle avoidance as summon / follow. Any of **W / A / S / D** takes control back. Lifts off first if you were not hovering. |
-| **]** (when the game leaves it free) | While Auto is on: **Cruise** on / off (fly where you look, at your current gear's speed). Out of your vehicle: cycles the profile of your unattended vehicle (scout, return home, hold, default). |
-| *Get out with Auto on* | The vehicle **holds where it is** (it neither follows nor lands). Summon or Follow ends the hold; getting back in gives you control. |
-| **F7** | Edit the on-screen layout: Page Up / Page Down pick any item (each button, the game's own vehicle HUD parts, or a group), arrows move it (Ctrl: x10), Delete resets it. Saved to `Logs\SeamlessVehicle\hoverui.ini`. |
+| **Space ×2** | Hover on / off |
+| **W / S** | Accelerate / brake (double-tap W: keep accelerating) |
+| **Shift + W / Shift + S**, **1–4** | Gear up / down, or pick a gear |
+| **A / D**, mouse | Turn / roll; the mouse aims |
+| **Q / Z**, **Shift + Space** | Up / down |
+| **T** | **Auto** on / off: the autopilot flies you to your map marker. Any of W / A / S / D takes control back. |
+| **]** (when free) | While Auto is on: **Cruise** (fly where you look at your gear's speed) |
+| *Get out with Auto on* | The vehicle holds where it is until you Summon, Follow or get back in. |
+| **F7** | Move any on-screen button (Page Up / Down pick, arrows move, Ctrl ×10, Delete resets). Saved to `hoverui.ini`. |
 
-Driving on the ground, the gears cap speed at 25 / 50 / 75 / 100 %. Movement keys follow your Vehicle bindings.
+### On-screen buttons
 
-### On-screen buttons (contextual)
-
-Buttons only show when they can be used; the scanner is no longer needed.
-
-- **On foot** (only if you own a vehicle): **Summon [N]**, **Follow [U]**, **Get in [E]** (only near your vehicle), a
-  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*, *HOLDING*, *MOVED TO YOU*) and, when NPC vehicles are active, the gang line
-  (*Gang 3  1 pursuit, 1 escort, 1 boarding*) with up to four rows under it (*pursuit  REV8  120 m*).
-- **In the vehicle**: the W/A/S/D keys with labels, Gear− / Gear+ / Hover, a GEAR box (Hover turns blue while on),
-  **Auto [T]** (blue while on, the W/A/S/D keys dim), an *AUTO GEAR n* line while Auto flies, and the gang line.
-
-F7 moves everything (on foot the arrows move the whole panel).
+Buttons only show when they can be used:
+- **On foot** (if you own a vehicle): Summon, Follow, Get in (near your vehicle), the **Auto: Stop / Orbit / Patrol** button, a
+  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*…), and when NPC vehicles are active, a line per vehicle (*pursuit REV8 120 m*).
+- **In the vehicle:** W / A / S / D, Gear− / Gear+ / Hover, the gear box, **Auto**, the **Auto behaviour** button (flashes blue when
+  you press its key) and the NPC vehicle lines.
 
 ---
 
-## What the autopilot does (your vehicle and NPC vehicles)
+## Your vehicle
 
-- **Terrain assist:** checks the ground ahead in three directions; climbs over, turns around or stops.
-- **Navigation:** the path toward the target is checked; when it is blocked the vehicle detours in 35° steps and
-  comes back once the way is clear. It also follows **your trail** (where you walked) when the direct way is
-  blocked.
-- **Height:** cruises just over the highest ground ahead.
-- **Speed:** matches your speed and uses its own gears (5 / 18 / 50 / 150 m/s). Obstacles limit the gear: 2 when
-  blocked, 3 on rough ground or while the ground ahead loads.
-- **Stuck:** first backs out, then climbs, then is moved next to you. If it gets no closer for 12 s while over
-  60 m away, it is moved too.
-- **Tight spaces:** being pushed up by something underneath, or bumping into something, no longer ends the flight.
-  Three contacts in 10 s: moved next to you.
-- **Flipped:** tipped over for 2 s: set upright where it is.
+### The autopilot
+- **Follows the terrain** and keeps just above the highest ground ahead; detours round obstacles in steps and comes back on course;
+  follows **your trail** when the direct way is blocked.
+- **Uses its own gears**, matches your speed, and is moved next to you if it gets truly stuck or lost.
+- **Tight spaces:** after repeated bumps it switches hover off and **drives** with the game's own controls (steer, boost, jump),
+  then hovers again once the way is clear.
+- **Flipped:** set upright where it is.
+- **Night and bad weather:** at planet-local night, and in rain, snow or dust, autopilots fly about 25-30 % slower and a little higher.
 
-### Not meeting other vehicles (lane planner)
+### Walls (no more "magnet")
+Earlier builds treated a wall like a hill: the hover tried to climb its face and stuck to it. Now a wall **never lifts the vehicle**.
+It raises a **wall warning** instead, which the forward rays pick up 25 m (or 2.4 s of travel) ahead:
+- **Autopilot:** slows so it can stop about 6 m short, goes round the wall, and slides off side walls closer than 4 m. It only flies
+  higher as a last resort, when both sides are blocked.
+- **Flying by hand:** you only get an **"Assist: wall ahead"** line; the vehicle does not steer for you.
 
-Every autopilot vehicle (yours on Auto / summon / follow, and every NPC vehicle) predicts its own path and every other
-vehicle's about 10 s ahead, in 3D. If two paths are closing on each other, the vehicle with the lower right of way
-yields, trying in order: a higher **altitude lane** (+8 / +16 / +24 m), a **side offset** (keep right first), both, and
-finally a **speed cap** (stopping short). Right of way: the vehicle you drive > your own autopilot vehicle > NPC
-vehicles (ties: the lower form id passes); parked vehicles never move, so everyone yields to them. A lane is held at
-least 3 s and released after the path has been clear for 3 s. Oncoming vehicles both keep right. Vehicles moving side
-by side at a steady gap (the gang's formation) are not a conflict. Log lines: `Route plan: …`.
+### Other vehicles
+Vehicles are no longer "ground" to each other, so two hovering vehicles no longer pull together. A quiet proximity warning
+makes the lower-ranked vehicle give way (it slows and slides aside). **Right of way:** parked > you and your vehicle > followers >
+neutral NPCs > hostiles. A longer-range lane planner also predicts every vehicle's path about 10 s ahead and changes height, side or
+speed to keep paths apart.
 
-### Drive mode (cramped spaces)
+### Catch from below
+When you are more than 4 m above the ground (jumping off a ledge, jetpacking, falling), your following vehicle flies to a point about
+7 m under where your fall will take you, so it can catch you. It moves smoothly (no wobbling) and goes back to normal following once
+you land.
 
-Hover's terrain assist struggles in tight spaces. After repeated contacts, push-ups, stuck decisions or being boxed in,
-an autopilot vehicle with someone aboard (NPC driver, or you while Auto flies) **turns hover off and drives with the
-game's own controls**: steer, accelerate, brake, **forward boost** (when open and aligned and the speed wanted is above
-30 m/s) and **vertical boost** (over what is ahead, a climb phase, or a hop after being stuck). After 8 s, once the way is
-clear again, hover comes back on. Log lines: `drive mode ON / off`, `drive: speed …`.
+---
 
-### Unlimited boost
+## Followers
 
-The game's boost charge is kept full for every vehicle that is in use (driven by you, hovering, your own, or driven by an NPC job), so
-boosting never runs out. Parked vehicles keep the game's own charge. Exceptions: a hovering vehicle (the flight model replaces the boost),
-the vehicle you are driving (Shift is the gear key there) and your own unattended vehicle, unless drive mode is using the game's boost.
+Followers are read from the game's own follower list.
 
-## NPC vehicles (automatic)
+### Follower drivers (crew)
+If a follower is free (on foot, within 60 m) when you press **Summon**, **Follow**, set a **scanner marker** or press the **Auto
+behaviour** key, your vehicle is brought to you and **the follower gets in and drives it**:
 
-A small rules engine (`context.cpp`) decides, about twice a second, what NPC vehicles do. Every NPC vehicle is one of the
-profiles below, assigned through the same table as the others (hold, return home, patrol, hauler, courier, scout, cruise).
-
-- **A fight starts** (any NPC within 80 m of you is in combat): that NPC, if it is not already in a vehicle, goes to the nearest
-  free vehicle within 40 m (it **runs** when it is in combat, walks when calm) and takes the driver seat. One of your followers
-  boards as **Escort**; anyone else as **Pursuit**. A follower with no free vehicle near boards a vehicle an NPC is driving, as a
-  **passenger** (a free seat of that vehicle).
-- **Escort:** trails you in formation, parks when you stand still, never fires.
-- **Pursuit:** hostile driver, circles you at 30 m, 6 m above your height, fires the vehicle weapon with the nose on you.
-- **Calm again:** the vehicle is nearly still (under 2 m/s) and nobody on board or you is in combat for 60 s: everyone gets out.
-- **Leash:** an NPC vehicle keeps following until it is 600 m from where the NPC started (its origin), however far you are; going indoors also ends it.
-- Up to **6** NPC vehicles at once. The seat is the driver's instant seat after the NPC has walked to the vehicle (the animated entry
-  is switched off in this build).
-- Switch the engine off with `Logs\SeamlessVehicle\seamless.ini`: `[context]` `enabled=0`.
-
-Tuning and test keys: `[log]` `verbose=1` brings back the chatty log lines. `[keys]` `debug=1` enables the manual test keys
-(board the NPC you face `;`, exit all `Insert`, escort / pursuit toggle `.`, cycle NPC vehicle profiles `[`); they are claimed from
-the keys the game leaves free and listed in the log (`Keys: ...`).
-
-## Getting into an occupied vehicle
-
-When you press **Activate (E)** at a vehicle (within 5 m, in front of you) that has someone in the driver seat:
-
-| | Tap E | Hold E (1 s) |
-|---|---|---|
-| **Any driver** | You get the **passenger seat** (the companion seat) and ride along | Pulls the driver out and you take the wheel |
-| Your gang / follower | same | They hand you the wheel (no crime) |
-| Neutral NPC | same | **Pulled out:** assault alarm, plus a theft alarm if someone else owns the vehicle |
-| Hostile NPC | same | **Hijack:** they're pulled out and fight you on foot |
-
-While you face an occupied vehicle on foot, two small prompts appear next to Get in (half size): **Passenger** (tap) and
-**Hold: eject**, both showing the Activate key. They can be moved with the F7 layout editor (Page Up / Down: Passenger, Eject).
-
-Empty vehicles use the game's own get-in and theft rules.
-
-### NPCs forcing you out
-
-Only while your vehicle is on the ground (hover off) and slow (under 3 m/s), and only after a 2 s warning:
-**drive off to escape**.
-
-| Who (within 4 m) | When | What happens |
-|---|---|---|
-| **Guard** | Hostile to you and part of a crime faction (you're wanted) | You're taken out (the game's own exit); the game's arrest / fight follows |
-| **Owner** | The vehicle's owner, or a member of its owning faction; you're in their vehicle | You're taken out, and they get back in |
-| **Hijacker** | Hostile NPC in combat with you | You're pulled out at once; they take the vehicle and come after you (Pursuit) |
-
-Your own vehicle is never reclaimed by an owner, and your gang never forces anyone out.
-
-### Riding as a passenger (taxi) and taking the wheel
-
-Next to a vehicle a gang member is flying (within 6 m), press the **passenger key** (the first free of G, I, L, M, X, V, /;
-the log line `Passenger: key …` names it):
-
-| Action | What happens |
+| You press | The follower… |
 |---|---|
-| **Tap** | You take the companion seat. The driver flies where **you look**; **W / S** set how far ahead it aims (its cruise speed). Tap again to get out. |
-| **Map marker placed** | **Taxi:** the driver flies to your marker and holds 6 m from it; after 2.5 s there you are let out. Remove the marker and it flies where you look again. |
-| **Hold 1 s** | **Take the wheel:** the driver steps out, you are seated as the driver, then the driver takes the companion seat. |
+| Summon / Follow | drives your vehicle after you, defends you in a fight, picks up other followers as passengers |
+| Scanner marker / Auto behaviour key | drives to your marker and does the Auto behaviour there (stop, orbit, patrol the chain) |
+| Follow again | gets out |
 
-Nobody forces a passenger out of the vehicle. Planned next: hailing a taxi and orders.
+No follower free? The buttons work as before. Your vehicle's own autopilot leaves it alone while a follower drives.
 
-## View distance
+### Escorts
+When a fight starts near you, followers take free vehicles close to them and become **escorts**:
 
-Vehicles fade out at 3 times the game's own distance (objects share one fade multiplier, so this also applies to other objects of that class:
-statics, furniture, doors). It only changes how far loaded objects stay visible; a vehicle in a cell that is not loaded does not show at any
-setting. It costs some frame rate. In `Logs\SeamlessVehicle\seamless.ini`:
+| Behaviour | When | What it does |
+|---|---|---|
+| Follow, convoy | always | Formation behind you; one column when you move fast |
+| **Intercept** | an enemy vehicle closes on you from far | Cuts it off between you and it |
+| **Shield** | the enemy is out of range, or there are many enemies, or it is the second escort | Sits between you and the enemy |
+| **Overwatch** | enemies on foot | Hovers high behind you and fires down |
+| **Attack** | an enemy vehicle in range | Circles it and fires |
+| **Rescue** | your health drops under 30 % | The nearest escort lands beside you so you can get in |
+| **Scout** | you walk toward your map marker | One escort flies ahead and tells you how many enemies are there |
+| **Wait at the door** | you go indoors | They park and wait aboard, then follow when you come out |
+| **Pick up wounded** | a follower is under 30 % health | An escort picks them up as a passenger |
 
-```
-[view]
-objectFade=3   ; 1 = the game's own distance, 0 = never fade, 3 = default
-actorFade=1    ; the same for actors
-```
-
-The file is re-read every 5 seconds. The log says `View distance: applied` when it takes effect.
-
-## Vehicle registry
-
-Nothing is spawned. Every real vehicle in the loaded area is recorded with its place, owner and who uses it
-(parked / player / npc escort / npc pursuit / own), and changes are written to
-`Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\vehicles.tsv`. Extra vehicles that an older build created
-at Parked Vehicles spots are hidden once (one is kept).
+Escorts target **enemy vehicles first**, spread their targets so two don't pile onto one enemy, and never target you or other followers.
+Hold **U** to recall them.
 
 ---
 
-## Status
+## Enemies
 
-Tested in game earlier: hover flight, gears, HUD buttons, summon / follow, NPC vehicles following with trail navigation and the gear
-system.
+In a fight, an enemy near a free vehicle (within 40 m; within 150 m once the fight has vehicles in it) runs to it and gives chase.
+Enemy drivers attack you **and your followers**, vehicles first, and choose what to do from the fight:
 
-Built, **not yet tested in game**: everything in [NPC vehicles](#npc-vehicles-automatic) (the rules engine, the passenger seats, the
-profile table with escort and pursuit in it, the per-vehicle HUD rows), riding as a passenger / taxi / take the wheel, the seat rules and
-forced exits, NPC vehicle weapon fire (Pursuit), aiming shots at the player, the tight-space handling, flip recovery, the vehicle registry
-and duplicate cleanup, the lane planner, drive mode, unlimited boost, the contextual HUD, **Auto** to the map marker, Cruise, and the
-shared navigation (nav map, heading sampler, hull-sized sweep, which fix the forward rays that never returned a hit in earlier builds).
+| Behaviour | When |
+|---|---|
+| **Retreat** | its vehicle is near the hit limit: it pulls back, lands, and the driver fights on foot (and calls up to 3 nearby allies into the fight) |
+| **Block** | you sit in a slow vehicle: the first enemy lands in front of you |
+| **Intercept** | you drive away fast: it flies at where you will be |
+| **Overwatch** | you are on foot and there are two or more enemy vehicles: one hovers over you and fires down |
+| **Flank** | two or more enemy vehicles: each comes from its own side |
+| **Pick up wounded** | an ally is under 30 % health: it carries them off and pulls out |
+| **Hijack** | your vehicle is on the ground and slow: a hostile pulls you out (after a 2 s warning; drive off to escape) |
 
-Also not tested in game: the view distance setting, the 600 m leash, and the redrawn gang HUD (one boxed line and a movable vehicles box).
+Hostile outposts also send **patrol convoys**: a hostile owner patrols in their vehicle, a second hostile vehicle follows, and they
+turn on you when the fight starts.
 
-Removed from this build: the follower-command Walk / Enter keys, the `,` send key, and followers taking vehicles when you get in
-(gang boarding).
+### The hit counter
+Vehicles have no health in the game, so the mod follows every shot. A shot that passes through a vehicle counts as a hit
+(15 by default). When a vehicle has taken about as much as **you** could (your own health), its **autopilot shuts down for 30 s** and it
+comes down. Friendly fire is not counted. It heals after 15 s without hits.
 
-Added 2026-10-20, built, **not yet tested in game**:
-- Vehicles are no longer terrain to each other (no "magnet" between hovering vehicles); a silent proximity warning slows the autopilot,
-  with right of way by rank (parked > you > followers > neutral > hostile).
-- Scanner marker: aims along the camera, estimates out to 1 km, marker chains (tap T to queue, hold T to replace) swapped about 4 s before
-  arrival, and an **Auto: Stop / Orbit / Patrol** HUD button.
-- Your vehicle following you catches you from below when you are in the air, and keeps following when you go indoors.
-- Followers drive your vehicle when you press Summon / Follow / set a marker (crew driver); hold Follow to recall escorts.
-- Escorts defend you (enemy vehicles first): intercept, shield, overwatch, attack, convoy column, roles, threat level, rescue when your
-  health is low, scout ahead to your marker, wait at the door, pick up wounded followers.
-- Enemy vehicles: flank, intercept, block, overwatch, retreat near their hit limit (driver fights on foot), pick up their wounded, call
-  reinforcements; enemies run to free vehicles up to 150 m away in vehicle fights.
-- Hit counter: shots through a vehicle add up; at your health worth its autopilot switches off for 30 s (`[hits]` in seamless.ini).
-- Walls are no longer a terrain-assist "magnet": a wall never raises the hover's hold, its floor or a climb-over. It sets a wall warning
-  instead: autopilots slow to stop about 6 m short and go around (sliding off side walls); flying by hand you only get an
-  "Assist: wall ahead" line. The forward rays and the hull sweep look farther ahead (25 m or 2.4 s of travel) for an earlier warning.
-- Night and bad weather (planet-local night, rain / snow / dust): autopilots fly slower and a little higher. Shift changes start a
-  transit at once, bystanders flee or cower after a vehicle crash, and hostile outposts send patrol convoys.
-- Civil traffic (outside fights, at most 2 at once, never essential / protected NPCs): transit with drop-off, shared rides, offer a ride,
-  outpost patrols, supply runs, return home, parking in clear spots, fleeing hostile vehicles, slowing for people on foot.
+---
 
-Logs to send when something goes wrong: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` (and
-`SeamlessVehicle.prev.log` for the previous session).
+## Everyday traffic (outside fights)
+
+When nobody near you is fighting, NPCs within 200 m use vehicles on their own (at most 2 at a time, so fights always have vehicles free):
+
+| Behaviour | What happens |
+|---|---|
+| **Transit** | An NPC walking somewhere over 300 m away, with a vehicle it may use within 30 m, drives there, parks and walks the rest |
+| **Shift change** | When an NPC's daily schedule moves them on to a far place, they set off by vehicle straight away |
+| **Shared ride** | Another NPC going the same way rides along |
+| **Offer a ride** | A driver passing you on foot stops for 10 s - tap the vehicle to ride along |
+| **Outpost patrol** | An owner by their parked vehicle drives two laps round the outpost and parks again |
+| **Supply run** | Sometimes the owner drives to the next settlement or outpost (200 m - 1 km), waits, and comes back |
+| **Return home** | After a fight, non-followers fly the vehicle back to where they took it before getting out |
+| **Parking** | Every trip ends in a clear spot, not on top of or right next to another vehicle |
+| **Flee** | Civilian drivers flee from hostile vehicles |
+| **Mind the people** | Autopilots slow down for anyone on foot ahead |
+| **Bystanders** | After a crash, people within 10 m flee and within 25 m cower |
+
+NPCs only take vehicles that are unowned or belong to them or their faction. **Quest NPCs (essential or protected) and followers are
+never used for traffic.**
 
 ---
 
 ## Settings
 
-All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\` (re-read every 5 seconds):
+All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 
-| File | Section | Key | What it does |
-|---|---|---|---|
-| `seamless.ini` | `[log]` | `verbose=1` | The chatty log lines (per-second NPC state, pilot positions, HUD notices) |
-| `seamless.ini` | `[context]` | `enabled=0` | Turns the NPC rules engine off |
-| `seamless.ini` | `[keys]` | `debug=1` | Manual test keys: board the NPC you face `;`, exit all `Insert`, escort / pursuit toggle `.`, NPC profile cycle `[` |
-| `seamless.ini` | `[view]` | `objectFade=3`, `actorFade=1` | Fade distance multipliers (1 = the game's own, 0 = never fade) |
-| `nav.ini` | `[nav]` | `sampler=0`, `shape=0`, `rays=0` | Turn off the heading sampler, the hull sweeps, or all engine ray and sweep queries |
-| `hoverui.ini` | | | HUD layout, saved by the F7 editor |
+| File | Section | Key | Default | What it does |
+|---|---|---|---|---|
+| `seamless.ini` | `[log]` | `verbose` | `0` | `1` = detailed log lines (needed for most bug reports) |
+| `seamless.ini` | `[context]` | `enabled` | `1` | `0` = NPCs never take vehicles on their own (fights and traffic) |
+| `seamless.ini` | `[hits]` | `damage` | `15` | Hit counter: damage per shot |
+| `seamless.ini` | `[hits]` | `limit` | `0` | `0` = your own health; any other number = a fixed limit |
+| `seamless.ini` | `[hits]` | `cooldown` | `30` | Seconds the autopilot stays off at the limit |
+| `seamless.ini` | `[witness]` | `enabled` | `1` | `0` = bystanders do not react to crashes |
+| `seamless.ini` | `[scanner]` | `key` | `84` (T) | The scanner marker key (Windows virtual-key code) |
+| `seamless.ini` | `[view]` | `objectFade`, `actorFade` | `3`, `1` | Fade distance multipliers (1 = the game's own, 0 = never fade) |
+| `seamless.ini` | `[keys]` | `debug` | `0` | `1` = manual test keys (listed in the log) |
+| `nav.ini` | `[nav]` | `sampler`, `shape`, `rays` | `1` | `0` turns off the heading sampler, the hull sweeps, or all ray queries |
+| `hoverui.ini` | | | | On-screen layout, written by the F7 editor |
 
-## Troubleshooting
+---
 
-- **Nothing happens / no log:** the plugin only runs on Starfield **1.16.244** with SFSE for that build. The first log line says why when it disables itself.
-- **NPCs never go to a vehicle:** `SeamlessPilots.esm` is not enabled (the log says so).
+## Compatibility
+
+- **Vehicle mods** that add vehicles the game recognises (with the vehicle keyword) work with the autopilot and NPC rules.
+- **Follower mods** work: followers come from the game's own list.
+- **Grav jump mods** (Seamless Grav Jumps, FTL, Grav Lanes) do not interact with this mod.
+- Not compatible with other mods that replace the vehicle physics step or the vehicle input handling.
+
+---
+
+## Status
+
+**Tested in game:** hover flight, gears, the HUD buttons, summon / follow, NPC vehicles following with trail navigation, the gears.
+
+**Built, not yet tested in game** (everything else), including: Auto and Cruise, the Auto behaviours and their button, scanner markers
+and chains, catch from below, follower drivers, every escort and enemy behaviour, the hit counter, everyday traffic, vehicle-to-vehicle
+right of way, the wall warning, night and weather, bystander reactions, passenger / taxi / take the wheel, the seat rules and forced
+exits, drive mode, unlimited boost, view distance and the vehicle registry.
+
+**Known risks:**
+- Reading your health (rescue, the hit limit, picking up the wounded) is not proven yet. The log line `Vehicle hits: your health reads …`
+  shows whether it works; without it the hit limit falls back to 300.
+- Whether the game lets an NPC sit in **your own** vehicle (follower drivers) is the first thing to check in game.
+- Cities are the least tested place: tight streets, many objects (watch the frame rate), and vehicles do not yet hold back their
+  weapons near civilians.
+- Quest aliases most likely set the same "essential" flag the mod checks, but that is not proven.
+
+---
+
+## Reporting a problem
+
+1. Set `[log] verbose=1` in `seamless.ini`.
+2. Play until it goes wrong.
+3. Send `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` (and `SeamlessVehicle.prev.log` for the previous session). A crash
+   report in the log lists the faulting address, the stack and what the plugin did in its last moments.
+
+**Common fixes**
+- **Nothing happens / no log:** the plugin only runs on Starfield **1.16.244** with SFSE for that build.
+- **NPCs never use vehicles:** `SeamlessPilots.esm` is not enabled, or there are no free parked vehicles near them.
 - **Parked props, not real vehicles:** `Vehicles - Real.esm` is not enabled, or Parked Vehicles is missing.
-- **A crash:** send `SeamlessVehicle.log` (and `.prev.log`). The report lists the faulting address, the stack and what the plugin did in the last moments.
-- **Frame rate drops with Auto or NPC vehicles:** set `[nav] rays=0` to test; lower `[view] objectFade`.
+- **Frame drops with many vehicles:** try `[nav] rays=0`, or a lower `[view] objectFade`.
 
-More: `docs/ARCHITECTURE.md` (how it fits together), `docs/ENGINE_NOTES.md` (engine addresses and findings), `docs/TESTING.md` (what is tested, the in-game checklist),
-`docs/KNOWN_ISSUES.md` (open bugs and next steps), `docs/research/` (research notes).
+---
 
-## Building from source
+## For modders: building from source
 
 Needs Visual Studio 2022 Build Tools (C++ workload) and CMake 3.24+.
 
@@ -299,20 +312,22 @@ cmake -S source -B source/build -G "Visual Studio 17 2022" -A x64
 cmake --build source/build --config Release --target SeamlessVehicle
 ```
 
-Output: `source/build/Release/SeamlessVehicle.dll`. The SFSE headers must be the version for Starfield 1.16.244
-(SFSE 0.2.21). `source/CMakeLists.txt` also builds `SeamlessPlanets.dll`, a separate traversal plugin that is not
-needed for this mod.
-
-### Repository layout
+Output: `source/build/Release/SeamlessVehicle.dll`. The SFSE headers must be the version for Starfield 1.16.244 (SFSE 0.2.21);
+point `SFSE_ROOT` at them if they are not in `ref/sfse`.
 
 ```
-Data/SFSE/Plugins/SeamlessVehicle.dll   the built plugin (copy into the Starfield folder)
-Data/SeamlessPilots.esm                 the walk-to-vehicle quest package (enable it)
-Data/Vehicles - Real.esm                Parked Vehicles props -> real vehicles (enable it)
+Data/SFSE/Plugins/SeamlessVehicle.dll   the built plugin
+Data/SeamlessPilots.esm                 the walk-to-vehicle quest package
+Data/Vehicles - Real.esm                Parked Vehicles props -> real vehicles
 source/                                 C++ source and CMake build (src/, tests/)
 tools/                                  integrate.sh (build + install), make_vehicles_real.py, make_pilots_esm.py
 docs/                                   ARCHITECTURE, ENGINE_NOTES, TESTING, KNOWN_ISSUES, research/
 ```
 
-`bash tools/integrate.sh "note"` builds and installs (it refuses to install while the game runs). It needs the SFSE headers for 1.16.244 in `ref/sfse`
-next to this folder (`git clone https://github.com/ianpatt/sfse ref/sfse`) or `SFSE_ROOT` set.
+More detail: `docs/ARCHITECTURE.md`, `docs/ENGINE_NOTES.md`, `docs/TESTING.md`, `docs/KNOWN_ISSUES.md`, `docs/research/`.
+
+## Credits
+
+- **SFSE** team (ianpatt and contributors) for the script extender.
+- **SarthesArai** for Parked Vehicles; **Aurelianis** for The Gang's All Here.
+- Built with the help of Claude (Anthropic).

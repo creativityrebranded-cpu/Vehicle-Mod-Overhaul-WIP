@@ -1307,7 +1307,8 @@ namespace npcvehicles
 			}
 			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 			// Flee (2026-10-20): a hostile vehicle (a pursuer) within kFleeNear -> drive kFleeDist away from it, then park.
-			if (j.task != 4 && j.taskStep >= 0) {
+			const bool enemyDriver = player && HostileTo(npc, player);  // an enemy patrol / convoy: never flees from its own side, offers no rides
+			if (j.task != 4 && j.taskStep >= 0 && !enemyDriver) {
 				for (const auto& o : g_jobs) {
 					if (o.phase != Phase::Following || o.profile != Profile::Pursuit || o.task) continue;
 					const uptr ov = RefById(o.vehicle);
@@ -1323,7 +1324,7 @@ namespace npcvehicles
 				}
 			}
 			// Offer a ride (2026-10-20): a transit passing the player on foot within kOfferNear stops for kOfferMs once (tap it to ride along).
-			if (j.task == 1 && j.taskStep == 0 && player && !InVehicle(player) && Dist(vehicle, player) < kOfferNear) {
+			if (j.task == 1 && j.taskStep == 0 && player && !enemyDriver && !InVehicle(player) && Dist(vehicle, player) < kOfferNear) {
 				j.taskStep = 1;  // offered
 				j.task = 6;
 				j.taskAt = now;

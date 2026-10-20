@@ -136,7 +136,7 @@ namespace context
 				g_lastPackage[id] = pkg;
 				if (shift) {
 					g_civilTried.erase(id);
-					logger::Write("Context: shift change: NPC %08X switched package", id);
+					if (logger::Verbose()) logger::Write("Context: shift change: NPC %08X switched package", id);  // (packages change often: verbose only)
 				}
 				const auto t = g_civilTried.find(id);
 				if (t != g_civilTried.end() && now - t->second < kCivilRetryMs) continue;

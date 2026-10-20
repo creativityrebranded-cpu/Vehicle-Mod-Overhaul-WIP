@@ -1243,16 +1243,24 @@ namespace vehicleflight
 			return r;
 		}
 
+		// The current weather has this keyword: what the game's own GetCurrentAndLastWeatherHaveKeyword condition does (FUN_140c4b4b0): the sky
+		// (DAT_1461DF6F0) +0x118 = the current weather, whose keywords FUN_1408ff500 searches (count +0x2E0, array +0x2E8). Plain reads, no engine
+		// call (2026-10-20 bug hunt: the first version called FUN_140CF7DE0 with no arguments; it takes an object and an index).
 		bool WeatherHas(std::uint32_t keywordId)
 		{
 			__try {
-				const std::uintptr_t w = EngineFn<std::uintptr_t (*)()>(0x00CF7DE0)();
+				const std::uintptr_t sky = Ptr(0x061DF6F0);
+				const std::uintptr_t w = sky ? At<std::uintptr_t>(sky, 0x118) : 0;
 				if (!w) return false;
-				auto** vt = *reinterpret_cast<void***>(w);
-				if (reinterpret_cast<char (*)(std::uintptr_t)>(vt[0x28 / 8])(w) != 1) return false;
 				const std::uintptr_t kw = EngineFn<std::uintptr_t (*)(std::uint32_t)>(kLookupForm)(keywordId);
 				if (!kw) return false;
-				return EngineFn<unsigned (*)(std::uintptr_t, std::uintptr_t)>(0x00CFC3F0)(kw, w) != 0;
+				const std::uint32_t n = At<std::uint32_t>(w, 0x2E0);
+				const std::uintptr_t* list = At<std::uintptr_t*>(w, 0x2E8);
+				if (!list || n > 256) return false;
+				for (std::uint32_t i = 0; i < n; ++i) {
+					if (list[i] == kw) return true;
+				}
+				return false;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
