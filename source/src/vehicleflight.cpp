@@ -1038,6 +1038,8 @@ namespace vehicleflight
 			bool playerAuto = false;       // Auto: the player is aboard and the autopilot flies (any W/A/S/D takes over)
 			std::uint32_t holdId = 0;      // the player got out with Auto on: this vehicle holds its spot
 			double holdX = 0, holdY = 0;
+			double holdZ=std::numeric_limits<double>::quiet_NaN();
+			bool routeHold=false;
 			// Taxi test (Auto, 2026-10-17): no map marker, it hovers where Auto was switched on (or where the marker went
 			// away); a marker, it flies there and holds over it.
 			bool taxiWait = false;
@@ -1045,6 +1047,8 @@ namespace vehicleflight
 			std::uint32_t taxiMarker = 0;
 			double taxiMx = 0, taxiMy = 0, taxiLeft = 0;
 			bool taxiArrived = false;
+			double taxiMz = std::numeric_limits<double>::quiet_NaN();
+			TripProgress trip;
 			bool apClimb = false;          // the first climb straight up, before moving
 			ULONGLONG autopilotSince = 0;
 			int avoid = 0;                 // 0 none, 1 climb, 2 left, 3 right, 4 stop
@@ -1812,19 +1816,19 @@ namespace vehicleflight
 			}
 			x = mp.x;
 			y = mp.y;
-            if (z && std::isfinite(mp.z)) {
-                const auto at = navmap::At(x, y, mp.z + 4.0);
-                if (at.known) {
-                    double surface = mp.z;
-                    if (at.haveGround) surface = std::max(surface, double(at.ground));
-                    // Keep embedded markers above the first mapped open height.
-                    for (int n=0; n<50; ++n) {
-                        const auto open=navmap::At(x,y,surface+4.0);
-                        if (!open.blocked && !open.objBlocked) { *z=surface+4.0; break; }
-                        surface+=4.0;
-                    }
-                }
-            }
+			if (z && std::isfinite(mp.z)) {
+				const auto at = navmap::At(x, y, mp.z + 4.0);
+				if (at.known) {
+					double surface = mp.z;
+					if (at.haveGround) surface = std::max(surface, double(at.ground));
+					// Keep embedded markers above the first mapped open height.
+					for (int n=0; n<50; ++n) {
+						const auto open=navmap::At(x,y,surface+4.0);
+						if (!open.blocked && !open.objBlocked) { *z=surface+4.0; break; }
+						surface+=4.0;
+					}
+				}
+			}
 			const double d = std::hypot(x - vp.x, y - vp.y);
 			if (d >= kTaxiMaxRange) {
 				if (say) logger::Write("Rover taxi: waiting; marker %08X at (%.0f, %.0f) is %.0f m away (over %.0f m)", id, mp.x, mp.y, d, kTaxiMaxRange);
@@ -1943,6 +1947,7 @@ namespace vehicleflight
 			g.autopilot = false;
 			g.playerAuto = false;
 			g.holdId = 0;
+			g.routeHold=false;
 			if (idx) logger::Write("%s: hover off (%s)", Who(idx), why);
 			else logger::Write("Rover flight: off (%s)", why);
 			if (!idx) notify::Log("Hover off");
@@ -2379,8 +2384,8 @@ namespace vehicleflight
 			if (escape) cost -= 2.0 * std::hypot(x - sx, y - sy);  // escape: get away from the stuck spot
 			else {
 				const double remaining = field.Value(x, y);
-                if (remaining >= 1e12) return -1.0;
-                cost += remaining;                                          // distance left
+				if (remaining >= 1e12) return -1.0;
+				cost += remaining;                                          // distance left
 				cost += 6.0 * std::fabs(Wrap(std::atan2(tx - x, ty - y) - h));              // facing the target at the end
 			}
 			cost += 12.0 * std::fabs(omega - g.mpcOmega) + 10.0 * (1.0 - factor);       // smooth, and keep the speed
@@ -2908,7 +2913,7 @@ namespace vehicleflight
 						}
 					}
 				}
-				if (!goal.keepGoing && dist <= goal.stop + 1.0 && sp < 1.5) {
+				if (!goal.keepGoing && AtDestination(vehicle, goal.x, goal.y, goal.z, goal.stop)) {
 					logger::Write("%s: arrived %.1f m from the target", wc, dist);
 					Stop(idx, "arrived");
 					return;
@@ -3507,6 +3512,19 @@ namespace vehicleflight
 				g_sh.cap = g.cap;
 			}
 
+			if (g.autopilot) {
+				const double dist = std::hypot(goal.x-pos.x, goal.y-pos.y);
+				const double targetZ = std::isfinite(goal.z) ? std::max(goal.z, refGround + kCallSkim + EnvClimb()) : pos.z;
+				const double zError = pos.z - targetZ;
+				const bool ready = groundOk && matched && (aheadLoaded || sp>3.0 || dist<=goal.stop+2.0);
+				const bool arrived = !goal.cruise && AtDestination(vehicle, goal.x, goal.y, goal.z, goal.stop);
+				const bool rerouting = GetTickCount64() < g.mpcEscapeUntil || GetTickCount64() < g.reverseUntil ||
+					g.trailOn || std::fabs(g.detourAng) > 0.1;
+				const bool blocked = g.avoid == 4 || (sp < 1.0 && g.lastF == 2 && g.mpcAt && !g.mpcOk);
+				g.trip = {true, ready && g.apClimb ? triplogic::Phase::AdjustingHeight : triplogic::Status(ready, arrived, dist <= goal.stop+2.0, zError, rerouting, blocked),
+					goal.x, goal.y, dist, std::hypot(sp,v[2]), zError, GetTickCount64()};
+			} else g.trip = {};
+
 			const ULONGLONG ms = GetTickCount64();
 			if (ms - g.lastLog >= 2000) {
 				g.lastLog = ms;
@@ -3558,6 +3576,7 @@ namespace vehicleflight
 			if (g.active) Stop("you died");
 			g.playerAuto = false;
 			g.holdId = 0;
+			g.routeHold=false;
 			g_follow = false;
 			hoverui::SetState(false, false, g.gear, false);
 			hoverui::SetAuto("", false, "");
@@ -3583,6 +3602,7 @@ namespace vehicleflight
 			if (last && g.active) {
 				const auto hp = At<game::Vec3>(last, off::kRefPosition);
 				g.holdId = At<std::uint32_t>(last, 0x28);
+				g.holdZ=hp.z;
 				g.holdX = hp.x;
 				g.holdY = hp.y;
 				g.autopilot = true;
@@ -3593,7 +3613,7 @@ namespace vehicleflight
 		}
 		if (driven) {
 			if (g.holdId && At<std::uint32_t>(driven, 0x28) != g.holdId) Stop("you took another vehicle");
-			g.holdId = 0;
+			if (!g.routeHold) g.holdId = 0;
 			g_lastDrivenVehicle.store(driven, std::memory_order_relaxed);
 			if (g.autopilot && !g.playerAuto) {
 				g.autopilot = false;  // the player got in: hover stays, under the player's control
@@ -3610,6 +3630,7 @@ namespace vehicleflight
 				logger::Write("Rover scanner trip: you boarded; Auto starts toward your marker");
 			}
 			if (autoPressed || goBoard) {
+				g.routeHold=false; g.holdId=0;
 				if (g.playerAuto && !goBoard) {
 					g.playerAuto = false;
 					g.autopilot = false;
@@ -3634,6 +3655,7 @@ namespace vehicleflight
 			else if (g.playerAuto && focused && (Held(g_mk.accel) || Held(g_mk.brake) || Held(g_mk.left) || Held(g_mk.right))) {
 				g.playerAuto = false;
 				g.autopilot = false;
+				g.routeHold=false; g.holdId=0;
 				notify::Log("Auto off - you have control");
 				logger::Write("Rover auto: off (movement key)");
 			}
@@ -3923,8 +3945,8 @@ namespace vehicleflight
 			hoverui::SetFoot(!driven && g_roverId != 0, rover && !driven && !g.autopilot && toRover <= kNearBoard, callKey.c_str(), followKey.c_str(), useKey.c_str(), status);
 			char line[64] = "";
 			if (driven && g.playerAuto) {
-				if (g.taxiMarker && g.taxiArrived) std::snprintf(line, sizeof(line), "ARRIVED");
-				else if (g.taxiMarker) std::snprintf(line, sizeof(line), "TO MARKER  %.0f m", std::min(g.taxiLeft, 99999.0));
+				if (g.taxiMarker && ProgressFor(g_roverId).phase==triplogic::Phase::Arrived) std::snprintf(line, sizeof(line), "ARRIVED");
+				else if (g.taxiMarker) std::snprintf(line, sizeof(line), "%s  %.0f m", triplogic::Text(ProgressFor(g_roverId).phase), std::min(g.taxiLeft, 99999.0));
 				else std::snprintf(line, sizeof(line), "SET A MARKER");
 			}
 			const std::string autoKey = g_keys.autoKey ? controlmap::KeyName(g_keys.autoKey) : std::string();
@@ -4022,6 +4044,7 @@ namespace vehicleflight
 			if (g.holdId) {
 				goal.x = g.holdX;
 				goal.y = g.holdY;
+				goal.z = g.holdZ;
 				goal.stop = 1.5;
 				goal.hold = true;
 			}
@@ -4041,10 +4064,12 @@ namespace vehicleflight
 				double mx = 0, my = 0;
 				std::uint32_t mid = 0;
 				if (TaxiMarker(player, vehicle, mid, mx, my, &goal.z)) {
-					if (mid != g.taxiMarker || std::hypot(mx - g.taxiMx, my - g.taxiMy) > 2.0) {
+					if (mid != g.taxiMarker || std::hypot(mx - g.taxiMx, my - g.taxiMy) > 2.0 ||
+						(std::isfinite(goal.z) && (!std::isfinite(g.taxiMz) || std::fabs(goal.z - g.taxiMz) > 2.5))) {
 						g.taxiMarker = mid;
 						g.taxiMx = mx;
 						g.taxiMy = my;
+						g.taxiMz = goal.z;
 						g.taxiArrived = false;
 						notify::Log("Auto: flying to your marker (%.0f m)", std::hypot(mx - pos.x, my - pos.y));
 						logger::Write("Rover taxi: marker %08X at (%.0f, %.0f), %.0f m away", mid, mx, my, std::hypot(mx - pos.x, my - pos.y));
@@ -4065,7 +4090,7 @@ namespace vehicleflight
 					else {
 						g.taxiOrbit = false;
 					}
-					if (!g.taxiArrived && g.taxiLeft <= kTaxiStop + 4.0) {
+					if (!g.taxiArrived && !g.taxiOrbit && AtDestination(vehicle, mx, my, goal.z, kTaxiStop)) {
 						g.taxiArrived = true;
 						notify::Log("Auto: arrived");
 						logger::Write("Rover taxi: arrived at marker %08X", mid);
@@ -4110,7 +4135,7 @@ namespace vehicleflight
 				double speed = 99.0;
 				if (lt && tNow > lt && tNow - lt < 1000) speed = std::hypot(rpos.x - lx, rpos.y - ly) / ((tNow - lt) / 1000.0);
 				lx = rpos.x; ly = rpos.y; lt = tNow;
-				if (pg.hold && pg.nav.landOnArrival && std::hypot(pg.x - rpos.x, pg.y - rpos.y) <= pg.stop + 2.0 && speed < 1.0) {
+				if (pg.hold && pg.nav.landOnArrival && AtDestination(vehicle, pg.x, pg.y, pg.z, pg.stop) && speed < 1.0) {
 					g_remoteDone = vcontract::AssignedTo(g_roverId);
 					g_remote = false;
 					Stop("arrived; parked");
@@ -4271,8 +4296,52 @@ namespace vehicleflight
 
 	bool ViewHeading(double& yaw) { return CameraHeading(yaw); }
 
+	TripProgress ProgressFor(std::uint32_t vehicleId)
+	{
+		for (int i=0; i<kPilots; ++i) {
+			const auto vehicle=g_hoverVehicles[i].load();
+			if (vehicle && g_gs[i].active && At<std::uint32_t>(vehicle,off::kFormId)==vehicleId &&
+				GetTickCount64()-g_gs[i].trip.at < 500) return g_gs[i].trip;
+		}
+		return {};
+	}
+
+	bool AtDestination(std::uintptr_t vehicle, double x, double y, double z, double stop)
+	{
+		if (!vehicle) return false;
+		for (int i=0; i<kPilots; ++i) {
+			if (g_hoverVehicles[i].load()!=vehicle || !g_gs[i].active) continue;
+			const auto& state=g_gs[i];
+			auto& shared=g_shs[i];
+			std::lock_guard lk(shared.lock);
+			const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
+			const double expected=std::isfinite(z) ? std::max(z,shared.refGround+kCallSkim+EnvClimb()) : pos.z;
+			const double speed=std::sqrt(shared.v[0]*shared.v[0]+shared.v[1]*shared.v[1]+shared.v[2]*shared.v[2]);
+			return triplogic::Reached(std::hypot(x-pos.x,y-pos.y),stop,pos.z-expected,speed,
+				shared.matched && state.haveGround && GetTickCount64()-state.groundAt<=500 && !state.apClimb);
+		}
+		return false;
+	}
+
+	void CancelScannerTrip()
+	{
+		g_scanCall.store(false); g_goOnBoard.store(false); g_goAt.store(0);
+		if (g_crewPending==npcvehicles::CrewOrder::Marker) g_crewPending=npcvehicles::CrewOrder::None;
+		if (npcvehicles::CrewOrderOf(g_roverId)==npcvehicles::CrewOrder::Marker)
+			npcvehicles::SetCrewOrder(g_roverId,npcvehicles::CrewOrder::Hold);
+		const auto vehicle=g_hoverVehicles[0].load();
+		if (vehicle && At<std::uint32_t>(vehicle,off::kFormId)==g_roverId && g.active && g.autopilot) {
+			const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
+			g.holdId=g_roverId; g.holdX=pos.x; g.holdY=pos.y; g.holdZ=pos.z; g.routeHold=true;
+			g.taxiMarker=0; g.taxiArrived=false; g.taxiOrbit=false; g.wHold=false;
+		}
+	}
+
 	void RequestScannerTrip()
 	{
+		g.holdId=0; g.routeHold=false;
+		if (npcvehicles::CrewOrderOf(g_roverId)==npcvehicles::CrewOrder::Hold)
+			npcvehicles::SetCrewOrder(g_roverId,npcvehicles::CrewOrder::Marker);
 		g_scanCall.store(true);
 		g_goOnBoard.store(true);
 		g_goAt.store(GetTickCount64());

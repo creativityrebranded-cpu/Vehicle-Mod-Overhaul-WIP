@@ -69,7 +69,7 @@ namespace profiles
 			g.nav.passThrough = true;   // corners: keep flying
 			g.nav.speedLimit = 25.0f;
 			g.nav.priority = 20;
-			if (Dist2(c.vehicle, g.x, g.y) < kReach) {
+			if (vehicleflight::AtDestination(c.vehicle, g.x, g.y, g.z, g.stop)) {
 				Step(c, c.step + 1);
 				logger::Write("Profiles: [%d] patrol corner %d", c.pilot, c.step & 3);
 			}
@@ -110,12 +110,13 @@ namespace profiles
 			if (c.step == 0) {
 				if (!vehicleflight::MarkerPoint(c.vehicle, mx, my, &mz)) return HoldGoal(c, g);  // waits for a marker
 				g.x = mx; g.y = my; g.z = mz; g.stop = 6.0;
-				if (Dist2(c.vehicle, mx, my) < kReach) { g.hold = true; if (Waited(c)) Step(c, 1); }
+				g.hold = Dist2(c.vehicle,mx,my) < kReach;
+				if (vehicleflight::AtDestination(c.vehicle, mx, my, mz, g.stop)) { g.hold = true; if (Waited(c)) Step(c, 1); }
 				else c.stepAt = GetTickCount64();
 				return true;
 			}
 			g.x = c.homeX; g.y = c.homeY; g.stop = 3.0; g.hold = true;
-			if (Dist2(c.vehicle, c.homeX, c.homeY) < kReach) c.done = true;
+			if (vehicleflight::AtDestination(c.vehicle, g.x, g.y, g.z, g.stop)) c.done = true;
 			return true;
 		}
 
@@ -128,14 +129,16 @@ namespace profiles
 			if (c.step == 0) {
 				if (!vehicleflight::MarkerPoint(c.vehicle, mx, my, &mz)) { c.done = true; return false; }
 				g.x = mx; g.y = my; g.z = mz; g.stop = 6.0;
-				if (Dist2(c.vehicle, mx, my) < kReach) { g.hold = true; if (GetTickCount64() - c.stepAt >= 3000) Step(c, 1); }
+				g.hold = Dist2(c.vehicle,mx,my) < kReach;
+				if (vehicleflight::AtDestination(c.vehicle, mx, my, mz, g.stop)) { g.hold = true; if (GetTickCount64() - c.stepAt >= 3000) Step(c, 1); }
 				else c.stepAt = GetTickCount64();
 				return true;
 			}
 			if (!c.player) return false;
 			const auto pp = PosOf(c.player);
 			g.x = pp.x; g.y = pp.y; g.stop = 8.0;
-			if (Dist2(c.vehicle, pp.x, pp.y) < 12.0) c.done = true;
+			g.hold = Dist2(c.vehicle,pp.x,pp.y) < 12.0;
+			if (vehicleflight::AtDestination(c.vehicle, g.x, g.y, g.z, g.stop)) c.done = true;
 			return true;
 		}
 

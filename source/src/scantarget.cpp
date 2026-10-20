@@ -74,6 +74,10 @@ namespace scantarget
 		// The Auto behaviour key (stop / orbit / patrol): the first free of these, claimed once.
 		int g_modeKey = -1;
 		bool g_modeDown = false;
+		int g_skipKey=-1, g_clearKey=-1;
+		bool g_skipDown=false, g_clearDown=false, g_routeCleared=false;
+		ULONGLONG g_clearedAt=0;
+		ULONGLONG g_lostSince=0;
 
 		bool Focused()
 		{
@@ -304,6 +308,7 @@ namespace scantarget
 			if (ok) {
 				g_current = q;
 				g_haveCurrent = true;
+				g_routeCleared = false;
 			}
 			return ok;
 		}
@@ -343,37 +348,108 @@ namespace scantarget
 			hoverui::SetAutoMode(keyName.c_str(), m == vehicleflight::AutoMode::Orbit ? "Auto: Orbit" : m == vehicleflight::AutoMode::Patrol ? "Auto: Patrol" : "Auto: Stop", pressed);
 		}
 
-		// Every frame (scanner open or not): the hot swap to the next queued point.
-		void ChainTick(ULONGLONG now)
+		bool AdvanceStop(bool skipped)
 		{
-			double left = 0, eta = 0;
-			const bool trip = TripState(now, left, eta);
-			if (g_chain.empty()) return;
-			static ULONGLONG lostSince = 0;
-			if (!trip) {
-				// The marker is gone (removed on the map) or the vehicle is not there: after 3 s the chain goes with it (a summon's move blinks the vehicle out).
-				if (!lostSince) lostSince = now;
-				if (now - lostSince < 3000) return;
-				logger::Write("Scanner marker: chain of %zu dropped (no marker or no vehicle for 3 s)", g_chain.size());
-				g_chain.clear();
-				lostSince = 0;
+			if(g_chain.empty()) return false;
+			if(!triplogic::Advance(g_chain,g_current,g_haveCurrent,
+				vehicleflight::GetAutoMode()==vehicleflight::AutoMode::Patrol,skipped,
+				[&](const Point& next){return PlaceMarker(next,skipped ? "skip to" : "next stop");})) return false;
+			const auto& next=g_current;
+			g_setAt=0;
+			char message[256];
+			std::snprintf(message,sizeof(message),"Next stop: %s",next.name.empty() ? "Map point" : next.name.c_str());
+			notify::Show(message);
+			return true;
+		}
+
+		void ClearRoute()
+		{
+			const auto vehicle=RefById(vehicleflight::OwnRoverId());
+			double mx=0,my=0;
+			if(vehicle && vehicleflight::MarkerPoint(vehicle,mx,my)) {g_current.x=float(mx); g_current.y=float(my);}
+			g_chain.clear(); g_haveCurrent=false; g_setAt=0;
+			g_routeCleared=true; g_clearedAt=GetTickCount64();
+			vehicleflight::CancelScannerTrip();
+			notify::Show("Route cleared | holding position");
+		}
+
+		std::string RouteName(const std::string& name, const char* fallback)
+		{
+			if(name.empty()) return fallback;
+			if(name.size()<=42) return name;
+			std::size_t end=42;
+			while(end && (static_cast<unsigned char>(name[end])&0xC0)==0x80) --end;
+			return name.substr(0,end)+"...";
+		}
+
+		void RouteTick(ULONGLONG now)
+		{
+			const uptr vehicle=RefById(vehicleflight::OwnRoverId());
+			double mx=0,my=0;
+			const bool marker=vehicle && vehicleflight::MarkerPoint(vehicle,mx,my);
+			if(marker && (g_haveCurrent || g_routeCleared) && std::hypot(mx-g_current.x,my-g_current.y)>2.0) {
+				// An externally replaced marker must not continue the old route under an old name.
+				g_chain.clear(); g_haveCurrent=false; g_routeCleared=false;
+			}
+			if(g_skipKey<0) g_skipKey=controlmap::ClaimFirst("route","Skip stop",{VK_OEM_4,VK_F9,VK_F10,'K'});
+			if(g_clearKey<0) g_clearKey=controlmap::ClaimFirst("route","Clear route",{VK_OEM_5,VK_F10,VK_F11,'N'});
+			const bool skip=Focused() && g_skipKey && (GetAsyncKeyState(g_skipKey)&0x8000)!=0;
+			const bool clear=Focused() && g_clearKey && (GetAsyncKeyState(g_clearKey)&0x8000)!=0;
+			const bool available=(marker || !g_chain.empty()) && !g_routeCleared;
+			if(clear && !g_clearDown && available) ClearRoute();
+			else if(skip && !g_skipDown && available) {
+				if(g_chain.empty()) ClearRoute();
+				else if(AdvanceStop(true)) vehicleflight::RequestScannerTrip();
+			}
+			g_skipDown=skip; g_clearDown=clear;
+			if(g_routeCleared) {
+				hoverui::SetRoute(now-g_clearedAt<3000 ? "ROUTE CLEARED\nHolding position" : "");
 				return;
 			}
-			lostSince = 0;
-			if (eta > kSwapEtaS && left > kSwapNear) return;
-			const Point next = g_chain.front();
-			g_chain.erase(g_chain.begin());
-			// Patrol: the point just reached goes back to the end, so the chain loops.
-			if (vehicleflight::GetAutoMode() == vehicleflight::AutoMode::Patrol && g_haveCurrent) g_chain.push_back(g_current);
-			char why[80];
-			std::snprintf(why, sizeof(why), "next in the chain (%.0f m / %.1f s from the last) at", left, eta > 1e8 ? -1.0 : eta);
-			if (PlaceMarker(next, why)) {
-				char msg[48];
-				if (g_chain.empty()) std::snprintf(msg, sizeof(msg), "Next marker (last)");
-				else std::snprintf(msg, sizeof(msg), "Next marker (%zu more)", g_chain.size());
-				notify::Show(msg);
+			if(!marker) {
+				if(!g_lostSince) g_lostSince=now;
+				if(now-g_lostSince>3000) { g_chain.clear(); g_haveCurrent=false; }
+				hoverui::SetRoute("");
+				return;
 			}
+			g_lostSince=0;
+			const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
+			const auto progress=vehicleflight::ProgressFor(vehicleflight::OwnRoverId());
+			const bool matching=progress.active && std::hypot(progress.x-mx,progress.y-my)<2.0;
+			const bool orbit=vehicleflight::GetAutoMode()==vehicleflight::AutoMode::Orbit;
+			const char* status=matching ? triplogic::Text(progress.phase) : orbit && progress.active ? "Orbiting" : "Waiting for driver";
+			double left=0,eta=0;
+			TripState(now,left,eta);
+			const std::string name=RouteName(g_haveCurrent ? g_current.name : "","Map marker");
+			char detail[160];
+			if(eta>0 && eta<3600 && matching && progress.phase==triplogic::Phase::Travelling)
+				std::snprintf(detail,sizeof(detail),"%s | %.0f m | ETA %.0f s",status,std::hypot(mx-pos.x,my-pos.y),eta);
+			else std::snprintf(detail,sizeof(detail),"%s | %.0f m",status,std::hypot(mx-pos.x,my-pos.y));
+			std::string panel="ROUTE\nTo: "+name+"\n"+detail;
+			for(std::size_t i=0;i<g_chain.size() && i<3;++i) {
+				panel+="\n"+std::to_string(i+1)+". "+RouteName(g_chain[i].name,"Map point");
+			}
+			if(g_chain.size()>3) panel+="\n+"+std::to_string(g_chain.size()-3)+" more stops";
+			panel+="\n["+(g_skipKey ? controlmap::KeyName(g_skipKey) : "unbound")+"] Skip stop   ["+
+				(g_clearKey ? controlmap::KeyName(g_clearKey) : "unbound")+"] Clear route";
+			hoverui::SetRoute(panel.c_str());
 		}
+
+		// Intermediate points keep the existing seamless handoff, but only at the destination's height.
+		void ChainTick(ULONGLONG now)
+		{
+			if(g_chain.empty() || g_routeCleared) return;
+			double left=0,eta=0;
+			if(!TripState(now,left,eta) || (eta>kSwapEtaS && left>kSwapNear)) return;
+			const auto progress=vehicleflight::ProgressFor(vehicleflight::OwnRoverId());
+			const auto vehicle=RefById(vehicleflight::OwnRoverId());
+			double mx=0,my=0;
+			if(!vehicle || !vehicleflight::MarkerPoint(vehicle,mx,my) || !progress.active ||
+				std::hypot(progress.x-mx,progress.y-my)>2.0 || std::fabs(progress.heightError)>2.5 ||
+				progress.phase==triplogic::Phase::WaitingTerrain) return;
+			AdvanceStop(false);
+		}
+
 	}
 
 	void Tick()
@@ -382,6 +458,7 @@ namespace scantarget
 		if (!player) return;
 		const ULONGLONG now = GetTickCount64();
 		ModeKey();
+		RouteTick(now);
 		ChainTick(now);
 		if (!hoverui::IsScannerOpen()) {
 			hoverui::SetScan("");
@@ -410,7 +487,7 @@ namespace scantarget
 				const Point q{ t.x, t.y, t.z, t.name };
 				double left = 0, eta = 0;
 				const bool trip = TripState(now, left, eta);
-				if (!hold && trip && left > kArrivedNear) {
+				if (!hold && trip && left > kArrivedNear && !g_routeCleared) {
 					g_chain.push_back(q);
 					g_setAt = now;
 					g_setDist = t.dist;
@@ -477,6 +554,8 @@ namespace scantarget
 		g_downAt = 0;
 		g_haveCurrent = false;
 		g_modeDown = false;
+		g_skipDown=false; g_clearDown=false; g_routeCleared=false; g_lostSince=0;
+		hoverui::SetRoute("");
 		g_pois.clear();
 		g_poiHave = false;
 		g_poiAt = 0;

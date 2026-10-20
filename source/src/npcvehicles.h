@@ -57,7 +57,7 @@ namespace npcvehicles
 	// Crew orders (2026-10-20, the user: with followers, the vehicle buttons send a follower to drive the player's own vehicle and do what was asked).
 	// Follow: the follower drives it after the player (an escort: it defends, rescues, scouts); Marker: it flies to the player's map marker and
 	// does the Auto behaviour there (vehicleflight::GetAutoMode: stop / orbit / patrol).
-	enum class CrewOrder : int { None = 0, Follow = 1, Marker = 2 };
+	enum class CrewOrder : int { None = 0, Follow = 1, Marker = 2, Hold = 3 };
 	// A follower free to drive (on foot, not busy, alive) within `range` metres of (x, y); 0 when none.
 	std::uintptr_t FreeFollower(std::uintptr_t player, double x, double y, double range);
 	// That follower walks to `vehicle` (the player's own one allowed) and drives it with `order`; false when nobody could be sent.

@@ -793,6 +793,8 @@ namespace hoverui
 			if (g_hudMenu.exchange(menu) != menu) logger::Write("Hover UI: HUD menu %p (movie %p)", reinterpret_cast<void*>(menu), *reinterpret_cast<void**>(menu + 0x88));
 		}
 
+		void RenderRoute(uptr menu, uptr movie, bool scanner);
+
 		void Work(uptr menu)
 		{
 			++g_calls;
@@ -815,6 +817,7 @@ namespace hoverui
 					g_ui.failed = false;
 				}
 				if (!movie || g_ui.failed) return;
+				RenderRoute(menu, movie, false);
 				WorkExtras(menu, movie);
 				if (!g_ui.built && !(g_inVehicle.load() && Build(menu))) {
 					if (g_inVehicle.load()) g_ui.failed = !g_ui.built;
@@ -848,6 +851,7 @@ namespace hoverui
 		std::string g_placeName;
 		ULONGLONG g_placeAt = 0;
 		double g_placeDistance = 0;
+		std::string g_routeText;
 		std::string g_scanText;  // the scanner screen status box text
 		struct MonoEl;
 		std::uint64_t MonoMessageDetour(uptr menu, void* msg)
@@ -859,6 +863,37 @@ namespace hoverui
 		}
 
 		bool ScannerOpen() { return GetTickCount64() - g_monoSeen.load() < 300; }
+
+		struct RouteView { uptr movie=0, menu=0; Value field; std::string last; };
+		RouteView g_routeViews[2];
+		void RenderRoute(uptr menu, uptr movie, bool scanner)
+		{
+			auto& view=g_routeViews[scanner ? 1 : 0];
+			if(view.movie!=movie || view.menu!=menu) { view=RouteView{}; view.movie=movie; view.menu=menu; }
+			std::string text;
+			{ std::lock_guard lk(g_scanLock); text=g_routeText; }
+			if(!scanner && ScannerOpen()) text.clear();
+			const auto& root=*reinterpret_cast<const Value*>(menu+0x58);
+			if(!IsObject(root)) return;
+			if(!IsObject(view.field) && !text.empty()) {
+				if(!CreateObject(movie,&view.field,"flash.text.TextField",nullptr,0)) return;
+				SetMember(view.field,"name",Str("SeamlessRoutePanel"));
+				SetMember(view.field,"x",Num(42)); SetMember(view.field,"y",Num(230));
+				SetMember(view.field,"width",Num(480)); SetMember(view.field,"height",Num(240));
+				SetMember(view.field,"multiline",Bool(true)); SetMember(view.field,"wordWrap",Bool(true));
+				SetMember(view.field,"selectable",Bool(false)); SetMember(view.field,"mouseEnabled",Bool(false));
+				SetMember(view.field,"background",Bool(true)); SetMember(view.field,"backgroundColor",Num(0x101820));
+				SetMember(view.field,"textColor",Num(0xDDEEFF));
+				Value format;
+				const Value args[]={Str("$MAIN_Font"),Num(18),Num(0xDDEEFF)};
+				if(CreateObject(movie,&format,"flash.text.TextFormat",args,3)) SetMember(view.field,"defaultTextFormat",Arg(format));
+				Release(format);
+				const Value child[]={Arg(view.field)}; Invoke(root,"addChild",child,1);
+			}
+			if(!IsObject(view.field)) return;
+			SetMember(view.field,"visible",Bool(!text.empty()));
+			if(text!=view.last) { SetMember(view.field,"text",Str(text.c_str())); view.last=text; }
+		}
 
 		// One scanner element: a BasicButton whose key box shows `key`, with `label` under it (empty label: the key box
 		// alone, e.g. the status box). Created in place (managed values never move).
@@ -1171,6 +1206,7 @@ namespace hoverui
 			if (movie) {
 				const auto& root = *reinterpret_cast<const Value*>(menu + 0x58);
 				if (IsObject(root)) CaptureScannerDestination(root);
+				RenderRoute(menu, movie, true);
 			}
 			if (!movie || g_mono.failed) return;
 			if (!g_mono.built) {
@@ -1260,6 +1296,7 @@ namespace hoverui
 				g_placeName.clear(); g_placeAt = 0;
 			}
 			void* r = g_movieDtorOriginal(movie, flags);
+			for(auto& view:g_routeViews) if(view.movie==movie) view=RouteView{};
 			// After the movie unlinked its values (they live in our memory): forget them, never release.
 			if (hud) {
 				Drop(false);
@@ -1333,6 +1370,12 @@ namespace hoverui
 	{
 		std::lock_guard lk(g_scanLock);
 		return ScannerOpen() && GetTickCount64() - g_placeAt < 200 ? ScannerDestination{g_placeName, g_placeDistance} : ScannerDestination{};
+	}
+
+	void SetRoute(const char* text)
+	{
+		std::lock_guard lk(g_scanLock);
+		g_routeText=text ? text : "";
 	}
 
 	void SetScan(const char* text)
@@ -1433,6 +1476,7 @@ namespace hoverui
 		g_reset = true;
 		std::lock_guard lk(g_scanLock);
 		g_placeName.clear(); g_placeAt = 0;
+		g_routeText.clear();
 	}
 
 	namespace

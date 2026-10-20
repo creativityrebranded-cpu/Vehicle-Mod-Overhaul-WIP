@@ -50,3 +50,6 @@ sp_options(navfield_test)
 
 add_executable(scannercontext_test tests/scannercontext_test.cpp)
 sp_options(scannercontext_test)
+
+add_executable(triplogic_test tests/triplogic_test.cpp)
+sp_options(triplogic_test)

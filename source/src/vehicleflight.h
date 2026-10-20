@@ -5,6 +5,7 @@
 #include <cstdint>
 
 #include "vcontract.h"
+#include "triplogic.h"
 
 // Planetary flight on the REV-8 rover (user, 2026-10-14; design: notes/plan-vehicle-flight.md). While driving, H
 // toggles hover: the rover holds a height above the ground with an infinite boost and flies with the flight model's
@@ -42,6 +43,15 @@ namespace vehicleflight
 	// The scanner marker button (scantarget): the player's own vehicle is summoned (as the call key does), and when the player gets in, Auto flies it to the
 	// marker. Driving already: Auto starts at once. Main thread.
 	void RequestScannerTrip();
+	void CancelScannerTrip(); // hold current position, preserving hover and the crew driver
+	struct TripProgress {
+		bool active = false;
+		triplogic::Phase phase = triplogic::Phase::Idle;
+		double x = 0, y = 0, distance = 0, speed = 0, heightError = 0;
+		unsigned long long at = 0;
+	};
+	TripProgress ProgressFor(std::uint32_t vehicleId);
+	bool AtDestination(std::uintptr_t vehicle, double x, double y, double z, double stop);
 	// The vehicle hit counter (vehiclehits): this vehicle's autopilot is switched off now and refused for `ms` (its hover ends; the player can still
 	// drive it by hand). Main thread.
 	void DisableAutopilot(std::uint32_t vehicleFormId, unsigned ms, const char* why);

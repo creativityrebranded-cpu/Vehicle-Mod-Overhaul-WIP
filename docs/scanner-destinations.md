@@ -9,3 +9,15 @@ Captured planet map records include their copied names. Matching uses name, view
 If planet map coordinates are unavailable (for example, before opening the star map), the game scanner range projects an estimated position along the camera view. Estimated positions retain the `~` indicator, including after marker placement. This projection is not an exact reference position.
 
 Validation: release DLL build and six offline destination-selection cases. Live scanner display and travel still require an in-game check.
+
+## Route panel and trip controls
+
+The HUD and scanner show the current destination name, travel status, distance, estimated time when making progress, and up to three queued stop names (plus the remaining count). Long names are shortened only in this panel. Full names remain in the queue. The panel uses the upper left area of the 1920-by-1080 HUD layout.
+
+Skip stop normally uses `[`, and Clear route normally uses `\`. The mod claims free keys from the shared binding registry and shows the actual keys on the panel if those defaults are occupied. Skip advances to the next queued stop; skipping the final stop clears the route. Clear cancels pending scanner dispatch, drops queued stops, and holds an active player or crew-driven vehicle at its present position and height. Hover remains active. Selecting a new scanner destination resumes travel. Patrol automatically requeues completed stops; manually skipped stops are not requeued. A failed marker placement retains the previous destination and queue.
+
+Arrival requires fresh terrain and physics, no initial climb in progress, horizontal distance within the stop radius plus 2 m, height within 2.5 m of the marker's reachable hover level, and total three-dimensional speed at or below 1.5 m/s. Two-dimensional markers use terrain following. Marker-driven profiles use the same check before starting destination wait timers. Intermediate seamless waypoint handoffs also wait for the required height; they do not claim final arrival.
+
+Statuses include Travelling, Waiting for terrain, Blocked, Finding another way, Adjusting height, Arrived, Orbiting, and Waiting for driver. ETA appears only while moving toward the current destination. Route metadata clears on save load and when an externally replaced marker invalidates the route.
+
+Validation: release build and 17 offline arrival, status, and queue-transition tests. Live HUD placement, bindings, and vehicle hold behavior still require an in-game check.

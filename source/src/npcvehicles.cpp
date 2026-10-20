@@ -129,7 +129,8 @@ namespace npcvehicles
 			double foeX = 0, foeY = 0, foeVx = 0, foeVy = 0;  // the target's last position and smoothed velocity (intercept)
 			ULONGLONG foeSeenAt = 0;
 			int defMode = -1;                  // escort in a fight: 0 attack, 1 shield, 2 intercept, 3 overwatch
-			int order = 0;                     // npcvehicles::CrewOrder: a crew job on the player's own vehicle (0 none)
+			int order = 0;
+			double orderX=0, orderY=0, orderZ=0;                     // npcvehicles::CrewOrder: a crew job on the player's own vehicle (0 none)
 			bool rescueParked = false;         // rescue: landed beside the player
 			bool scoutReported = false;        // scout: the enemies at the marker were reported
 			bool waiting = false;              // the player is indoors: parked, waiting at the door
@@ -1961,6 +1962,10 @@ namespace npcvehicles
 					pg.z = std::numeric_limits<double>::quiet_NaN();
 					pg.stop = 4.0;
 					pg.hold = false;
+				}
+				else if (escortJob && !defending && j.order == int(CrewOrder::Hold)) {
+					pg.x=j.orderX; pg.y=j.orderY; pg.z=j.orderZ; pg.stop=1.5; pg.hold=true;
+					toMarker=true; // explicit hold takes priority over the ordinary escort formation
 				}
 				else if (escortJob && !defending && j.order == int(CrewOrder::Marker)) {
 					toMarker = MarkerGoal(j, vehicle, pg);
@@ -3805,8 +3810,14 @@ namespace npcvehicles
 		for (auto& j : g_jobs) {
 			if (!vehicleId || j.phase == Phase::Idle || j.vehicle != vehicleId || !j.order || j.order == int(order)) continue;
 			j.order = int(order);
-			logger::Write("NPC vehicles: [%d] crew order: %s", j.pilot, order == CrewOrder::Marker ? "to your marker" : "follow you");
-			notify::Show(order == CrewOrder::Marker ? "Your follower drives to the marker" : "Your follower follows you");
+				if (order==CrewOrder::Hold) {
+					if (const auto vehicle=RefById(j.vehicle)) {
+						const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
+						j.orderX=pos.x; j.orderY=pos.y; j.orderZ=pos.z;
+					}
+				}
+			logger::Write("NPC vehicles: [%d] crew order: %s", j.pilot, order == CrewOrder::Marker ? "to your marker" : order == CrewOrder::Hold ? "hold position" : "follow you");
+			notify::Show(order == CrewOrder::Marker ? "Your follower drives to the marker" : order == CrewOrder::Hold ? "Your follower holds position" : "Your follower follows you");
 		}
 	}
 
