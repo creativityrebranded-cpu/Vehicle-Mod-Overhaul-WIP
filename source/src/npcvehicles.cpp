@@ -2150,6 +2150,24 @@ namespace npcvehicles
 		using SeatPlayer_t = void (*)(uptr);
 		SeatPlayer_t g_seatPlayerOriginal = nullptr;
 
+		// An actor's name as the game shows it (vtable +0x268, what the console's PickLastRef prints); the form id when it has none.
+		const char* RawDisplayName(uptr ref)
+		{
+			__try {
+				return reinterpret_cast<const char* (*)(uptr)>((*reinterpret_cast<void***>(ref))[0x268 / 8])(ref);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+
+		void ActorName(uptr actor, std::uint32_t id, char* out, size_t cap)
+		{
+			const char* n = actor ? RawDisplayName(actor) : nullptr;
+			if (n && n[0]) std::snprintf(out, cap, "%s", n);
+			else std::snprintf(out, cap, "%08X", id);
+		}
+
 		bool OursVehicle(std::uint32_t id)
 		{
 			for (const auto& j : g_jobs) {
@@ -2937,7 +2955,29 @@ namespace npcvehicles
 		add(leaving, "getting out");
 		add(int(g_riders.size()), "riding");
 		total += int(g_riders.size());
-		hoverui::SetGang(total, "", g_aggroKey ? controlmap::KeyName(g_aggroKey).c_str() : "");  // the count; the rows below say what each vehicle does
+		{
+			// The NPCs' names (2026-10-20, the user: names instead of "Gang n"): up to three, then "+n".
+			char names[96] = "";
+			int shown = 0, more = 0;
+			auto addName = [&](std::uint32_t npcId) {
+				if (shown >= 3) { ++more; return; }
+				char nm[40];
+				ActorName(RefById(npcId), npcId, nm, sizeof(nm));
+				std::strncat(names, shown ? ", " : "", sizeof(names) - std::strlen(names) - 1);
+				std::strncat(names, nm, sizeof(names) - std::strlen(names) - 1);
+				++shown;
+			};
+			for (const auto& j : g_jobs) {
+				if (j.phase != Phase::Idle) addName(j.npc);
+			}
+			for (const auto& r : g_riders) addName(r.npc);
+			if (more) {
+				char tail[16];
+				std::snprintf(tail, sizeof(tail), " +%d", more);
+				std::strncat(names, tail, sizeof(names) - std::strlen(names) - 1);
+			}
+			hoverui::SetGang(total, names, g_aggroKey ? controlmap::KeyName(g_aggroKey).c_str() : "");
+		}
 		{
 			// One line per NPC vehicle / rider: "pursuit  REV8  120 m".
 			static char line[hoverui::kMaxRows][80];
@@ -2947,20 +2987,20 @@ namespace npcvehicles
 			for (const auto& j : g_jobs) {
 				if (j.phase == Phase::Idle || nr >= hoverui::kMaxRows) continue;
 				const uptr v = RefById(j.vehicle);
-				char name[48] = "";
-				if (v) CopyEditorId(At<uptr>(v, 0x98), name, sizeof(name));
-				const char* state = j.phase == Phase::Following ? kProfiles[int(j.profile)].name : j.passenger ? "boarding as passenger" : j.phase == Phase::Boarding ? "boarding" : "getting out";
+				char name[40] = "";
+				ActorName(RefById(j.npc), j.npc, name, sizeof(name));  // who, not which vehicle
+				const char* state = j.phase == Phase::Following ? (j.task ? "driving" : kProfiles[int(j.profile)].name) : j.passenger ? "boarding as passenger" : j.phase == Phase::Boarding ? "boarding" : "getting out";
 				const double d = v ? Dist(v, player) : 0.0;
-				std::snprintf(line[nr], sizeof(line[nr]), "%s%s%s  %.0f m", state, name[0] ? " " : "", name, d);
+				std::snprintf(line[nr], sizeof(line[nr]), "%s  %s  %.0f m", name, state, d);
 				ptrs[nr] = line[nr];
 				++nr;
 			}
 			for (const auto& r : g_riders) {
 				if (nr >= hoverui::kMaxRows) break;
 				const uptr v = RefById(r.vehicle);
-				char name[48] = "";
-				if (v) CopyEditorId(At<uptr>(v, 0x98), name, sizeof(name));
-				std::snprintf(line[nr], sizeof(line[nr]), "riding%s%s  %.0f m", name[0] ? " " : "", name, v ? Dist(v, player) : 0.0);
+				char name[40] = "";
+				ActorName(RefById(r.npc), r.npc, name, sizeof(name));
+				std::snprintf(line[nr], sizeof(line[nr]), "%s  riding  %.0f m", name, v ? Dist(v, player) : 0.0);
 				ptrs[nr] = line[nr];
 				++nr;
 			}

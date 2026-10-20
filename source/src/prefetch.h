@@ -28,7 +28,9 @@ namespace prefetch
 		kSlotPilot0 = kSlotRescue0 + 2, kSlotPilotEach = 16, kSlotPilotCount = 6,
 		// SeamlessVehicle: the ground under the player (the rover's follow-from-below).
 		kSlotFollow = kSlotPilot0 + kSlotPilotEach * kSlotPilotCount,
-		kSlotCount = kSlotFollow + 1 };
+		// SeamlessVehicle: the flight-level probes beside the terrain probes ahead (pilots 0..6, 16 each: 7 model samples, then 9 corridors).
+		kSlotLow0 = kSlotFollow + 1, kSlotLowEach = 16, kSlotLowCount = 7,
+		kSlotCount = kSlotLow0 + kSlotLowEach * kSlotLowCount };
 
 	// Also service probes when the engine updates the loaded grid around this reference (the flown ship).
 	void SetProbeAnchor(std::uintptr_t ref);
@@ -46,8 +48,9 @@ namespace prefetch
 	// Forward obstacle rays (2026-10-17): a straight ray from -> to through the game's own hknpBSWorld::CastRay
 	// (the query the vertical ground ray builds, FUN_140583CB0, with our own end points), on `mask`'s collision layers
 	// (64-bit, bit n = layer n). Queued and run like the ground probes; the nearest hit comes back next frame.
-	// 0..20: pilot * 3 + corridor (pilots 0..6, straight / left / right); 24..44: pilot * 3 + k, the sweep rays that feed the nav map.
-	enum { kRaySlots = 48 };
+	// 0..20: pilot * 3 + corridor (pilots 0..6, straight / left / right); 24..44: pilot * 3 + k, the sweep rays that feed the nav map;
+	// 48..61: pilot * 2 + k, the ceiling rays (straight up, up and ahead).
+	enum { kRaySlots = 62 };
 	struct RayHit
 	{
 		bool hit = false;

@@ -1359,8 +1359,9 @@ namespace hoverui
 
 	void SetGang(int count, const char* profile, const char* key)
 	{
-		char t[64];
-		if (profile && profile[0]) std::snprintf(t, sizeof(t), "Gang %d  %s", count, profile);
+		// (2026-10-20, the user: the NPCs' names instead of "Gang n"): the caller's text is the names; no text = the count as before.
+		char t[96];
+		if (profile && profile[0]) std::snprintf(t, sizeof(t), "%s", profile);
 		else std::snprintf(t, sizeof(t), "Gang %d", count);
 		std::lock_guard lk(g_ctx.lock);
 		g_ctx.gang = count;

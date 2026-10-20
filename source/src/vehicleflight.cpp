@@ -147,7 +147,7 @@ namespace vehicleflight
 		constexpr double kAvoidTurnRate = 0.9;    // rad/s of turn while avoiding
 		constexpr double kAvoidSlowTo = 40.0;     // m/s: turning away is done at most this fast
 		constexpr double kBrakeAcc = 30.0;        // m/s^2 when stopping
-		constexpr ULONGLONG kAvoidHoldMs = 600;   // an avoidance action is kept at least this long (no flicker)
+		constexpr ULONGLONG kAvoidHoldMs = 250;   // an avoidance action is kept at least this long (no flicker; 2026-10-20: was 600, snappier)
 		// Call
 		constexpr double kCallFar = 150.0;        // m: farther than this (or not loaded) the rover is moved, not flown (2026-10-17: was 300)
 		constexpr double kCruiseAhead = 300.0;    // m: Auto (player aboard) flies at a point this far along the camera's heading
@@ -157,7 +157,7 @@ namespace vehicleflight
 		constexpr ULONGLONG kCallTimeoutMs = 90000;
 		constexpr ULONGLONG kGuardMs = 6000;
 		// Autopilot attitude: its own yaw, pitch and roll (the player only has the camera aim and the A / D bank).
-		constexpr double kApYawGain = 1.6;        // 1/s: turn rate per radian of heading error
+		constexpr double kApYawGain = 2.2;        // 1/s: turn rate per radian of heading error (2026-10-20: was 1.6, snappier)
 		constexpr double kApYawMax = 1.2;         // rad/s
 		constexpr double kApBankPerYaw = 0.35;    // rad of bank per rad/s of turn (coordinated turn)
 		constexpr double kApBankMax = 0.45;       // rad
@@ -178,7 +178,7 @@ namespace vehicleflight
 		// heading turns away in kAvoidSide steps (up to kDetourMax) and keeps that side until the corridor back toward
 		// the target is clear again (wall following); nothing open on either side: it climbs.
 		constexpr double kDetourMax = 1.8;           // rad (3 steps, about 100 degrees)
-		constexpr ULONGLONG kDetourHoldMs = 900;     // a detour step is held at least this long
+		constexpr ULONGLONG kDetourHoldMs = 400;     // a detour step is held at least this long (2026-10-20: was 900, snappier)
 		constexpr double kDetourSlowTo = 25.0;       // m/s while detouring
 		constexpr double kCruiseExtraMax = 30.0;     // m: blocked everywhere, the skim height rises at most this much
 		// Stuck escape: first climb out higher; stuck again within kEscapeWindowMs, or not closing on the target:
@@ -271,6 +271,19 @@ namespace vehicleflight
 		// Sweep rays (2026-10-18, the shared nav map): three more rays a frame per autopilot vehicle, walking round a fixed
 		// ring of 16 compass directions (a full turn in about 6 frames), only to fill the map the heading sampler reads.
 		constexpr int kSweepSlot0 = 24, kSweepRays = 3, kSweepRing = 16;
+		// What is ground (2026-10-20, the user: "terrain assist should only be for the ground and for everything else just a warning ... should
+		// still be able to go through"; the design picked: terrain plus surfaces below the flight level). Every probe ahead (front, the three
+		// look-ahead samples, the nine corridors) is two probes: the terrain and planet ground layers (13, 17) from kCastAbove (hills, cliffs) and
+		// every surface from kFlightLevel over the vehicle down (a street, platform or roof it can reach without climbing into anything). The
+		// higher of the two is the ground. A building face, overhang or bridge above the flight level lifts nothing: it is the forward rays' wall
+		// warning. The probe straight down and the two side probes see every surface, as before.
+		constexpr std::uint32_t kTerrainLayers = (1u << 13) | (1u << 17);
+		constexpr double kFlightLevel = 3.0;      // m over the vehicle the flight-level probes start
+		int LowSlot(int idx, int i) { return prefetch::kSlotLow0 + idx * prefetch::kSlotLowEach + i; }
+		// Ceilings: two rays a frame per pilot (straight up kCeilUp, and up and ahead), the lowest hit above the vehicle caps the height hold
+		// kCeilClear under it, so it never presses itself into an underside; under an overhang it flies through at that height.
+		constexpr int kCeilSlot0 = 48;
+		constexpr double kCeilUp = 30.0, kCeilAhead = 15.0, kCeilAheadUp = 12.0, kCeilClear = 2.5, kVehicleTop = 2.0;
 		constexpr double kSelfHitBand = 3.0;      // m: a front sample this close to the rover's own height is the rover
 		constexpr double kLandHeight = 1.0;       // m: settling under this (not climbing) for kLandMs ends the hover
 		constexpr ULONGLONG kLandMs = 1500;
@@ -1093,6 +1106,18 @@ namespace vehicleflight
 			int aiGear = 1;
 			ULONGLONG shiftAt = 0;
 			bool taxiOrbit = false;        // Auto's orbit around the marker is on (AutoMode::Orbit)
+			// The short-horizon planner (MPC): last plan, progress watch, escape.
+			double mpcOmega = 0, mpcFactor = 1.0, mpcSpeed = 0;
+			bool mpcOk = false;
+			ULONGLONG mpcAt = 0, mpcLogAt = 0;
+			double mpcBestDist = 1e9;      // the closest it got to the target in this progress window
+			ULONGLONG mpcProgAt = 0;       // when that window started
+			double mpcStuckX = 0, mpcStuckY = 0;
+			ULONGLONG mpcEscapeUntil = 0;
+			unsigned mpcInvalid = 0;       // candidates that collided in the last plan
+			bool ceilValid = false;        // a ceiling over the vehicle (the ceiling rays); the height hold stays kCeilClear under it
+			double ceilZ = 0;
+			ULONGLONG ceilLogAt = 0;
 			bool wallAhead = false;        // the wall warning: a wall along the way (rays, hull sweep, steep ground samples)
 			double wallDist = 1e9;         // m to it
 			double wallL = 1e9, wallR = 1e9;  // m to a wall left / right (the side rays)
@@ -1983,6 +2008,14 @@ namespace vehicleflight
 				unsigned age = 0;
 				g.asked[i].valid = prefetch::LatestGround(ModelSlot(idx, i), h, age) && age <= kProbeMaxAge && h > -1e30f && h != -500.0f;
 				g.asked[i].h = h;
+				if (i != kCentre && i != kLeft && i != kRight) {  // ahead: the terrain or the surface under the flight level, whichever is higher
+					float lh = -3.4e38f;
+					unsigned la = 0;
+					if (prefetch::LatestGround(LowSlot(idx, i), lh, la) && la <= kProbeMaxAge && lh > -1e30f && lh != -500.0f && (!g.asked[i].valid || lh > g.asked[i].h)) {
+						g.asked[i].h = lh;
+						g.asked[i].valid = true;
+					}
+				}
 				if (g.asked[i].valid && InVehicleSpace(SelfId(idx), g.asked[i].x, g.asked[i].y, h, true)) {  // another vehicle's roof is no ground
 					g.asked[i].valid = false;
 					++g.vehDropped;
@@ -2043,8 +2076,14 @@ namespace vehicleflight
 				g.asked[kAhead0 + i] = { pos.x + dx * ahead[i], pos.y + dy * ahead[i], ahead[i] };
 			}
 			for (int i = 0; i < kSamples; ++i) {
-				prefetch::RequestGround(ModelSlot(idx, i), float(g.asked[i].x), float(g.asked[i].y), i == kCentre ? pos.z - 1.5f : pos.z + float(kCastAbove),
-					0.0f, 8000.0f);
+				const float z = i == kCentre ? pos.z - 1.5f : pos.z + float(kCastAbove);
+				if (i == kCentre || i == kLeft || i == kRight) {
+					prefetch::RequestGround(ModelSlot(idx, i), float(g.asked[i].x), float(g.asked[i].y), z, 0.0f, 8000.0f);
+				}
+				else {  // ahead: the terrain from high above, and every surface under the flight level
+					prefetch::RequestGroundMask(ModelSlot(idx, i), float(g.asked[i].x), float(g.asked[i].y), z, 0.0f, 8000.0f, kTerrainLayers);
+					prefetch::RequestGround(LowSlot(idx, i), float(g.asked[i].x), float(g.asked[i].y), pos.z + float(kFlightLevel), 0.0f, 8000.0f);
+				}
 			}
 			g.haveAsked = true;
 		}
@@ -2111,7 +2150,8 @@ namespace vehicleflight
 					q.x = pos.x + std::sin(hd) * dist[k];
 					q.y = pos.y + std::cos(hd) * dist[k];
 					q.d = dist[k];
-					prefetch::RequestGround(CorridorSlot(idx, c * 3 + k), float(q.x), float(q.y), pos.z + float(kCastAbove), 0.0f, 8000.0f);
+					prefetch::RequestGroundMask(CorridorSlot(idx, c * 3 + k), float(q.x), float(q.y), pos.z + float(kCastAbove), 0.0f, 8000.0f, kTerrainLayers);  // terrain
+					prefetch::RequestGround(LowSlot(idx, 7 + c * 3 + k), float(q.x), float(q.y), pos.z + float(kFlightLevel), 0.0f, 8000.0f);              // under the flight level
 				}
 				const double range = std::max(kRayMin, speed * kRayLead);
 				const float from[3] = { float(pos.x + std::sin(hd) * kRayStart), float(pos.y + std::cos(hd) * kRayStart), float(pos.z + kRayLift) };
@@ -2120,6 +2160,13 @@ namespace vehicleflight
 				g.rayRange[c] = range;
 			}
 			g.haveCorr = true;
+			{
+				const float from[3] = { float(pos.x), float(pos.y), float(pos.z + 1.5) };
+				const float up[3] = { from[0], from[1], float(from[2] + kCeilUp) };
+				const float ahead[3] = { float(pos.x + std::sin(heading) * kCeilAhead), float(pos.y + std::cos(heading) * kCeilAhead), float(from[2] + kCeilAheadUp) };
+				prefetch::RequestRay(kCeilSlot0 + idx * 2, from, up, kWallLayers);
+				prefetch::RequestRay(kCeilSlot0 + idx * 2 + 1, from, ahead, kWallLayers);
+			}
 			if (g.autopilot && navmap::HullEnabled()) {
 				// The vehicle's own shape swept along the planned heading (hull-sized: what a thin ray cannot know).
 				const std::uintptr_t inst = g_shs[idx].instance.load(std::memory_order_relaxed);
@@ -2149,6 +2196,14 @@ namespace vehicleflight
 				unsigned age = 0;
 				g.corr[i].valid = prefetch::LatestGround(CorridorSlot(idx, i), h, age) && age <= kProbeMaxAge && h > -1e30f && h != -500.0f;
 				g.corr[i].h = h;
+				{
+					float lh = -3.4e38f;
+					unsigned la = 0;
+					if (prefetch::LatestGround(LowSlot(idx, 7 + i), lh, la) && la <= kProbeMaxAge && lh > -1e30f && lh != -500.0f && (!g.corr[i].valid || lh > g.corr[i].h)) {
+						g.corr[i].h = lh;
+						g.corr[i].valid = true;
+					}
+				}
 				if (g.corr[i].valid && InVehicleSpace(SelfId(idx), g.corr[i].x, g.corr[i].y, h, true)) {
 					g.corr[i].valid = false;
 					++g.vehDropped;
@@ -2171,6 +2226,15 @@ namespace vehicleflight
 					++g.vehDropped;
 				}
 				if (g.rayValid[c]) navmap::NoteRay(h.from, h.to, rawHit && !onVehicle, h.x, h.y, h.z, h.layer, h.normalOk);  // characters and vehicles are free space to the map, not walls
+			}
+			// Ceiling: the lowest hit above the vehicle of the two ceiling rays (another vehicle's underside does not count).
+			g.ceilValid = false;
+			for (int k = 0; k < 2; ++k) {
+				prefetch::RayHit ch;
+				unsigned age = 0;
+				if (!prefetch::LatestRay(kCeilSlot0 + idx * 2 + k, ch, age) || age > kProbeMaxAge || !ch.hit) continue;
+				if (ch.z < g.askZ + 1.0 || InVehicleSpace(SelfId(idx), ch.x, ch.y, ch.z)) continue;
+				if (!g.ceilValid || ch.z < g.ceilZ) { g.ceilZ = ch.z; g.ceilValid = true; }
 			}
 			g.hullValid = g.hullHit = false;
 			if (g.autopilot && navmap::HullEnabled()) {
@@ -2239,6 +2303,136 @@ namespace vehicleflight
 				g.wallLogAt = now;
 				logger::Write("%s: wall warning: %.1f m ahead (left %.0f, right %.0f)", who, g.wallDist, g.wallL > 1e8 ? -1.0 : g.wallL, g.wallR > 1e8 ? -1.0 : g.wallR);
 			}
+		}
+
+		// ---- Short-horizon planner (MPC, 2026-10-20, the user: "something closer to MPC for short path planning ... with the things added for
+		// cheap escapes ... make decision making snappier"). Every kMpcEveryMs: kMpcOmegas turn rates x kMpcFactors speed shares (held for the
+		// horizon), the same turn rates turning only for the first second, and the last plan; each rolled kMpcSteps x kMpcDt ahead with a simple
+		// hover model (turn rate, speed easing toward its target), scored on every step against the nav map (a remembered solid, ground above
+		// the flight level = a collision; bump spots and unknown space cost), every other vehicle's straight-line prediction, and at the end the
+		// distance left to the target, the heading to it, the change from the last plan and lost speed. The first step of the best is flown.
+		// All candidates colliding = no plan: the old detour / trail / climb rules steer (the first cheap escape). No progress for kMpcStuckMs =
+		// escape for kMpcEscapeMs: the player's trail when there is one, else the target term is swapped for "away from where it got stuck".
+		constexpr ULONGLONG kMpcEveryMs = 50, kMpcStuckMs = 6000, kMpcEscapeMs = 3000;
+		constexpr int kMpcSteps = 10;
+		constexpr bool kMpcEnabled = true;
+		constexpr double kMpcDt = 0.25;
+		constexpr double kMpcOmegas[9] = { -1.2, -0.8, -0.45, -0.2, 0.0, 0.2, 0.45, 0.8, 1.2 };
+		constexpr double kMpcFactors[3] = { 1.0, 0.6, 0.3 };
+		constexpr double kMpcAccel = 6.0, kMpcDecel = 10.0, kMpcHalfWidth = 2.5;
+		constexpr double kMpcClimb = 5.0;   // m/s of climb the height hold makes while it flies toward rising ground
+		struct MpcOut { bool ok = false, escape = false; double omega = 0, speed = 0, cost = 0; unsigned invalid = 0, total = 0; };
+
+		// One rollout: its cost, or a negative value when it collides.
+		double MpcRollout(int idx, const game::Vec3& pos, double heading, double v0, double vmax, double omega, double factor, bool turnFirstOnly,
+			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self)
+		{
+			const State& g = g_gs[idx];
+			double x = pos.x, y = pos.y, h = heading, v = v0, cost = 0;
+			const double vt = std::max(2.0, vmax * factor);
+			for (int k = 1; k <= kMpcSteps; ++k) {
+				const double t = k * kMpcDt;
+				const double w = (turnFirstOnly && t > 1.0) ? 0.0 : omega;
+				h += w * kMpcDt;
+				v += std::clamp(vt - v, -kMpcDecel * kMpcDt, kMpcAccel * kMpcDt);
+				x += std::sin(h) * v * kMpcDt;
+				y += std::cos(h) * v * kMpcDt;
+				// The map: the centre and both sides of the hull.
+				const double rx = std::cos(h) * kMpcHalfWidth, ry = -std::sin(h) * kMpcHalfWidth;
+				for (int sdx = -1; sdx <= 1; ++sdx) {
+					const auto m = navmap::At(x + rx * sdx, y + ry * sdx, pos.z);
+					if (m.blocked) return -1.0;
+					// Ground higher than the flight level plus the climb it can make by then (a hill is climbed, a cliff or building is a wall).
+					if (m.haveGround && m.ground > pos.z + kWallMinRise + kMpcClimb * t) return -1.0;
+					if (m.contacts > 0) cost += 25.0 * m.contacts;
+					if (!m.known) cost += 1.5;
+				}
+				// Other vehicles, predicted straight on.
+				if (g_vsnapOk) {
+					for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
+						const auto& o = g_vsnap.v[i];
+						if (!o.formId || o.formId == self) continue;
+						if (std::fabs(double(o.pos[2]) - pos.z) > 2.0 * (VehHalfZ(o) + 2.0)) continue;
+						const double ox = o.pos[0] + o.vel[0] * t, oy = o.pos[1] + o.vel[1] * t;
+						const double gap = std::hypot(x - ox, y - oy) - VehRadius(o) - kMpcHalfWidth;
+						if (gap < 0.5 && k > 1) return -1.0;
+						if (gap < 8.0) cost += (8.0 - gap) * 15.0;
+					}
+				}
+			}
+			if (escape) cost -= 2.0 * std::hypot(x - sx, y - sy);  // escape: get away from the stuck spot
+			else {
+				cost += std::hypot(tx - x, ty - y);                                          // distance left
+				cost += 6.0 * std::fabs(Wrap(std::atan2(tx - x, ty - y) - h));              // facing the target at the end
+			}
+			cost += 12.0 * std::fabs(omega - g.mpcOmega) + 10.0 * (1.0 - factor);       // smooth, and keep the speed
+			return cost + 1000.0;  // (offset: always positive, even with the escape's reward; a collision is -1)
+		}
+
+		MpcOut MpcPlan(int idx, std::uintptr_t vehicle, const game::Vec3& pos, double heading, double sp, double vmax, double tx, double ty, const char* who)
+		{
+			State& g = g_gs[idx];
+			MpcOut out;
+			const ULONGLONG now = GetTickCount64();
+			if (now - g.mpcAt < kMpcEveryMs) {  // between plans: the last one
+				out.ok = g.mpcOk;
+				out.omega = g.mpcOmega;
+				out.speed = g.mpcSpeed;
+				out.escape = now < g.mpcEscapeUntil;
+				return out;
+			}
+			g.mpcAt = now;
+			// Stuck watch: the vehicle itself moved under 4 m within kMpcStuckMs while still far from the target = escape. (Not "no closer to the
+			// target": an escort keeping a steady gap to a moving player never gets closer and is not stuck.)
+			const double dist = std::hypot(tx - pos.x, ty - pos.y);
+			if (!g.mpcProgAt || std::hypot(pos.x - g.mpcStuckX, pos.y - g.mpcStuckY) > 4.0 || dist < 15.0) {
+				g.mpcProgAt = now;
+				g.mpcStuckX = pos.x;
+				g.mpcStuckY = pos.y;
+			}
+			if (now >= g.mpcEscapeUntil && dist > 15.0 && now - g.mpcProgAt > kMpcStuckMs) {
+				g.mpcEscapeUntil = now + kMpcEscapeMs;
+				g.mpcStuckX = pos.x;
+				g.mpcStuckY = pos.y;
+				g.mpcProgAt = now;
+				g.mpcBestDist = dist;
+				logger::Write("%s: planner: no progress for %.0f s (%.0f m from the target): escaping", who, kMpcStuckMs / 1000.0, dist);
+			}
+			const bool escape = now < g.mpcEscapeUntil;
+			out.escape = escape;
+			const std::uint32_t self = At<std::uint32_t>(vehicle, off::kFormId);
+			double best = 1e18, bestW = 0, bestF = 1.0;
+			unsigned invalid = 0, total = 0;
+			auto consider = [&](double w, double f, bool firstOnly) {
+				++total;
+				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self);
+				if (c <= 0.0) { ++invalid; return; }
+				if (c < best) { best = c; bestW = w; bestF = f; }
+			};
+			for (const double w : kMpcOmegas) {
+				for (const double f : kMpcFactors) consider(w, f, false);
+				consider(w, 1.0, true);
+			}
+			consider(g.mpcOmega, g.mpcFactor, false);  // the last plan, carried on
+			out.invalid = invalid;
+			out.total = total;
+			g.mpcInvalid = invalid;
+			g.mpcOk = best < 1e17;
+			if (g.mpcOk) {
+				g.mpcOmega = bestW;
+				g.mpcFactor = bestF;
+				g.mpcSpeed = std::max(2.0, vmax * bestF);
+			}
+			out.ok = g.mpcOk;
+			out.omega = g.mpcOmega;
+			out.speed = g.mpcSpeed;
+			out.cost = best;
+			if (logger::Verbose() && now - g.mpcLogAt >= 2000) {
+				g.mpcLogAt = now;
+				logger::Write("%s: planner: %s turn %+.2f rad/s at %.0f m/s (%u of %u plans collide)%s", who, g.mpcOk ? "flying" : "no plan,", bestW, g.mpcSpeed, invalid, total,
+					escape ? ", escaping" : "");
+			}
+			return out;
 		}
 
 		// A corridor: 0 clear at the current height, 1 clear with a climb that fits in time, 2 blocked (or unknown).
@@ -2794,7 +2988,28 @@ namespace vehicleflight
 					// Corridors here are cast along the target bearing plus the detour (castHeading), not the velocity.
 					const ULONGLONG nowMs = GetTickCount64();
 					const bool hold = nowMs - g.detourAt < kDetourHoldMs;
-					if (f == 2 && !hold && goal.keepGoing && !goal.cruise && !goal.hold && !g.trailOn && g_trailCount > 3 && std::hypot(goal.x - pos.x, goal.y - pos.y) > kTrailOff) {
+					// The planner first (drive mode keeps its own steering); no plan = the old rules below.
+					MpcOut mo;
+					if (!g.drive && kMpcEnabled) {
+						const double tdx = std::sin(apBearing), tdy = std::cos(apBearing);
+						const double tdist = g.trailOn && TrailHas(g.trailSeq) ? std::hypot(TrailAt(g.trailSeq).x - pos.x, TrailAt(g.trailSeq).y - pos.y)
+							: std::hypot(goal.x - pos.x, goal.y - pos.y);
+						const double reach = std::max(tdist, 20.0);
+						mo = MpcPlan(idx, vehicle, pos, bodyHeading, sp, std::max(top, 5.0), pos.x + tdx * reach, pos.y + tdy * reach, wc);
+						// Escape with the player's trail available: follow it (the second cheap escape).
+						if (mo.escape && !g.trailOn && goal.keepGoing && !goal.cruise && !goal.hold && g_trailCount > 3) {
+							g.trailOn = true;
+							g.trailSeq = TrailNearest(pos.x, pos.y);
+							logger::Write("%s: planner escape: following your trail (%u points)", wc, g_trailCount);
+						}
+					}
+					if (mo.ok) {
+						// The planner steers: its first step's turn rate as the heading to hold, its speed as the cap; no detour steps.
+						g.detourAng = 0;
+						apBearing = bodyHeading + mo.omega / kApYawGain;
+						top = std::min(top, mo.speed);
+					}
+					else if (f == 2 && !hold && goal.keepGoing && !goal.cruise && !goal.hold && !g.trailOn && g_trailCount > 3 && std::hypot(goal.x - pos.x, goal.y - pos.y) > kTrailOff) {
 						g.trailOn = true;
 						g.trailSeq = TrailNearest(pos.x, pos.y);
 						g.detourAng = 0;
@@ -2854,7 +3069,7 @@ namespace vehicleflight
 							rq.ground = g.drive;
 							rq.distToGoal = float(std::hypot(goal.x - pos.x, goal.y - pos.y));
 							const routeplan::Plan pl = routeplan::Update(idx, rq);
-							apBearing += pl.yawOffset;
+							if (!mo.ok) apBearing += pl.yawOffset;  // (the planner already weighs the other vehicles)
 							g.laneZ = g.drive ? 0.0 : pl.laneZ;
 							if (pl.speedCap >= 0.0f) {
 								top = std::min(top, double(pl.speedCap));
@@ -2865,7 +3080,7 @@ namespace vehicleflight
 							}
 						}
 					want = f == 1 ? 1 : 0;
-					if (g.detourAng != 0 || f == 2) top = std::min(top, f == 2 ? 12.0 : kDetourSlowTo);
+					if (!mo.ok && (g.detourAng != 0 || f == 2)) top = std::min(top, f == 2 ? 12.0 : kDetourSlowTo);
 				}
 				else if (sp < 3.0 && !boosting) want = 0;        // parked in the air: nothing to avoid
 				else if (f == 0) want = 0;
@@ -3236,6 +3451,19 @@ namespace vehicleflight
 				g_sh.rollAimOn = rollAimOn;
 				g_sh.rollAim = rollAim;
 				g_sh.holding = g.holding;
+				if (g.ceilValid) {
+					// Never up into a ceiling: the hold (metres over refGround) stays under it; the climb-outs give way to it too.
+					const double maxHold = g.ceilZ - kCeilClear - kVehicleTop - refGround;
+					if (g.hold > maxHold) {
+						g.hold = std::max(0.8, maxHold);
+						if (g.apClimb && pos.z - refGround >= g.hold - 0.5) g.apClimb = false;
+						const ULONGLONG cNow = GetTickCount64();
+						if (logger::Verbose() && cNow - g.ceilLogAt >= 2000) {
+							g.ceilLogAt = cNow;
+							logger::Write("%s: ceiling %.1f m over the vehicle: height held %.1f m under it", wf, g.ceilZ - pos.z, kCeilClear);
+						}
+					}
+				}
 				g_sh.hold = g.hold;
 				g_sh.refGround = refGround;
 				g_sh.groundUnder = floorOn ? std::max(g.ground, g.floorZ - 0.5) : g.ground;

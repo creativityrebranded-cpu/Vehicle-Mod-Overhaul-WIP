@@ -30,6 +30,8 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
 | **Vehicles respect each other** | No more vehicles "magnetised" together; right of way decides who gives way | Untested |
 | **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
+| **Short-horizon planner** | The autopilot looks 2.5 s ahead 20 times a second and picks the best of 37 paths; quick escapes when stuck | Untested |
+| **Flies under things** | Overhangs and bridges are flown under; ceilings cap the height | Untested |
 | **Night and weather** | Autopilots slow down and fly a little higher at night and in rain, snow or dust | Untested |
 | **Bystanders react** | People near a crash flee or cower | Untested |
 | **Passenger, taxi, take the wheel** | Ride with an NPC driver, let them taxi you, or take over | Untested |
@@ -118,7 +120,8 @@ the vehicle flies on without stopping. With **Auto: Patrol**, the chain loops fo
 
 Buttons only show when they can be used:
 - **On foot** (if you own a vehicle): Summon, Follow, Get in (near your vehicle), the **Auto: Stop / Orbit / Patrol** button, a
-  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*…), and when NPC vehicles are active, a line per vehicle (*pursuit REV8 120 m*).
+  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*…), and when NPC vehicles are active, who is in them (*Sarah, Barrett +1*) and a line
+  per NPC (*Sarah  escort  42 m*).
 - **In the vehicle:** W / A / S / D, Gear− / Gear+ / Hover, the gear box, **Auto**, the **Auto behaviour** button (flashes blue when
   you press its key) and the NPC vehicle lines.
 
@@ -127,13 +130,26 @@ Buttons only show when they can be used:
 ## Your vehicle
 
 ### The autopilot
-- **Follows the terrain** and keeps just above the highest ground ahead; detours round obstacles in steps and comes back on course;
-  follows **your trail** when the direct way is blocked.
+- **Plans a few seconds ahead (MPC):** 20 times a second it tries 37 short paths (9 turn rates × 3 speeds, "turn then straighten" and
+  its last plan), simulates each 2.5 s ahead and scores them against what the vehicles have mapped (walls, ground above its flight
+  level, bump spots, unknown space), the other vehicles' predicted paths, progress toward the target and smoothness. It flies the best
+  one and plans again. Decisions are snappier than before.
+- **Cheap escapes:** if every path is blocked, the older rules take over (turn away in steps, follow **your trail**, climb as a last
+  resort). If it barely moves for 6 s while still far from its target, it escapes for 3 s: along your trail when there is one,
+  otherwise away from the spot where it got stuck.
+- **Follows the terrain** and keeps just above the highest ground ahead.
 - **Uses its own gears**, matches your speed, and is moved next to you if it gets truly stuck or lost.
 - **Tight spaces:** after repeated bumps it switches hover off and **drives** with the game's own controls (steer, boost, jump),
   then hovers again once the way is clear.
 - **Flipped:** set upright where it is.
 - **Night and bad weather:** at planet-local night, and in rain, snow or dust, autopilots fly about 25-30 % slower and a little higher.
+
+### What counts as ground
+**Ground** is the real terrain (hills and cliffs, seen from high above), or any surface **at or below the vehicle's flight level** (a
+street, platform or roof it can reach without climbing into anything). Everything **above** the flight level that is not terrain
+(building faces, overhangs, bridges, undersides) never lifts the hover: it is only a warning (below). Two rays look up (straight up and
+up-ahead): under a ceiling the height is capped 2.5 m below it, so the vehicle **flies through under bridges and overhangs** instead of
+pressing into them.
 
 ### Walls (no more "magnet")
 Earlier builds treated a wall like a hill: the hover tried to climb its face and stuck to it. Now a wall **never lifts the vehicle**.
