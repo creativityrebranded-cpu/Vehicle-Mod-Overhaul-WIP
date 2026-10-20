@@ -27,6 +27,11 @@ namespace navmap
 	void NoteRay(const float from[3], const float to[3], bool hit, float hx, float hy, float hz, std::uint32_t layer, bool normalOk);
 	// A contact at the vehicle's place: up = the solver pushed it up (a floor under it), else a side bump toward (dx, dy).
 	void NoteContact(double x, double y, double z, bool up, double dx, double dy);
+	// The game's own collision objects (navseed, 2026-10-20): a solid object's box (centre, heading, half-extents, bottom and top) marks
+	// every cell it covers as solid between zlo and zhi (two height bands per cell, so a floor and a roof above it stay apart). Refreshed
+	// every few seconds by the scan; NoteSeeded says which area the last full scan covered (cells there count as known).
+	void NoteObject(double cx, double cy, double yaw, double hx, double hy, double zlo, double zhi);
+	void NoteSeeded(double cx, double cy, double radius);
 
 	// ---- Questions ----
 	struct Sample
@@ -35,6 +40,7 @@ namespace navmap
 		bool haveGround = false;
 		float ground = 0;       // highest surface remembered (ground or learned floor)
 		bool blocked = false;   // a solid static hit near height z
+		bool objBlocked = false;  // a game collision object's box (navseed) covers height z here (kept apart: a box can be a poor fit)
 		bool free = false;      // a ray passed through this height
 		int contacts = 0;
 	};

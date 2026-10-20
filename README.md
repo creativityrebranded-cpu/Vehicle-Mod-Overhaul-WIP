@@ -32,6 +32,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
 | **Short-horizon planner** | The autopilot looks 2.5 s ahead 20 times a second and picks the best of 37 paths; quick escapes when stuck | Untested |
 | **Flies under things** | Overhangs and bridges are flown under; ceilings cap the height | Untested |
+| **Knows the area up front** | The game's own collision objects are read into the vehicles' map, so planning starts with the walls already known | Untested |
 | **Night and weather** | Autopilots slow down and fly a little higher at night and in rain, snow or dust | Untested |
 | **Bystanders react** | People near a crash flee or cower | Untested |
 | **Passenger, taxi, take the wheel** | Ride with an NPC driver, let them taxi you, or take over | Untested |
@@ -134,6 +135,11 @@ Buttons only show when they can be used:
   its last plan), simulates each 2.5 s ahead and scores them against what the vehicles have mapped (walls, ground above its flight
   level, bump spots, unknown space), the other vehicles' predicted paths, progress toward the target and smoothness. It flies the best
   one and plans again. Decisions are snappier than before.
+- **Knows the area up front:** every couple of seconds the mod reads the game's own list of loaded objects that have collision
+  (buildings, walls, rocks, bridge decks…) within 250 m and writes each one's box (its size, position and heading) into the map the
+  planner uses, as a height band, so open space under a deck stays open. The planner no longer has to discover walls by bumping its
+  rays into them. Very large objects (over 120 m across) are left to the rays, and where the vehicle is inside an object's box (a
+  big composite structure) the planner trusts the rays instead.
 - **Cheap escapes:** if every path is blocked, the older rules take over (turn away in steps, follow **your trail**, climb as a last
   resort). If it barely moves for 6 s while still far from its target, it escapes for 3 s: along your trail when there is one,
   otherwise away from the spot where it got stuck.

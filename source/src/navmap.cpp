@@ -27,6 +27,11 @@ namespace navmap
 		constexpr double kFreeBand = 3.0;             // m: a free band is extended by rays this close to it
 		constexpr double kFloorBelowOrigin = 1.5;     // m: a push-up's floor sits about this far under the vehicle's origin
 		constexpr float kNaN = std::numeric_limits<float>::quiet_NaN();
+		constexpr ULONGLONG kObjLifeMs = 8000;        // an object band not refreshed by the scan this long is gone (the scan runs every ~2 s)
+		constexpr double kObjVehTop = 2.0;            // m: the vehicle's height over its origin (a band meeting [z - 0.5, z + this] blocks it)
+		constexpr int kObjMaxCells = 1600;            // cells one object may mark (a 160 m square)
+		double g_seedX = 0, g_seedY = 0, g_seedR = 0;
+		ULONGLONG g_seedAt = 0;
 
 		// Collision layers whose hits are remembered as obstacles: static things that stay where they are. Characters
 		// (8 biped, 30 character controller, 33) and debris are not.
@@ -37,6 +42,8 @@ namespace navmap
 			float ground = kNaN, floor = kNaN, blockedZ = kNaN, freeLo = kNaN, freeHi = kNaN;
 			ULONGLONG seen = 0, groundAt = 0, floorAt = 0, blockedAt = 0, freeAt = 0, contactAt = 0;
 			std::uint8_t contacts = 0;
+			float objLo[2] = { kNaN, kNaN }, objHi[2] = { kNaN, kNaN };  // solid height bands from the game's collision objects (navseed)
+			ULONGLONG objAt[2] = {};
 		};
 
 		std::unordered_map<std::uint64_t, Cell> g_cells;
@@ -74,6 +81,57 @@ namespace navmap
 			}
 			c.freeAt = c.seen = now;
 		}
+	}
+
+	void NoteObject(double cx, double cy, double yaw, double hx, double hy, double zlo, double zhi)
+	{
+		if (!Finite(cx) || !Finite(cy) || !Finite(zlo) || !Finite(zhi) || !(hx > 0) || !(hy > 0)) return;
+		const ULONGLONG now = GetTickCount64();
+		const double c = std::cos(yaw), s = std::sin(yaw);
+		// The box's world footprint (heading `yaw`: forward = (sin, cos), right = (cos, -sin)), inflated by half a cell.
+		const double ex = std::fabs(c) * hx + std::fabs(s) * hy + kCell * 0.5, ey = std::fabs(s) * hx + std::fabs(c) * hy + kCell * 0.5;
+		const int x0 = CellIndex(cx - ex), x1 = CellIndex(cx + ex), y0 = CellIndex(cy - ey), y1 = CellIndex(cy + ey);
+		if ((x1 - x0 + 1) * (y1 - y0 + 1) > kObjMaxCells) return;
+		for (int ix = x0; ix <= x1; ++ix) {
+			for (int iy = y0; iy <= y1; ++iy) {
+				const double px = (ix + 0.5) * kCell - cx, py = (iy + 0.5) * kCell - cy;
+				const double lr = px * c - py * s, lf = px * s + py * c;  // into the box's own right / forward
+				if (std::fabs(lr) > hx + kCell * 0.5 || std::fabs(lf) > hy + kCell * 0.5) continue;
+				Cell& cell = g_cells[Key(ix, iy)];
+				cell.seen = now;
+				// Merge into an overlapping band, else a free / stale slot, else the nearer band.
+				int k = -1;
+				for (int b = 0; b < 2; ++b) {
+					if (Valid(cell.objLo[b]) && now - cell.objAt[b] < kObjLifeMs && zlo <= cell.objHi[b] + 1.0 && zhi >= cell.objLo[b] - 1.0) { k = b; break; }
+				}
+				if (k < 0) {
+					for (int b = 0; b < 2; ++b) {
+						if (!Valid(cell.objLo[b]) || now - cell.objAt[b] >= kObjLifeMs) { k = b; cell.objLo[b] = float(zlo); cell.objHi[b] = float(zhi); break; }
+					}
+				}
+				if (k < 0) {
+					const double mid = 0.5 * (zlo + zhi);
+					k = std::fabs(mid - 0.5 * (cell.objLo[0] + cell.objHi[0])) <= std::fabs(mid - 0.5 * (cell.objLo[1] + cell.objHi[1])) ? 0 : 1;
+				}
+				if (now - cell.objAt[k] < kObjLifeMs && Valid(cell.objLo[k])) {
+					cell.objLo[k] = std::min(cell.objLo[k], float(zlo));
+					cell.objHi[k] = std::max(cell.objHi[k], float(zhi));
+				}
+				else {
+					cell.objLo[k] = float(zlo);
+					cell.objHi[k] = float(zhi);
+				}
+				cell.objAt[k] = now;
+			}
+		}
+	}
+
+	void NoteSeeded(double cx, double cy, double radius)
+	{
+		g_seedX = cx;
+		g_seedY = cy;
+		g_seedR = radius;
+		g_seedAt = GetTickCount64();
 	}
 
 	void NoteGround(double x, double y, double h)
@@ -143,9 +201,14 @@ namespace navmap
 	Sample At(double x, double y, double z)
 	{
 		Sample s;
-		const Cell* c = Find(x, y);
-		if (!c) return s;
 		const ULONGLONG now = GetTickCount64();
+		// Inside the area the object scan covered: known (no object here = open), whatever the probes saw.
+		const bool seeded = g_seedAt && now - g_seedAt < kObjLifeMs && std::hypot(x - g_seedX, y - g_seedY) < g_seedR;
+		const Cell* c = Find(x, y);
+		if (!c) {
+			s.known = seeded;
+			return s;
+		}
 		if (Valid(c->ground) && now - c->groundAt < kCellLifeMs) {
 			s.haveGround = true;
 			s.ground = c->ground;
@@ -157,7 +220,10 @@ namespace navmap
 		s.blocked = Valid(c->blockedZ) && now - c->blockedAt < kBlockedLifeMs && std::fabs(z - c->blockedZ) <= kBlockedBand;
 		s.free = Valid(c->freeLo) && now - c->freeAt < kCellLifeMs && z >= c->freeLo - 2.0 && z <= c->freeHi + 2.0;
 		if (now - c->contactAt < kContactLifeMs) s.contacts = c->contacts;
-		s.known = s.haveGround || s.blocked || s.free || s.contacts > 0;
+		for (int b = 0; b < 2; ++b) {  // a solid object's band where the vehicle would be
+			if (Valid(c->objLo[b]) && now - c->objAt[b] < kObjLifeMs && z + kObjVehTop >= c->objLo[b] - 0.5 && z - 0.5 <= c->objHi[b]) s.objBlocked = true;
+		}
+		s.known = s.haveGround || s.blocked || s.objBlocked || s.free || s.contacts > 0 || seeded;
 		return s;
 	}
 
@@ -333,6 +399,7 @@ namespace navmap
 	void Reset()
 	{
 		g_cells.clear();
+		g_seedAt = 0;
 		g_n = Counters{};
 		g_lastTick = g_lastLog = 0;
 	}

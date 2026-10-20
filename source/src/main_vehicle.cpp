@@ -18,6 +18,7 @@
 #include "mappoints.h"
 #include "vehicleworld.h"
 #include "vehiclehits.h"
+#include "navseed.h"
 #include "vehicleaim.h"
 #include "plugininfo.h"
 #include "shipmodel.h"
@@ -64,6 +65,7 @@ namespace
 		routeplan::Reset();
 		world::Reset();
 		vehiclehits::Reset();
+		navseed::Reset();
 		navmap::Reset();
 	}
 
@@ -72,6 +74,7 @@ namespace
 		modscene::NewFrame();  // the shared scan of loaded references starts over
 		world::Publish();      // the shared vehicle list (positions, velocities, sizes), once per frame
 		vehiclehits::Tick();   // projectiles through vehicles: the hit counter (needs this frame's vehicle list)
+		navseed::Tick();       // the game's collision objects into the nav map (a slice a frame)
 		routeplan::Frame();    // its copy for the lane planner
 		vehicleflight::Tick();
 		navmap::Tick();

@@ -2325,7 +2325,7 @@ namespace vehicleflight
 
 		// One rollout: its cost, or a negative value when it collides.
 		double MpcRollout(int idx, const game::Vec3& pos, double heading, double v0, double vmax, double omega, double factor, bool turnFirstOnly,
-			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self)
+			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self, bool useObjects)
 		{
 			const State& g = g_gs[idx];
 			double x = pos.x, y = pos.y, h = heading, v = v0, cost = 0;
@@ -2341,7 +2341,7 @@ namespace vehicleflight
 				const double rx = std::cos(h) * kMpcHalfWidth, ry = -std::sin(h) * kMpcHalfWidth;
 				for (int sdx = -1; sdx <= 1; ++sdx) {
 					const auto m = navmap::At(x + rx * sdx, y + ry * sdx, pos.z);
-					if (m.blocked) return -1.0;
+					if (m.blocked || (useObjects && m.objBlocked)) return -1.0;  // a solid hit, or a game collision object's box
 					// Ground higher than the flight level plus the climb it can make by then (a hill is climbed, a cliff or building is a wall).
 					if (m.haveGround && m.ground > pos.z + kWallMinRise + kMpcClimb * t) return -1.0;
 					if (m.contacts > 0) cost += 25.0 * m.contacts;
@@ -2401,11 +2401,14 @@ namespace vehicleflight
 			const bool escape = now < g.mpcEscapeUntil;
 			out.escape = escape;
 			const std::uint32_t self = At<std::uint32_t>(vehicle, off::kFormId);
+			// The game's object boxes (navseed) count, unless the vehicle itself sits inside one: then that box is a poor fit (a big composite
+			// object around open space) and only the probes' map is trusted for this plan.
+			const bool useObjects = !navmap::At(pos.x, pos.y, pos.z).objBlocked;
 			double best = 1e18, bestW = 0, bestF = 1.0;
 			unsigned invalid = 0, total = 0;
 			auto consider = [&](double w, double f, bool firstOnly) {
 				++total;
-				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self);
+				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self, useObjects);
 				if (c <= 0.0) { ++invalid; return; }
 				if (c < best) { best = c; bestW = w; bestF = f; }
 			};
