@@ -252,6 +252,9 @@ Added 2026-10-20, built, **not yet tested in game**:
 - Enemy vehicles: flank, intercept, block, overwatch, retreat near their hit limit (driver fights on foot), pick up their wounded, call
   reinforcements; enemies run to free vehicles up to 150 m away in vehicle fights.
 - Hit counter: shots through a vehicle add up; at your health worth its autopilot switches off for 30 s (`[hits]` in seamless.ini).
+- Walls are no longer a terrain-assist "magnet": a wall never raises the hover's hold, its floor or a climb-over. It sets a wall warning
+  instead: autopilots slow to stop about 6 m short and go around (sliding off side walls); flying by hand you only get an
+  "Assist: wall ahead" line. The forward rays and the hull sweep look farther ahead (25 m or 2.4 s of travel) for an earlier warning.
 - Civil traffic (outside fights, at most 2 at once, never essential / protected NPCs): transit with drop-off, shared rides, offer a ride,
   outpost patrols, supply runs, return home, parking in clear spots, fleeing hostile vehicles, slowing for people on foot.
 

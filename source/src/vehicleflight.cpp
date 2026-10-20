@@ -257,7 +257,17 @@ namespace vehicleflight
 		constexpr std::uint64_t kWallLayers = kSolidLayers & ~((1ull << 8) | (1ull << 30) | (1ull << 33));
 		constexpr double kRayStart = 3.5;         // m ahead of the vehicle's origin (past its own hull)
 		constexpr double kRayLift = 1.0;          // m above its origin
-		constexpr double kRayMin = 15.0;          // m: the shortest look ahead
+		constexpr double kRayMin = 25.0;          // m: the shortest look ahead (2026-10-20: was 15; walls are flagged earlier)
+		constexpr double kRayLead = 2.4;          // s of travel the forward rays and the hull sweep look ahead (was 1.6)
+		// Walls (2026-10-20, the user: "terrain assist tends to act like a magnet to walls ... turn it off but use it as warning flag for the
+		// control system ... increase the distance for an earlier flag"). A wall = a forward ray / hull sweep hit, or a ground sample that
+		// rises faster than kWallSlope from the ground under the vehicle. Walls never lift the vehicle (no hold, no floor, no "climb over");
+		// they set the wall warning, and the autopilot slows to stop kWallStandoff short and goes around (the detour steering). Gentle
+		// terrain still raises the hold as before.
+		constexpr double kWallSlope = 0.6;        // rise / distance (about 30 degrees)
+		constexpr double kWallMinRise = 4.0;      // m: lower steps are terrain
+		constexpr double kWallStandoff = 6.0;     // m kept from a wall
+		constexpr double kWallDecel = 8.0;        // m/s^2 the speed cap plans with
 		// Sweep rays (2026-10-18, the shared nav map): three more rays a frame per autopilot vehicle, walking round a fixed
 		// ring of 16 compass directions (a full turn in about 6 frames), only to fill the map the heading sampler reads.
 		constexpr int kSweepSlot0 = 24, kSweepRays = 3, kSweepRing = 16;
@@ -1083,6 +1093,10 @@ namespace vehicleflight
 			int aiGear = 1;
 			ULONGLONG shiftAt = 0;
 			bool taxiOrbit = false;        // Auto's orbit around the marker is on (AutoMode::Orbit)
+			bool wallAhead = false;        // the wall warning: a wall along the way (rays, hull sweep, steep ground samples)
+			double wallDist = 1e9;         // m to it
+			double wallL = 1e9, wallR = 1e9;  // m to a wall left / right (the side rays)
+			ULONGLONG wallLogAt = 0;
 			bool personAhead = false;      // someone on foot in the way (checked every kPersonEveryMs)
 			double personDist = 1e9;
 			ULONGLONG personAt = 0;
@@ -2038,7 +2052,7 @@ namespace vehicleflight
 					q.d = dist[k];
 					prefetch::RequestGround(CorridorSlot(idx, c * 3 + k), float(q.x), float(q.y), pos.z + float(kCastAbove), 0.0f, 8000.0f);
 				}
-				const double range = std::max(kRayMin, speed * 1.6);
+				const double range = std::max(kRayMin, speed * kRayLead);
 				const float from[3] = { float(pos.x + std::sin(hd) * kRayStart), float(pos.y + std::cos(hd) * kRayStart), float(pos.z + kRayLift) };
 				const float to[3] = { float(from[0] + std::sin(hd) * range), float(from[1] + std::cos(hd) * range), from[2] };
 				prefetch::RequestRay(idx * 3 + c, from, to, kWallLayers);
@@ -2049,12 +2063,12 @@ namespace vehicleflight
 				// The vehicle's own shape swept along the planned heading (hull-sized: what a thin ray cannot know).
 				const std::uintptr_t inst = g_shs[idx].instance.load(std::memory_order_relaxed);
 				if (inst) {
-					g.hullRange = std::max(kRayMin, speed * 1.6);
+					g.hullRange = std::max(kRayMin, speed * kRayLead);
 					prefetch::RequestSweep(idx, inst, float(std::sin(heading)), float(std::cos(heading)), float(g.hullRange), kWallLayers);
 				}
 			}
 			if (g.autopilot) {
-				const double sweepRange = std::clamp(speed * 2.0, 20.0, 60.0);
+				const double sweepRange = std::clamp(speed * 2.5, 30.0, 80.0);
 				for (int k = 0; k < kSweepRays; ++k) {
 					const double hd = double((g.sweepPhase * kSweepRays + k) % kSweepRing) * (6.283185307179586 / kSweepRing);
 					const float from[3] = { float(pos.x + std::sin(hd) * kRayStart), float(pos.y + std::cos(hd) * kRayStart), float(pos.z + kRayLift) };
@@ -2133,6 +2147,39 @@ namespace vehicleflight
 			if (g.autopilot && g.rayValid[0] && g.ray[0].hit && logger::Verbose()) NameBlocker(idx);
 		}
 
+		// The wall warning (once a frame, after ReadCorridors): how far the nearest wall is along the way and to each side.
+		bool IsWallSample(const State& g, double h, double d)
+		{
+			if (!g.haveGround) return false;
+			const double rise = h - g.ground;
+			return rise > kWallMinRise && rise / std::max(d, 1.0) > kWallSlope && h > g.askZ - 1.0;  // (a wall whose top is under us is no wall)
+		}
+
+		void WallScan(int idx, const char* who)
+		{
+			State& g = g_gs[idx];
+			g.wallAhead = false;
+			g.wallDist = g.wallL = g.wallR = 1e9;
+			if (g.rayValid[0] && g.ray[0].hit) { g.wallAhead = true; g.wallDist = std::min(g.wallDist, double(g.ray[0].distance) + kRayStart); }
+			if (g.hullValid && g.hullHit) { g.wallAhead = true; g.wallDist = std::min(g.wallDist, double(g.hullDist)); }
+			for (int k = 0; k < 3; ++k) {
+				const auto& q = g.corr[k];
+				if (q.valid && IsWallSample(g, q.h, q.d)) { g.wallAhead = true; g.wallDist = std::min(g.wallDist, q.d); }
+			}
+			if (g.rayValid[1] && g.ray[1].hit) g.wallL = double(g.ray[1].distance) + kRayStart;
+			if (g.rayValid[2] && g.ray[2].hit) g.wallR = double(g.ray[2].distance) + kRayStart;
+			const ULONGLONG now = GetTickCount64();
+			static ULONGLONG toldAt[kPilots] = {};
+			if (g.wallAhead && !g.autopilot && g.active && g.wallDist < 25.0 && now - toldAt[idx] >= 3000) {  // by hand: the warning only
+				toldAt[idx] = now;
+				notify::Log("Assist: wall ahead %.0f m", g.wallDist);
+			}
+			if (g.wallAhead && logger::Verbose() && now - g.wallLogAt >= 2000) {
+				g.wallLogAt = now;
+				logger::Write("%s: wall warning: %.1f m ahead (left %.0f, right %.0f)", who, g.wallDist, g.wallL > 1e8 ? -1.0 : g.wallL, g.wallR > 1e8 ? -1.0 : g.wallR);
+			}
+		}
+
 		// A corridor: 0 clear at the current height, 1 clear with a climb that fits in time, 2 blocked (or unknown).
 		int Corridor(int idx, int c, double z, double speed, double& needOut)
 		{
@@ -2155,6 +2202,10 @@ namespace vehicleflight
 				const double n = q.h + kAvoidClear - z;  // metres to climb to pass this sample
 				need = std::max(need, n);
 				if (n <= 0) continue;
+				if (IsWallSample(g, q.h, q.d)) {
+					if (!g.autopilot) continue;   // flying by hand: a wall is only the warning (no turn, no stop, no climb)
+					return needOut = need, 2;     // autopilot: go round it (climbing only as the last resort, cruiseExtra)
+				}
 				const double t = q.d / std::max(speed, 5.0);
 				if (n <= kHoldMaxVz * t) continue;  // the normal height hold rises over this in time
 				if (n > kAvoidMaxClimb || n > kAvoidClimbRate * t + 2.0) return needOut = need, 2;
@@ -2336,7 +2387,7 @@ namespace vehicleflight
 						g.autopilotSince = nowMs;
 						logger::Write("%s: %d contacts in %.0f s (cramped); climbing out (+%.0f m), still flying", wc, kBumpLimit, kBumpWindowMs / 1000.0, g.cruiseExtra);
 					}
-					if (up) {
+					if (up && !(g.wallAhead && g.wallDist < kWallStandoff + 4.0) && g.wallL > 4.0 && g.wallR > 4.0) {
 						g.floorZ = pos.z;
 						g.floorUntil = nowMs + kFloorMs;
 						g.apClimb = true;
@@ -2364,7 +2415,7 @@ namespace vehicleflight
 						// 20:41:52: a 120 m/s push up, then 18 ms later the step after it read as "83 m/s knocked off".
 						if (g.contactsIgnored++ < 6) logger::Write("%s: contact %.0f m/s %s ignored (just pushed up)", wf, delta, up ? "up" : "side");
 					}
-					else if (up) {
+					else if (up && !(g.wallAhead && g.wallDist < kWallStandoff + 4.0) && g.wallL > 4.0 && g.wallR > 4.0) {
 						g.floorZ = pos.z;
 						g.floorUntil = nowMs + kFloorMs;
 						g.contactGraceUntil = nowMs + kPushGraceMs;
@@ -2410,6 +2461,7 @@ namespace vehicleflight
 
 			ReadSamples(idx);
 			ReadCorridors(idx);
+			WallScan(idx, wc);
 			const bool groundOk = g.haveGround && GetTickCount64() - g.groundAt <= 500;
 			if (groundOk) {
 				g.baseZ = g.ground;
@@ -2973,7 +3025,8 @@ namespace vehicleflight
 			double refGround = groundOk ? g.ground : g.baseZ;
 			const bool floorOn = GetTickCount64() < g.floorUntil;
 			if (floorOn) refGround = std::max(refGround, g.floorZ - kFloorClear + 0.5);  // ride over the floor the rays miss
-			const bool frontOk = g.asked[kFront].valid && std::fabs(g.asked[kFront].h - pos.z) > kSelfHitBand && g.asked[kFront].h < pos.z + kCastAbove;
+			const bool frontOk = g.asked[kFront].valid && std::fabs(g.asked[kFront].h - pos.z) > kSelfHitBand && g.asked[kFront].h < pos.z + kCastAbove &&
+				!IsWallSample(g, g.asked[kFront].h, g.asked[kFront].dist);  // a wall 6 m ahead is no ground to hold above (the wall "magnet")
 			if (frontOk) refGround = std::max(refGround, g.asked[kFront].h);
 			if (g.asked[kAhead0].valid && sp > 2.0 && g.asked[kAhead0].h < pos.z - 0.5) refGround = std::max(refGround, g.asked[kAhead0].h);
 			const double aboveRef = pos.z - refGround;
@@ -2987,7 +3040,7 @@ namespace vehicleflight
 					double want = kCallSkim;
 					for (int k = 0; k < 3; ++k) {
 						const auto& q = g.corr[k];
-						if (q.valid) want = std::max(want, q.h + kTerrainClear - refGround);
+						if (q.valid && !IsWallSample(g, q.h, q.d)) want = std::max(want, q.h + kTerrainClear - refGround);  // walls: the warning, not a climb
 					}
 					want = std::min(want, kAvoidMaxClimb);
 					const double goalZ = goal.z;
@@ -3038,6 +3091,18 @@ namespace vehicleflight
 					pitchAim = 0.0;
 				}
 				if (g.detourAng != 0 && !g.apClimb) strafe = g.detourAng > 0 ? 0.4 : -0.4;  // slide toward the open side
+				if (g.wallAhead && !g.apClimb) {
+					// The wall warning: a speed that stops kWallStandoff short of it; inside the standoff: brake (the detour steering turns away).
+					const double room = g.wallDist - kWallStandoff;
+					const double safe = std::max(2.0, std::sqrt(2.0 * kWallDecel * std::max(0.0, room)));
+					if (sp > safe || room < 0.0) {
+						thrustAcc = std::min(thrustAcc, 0.0);
+						thrust = thrustAcc != 0.0;
+						braking = room < 0.0 || sp > safe + 2.0;
+					}
+				}
+				// A wall close beside: slide away from it (never into it).
+				if (!g.apClimb && (g.wallL < 4.0 || g.wallR < 4.0)) strafe = std::clamp(strafe + (g.wallL < g.wallR ? 0.4 : -0.4), -1.0, 1.0);
 				if (g.personAhead && !g.apClimb) {
 					// Someone on foot ahead (2026-10-20): slow to a speed that stops short of them.
 					const double safe = std::max(2.0, std::sqrt(2.0 * 6.0 * std::max(0.0, g.personDist - 4.0)));
