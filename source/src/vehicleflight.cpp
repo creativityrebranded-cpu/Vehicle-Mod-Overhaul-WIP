@@ -11,6 +11,8 @@
 #include "modscene.h"
 #include "navmap.h"
 #include "navfield.h"
+#include "recovery.h"
+#include "environment.h"
 #include "npcvehicles.h"
 #include "notify.h"
 #include "prefetch.h"
@@ -1049,6 +1051,7 @@ namespace vehicleflight
 			bool taxiArrived = false;
 			double taxiMz = std::numeric_limits<double>::quiet_NaN();
 			TripProgress trip;
+            recovery::Budget recovery;
 			bool apClimb = false;          // the first climb straight up, before moving
 			ULONGLONG autopilotSince = 0;
 			int avoid = 0;                 // 0 none, 1 climb, 2 left, 3 right, 4 stop
@@ -1112,7 +1115,8 @@ namespace vehicleflight
 			ULONGLONG shiftAt = 0;
 			bool taxiOrbit = false;        // Auto's orbit around the marker is on (AutoMode::Orbit)
 			// The short-horizon planner (MPC): last plan, progress watch, escape.
-			double mpcOmega = 0, mpcFactor = 1.0, mpcSpeed = 0;
+			double mpcVz = 0;
+            double mpcOmega = 0, mpcFactor = 1.0, mpcSpeed = 0;
 			bool mpcOk = false;
 			ULONGLONG mpcAt = 0, mpcLogAt = 0;
 			double mpcBestDist = 1e9;      // the closest it got to the target in this progress window
@@ -1525,7 +1529,6 @@ namespace vehicleflight
 		// Probe slots: pilot 0 keeps its original ones; NPC pilots have their own block.
 		int ModelSlot(int idx, int i) { return idx ? prefetch::kSlotPilot0 + (idx - 1) * prefetch::kSlotPilotEach + i : prefetch::kSlotModel0 + i; }
 		int CorridorSlot(int idx, int i) { return idx ? prefetch::kSlotPilot0 + (idx - 1) * prefetch::kSlotPilotEach + 7 + i : prefetch::kSlotCheck0 + i; }
-		int MoveSlot(int idx) { return idx ? CorridorSlot(idx, 0) : prefetch::kSlotRescue0; }
 
 		// Where an autopilot flies: the shared goal type (vcontract.h): a point, the stop radius, hold / keep-going / cruise, nav settings.
 		using Goal = vcontract::Goal;
@@ -1745,15 +1748,6 @@ namespace vehicleflight
 		} g_move;
 		ULONGLONG g_movedAt = 0;  // the last summon move (the HUD says "MOVED TO YOU" for a few seconds)
 
-		// NPC pilots' moves (stuck escape): the vehicle by form id, to a point; grounded by a ray in its own slot.
-		struct PilotMove
-		{
-			bool pending = false;
-			std::uint32_t id = 0;
-			double x = 0, y = 0, z = 0, yaw = 0;
-			ULONGLONG asked = 0;
-		} g_pmoves[kPilots];
-		int MoveSlot(int idx);
 		std::uintptr_t RefById(std::uint32_t id);
 
 		// The player's custom map marker (form id at player +0xE40, placed by SetCustomMarker) as a point in the
@@ -1850,64 +1844,29 @@ namespace vehicleflight
 		void FinishMove(std::uintptr_t player)
 		{
 			if (!g_move.pending) return;
-			float h = -3.4e38f;
-			unsigned age = 0;
-			const bool have = prefetch::LatestGround(prefetch::kSlotRescue0, h, age) && age <= 2 && h > -1e30f && h != -500.0f;
-			if (!have && GetTickCount64() - g_move.asked < 1000) return;  // wait for the ray (up to 1 s)
-			g_move.pending = false;
-			const auto rover = Rover();
+            const auto rover=Rover();
+            const auto site=environment::CheckSite(g_roverId,g_move.x,g_move.y,g_move.z,g_move.yaw);
+            if(site.verdict!=environment::Verdict::Safe) {
+                if(GetTickCount64()-g_move.asked<4000)return;
+                g_move.pending=false;notify::Show("Summon: no safe pickup site");logger::Write("Summon refused: %s",site.reason);return;
+            }
+            g_move.pending=false;
 			const auto cell = At<std::uintptr_t>(player, off::kRefParentCell);
 			const auto ws = cell ? At<std::uintptr_t>(cell, off::kCellWorldspace) : 0;
 			if (!rover || !cell || !ws) {
 				logger::Write("Rover call: move cancelled (%s)", rover ? "player not outdoors" : "rover not found");
 				return;
 			}
-			float pos[3] = { float(g_move.x), float(g_move.y), float((have ? h : g_move.z) + 1.0) };
+			float pos[3] = { float(g_move.x), float(g_move.y), float(site.ground+1.0) };
 			float rot[3] = { 0.0f, 0.0f, float(g_move.yaw) };
 			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
 			__try {
 				EngineFn<void (*)(std::uintptr_t, std::uint64_t*, std::uintptr_t, std::uintptr_t, float*, float*)>(addr::kMoveReference)(rover, &handle, cell, ws, pos, rot);
-				logger::Write("Rover call: moved to (%.1f, %.1f, %.1f) next to the player (ground %s)", pos[0], pos[1], pos[2], have ? "from the ray" : "not found: player height");
+				logger::Write("Rover call: moved to (%.1f, %.1f, %.1f) next to the player (ground %s)", pos[0], pos[1], pos[2], "validated footprint and boarding side");
 				g_movedAt = GetTickCount64();
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				logger::Write("Rover call: move raised an exception");
-			}
-		}
-
-		void AskPilotMove(int idx, std::uint32_t id, double x, double y, double z, double yaw)
-		{
-			g_pmoves[idx] = { true, id, x, y, z, yaw, GetTickCount64() };
-			prefetch::RequestGround(MoveSlot(idx), float(x), float(y), float(z) + 60.0f, 0.0f, 400.0f);
-		}
-
-		void FinishPilotMoves(std::uintptr_t player)
-		{
-			for (int idx = 1; idx < kPilots; ++idx) {
-				auto& m = g_pmoves[idx];
-				if (!m.pending) continue;
-				float h = -3.4e38f;
-				unsigned age = 0;
-				const bool have = prefetch::LatestGround(MoveSlot(idx), h, age) && age <= 2 && h > -1e30f && h != -500.0f;
-				if (!have && GetTickCount64() - m.asked < 1000) continue;
-				m.pending = false;
-				const auto vehicle = RefById(m.id);
-				const auto cell = At<std::uintptr_t>(player, off::kRefParentCell);
-				const auto ws = cell ? At<std::uintptr_t>(cell, off::kCellWorldspace) : 0;
-				if (!vehicle || !cell || !ws) {
-					logger::Write("%s: move cancelled (%s)", Who(idx), vehicle ? "player not outdoors" : "vehicle not found");
-					continue;
-				}
-				float pos[3] = { float(m.x), float(m.y), float((have ? h : m.z) + 1.0) };
-				float rot[3] = { 0.0f, 0.0f, float(m.yaw) };
-				std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
-				__try {
-					EngineFn<void (*)(std::uintptr_t, std::uint64_t*, std::uintptr_t, std::uintptr_t, float*, float*)>(addr::kMoveReference)(vehicle, &handle, cell, ws, pos, rot);
-					logger::Write("%s: moved to (%.1f, %.1f, %.1f) (ground %s)", Who(idx), pos[0], pos[1], pos[2], have ? "from the ray" : "not found: player height");
-				}
-				__except (EXCEPTION_EXECUTE_HANDLER) {
-					logger::Write("%s: move raised an exception", Who(idx));
-				}
 			}
 		}
 
@@ -2342,15 +2301,15 @@ namespace vehicleflight
 		constexpr double kMpcAccel = 6.0, kMpcDecel = 10.0, kMpcHalfWidth = 2.5;
 		constexpr double kMpcClimb = 5.0;   // m/s of climb the height hold makes while it flies toward rising ground
 		constexpr double kKnownDecel = 15.0;  // m/s^2: the speed cap plans to stop within the mapped area ahead at this
-		struct MpcOut { bool ok = false, escape = false; double omega = 0, speed = 0, cost = 0; unsigned invalid = 0, total = 0; };
+		struct MpcOut { bool ok = false, escape = false; double omega = 0, speed = 0, cost = 0, vz = 0; unsigned invalid = 0, total = 0; };
 
 		// One rollout: its cost, or a negative value when it collides.
 		double MpcRollout(int idx, const game::Vec3& pos, double heading, double v0, double vmax, double omega, double factor, bool turnFirstOnly,
-			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self, bool useObjects, double halfWidth, double selfRadius, const navfield::Field& field)
+			double tx, double ty, bool escape, double sx, double sy, std::uint32_t self, bool useObjects, double halfWidth, double halfHeight, double selfRadius, const navfield::Field& field, double vz)
 		{
 			const State& g = g_gs[idx];
 			double x = pos.x, y = pos.y, h = heading, v = v0, cost = 0;
-			const double vt = std::max(2.0, vmax * factor);
+			const double vt = std::max(0.0, vmax * factor);
 			for (int k = 1; k <= kMpcSteps; ++k) {
 				const double t = k * kMpcDt;
 				const double w = (turnFirstOnly && t > 1.0) ? 0.0 : omega;
@@ -2358,22 +2317,28 @@ namespace vehicleflight
 				v += std::clamp(vt - v, -kMpcDecel * kMpcDt, kMpcAccel * kMpcDt);
 				x += std::sin(h) * v * kMpcDt;
 				y += std::cos(h) * v * kMpcDt;
-				// The map: the centre and both sides of the hull.
-				const double rx = std::cos(h) * halfWidth, ry = -std::sin(h) * halfWidth;
-				for (int sdx = -1; sdx <= 1; ++sdx) {
-					const auto m = navmap::At(x + rx * sdx, y + ry * sdx, pos.z);
-					if (m.blocked || (useObjects && m.objBlocked)) return -1.0;  // a solid hit, or a game collision object's box
-					// Ground higher than the flight level plus the climb it can make by then (a hill is climbed, a cliff or building is a wall).
-					if (m.haveGround && m.ground > pos.z + kWallMinRise + kMpcClimb * t) return -1.0;
-					if (m.contacts > 0) cost += 25.0 * m.contacts;
-					if (!m.known) cost += 1.5;
-				}
+                // Sweep each rollout segment, at the candidate altitude, with both hull sides.
+                const double rx=std::cos(h)*halfWidth,ry=-std::sin(h)*halfWidth;
+                const int samples=std::max(1,int(std::ceil(std::max(v*kMpcDt/4.0,std::fabs(vz)*kMpcDt))));
+                for(int n=1;n<=samples;++n) {
+                    const double age=t-kMpcDt+kMpcDt*n/samples;
+                    const double zz=pos.z+vz*age;
+                    const double px=x-std::sin(h)*v*kMpcDt*(1.0-double(n)/samples);
+                    const double py=y-std::cos(h)*v*kMpcDt*(1.0-double(n)/samples);
+                    for(int side=-1;side<=1;++side)for(int height=-1;height<=1;++height) {
+                        const double sampleZ=zz+height*halfHeight;
+                        const auto m=navmap::At(px+rx*side,py+ry*side,sampleZ);
+                        if(m.blocked || (useObjects&&m.objBlocked) || (m.haveGround&&m.ground+(height==0?2.5:0.1)>sampleZ)) return -1;
+                        if(std::fabs(vz)>0.1 && !m.known) return -1;
+                        if(n==samples) {cost+=25.0*m.contacts;if(!m.known)cost+=1.5;}
+                    }
+                }
 				// Other vehicles, predicted straight on.
 				if (g_vsnapOk) {
 					for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
 						const auto& o = g_vsnap.v[i];
 						if (!o.formId || o.formId == self) continue;
-						if (std::fabs(double(o.pos[2]) - pos.z) > 2.0 * (VehHalfZ(o) + 2.0)) continue;
+						if (std::fabs(double(o.pos[2]) - (pos.z+vz*t)) > 2.0 * (VehHalfZ(o) + 2.0)) continue;
 						const double ox = o.pos[0] + o.vel[0] * t, oy = o.pos[1] + o.vel[1] * t;
 						const double gap = std::hypot(x - ox, y - oy) - VehRadius(o) - selfRadius;
 						if (gap < 0.5 && k > 1) return -1.0;
@@ -2383,16 +2348,17 @@ namespace vehicleflight
 			}
 			if (escape) cost -= 2.0 * std::hypot(x - sx, y - sy);  // escape: get away from the stuck spot
 			else {
-				const double remaining = field.Value(x, y);
+				const double remaining = field.Value(x, y, pos.z+vz*kMpcSteps*kMpcDt);
 				if (remaining >= 1e12) return -1.0;
 				cost += remaining;                                          // distance left
 				cost += 6.0 * std::fabs(Wrap(std::atan2(tx - x, ty - y) - h));              // facing the target at the end
 			}
 			cost += 12.0 * std::fabs(omega - g.mpcOmega) + 10.0 * (1.0 - factor);       // smooth, and keep the speed
-			return cost + 1000.0;  // (offset: always positive, even with the escape's reward; a collision is -1)
+			cost += 0.4*std::fabs(vz-g.mpcVz);
+            return cost + 1000.0;  // (offset: always positive, even with the escape's reward; a collision is -1)
 		}
 
-		MpcOut MpcPlan(int idx, std::uintptr_t vehicle, const game::Vec3& pos, double heading, double sp, double vmax, double tx, double ty, const char* who)
+		MpcOut MpcPlan(int idx, std::uintptr_t vehicle, const game::Vec3& pos, double heading, double sp, double vmax, double tx, double ty, double tz, const char* who)
 		{
 			State& g = g_gs[idx];
 			MpcOut out;
@@ -2401,6 +2367,7 @@ namespace vehicleflight
 				out.ok = g.mpcOk;
 				out.omega = g.mpcOmega;
 				out.speed = g.mpcSpeed;
+                out.vz = g.mpcVz;
 				out.escape = now < g.mpcEscapeUntil;
 				return out;
 			}
@@ -2429,26 +2396,30 @@ namespace vehicleflight
 			const bool useObjects = !navmap::At(pos.x, pos.y, pos.z).objBlocked;
 			// The flown vehicle's own size (2026-10-20): its half-width (plus a margin) for the map, its footprint radius against other
 			// vehicles, from the world list's bounds; the old fixed 2.5 m when it is not listed.
-			double halfWidth = kMpcHalfWidth, selfRadius = kMpcHalfWidth;
+			double halfWidth = kMpcHalfWidth, halfHeight=kVehicleTop, selfRadius = kMpcHalfWidth;
 			for (std::uint32_t i = 0; g_vsnapOk && i < g_vsnap.count && i < 64; ++i) {
 				if (g_vsnap.v[i].formId != self) continue;
 				halfWidth = std::clamp(double(g_vsnap.v[i].half[0]) + 0.5, 1.0, 6.0);
+				halfHeight=std::clamp(double(g_vsnap.v[i].half[2]),0.5,6.0);
 				selfRadius = VehRadius(g_vsnap.v[i]);
 			}
-			const auto& field = navfield::Get(pos.x, pos.y, pos.z, tx, ty, halfWidth, useObjects);
-			double best = 1e18, bestW = 0, bestF = 1.0;
+			const auto& field = navfield::Get(pos.x, pos.y, pos.z, tx, ty, halfWidth, useObjects, tz);
+			double best = 1e18, bestW = 0, bestF = 1.0, bestVz = 0;
 			unsigned invalid = 0, total = 0;
-			auto consider = [&](double w, double f, bool firstOnly) {
+			auto consider = [&](double w, double f, bool firstOnly, double vz) {
 				++total;
-				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self, useObjects, halfWidth, selfRadius, field);
+				const double c = MpcRollout(idx, pos, heading, sp, vmax, w, f, firstOnly, tx, ty, escape, g.mpcStuckX, g.mpcStuckY, self, useObjects, halfWidth, halfHeight, selfRadius, field, vz);
 				if (c <= 0.0) { ++invalid; return; }
-				if (c < best) { best = c; bestW = w; bestF = f; }
+				if (c < best) { best = c; bestW = w; bestF = f; bestVz = vz; }
 			};
-			for (const double w : kMpcOmegas) {
-				for (const double f : kMpcFactors) consider(w, f, false);
-				consider(w, 1.0, true);
-			}
-			consider(g.mpcOmega, g.mpcFactor, false);  // the last plan, carried on
+            for(const double vz : {-5.0,-2.5,0.0,2.5,5.0}) {
+                for(const double w:kMpcOmegas) {
+                    for(const double f:kMpcFactors) consider(w,f,false,vz);
+                    consider(w,1.0,true,vz);
+                }
+                consider(0.0,0.0,false,vz); // stop and climb/descend in a clear column
+            }
+            consider(g.mpcOmega,g.mpcFactor,false,g.mpcVz);
 			out.invalid = invalid;
 			out.total = total;
 			g.mpcInvalid = invalid;
@@ -2456,12 +2427,14 @@ namespace vehicleflight
 			if (g.mpcOk) {
 				g.mpcOmega = bestW;
 				g.mpcFactor = bestF;
-				g.mpcSpeed = std::max(2.0, vmax * bestF);
+				g.mpcSpeed = std::max(0.0, vmax * bestF);
+                g.mpcVz = bestVz;
 			}
 			out.ok = g.mpcOk;
 			out.omega = g.mpcOmega;
 			out.speed = g.mpcSpeed;
 			out.cost = best;
+            out.vz = g.mpcVz;
 			if (logger::Verbose() && now - g.mpcLogAt >= 2000) {
 				g.mpcLogAt = now;
 				logger::Write("%s: planner: %s turn %+.2f rad/s at %.0f m/s (%u of %u plans collide)%s", who, g.mpcOk ? "flying" : "no plan,", bestW, g.mpcSpeed, invalid, total,
@@ -2554,37 +2527,14 @@ namespace vehicleflight
 			logger::Write("%s: drive mode off (%s): hover on", idx ? Who(idx) : "Rover call", why);
 		}
 
-		// Stuck or lost on autopilot: stop and move the vehicle next to the target (pilot 0: next to the player, as the
-		// far summon; NPC pilots: to their goal point). Following picks up again from there.
+		// Stuck/lost recovery never teleports a vehicle. A failed trip holds until retried or given a new goal.
 		void EscapeMove(int idx, std::uintptr_t vehicle, const Goal& goal)
 		{
-			if (!idx && (goal.cruise || goal.hold)) {
-				State& g0 = g_gs[0];
-				if (goal.cruise) {
-					g0.autopilot = false;
-					g0.playerAuto = false;
-					notify::Log("Auto off: stuck");
-					logger::Write("Rover auto: stuck; control back to the player");
-				}
-				else {
-					// Taxi / hold: keep flying; climb and come at it again.
-					g0.cruiseExtra = std::min(kCruiseExtraMax, g0.cruiseExtra + 12.0);
-					g0.apClimb = true;
-					g0.autopilotSince = GetTickCount64();
-					logger::Write("Rover taxi: stuck; climbing out (+%.0f m), still flying", g0.cruiseExtra);
-				}
-				return;
-			}
-			Stop(idx, "stuck; moved to the target");
-			const auto player = Ptr(addr::kPlayerCharacterPtr);
-			if (!player) return;
-			if (!idx) {
-				AskMove(player);
-				return;
-			}
-			const auto pp = At<game::Vec3>(player, off::kRefPosition);
-			AskPilotMove(idx, At<std::uint32_t>(vehicle, 0x28), goal.x, goal.y, pp.z, At<game::Vec3>(player, off::kRefRotation).z);
-		}
+            auto& state=g_gs[idx];
+            state.recovery.failed=true;
+            logger::Write("%s: recovery exhausted; holding for Retry, Skip, or Cancel",Who(idx));
+            (void)vehicle; (void)goal;
+        }
 
 		// A contact at the vehicle's place, for the shared nav map (up = pushed up by a floor, else a side bump ahead).
 		void NoteContactAt(std::uintptr_t vehicle, bool up)
@@ -2758,6 +2708,16 @@ namespace vehicleflight
 				g.baseZ = g.ground;
 			}
 			const double above = groundOk ? pos.z - g.ground : pos.z - g.baseZ;
+
+            if(g.autopilot && !g.routeHold) {
+                const double goalHeight=std::isfinite(goal.z) ? goal.z : 0;
+                if(g.recovery.Update(GetTickCount64(),pos.x,pos.y,pos.z,goal.x,goal.y,goalHeight,
+                    AtDestination(vehicle,goal.x,goal.y,goal.z,goal.stop),!groundOk || (!matched && !g.drive))) {
+                    navfield::Reset();
+                    g.mpcEscapeUntil=GetTickCount64()+kMpcEscapeMs;
+                    logger::Write("%s: recovery attempt %u of 3",wc,g.recovery.attempts);
+                }
+            }
 
 			// ---- Input ----
 			// Shift + W / Shift + S: one gear up / down per press (gears 1-4 set the boost strength and top speed; 1-4 keys
@@ -3035,7 +2995,7 @@ namespace vehicleflight
 						const double known = std::max(navmap::KnownAhead(pos.x, pos.y, bodyHeading), g.rayRange[0]);
 						const double knownCap = std::max(15.0, std::sqrt(2.0 * kKnownDecel * known));
 						if (top > knownCap) top = knownCap;
-						mo = MpcPlan(idx, vehicle, pos, bodyHeading, sp, std::max(top, 5.0), pos.x + tdx * reach, pos.y + tdy * reach, wc);
+						mo = MpcPlan(idx, vehicle, pos, bodyHeading, sp, std::max(top, 5.0), pos.x + tdx * reach, pos.y + tdy * reach, goal.z, wc);
 						// Escape with the player's trail available: follow it (the second cheap escape).
 						if (mo.escape && !g.trailOn && goal.keepGoing && !goal.cruise && !goal.hold && g_trailCount > 3) {
 							g.trailOn = true;
@@ -3101,6 +3061,8 @@ namespace vehicleflight
 							// that does not meet (routeplan.h).
 							routeplan::Query rq;
 							rq.selfId = At<std::uint32_t>(vehicle, 0x28);
+							for(unsigned i=0;g_vsnapOk&&i<g_vsnap.count&&i<64;++i)if(g_vsnap.v[i].formId==rq.selfId){
+								for(int axis=0;axis<3;++axis)rq.half[axis]=g_vsnap.v[i].half[axis];break;}
 							rq.priority = PilotNavOf(idx).priority > 0 ? PilotNavOf(idx).priority : (idx == 0 ? 120 : 60);
 							rq.pos[0] = pos.x; rq.pos[1] = pos.y; rq.pos[2] = pos.z;
 							rq.dir[0] = float(std::sin(apBearing));
@@ -3281,6 +3243,14 @@ namespace vehicleflight
 						g.steerSecs = 0;
 					}
 					const double spD = g.drvSp;
+                    const double level=std::max(double(pos.z),double(g.ground)+2.5);
+                    const auto& field=navfield::Get(pos.x,pos.y,level,goal.x,goal.y,kMpcHalfWidth,true,goal.z);
+                    double best=1e12,bearing=apBearing;
+                    for(int n=0;n<16;++n){const double h=n*0.39269908169872414,reach=std::max(8.0,spD*1.5);
+                        const double value=field.Value(pos.x+std::sin(h)*reach,pos.y+std::cos(h)*reach,level);
+                        const double score=value+3*std::fabs(Wrap(h-bodyHeading));if(score<best){best=score;bearing=h;}}
+                    if(best<1e12)apBearing=bearing;
+
 					const double e = Wrap(apBearing - heading);  // + : the target is to the right
 					double steer = std::clamp(1.8 * e, -1.0, 1.0);
 					// Boxed in by something climbable (the hover assist stops dead there): go over it with the boost instead; only a tall
@@ -3312,7 +3282,12 @@ namespace vehicleflight
 						accel = 1.0;
 						brake = 0.0;
 					}
-					const bool driveBoost = fwdBoost || (vert && accel > 0.4);  // (named so it no longer hides the booster-visuals `boost` above)
+                    if(g.recovery.failed){accel=0;brake=1;vert=false;steer=0;}
+                    const double dist=std::hypot(goal.x-pos.x,goal.y-pos.y);
+                    g.trip={true,g.recovery.failed?triplogic::Phase::Unreachable:triplogic::Status(groundOk,
+                        triplogic::Reached(dist,goal.stop,std::isfinite(goal.z)?pos.z-goal.z:0,spD,groundOk),dist<=goal.stop+2,
+                        std::isfinite(goal.z)?pos.z-goal.z:0,GetTickCount64()<g.reverseUntil,boxed),goal.x,goal.y,dist,spD,0,GetTickCount64()};
+					const bool driveBoost = !g.recovery.failed && (fwdBoost || (vert && accel > 0.4));  // (named so it no longer hides the booster-visuals `boost` above)
 					g.drvSteer = steer;
 					g_driveOut[idx].steer.store(float(steer * g.steerSign));
 					g_driveOut[idx].accel.store(float(accel));
@@ -3446,6 +3421,11 @@ namespace vehicleflight
 						strafe = std::clamp(strafe + (side > 0 ? -0.5 : 0.5), -1.0, 1.0);
 					}
 				}
+                // Zero vertical route speed leaves precise terrain/goal-height following in control.
+                // Holding zero here would strand the vehicle between the field's eight-metre layers.
+                if(!g.drive && !g.apClimb && g.mpcOk && std::fabs(g.mpcVz)>0.1 && nowMs-g.mpcAt<150 && !g.recovery.failed) {
+                    vzOn=true; vzCmd=g.mpcVz;
+                }
 				rollAim = std::clamp(kApBankPerYaw * yawWant * std::clamp(sp / 15.0, 0.0, 1.0), -kApBankMax, kApBankMax);
 				rollAimOn = true;
 				const auto& hc = g_cmds[idx];
@@ -3469,6 +3449,11 @@ namespace vehicleflight
 					if (c.set & Command::kGear) g.gear = cg;
 				}
 			}
+            if(g.autopilot && g.recovery.failed) {
+                thrustAcc=0; thrust=false; braking=true; strafe=0; yawWant=0;
+                vzOn=true; vzCmd=0;
+                g.holding=true; g.hold=std::max(kMinClearance,pos.z-refGround);
+            }
 			AskCorridors(idx, pos, (g.autopilot && apSteer && !g.apClimb) ? apBearing : (sp > 2.0 ? std::atan2(v[0], v[1]) : bodyHeading), std::max(sp, g.autopilot ? 10.0 : 0.0));
 			{
 				std::lock_guard lk(g_sh.lock);
@@ -3523,6 +3508,7 @@ namespace vehicleflight
 				const bool blocked = g.avoid == 4 || (sp < 1.0 && g.lastF == 2 && g.mpcAt && !g.mpcOk);
 				g.trip = {true, ready && g.apClimb ? triplogic::Phase::AdjustingHeight : triplogic::Status(ready, arrived, dist <= goal.stop+2.0, zError, rerouting, blocked),
 					goal.x, goal.y, dist, std::hypot(sp,v[2]), zError, GetTickCount64()};
+                if(g.recovery.failed) g.trip.phase=triplogic::Phase::Unreachable;
 			} else g.trip = {};
 
 			const ULONGLONG ms = GetTickCount64();
@@ -4135,7 +4121,8 @@ namespace vehicleflight
 				double speed = 99.0;
 				if (lt && tNow > lt && tNow - lt < 1000) speed = std::hypot(rpos.x - lx, rpos.y - ly) / ((tNow - lt) / 1000.0);
 				lx = rpos.x; ly = rpos.y; lt = tNow;
-				if (pg.hold && pg.nav.landOnArrival && AtDestination(vehicle, pg.x, pg.y, pg.z, pg.stop) && speed < 1.0) {
+				if (pg.hold && pg.nav.landOnArrival && AtDestination(vehicle, pg.x, pg.y, pg.z, pg.stop) && speed < 1.0 &&
+					environment::BoardingSite(vehicle).verdict==environment::Verdict::Safe) {
 					g_remoteDone = vcontract::AssignedTo(g_roverId);
 					g_remote = false;
 					Stop("arrived; parked");
@@ -4256,6 +4243,7 @@ namespace vehicleflight
 		job.goal.keepGoing = keepGoing;
 		job.goal.timeoutMs = timeoutMs;
 		job.goal.z = z;
+        job.goal.hold=false;job.goal.cruise=false;
 		State& g = g_gs[pilot];
 		if (g.active && job.vehicleId == id) return true;  // a new target for the same flight
 		if (g.active) Stop(pilot, "another vehicle");
@@ -4273,7 +4261,12 @@ namespace vehicleflight
 	bool PilotFly(int pilot, std::uintptr_t vehicle, const vcontract::Goal& goal, unsigned timeoutMs, bool keepGoing)
 	{
 		PilotNav(pilot, goal.nav);
-		return PilotFly(pilot, vehicle, goal.x, goal.y, goal.stop, timeoutMs, keepGoing, goal.z);
+        if(!PilotFly(pilot,vehicle,goal.x,goal.y,goal.stop,timeoutMs,keepGoing,goal.z))return false;
+        // Preserve the complete shared goal contract, including braking and pass-through semantics.
+        g_jobs[pilot].goal.hold=goal.hold;
+        g_jobs[pilot].goal.cruise=goal.cruise||goal.nav.passThrough;
+        g_jobs[pilot].goal.cruiseSpeed=goal.cruise ? goal.cruiseSpeed : goal.nav.speedLimit>0 ? goal.nav.speedLimit : kAiGearTop[4];
+        return true;
 	}
 
 	bool PilotActive(int pilot) { return pilot >= 1 && pilot < kPilots && g_gs[pilot].active; }
@@ -4306,7 +4299,7 @@ namespace vehicleflight
 		return {};
 	}
 
-	bool AtDestination(std::uintptr_t vehicle, double x, double y, double z, double stop)
+	bool AtDestination(std::uintptr_t vehicle, double x, double y, double z, double stop, bool requireStopped)
 	{
 		if (!vehicle) return false;
 		for (int i=0; i<kPilots; ++i) {
@@ -4317,8 +4310,11 @@ namespace vehicleflight
 			const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
 			const double expected=std::isfinite(z) ? std::max(z,shared.refGround+kCallSkim+EnvClimb()) : pos.z;
 			const double speed=std::sqrt(shared.v[0]*shared.v[0]+shared.v[1]*shared.v[1]+shared.v[2]*shared.v[2]);
-			return triplogic::Reached(std::hypot(x-pos.x,y-pos.y),stop,pos.z-expected,speed,
-				shared.matched && state.haveGround && GetTickCount64()-state.groundAt<=500 && !state.apClimb);
+			if(state.drive)return triplogic::Reached(std::hypot(x-pos.x,y-pos.y),stop,
+				std::isfinite(z)?pos.z-z:0,requireStopped?state.drvSp:0,
+				state.haveGround && GetTickCount64()-state.groundAt<=500 && !state.recovery.failed);
+			return triplogic::Reached(std::hypot(x-pos.x,y-pos.y),stop,pos.z-expected,requireStopped?speed:0,
+				shared.matched && state.haveGround && GetTickCount64()-state.groundAt<=500 && !state.apClimb && !state.recovery.failed);
 		}
 		return false;
 	}
@@ -4337,9 +4333,17 @@ namespace vehicleflight
 		}
 	}
 
+    void RetryScannerTrip() {
+        for(int i=0;i<kPilots;++i){const auto vehicle=g_hoverVehicles[i].load();if(i==0||(vehicle&&At<std::uint32_t>(vehicle,off::kFormId)==g_roverId)){
+            g_gs[i].recovery.Reset();g_gs[i].mpcEscapeUntil=0;g_gs[i].reverseUntil=0;}}
+        navfield::Reset();
+        RequestScannerTrip();
+    }
+
 	void RequestScannerTrip()
 	{
 		g.holdId=0; g.routeHold=false;
+        for(int i=0;i<kPilots;++i){const auto vehicle=g_hoverVehicles[i].load();if(i==0||(vehicle&&At<std::uint32_t>(vehicle,off::kFormId)==g_roverId))g_gs[i].recovery.Reset();}
 		if (npcvehicles::CrewOrderOf(g_roverId)==npcvehicles::CrewOrder::Hold)
 			npcvehicles::SetCrewOrder(g_roverId,npcvehicles::CrewOrder::Marker);
 		g_scanCall.store(true);
@@ -4495,7 +4499,6 @@ namespace vehicleflight
 		PlayerTick();
 		PilotsTick();
 		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
-			FinishPilotMoves(player);
 			if (!PlayerVehicle(player)) WatchFlip(Rover(), "Rover");  // never while the player drives it
 		}
 	}

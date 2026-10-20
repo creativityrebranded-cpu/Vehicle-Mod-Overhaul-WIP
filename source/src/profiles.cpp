@@ -9,6 +9,7 @@
 #include "vcontract.h"
 #include "vehicleflight.h"
 #include "vehicleworld.h"
+#include "environment.h"
 
 #include <Windows.h>
 
@@ -69,7 +70,7 @@ namespace profiles
 			g.nav.passThrough = true;   // corners: keep flying
 			g.nav.speedLimit = 25.0f;
 			g.nav.priority = 20;
-			if (vehicleflight::AtDestination(c.vehicle, g.x, g.y, g.z, g.stop)) {
+			if (vehicleflight::AtDestination(c.vehicle, g.x, g.y, g.z, g.stop,false)) {
 				Step(c, c.step + 1);
 				logger::Write("Profiles: [%d] patrol corner %d", c.pilot, c.step & 3);
 			}
@@ -92,7 +93,9 @@ namespace profiles
 			if (Dist2(c.vehicle, g.x, g.y) < kReach) {
 				g.hold = true;
 				g.nav.landOnArrival = true;
-				if (marker && Waited(c)) Step(c, c.step + 1);  // turn round after the wait (only with a marker to go to)
+				if(!vehicleflight::AtDestination(c.vehicle,g.x,g.y,g.z,g.stop) ||
+					environment::BoardingSite(c.vehicle).verdict!=environment::Verdict::Safe)c.stepAt=GetTickCount64();
+				else if (marker && Waited(c)) Step(c, c.step + 1);
 			}
 			else {
 				c.stepAt = GetTickCount64();  // the wait starts on arrival

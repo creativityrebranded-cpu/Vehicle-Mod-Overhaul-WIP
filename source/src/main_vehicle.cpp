@@ -10,6 +10,7 @@
 #include "modscene.h"
 #include "navmap.h"
 #include "navfield.h"
+#include "environment.h"
 #include "npcvehicles.h"
 #include "passenger.h"
 #include "traffic.h"
@@ -69,6 +70,7 @@ namespace
 		navseed::Reset();
 		navmap::Reset();
 		navfield::Reset();
+        environment::Reset();
 	}
 
 	void Frame()
@@ -78,6 +80,8 @@ namespace
 		vehiclehits::Tick();   // projectiles through vehicles: the hit counter (needs this frame's vehicle list)
 		navseed::Tick();       // the game's collision objects into the nav map (a slice a frame)
 		routeplan::Frame();    // its copy for the lane planner
+		navfield::Service();
+		environment::Tick();
 		vehicleflight::Tick();
 		navmap::Tick();
 		shipvehicle::Tick();

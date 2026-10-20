@@ -43,7 +43,8 @@ namespace vehicleflight
 	// The scanner marker button (scantarget): the player's own vehicle is summoned (as the call key does), and when the player gets in, Auto flies it to the
 	// marker. Driving already: Auto starts at once. Main thread.
 	void RequestScannerTrip();
-	void CancelScannerTrip(); // hold current position, preserving hover and the crew driver
+	void RetryScannerTrip();
+    void CancelScannerTrip(); // hold current position, preserving hover and the crew driver
 	struct TripProgress {
 		bool active = false;
 		triplogic::Phase phase = triplogic::Phase::Idle;
@@ -51,7 +52,7 @@ namespace vehicleflight
 		unsigned long long at = 0;
 	};
 	TripProgress ProgressFor(std::uint32_t vehicleId);
-	bool AtDestination(std::uintptr_t vehicle, double x, double y, double z, double stop);
+	bool AtDestination(std::uintptr_t vehicle, double x, double y, double z, double stop, bool requireStopped=true);
 	// The vehicle hit counter (vehiclehits): this vehicle's autopilot is switched off now and refused for `ms` (its hover ends; the player can still
 	// drive it by hand). Main thread.
 	void DisableAutopilot(std::uint32_t vehicleFormId, unsigned ms, const char* why);

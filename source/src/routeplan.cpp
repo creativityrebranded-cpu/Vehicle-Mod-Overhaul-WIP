@@ -2,6 +2,7 @@
 
 #include "log.h"
 #include "vehicleworld.h"
+#include "navmap.h"
 
 #include <Windows.h>
 
@@ -84,6 +85,23 @@ namespace routeplan
 			return false;
 		}
 
+		bool EnvironmentClear(const Query& q,float lane,float yaw)
+		{
+			const double c=std::cos(yaw),s=std::sin(yaw),dx=q.dir[0]*c+q.dir[1]*s,dy=q.dir[1]*c-q.dir[0]*s;
+			const double speed=std::max(q.speed,4.0f),dt=std::min(0.2,2.0/speed);
+			const double radius=std::hypot(q.half[0],q.half[1])+kMargin;
+			for(double t=dt;t<=kHorizon;t+=dt){
+				const double distance=std::min(speed*t,double(std::max(q.distToGoal,0.0f)));
+				const double x=q.pos[0]+dx*distance,y=q.pos[1]+dy*distance,z=q.pos[2]+std::min(double(lane),t*kLaneRamp);
+				for(int point=0;point<5;++point)for(int h=-1;h<=1;++h){
+					const double px=x+(point==1?radius:point==2?-radius:0),py=y+(point==3?radius:point==4?-radius:0);
+					const double height=z+h*q.half[2];const auto m=navmap::At(px,py,height);
+					if(!m.known||m.blocked||m.objBlocked||(m.haveGround&&m.ground>height))return false;
+				}
+			}
+			return true;
+		}
+
 		const world::VehicleInfo* Find(std::uint32_t id)
 		{
 			for (std::uint32_t i = 0; i < g_snap.count; ++i) {
@@ -162,17 +180,17 @@ namespace routeplan
 				for (int li = 0; li < kLanes && !found; ++li) {            // altitude first
 					if (kLaneZ[li] > laneMax) break;
 					float t; std::uint32_t oo; float d;
-					if (!FirstConflict(q, kLaneZ[li], 0.0f, t, oo, d)) { found = true; bestLane = kLaneZ[li]; bestYaw = 0; }
+					if (!FirstConflict(q, kLaneZ[li], 0.0f, t, oo, d) && EnvironmentClear(q,kLaneZ[li],0)) { found = true; bestLane = kLaneZ[li]; bestYaw = 0; }
 				}
 				for (int yi = 1; yi < kYaws && !found; ++yi) {             // then sideways
 					float t; std::uint32_t oo; float d;
-					if (!FirstConflict(q, 0.0f, kYaw[yi], t, oo, d)) { found = true; bestLane = 0; bestYaw = kYaw[yi]; }
+					if (!FirstConflict(q, 0.0f, kYaw[yi], t, oo, d) && EnvironmentClear(q,0,kYaw[yi])) { found = true; bestLane = 0; bestYaw = kYaw[yi]; }
 				}
 				for (int li = 1; li < kLanes && !found; ++li) {            // then both
 					if (kLaneZ[li] > laneMax) break;
 					for (int yi = 1; yi < kYaws && !found; ++yi) {
 						float t; std::uint32_t oo; float d;
-						if (!FirstConflict(q, kLaneZ[li], kYaw[yi], t, oo, d)) { found = true; bestLane = kLaneZ[li]; bestYaw = kYaw[yi]; }
+						if (!FirstConflict(q, kLaneZ[li], kYaw[yi], t, oo, d) && EnvironmentClear(q,kLaneZ[li],kYaw[yi])) { found = true; bestLane = kLaneZ[li]; bestYaw = kYaw[yi]; }
 					}
 				}
 				if (found) {
@@ -194,6 +212,10 @@ namespace routeplan
 					}
 				}
 			}
+		}
+		// A held manoeuvre and priority-based keep-right must still fit the current world.
+		if((s.laneZ!=0||s.yaw!=0||plan.yawOffset!=0)&&!EnvironmentClear(q,s.laneZ,s.yaw+plan.yawOffset)){
+			s.laneZ=0;s.yaw=0;plan.yawOffset=0;plan.speedCap=0;
 		}
 		plan.laneZ = s.laneZ;
 		plan.yawOffset += s.yaw;

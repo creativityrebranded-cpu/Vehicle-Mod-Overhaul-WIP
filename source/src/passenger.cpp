@@ -8,12 +8,14 @@
 #include "notify.h"
 #include "npcvehicles.h"
 #include "vehicleflight.h"
+#include "environment.h"
 
 #include <Windows.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <cstdint>
 #include <intrin.h>
 
@@ -145,6 +147,7 @@ namespace passenger
 		// Seats the player in the vehicle's companion seat: the game's interaction build, the seat set before it completes.
 		int SeatPlayer(uptr player, uptr vehicle, uptr seatKw)
 		{
+            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe)return 0;
 			uptr link = 0;
 			__try {
 				EngineFn<void (*)(uptr, uptr, uptr*)>(kSeatLink)(player, vehicle, &link);
@@ -182,7 +185,9 @@ namespace passenger
 			const uptr cell = At<uptr>(vehicle, off::kRefParentCell);
 			const uptr ws = cell ? At<uptr>(cell, off::kCellWorldspace) : 0;
 			if (!cell) return false;
-			float pos[3] = { float(vp.x - std::cos(yaw) * 3.5), float(vp.y + std::sin(yaw) * 3.5), vp.z + 1.0f };
+			const auto site=environment::BoardingSite(vehicle);
+            if(site.verdict!=environment::Verdict::Safe)return false;
+            float pos[3]={float(site.x),float(site.y),float(site.z)};
 			float rot[3] = { 0.0f, 0.0f, float(yaw) };
 			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
 			__try {
@@ -196,7 +201,10 @@ namespace passenger
 
 		void GetOut(uptr player, const char* why)
 		{
-			const std::uint32_t id = g_riding.exchange(0);
+			const std::uint32_t id = g_riding.load();
+            const auto checked=RefById(id);
+            if(!checked || environment::BoardingSite(checked).verdict!=environment::Verdict::Safe){notify::Show("Waiting for a safe drop-off site");return;}
+            g_riding.store(0);
 			const uptr vehicle = RefById(id);
 			const bool out = EndSeat(player);
 			const bool placed = vehicle && PlaceBeside(player, vehicle);
@@ -207,6 +215,7 @@ namespace passenger
 		// Take the wheel: the driver steps out, the player is seated as the driver, then the NPC takes the companion seat.
 		void StartWheel(uptr player, uptr vehicle)
 		{
+            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe){notify::Show("Stop at a safe site before swapping seats");return;}
 			const std::uint32_t vid = At<std::uint32_t>(vehicle, off::kFormId);
 			const uptr seat = PassengerSeat(vehicle);
 			const std::uint32_t npc = npcvehicles::TakeDriver(vid);
@@ -266,6 +275,7 @@ namespace passenger
 		// The companion seat of `vehicle` (any occupied vehicle: a gang driver, a job, a hijacker).
 		void BoardTo(uptr player, uptr vehicle)
 		{
+            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe){notify::Show("Waiting for a safe boarding site");return;}
 			const std::uint32_t id = At<std::uint32_t>(vehicle, off::kFormId);
 			const uptr seat = PassengerSeat(vehicle);
 			if (!seat) {
@@ -297,7 +307,7 @@ namespace passenger
 
 	bool BoardVehicle(std::uintptr_t player, std::uintptr_t vehicle)
 	{
-		if (!player || !vehicle || VehicleOf(player)) return false;
+		if (!player || !vehicle || VehicleOf(player) || environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe) return false;
 		BoardTo(player, vehicle);
 		return g_riding.load() == At<std::uint32_t>(vehicle, off::kFormId);
 	}
@@ -306,12 +316,13 @@ namespace passenger
 	{
 		const ULONGLONG now = GetTickCount64();
 		// Taxi: a map marker is the destination; arriving lets the player out.
-		double mx = 0, my = 0;
-		if (vehicleflight::MarkerPoint(vehicle, mx, my)) {
-			vehicleflight::PilotFly(pilot, vehicle, mx, my, kTaxiStop, 0, true);
+		double mx = 0, my = 0, mz = std::numeric_limits<double>::quiet_NaN();
+		if (vehicleflight::MarkerPoint(vehicle, mx, my, &mz)) {
+			vcontract::Goal goal;goal.x=mx;goal.y=my;goal.z=mz;goal.stop=kTaxiStop;goal.hold=true;
+            vehicleflight::PilotFly(pilot,vehicle,goal);
 			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 			const double d = std::hypot(mx - vp.x, my - vp.y);
-			if (d < kTaxiStop + 5.0) {
+			if (vehicleflight::AtDestination(vehicle,mx,my,mz,kTaxiStop) && environment::BoardingSite(vehicle).verdict==environment::Verdict::Safe) {
 				if (!g_nearSince) g_nearSince = now;
 				else if (now - g_nearSince >= kArriveMs) g_arrived = true;
 			}

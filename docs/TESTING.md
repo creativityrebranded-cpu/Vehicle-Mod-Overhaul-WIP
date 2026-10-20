@@ -5,6 +5,14 @@ The log timestamps every line; a crash prints `CRASH?` with the stack and the pl
 
 ## Status as of this version (2026-10-18)
 
+### Shared-system update (2026-10-20)
+
+The current Release DLL builds successfully. Six offline executables pass 69 assertions: `navfield_test` (15), `environment_test` (14), `recovery_test` (12), `triplogic_test` (17), `scannercontext_test` (6), and `routeplan_test` (5). They cover U-shaped routes, altitude/deck/unknown-column routing, atomic field publication, site support/water/edges/headroom, blocked boarding sides, firing visibility, bounded recovery, route controls, selected names, and traffic detours constrained by the environment.
+
+These changes have **not been tested in game**. The older gameplay results below apply to older builds. Persistence is paused; no save continuity is added. See [the integration audit](SHARED_SYSTEMS_AUDIT.md) for ownership and limits.
+
+Live cases still needed: Auto into/out of a U-shaped pocket; a rooftop marker; crossing a finite wall and passing under a thin deck; two opposing vehicles under an overhang; cover selection and firing with a wall or third actor between combatants; supply/hauler arrival; taxi/rescue boarding at a platform edge; both exit sides blocked; and a deliberately unreachable route showing Retry/Skip/Clear. Record frame time with several active vehicles while fields rebuild. Use a disposable test save; no live save was selected or modified for this update.
+
 | Area | State |
 |---|---|
 | Hover, gears, summon (N), follow (U) | **Tested in game** (13:11 to 13:13 run, no crash) |

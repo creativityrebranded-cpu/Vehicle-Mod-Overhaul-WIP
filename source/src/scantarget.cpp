@@ -74,8 +74,8 @@ namespace scantarget
 		// The Auto behaviour key (stop / orbit / patrol): the first free of these, claimed once.
 		int g_modeKey = -1;
 		bool g_modeDown = false;
-		int g_skipKey=-1, g_clearKey=-1;
-		bool g_skipDown=false, g_clearDown=false, g_routeCleared=false;
+		int g_skipKey=-1, g_clearKey=-1, g_retryKey=-1;
+		bool g_retryDown=false, g_skipDown=false, g_clearDown=false, g_routeCleared=false;
 		ULONGLONG g_clearedAt=0;
 		ULONGLONG g_lostSince=0;
 
@@ -391,17 +391,20 @@ namespace scantarget
 				// An externally replaced marker must not continue the old route under an old name.
 				g_chain.clear(); g_haveCurrent=false; g_routeCleared=false;
 			}
-			if(g_skipKey<0) g_skipKey=controlmap::ClaimFirst("route","Skip stop",{VK_OEM_4,VK_F9,VK_F10,'K'});
+			if(g_retryKey<0) g_retryKey=controlmap::ClaimFirst("route","Retry trip",{VK_OEM_1,VK_F8,VK_F12});
+            if(g_skipKey<0) g_skipKey=controlmap::ClaimFirst("route","Skip stop",{VK_OEM_4,VK_F9,VK_F10,'K'});
 			if(g_clearKey<0) g_clearKey=controlmap::ClaimFirst("route","Clear route",{VK_OEM_5,VK_F10,VK_F11,'N'});
 			const bool skip=Focused() && g_skipKey && (GetAsyncKeyState(g_skipKey)&0x8000)!=0;
 			const bool clear=Focused() && g_clearKey && (GetAsyncKeyState(g_clearKey)&0x8000)!=0;
-			const bool available=(marker || !g_chain.empty()) && !g_routeCleared;
-			if(clear && !g_clearDown && available) ClearRoute();
+			const bool retry=Focused() && g_retryKey && (GetAsyncKeyState(g_retryKey)&0x8000)!=0;
+            const bool available=(marker || !g_chain.empty()) && !g_routeCleared;
+			if(retry && !g_retryDown && available) vehicleflight::RetryScannerTrip();
+            else if(clear && !g_clearDown && available) ClearRoute();
 			else if(skip && !g_skipDown && available) {
 				if(g_chain.empty()) ClearRoute();
 				else if(AdvanceStop(true)) vehicleflight::RequestScannerTrip();
 			}
-			g_skipDown=skip; g_clearDown=clear;
+			g_skipDown=skip; g_clearDown=clear; g_retryDown=retry;
 			if(g_routeCleared) {
 				hoverui::SetRoute(now-g_clearedAt<3000 ? "ROUTE CLEARED\nHolding position" : "");
 				return;
@@ -430,7 +433,8 @@ namespace scantarget
 				panel+="\n"+std::to_string(i+1)+". "+RouteName(g_chain[i].name,"Map point");
 			}
 			if(g_chain.size()>3) panel+="\n+"+std::to_string(g_chain.size()-3)+" more stops";
-			panel+="\n["+(g_skipKey ? controlmap::KeyName(g_skipKey) : "unbound")+"] Skip stop   ["+
+			if(progress.phase==triplogic::Phase::Unreachable) panel+="\n["+(g_retryKey ? controlmap::KeyName(g_retryKey) : "unbound")+"] Retry trip";
+            panel+="\n["+(g_skipKey ? controlmap::KeyName(g_skipKey) : "unbound")+"] Skip stop   ["+
 				(g_clearKey ? controlmap::KeyName(g_clearKey) : "unbound")+"] Clear route";
 			hoverui::SetRoute(panel.c_str());
 		}
@@ -446,7 +450,7 @@ namespace scantarget
 			double mx=0,my=0;
 			if(!vehicle || !vehicleflight::MarkerPoint(vehicle,mx,my) || !progress.active ||
 				std::hypot(progress.x-mx,progress.y-my)>2.0 || std::fabs(progress.heightError)>2.5 ||
-				progress.phase==triplogic::Phase::WaitingTerrain) return;
+				progress.phase==triplogic::Phase::WaitingTerrain || progress.phase==triplogic::Phase::Unreachable) return;
 			AdvanceStop(false);
 		}
 
@@ -554,7 +558,7 @@ namespace scantarget
 		g_downAt = 0;
 		g_haveCurrent = false;
 		g_modeDown = false;
-		g_skipDown=false; g_clearDown=false; g_routeCleared=false; g_lostSince=0;
+		g_retryDown=false; g_skipDown=false; g_clearDown=false; g_routeCleared=false; g_lostSince=0;
 		hoverui::SetRoute("");
 		g_pois.clear();
 		g_poiHave = false;

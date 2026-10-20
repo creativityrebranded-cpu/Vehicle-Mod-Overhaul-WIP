@@ -30,7 +30,9 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
 | **Vehicles respect each other** | No more vehicles "magnetised" together; right of way decides who gives way | Untested |
 | **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
-| **Short-horizon planner** | The autopilot looks 2.5 s ahead 20 times a second and picks the best of 37 paths; quick escapes when stuck | Untested |
+| **Shared 3D navigation** | Altitude cost fields guide local trajectory plans; bounded recovery holds failed trips with Retry / Skip / Clear controls | Untested in game; offline checks pass |
+| **Environment-aware traffic and combat** | Traffic detours check the world map; combat positions consider cover and automated fire requires a clear-shot probe | Untested in game; offline checks pass |
+| **Checked boarding and drop-off** | Vehicle footprint, slope, water, headroom, standing space, and stopped arrival are checked before boarding or exit | Untested in game; offline checks pass |
 | **Flies under things** | Overhangs and bridges are flown under; ceilings cap the height | Untested |
 | **Knows the area up front** | The game's own collision objects are read into the vehicles' map, so planning starts with the walls already known | Untested |
 | **Night and weather** | Autopilots slow down and fly a little higher at night and in rain, snow or dust | Untested |
@@ -41,6 +43,8 @@ outside a fight the people around you drive, patrol and run errands on their own
 ---
 
 ## Requirements
+
+The [shared-systems audit](docs/SHARED_SYSTEMS_AUDIT.md) maps each consumer to navigation and environmental checks. Save/load persistence is paused and is not included in this build.
 
 | What | Version | Link |
 |---|---|---|

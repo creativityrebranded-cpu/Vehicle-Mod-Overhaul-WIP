@@ -14,6 +14,7 @@
 #include "pilotquest.h"
 #include "vcontract.h"
 #include "vehicleflight.h"
+#include "environment.h"
 #include "vehiclehits.h"
 #include "vehicleworld.h"
 #include <ShlObj.h>
@@ -263,6 +264,7 @@ namespace npcvehicles
 		constexpr std::uint32_t kInteraction = 0x01995460;
 		int InstantSeat(uptr actor, uptr vehicle, int& seated)
 		{
+            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe){seated=0;return 0;}
 			seated = -1;
 			uptr link = 0;
 			__try {
@@ -664,6 +666,9 @@ namespace npcvehicles
 
 		bool PlaceBeside(uptr actor, uptr vehicle, int kind, double dist)
 		{
+            const auto site=environment::BoardingSite(vehicle);
+            if(site.verdict!=environment::Verdict::Safe)return false;
+
 			const uptr cell = At<uptr>(vehicle, off::kRefParentCell);
 			const uptr ws = cell ? At<uptr>(cell, off::kCellWorldspace) : 0;
 			if (!cell) return false;
@@ -676,7 +681,7 @@ namespace npcvehicles
 			else if (kind == 2) { ox = fx; oy = fy; }
 			else { ox = -fx; oy = -fy; }
 			const double px = vp.x + ox * dist, py = vp.y + oy * dist;
-			float pos[3] = { float(px), float(py), vp.z + 0.2f };
+			float pos[3]={float(site.x),float(site.y),float(site.z)};
 			float rot[3] = { 0.0f, 0.0f, float(std::atan2(vp.x - px, vp.y - py)) };
 			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
 			__try {
@@ -925,27 +930,19 @@ namespace npcvehicles
 			az = pp.z + kAimHeight + j.aimVz * t;
 		}
 
-		// Attack run (close): every control channel: nose on the aim point (yaw and pitch), circle the player (strafe;
-		// slower while a burst is on), hold the orbit radius (throttle, reverse when too close).
+		// Close-range aiming changes yaw/pitch only while nearly stationary at the planned position.
 		void AttackRun(Job& j, uptr player, uptr vehicle)
 		{
-			double axp, ayp, azp;
-			AimPoint(j, player, vehicle, axp, ayp, azp);
-			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
-			const game::Vec3 pp{ float(axp), float(ayp), float(azp) };
-			const double dx = double(pp.x) - vp.x, dy = double(pp.y) - vp.y;
-			const double dist = std::hypot(dx, dy);
-			const double heading = At<game::Vec3>(vehicle, off::kRefRotation).z;
-			vehicleflight::Command c;
-			c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kStrafe | vehicleflight::Command::kThrottle |
-				vehicleflight::Command::kPitch | vehicleflight::Command::kGear;
-			c.yawRate = std::clamp((j.firing ? 2.5 : 1.6) * WrapAngle(std::atan2(dx, dy) - heading), -1.2, 1.2);
-			c.strafe = ((j.pilot % 2) ? 1.0 : -1.0) * (j.firing ? 0.3 : 0.6);
-			c.throttle = std::clamp((dist - kAttackRadius) / 20.0, -0.6, 0.6);
-			c.pitch = std::clamp(std::atan2(double(pp.z) - vp.z, std::max(dist, 5.0)), -0.6, 0.6);
-			c.gear = 2;
-			c.holdMs = 300;
-			vehicleflight::PilotCommand(j.pilot, c);
+            const auto progress=vehicleflight::ProgressFor(j.vehicle);
+            if(!progress.active || progress.speed>3.0 || progress.distance>12.0)return;
+            double x,y,z;AimPoint(j,player,vehicle,x,y,z);
+            const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
+            const double heading=At<game::Vec3>(vehicle,off::kRefRotation).z;
+            vehicleflight::Command c;c.set=vehicleflight::Command::kYaw|vehicleflight::Command::kPitch;
+            c.yawRate=std::clamp(1.6*WrapAngle(std::atan2(x-pos.x,y-pos.y)-heading),-1.2,1.2);
+            c.pitch=std::clamp(std::atan2(z-pos.z,std::max(1.0,std::hypot(x-pos.x,y-pos.y))),-0.6,0.6);
+            vehicleflight::PilotCommand(j.pilot,c);
+
 		}
 
 		// ---- Combat targets (the user, 2026-10-19: "fighting enemies on vehicles is the number 1 priority"; escorts defend the player). Every armed NPC
@@ -1253,7 +1250,7 @@ namespace npcvehicles
 
 		// Parking etiquette: a clear spot near (x, y): the point itself, else rings of 8, 14 and 20 m (8 directions); no other vehicle within
 		// kParkClear, never on top of the player.
-		void ParkSpot(std::uint32_t self, uptr player, double x, double y, double& ox, double& oy)
+		bool ParkSpot(std::uint32_t self, uptr player, double x, double y, double& ox, double& oy)
 		{
 			static world::Snapshot snap;
 			const bool have = world::Vehicles(snap);
@@ -1268,15 +1265,24 @@ namespace npcvehicles
 						const auto& v = snap.v[i];
 						if (v.formId && v.formId != self && std::hypot(cx - v.pos[0], cy - v.pos[1]) < kParkClear) clear = false;
 					}
-					if (clear) { ox = cx; oy = cy; return; }
+					if (clear) {
+                        const auto vehicle=RefById(self);if(!vehicle)return false;
+                        const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
+                        const auto site=environment::CheckSite(self,cx,cy,pos.z,At<game::Vec3>(vehicle,off::kRefRotation).z);
+                        if(site.verdict==environment::Verdict::Pending)return false;
+                        if(site.verdict==environment::Verdict::Safe){ox=cx;oy=cy;return true;}
+                    }
 				}
 			}
-			ox = x; oy = y;
+			return false;
 		}
 
 		void BeginPark(Job& j, uptr player, double x, double y, const char* why)
 		{
-			ParkSpot(j.vehicle, player, x, y, j.taskX, j.taskY);
+			if(!ParkSpot(j.vehicle,player,x,y,j.taskX,j.taskY)) {
+                // Keep the parking search active; an unchecked original point is never treated as safe.
+                j.taskX=x;j.taskY=y;
+            }
 			j.task = 4;
 			j.taskAt = GetTickCount64();
 			logger::Write("NPC vehicles: [%d] %s; parking at a clear spot (%.0f, %.0f)", j.pilot, why, j.taskX, j.taskY);
@@ -1352,8 +1358,8 @@ namespace npcvehicles
 				g.nav.speedLimit = 18.0f;
 			}
 			else if (j.task == 5) {  // supply run: out to the other place
-				g.x = j.taskX; g.y = j.taskY; g.stop = 6.0;
-				if (std::hypot(vp.x - j.taskX, vp.y - j.taskY) < kTransitArrive) {
+				g.x = j.taskX; g.y = j.taskY; g.stop = 6.0;g.hold=true;
+				if (vehicleflight::AtDestination(vehicle,g.x,g.y,g.z,g.stop) && environment::BoardingSite(vehicle).verdict==environment::Verdict::Safe) {
 					j.task = 7;
 					j.taskAt = now;
 					vehicleflight::PilotStop(j.pilot, "supply run: unloading");
@@ -1392,10 +1398,17 @@ namespace npcvehicles
 				if (std::hypot(vp.x - j.homeX, vp.y - j.homeY) < kHomeArrive) { BeginPark(j, player, j.homeX, j.homeY, "home"); return; }
 			}
 			else if (j.task == 4) {  // parking: to the clear spot, land, get out
-				g.x = j.taskX; g.y = j.taskY; g.stop = 1.5; g.hold = true;
+				double parkX=j.taskX,parkY=j.taskY;
+                if(!ParkSpot(j.vehicle,player,j.taskX,j.taskY,parkX,parkY)) {
+                    g.x=vp.x;g.y=vp.y;g.z=vp.z;g.stop=1.5;g.hold=true;
+                    vehicleflight::PilotFly(j.pilot,vehicle,g);return;
+                }
+                j.taskX=parkX;j.taskY=parkY;
+                const auto site=environment::CheckSite(j.vehicle,parkX,parkY,vp.z,At<game::Vec3>(vehicle,off::kRefRotation).z);
+                g.x=parkX;g.y=parkY;g.z=site.ground+2.5;g.stop=1.5;g.hold=true;
 				g.nav.landOnArrival = true;
 				g.nav.speedLimit = 8.0f;
-				if (std::hypot(vp.x - j.taskX, vp.y - j.taskY) < 4.0 || now - j.taskAt > 30000) {
+				if (vehicleflight::AtDestination(vehicle,g.x,g.y,g.z,g.stop) && environment::BoardingSite(vehicle).verdict==environment::Verdict::Safe) {
 					vehicleflight::PilotStop(j.pilot, "parked");
 					const int out = UnloadVehicle(vehicle, vcontract::ExitRequest{}, false);  // passengers (a shared ride) get out too
 					if (out) logger::Write("NPC vehicles: [%d] %d passenger(s) get out", j.pilot, out);
@@ -1509,6 +1522,8 @@ namespace npcvehicles
 
 		bool InstantExit(uptr npc)
 		{
+            const auto vehicle=InVehicle(npc);
+            if(vehicle&&environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe)return false;
 			g_allowDismount = true;
 			__try {
 				EngineFn<void (*)(uptr)>(0x01A9C530)(npc);
@@ -1534,6 +1549,15 @@ namespace npcvehicles
 		void Leave(Job& j, uptr npc, const char* why)
 		{
 			const uptr vehicle = RefById(j.vehicle);
+            if(vehicle && npc && InVehicle(npc)==vehicle) {
+                const auto site=environment::BoardingSite(vehicle);
+                if(site.verdict!=environment::Verdict::Safe) {
+                    const auto p=At<game::Vec3>(vehicle,off::kRefPosition);
+                    vcontract::Goal hold;hold.x=p.x;hold.y=p.y;hold.stop=1.5;hold.hold=true;
+                    hold.z=site.supported?site.ground+2.5:p.z;
+                    vehicleflight::PilotFly(j.pilot,vehicle,hold);return;
+                }
+            }
 			if (!npc) {
 				Set(j, Phase::Idle);
 				return;
@@ -1654,6 +1678,12 @@ namespace npcvehicles
 					FinishExit(t, npc, vehicle, true);
 					continue;
 				}
+                const auto site=environment::BoardingSite(vehicle);
+                if(site.verdict!=environment::Verdict::Safe) {
+                    if(now-t.t0>t.req.timeoutMs){logger::Write("Exit refused: %s",site.reason);FinishExit(t,npc,vehicle,false);}
+                    continue;
+                }
+                t.req.x=float(site.x);t.req.y=float(site.y);t.req.z=float(site.z);
 				if (t.stage == 1) {
 					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 					const double moved = std::sqrt(std::pow(double(vp.x) - t.lx, 2) + std::pow(double(vp.y) - t.ly, 2) + std::pow(double(vp.z) - t.lz, 2));
@@ -1776,6 +1806,10 @@ namespace npcvehicles
 			if (j.phase == Phase::Following) vehicleflight::WatchFlip(vehicle, "NPC vehicles");
 			switch (j.phase) {
 			case Phase::Boarding:
+                if(!aboard && environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe) {
+                    if(now-j.since>kBoardTimeoutMs){pilotquest::Release(j.pilot-1);Set(j,Phase::Idle);logger::Write("Boarding refused: no validated boarding site");}
+                    return;
+                }
 				if (logger::Verbose() && j.cmd && now - j.cmdLog >= 1000) {
 					j.cmdLog = now;
 					LogCmdState(j, npc, vehicle);
@@ -1987,6 +2021,11 @@ namespace npcvehicles
 						logger::Write("NPC vehicles: [%d] scouted the marker: %d enemies within 80 m", j.pilot, n);
 					}
 				}
+                if(foe && !rescuer && !toMarker && !scouting) {
+                    const auto enemy=At<game::Vec3>(aimRef,off::kRefPosition);
+                    const float threat[]={enemy.x,enemy.y,enemy.z+1.2f};
+                    environment::CombatPosition(j.vehicle,threat,pg.x,pg.y,pg.z,defending||j.retreating);
+                }
 				const bool busyGoal = rescuer || toMarker || scouting;
 				const bool attackRun = defMode == 0 && (pMode < 0 || pMode == 10) && toFoe < kAttackRun && !rescuer;
 				if (!aboard) {
@@ -2024,7 +2063,7 @@ namespace npcvehicles
 					CallReinforcements(player, vehicle);
 					Set(j, Phase::Settling);
 				}
-				else if (rescuer && (j.rescueParked || toPlayer < 7.0)) {
+				else if (rescuer && (j.rescueParked || (vehicleflight::AtDestination(vehicle,pg.x,pg.y,pg.z,pg.stop) && environment::BoardingSite(vehicle).verdict==environment::Verdict::Safe))) {
 					if (!j.rescueParked) {
 						j.rescueParked = true;
 						j.parked = true;
@@ -2067,8 +2106,12 @@ namespace npcvehicles
 					const double pitchErr = std::fabs(pitchWant + vr.x);
 					const bool onTarget = aimErr < kFireCone && pitchErr < kFireCone * 1.5;
 					const bool inRange = (kProfiles[int(j.profile)].fire || defending) && Dist3(vehicle, aimRef) < kFireRange;
-					const bool canFire = inRange && onTarget;
-					StoreAim(j.pilot - 1, AimSnap{ j.vehicle, j.npc, axp, ayp, azp, inRange, now });
+					const float muzzle[]={vp.x+float(std::sin(vr.z)*4),vp.y+float(std::cos(vr.z)*4),vp.z+1.5f};
+                    const float shot[]={float(axp),float(ayp),float(azp)};
+                    const bool clearShot=environment::ClearShot(j.vehicle,At<std::uint32_t>(aimRef,off::kFormId),
+                        aimRef==vehicle?0:At<std::uint32_t>(aimRef,off::kFormId),muzzle,shot);
+                    const bool canFire = inRange && onTarget && clearShot;
+					StoreAim(j.pilot - 1, AimSnap{ j.vehicle, j.npc, axp, ayp, azp, inRange && clearShot, now });
 					const int slot = j.pilot - 1;
 					if (j.firing) {
 						if (!canFire || now - j.fireAt >= kBurstMs) {
@@ -3835,6 +3878,11 @@ namespace npcvehicles
 	{
 		if (!vehicleId) return false;
 		StoreAim(7, AimSnap{ vehicleId, 0, x, y, z, fire, GetTickCount64() });  // vehicleaim turns the shot at launch
+        const auto vehicle=RefById(vehicleId);
+        if(fire&&vehicle){const auto p=At<game::Vec3>(vehicle,off::kRefPosition);const double h=At<game::Vec3>(vehicle,off::kRefRotation).z;
+            const float from[]={p.x+float(std::sin(h)*4),p.y+float(std::cos(h)*4),p.z+1.5f},to[]={float(x),float(y),float(z)};
+            fire=environment::ClearShot(vehicleId,0,0,from,to);
+        }
 		return SubmitFire(kJobs, vehicleId, fire);
 	}
 

@@ -1,7 +1,7 @@
 #pragma once
 #include <cmath>
 namespace triplogic {
-enum class Phase { Idle, Travelling, WaitingTerrain, Blocked, FindingWay, AdjustingHeight, Arrived };
+enum class Phase { Idle, Travelling, WaitingTerrain, Blocked, FindingWay, AdjustingHeight, Arrived, Unreachable };
 inline bool Reached(double distance, double stop, double heightError, double speed, bool ready) {
  return ready && std::isfinite(distance) && std::isfinite(heightError) && std::isfinite(speed) &&
   distance <= stop + 2.0 && std::fabs(heightError) <= 2.5 && speed <= 1.5;
@@ -33,6 +33,7 @@ inline const char* Text(Phase p) {
  case Phase::FindingWay:return "Finding another way";
  case Phase::AdjustingHeight:return "Adjusting height";
  case Phase::Arrived:return "Arrived";
+ case Phase::Unreachable:return "Cannot reach destination";
  default:return "Waiting for driver";
  }
 }
