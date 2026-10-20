@@ -229,6 +229,7 @@ namespace vehiclehits
 			const bool own = v.formId == vehicleflight::OwnRoverId();
 			logger::Write("Vehicle hits: %08X reached the limit (%u hits, %.0f / %.0f): autopilot off for %u s", v.formId, d->hits, d->damage, limit, g_cooldownS);
 			vehicleflight::DisableAutopilot(v.formId, g_cooldownS * 1000u, "too many hits");
+			npcvehicles::WitnessCrash(v.pos[0], v.pos[1], v.pos[2], "a vehicle knocked out");
 			if (own) {
 				char msg[80];
 				std::snprintf(msg, sizeof(msg), "Your vehicle took too many hits: autopilot off for %u s", g_cooldownS);

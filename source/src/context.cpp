@@ -105,6 +105,11 @@ namespace context
 		constexpr ULONGLONG kCivilScanMs = 2000, kCivilRetryMs = 60000, kPatrolEveryMs = 240000;
 		ULONGLONG g_civilAt = 0;
 		std::unordered_map<std::uint32_t, ULONGLONG> g_civilTried, g_patrolledAt;
+		// Shift change (2026-10-20): each calm actor's current AI package (npcvehicles::CurrentPackage); a change = its schedule moved it on, and a far new
+		// goal then starts the transit at once (no retry wait).
+		std::unordered_map<std::uint32_t, std::uintptr_t> g_lastPackage;
+		// Enemy patrol convoys: a hostile owner's patrol takes a second hostile vehicle within kConvoyNear along.
+		constexpr double kConvoyNear = 60.0;
 
 		bool VehicleFight(uptr player);
 
@@ -121,9 +126,18 @@ namespace context
 				if (npcvehicles::IsInCombat(r)) return;  // somebody fights here: no civil traffic now
 				actors.push_back(r);
 			}
-			// Transit.
+			// Transit (a shift change first: the package just changed).
+			if (g_lastPackage.size() > 2048) g_lastPackage.clear();
 			for (const uptr r : actors) {
 				const std::uint32_t id = *reinterpret_cast<std::uint32_t*>(r + off::kFormId);
+				const std::uintptr_t pkg = npcvehicles::CurrentPackage(r);
+				const auto lp = g_lastPackage.find(id);
+				const bool shift = lp != g_lastPackage.end() && lp->second && pkg && lp->second != pkg;
+				g_lastPackage[id] = pkg;
+				if (shift) {
+					g_civilTried.erase(id);
+					logger::Write("Context: shift change: NPC %08X switched package", id);
+				}
 				const auto t = g_civilTried.find(id);
 				if (t != g_civilTried.end() && now - t->second < kCivilRetryMs) continue;
 				if (!npcvehicles::ActorFree(r)) continue;
@@ -185,6 +199,26 @@ namespace context
 					}
 					const bool ok = npcvehicles::StartPatrol(r, v.ref);
 					logger::Write("Context: patrol: NPC %08X by its vehicle %08X -> %s", *reinterpret_cast<std::uint32_t*>(r + off::kFormId), v.formId, ok ? "patrolling" : "refused");
+					if (ok && npcvehicles::HostileToPlayer(r)) {
+						// An enemy patrol: a second hostile vehicle close by with a hostile owner near it follows in convoy.
+						for (std::uint32_t k = 0; k < g_snap.count && k < 64; ++k) {
+							const auto& v2 = g_snap.v[k];
+							if (!v2.ref || v2.formId == v.formId || v2.who == world::VehicleInfo::Who::Player || v2.who == world::VehicleInfo::Who::Npc) continue;
+							if (npcvehicles::UsesVehicle(v2.formId) || npcvehicles::HasDriver(v2.formId) || vehicleflight::AutopilotDisabled(v2.formId)) continue;
+							if (std::hypot(double(v2.pos[0]) - v.pos[0], double(v2.pos[1]) - v.pos[1]) > kConvoyNear) continue;
+							bool sent = false;
+							for (const uptr r2 : actors) {
+								if (r2 == r || !npcvehicles::ActorFree(r2) || !npcvehicles::HostileToPlayer(r2) || !npcvehicles::MayUse(r2, v2.ref)) continue;
+								const auto p2 = PosOf(r2);
+								if (std::hypot(double(v2.pos[0]) - p2.x, double(v2.pos[1]) - p2.y) > kPatrolNear) continue;
+								sent = npcvehicles::StartConvoy(r2, v2.ref, v.formId);
+								logger::Write("Context: enemy convoy: NPC %08X takes vehicle %08X behind %08X -> %s", *reinterpret_cast<std::uint32_t*>(r2 + off::kFormId), v2.formId, v.formId,
+									sent ? "following" : "refused");
+								break;
+							}
+							if (sent) break;
+						}
+					}
 					if (ok) return;
 				}
 				g_patrolledAt[v.formId] = now - kPatrolEveryMs / 2;  // nobody suitable: look again in a while

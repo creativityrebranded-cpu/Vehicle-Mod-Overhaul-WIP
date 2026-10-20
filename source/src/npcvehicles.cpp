@@ -16,6 +16,8 @@
 #include "vehicleflight.h"
 #include "vehiclehits.h"
 #include "vehicleworld.h"
+#include <ShlObj.h>
+#include <unordered_map>
 
 #include <Windows.h>
 #include <intrin.h>
@@ -138,6 +140,7 @@ namespace npcvehicles
 			bool haveHome = false;
 			int taskStep = 0;
 			ULONGLONG taskAt = 0;
+			std::uint32_t lead = 0;            // convoy (task 8): the lead vehicle
 			bool retreating = false;           // pursuer near its hit limit: pulling back to get out and fight on foot
 		} g_jobs[kJobs];
 		// Boarding steps (2026-10-17 15:21-15:22: the walk package was accepted, board -> 1, but 5 of 6 NPCs never moved):
@@ -1287,6 +1290,13 @@ namespace npcvehicles
 				Set(j, Phase::Idle);
 				return;
 			}
+			if (player && (InCombat(npc) || (InCombat(player) && Dist(vehicle, player) < 120.0)) && HostileTo(npc, player)) {
+				// An enemy driver (a patrol / convoy at a hostile outpost) stays aboard and attacks: the task becomes a pursuit.
+				j.task = 0;
+				ApplyProfile(j, Profile::Pursuit, player);
+				logger::Write("NPC vehicles: [%d] enemy driver %08X turns on you (task ended, pursuit)", j.pilot, j.npc);
+				return;
+			}
 			if (InCombat(npc) || (player && InCombat(player) && Dist(vehicle, player) < 120.0)) {
 				// A fight: the task ends; the NPC gets out (the fight rules may put it back in a vehicle with a combat profile).
 				vehicleflight::PilotStop(j.pilot, "a fight");
@@ -1329,7 +1339,17 @@ namespace npcvehicles
 			vcontract::Goal g;
 			g.nav.speedLimit = 22.0f;
 			g.nav.priority = 10;
-			if (j.task == 5) {  // supply run: out to the other place
+			if (j.task == 8) {  // convoy: behind the lead vehicle; the lead's job over -> park
+				const uptr lead = RefById(j.lead);
+				if (!lead || !Busy(j.lead)) { BeginPark(j, player, vp.x, vp.y, "convoy: the lead is done"); return; }
+				const auto lp = At<game::Vec3>(lead, off::kRefPosition);
+				const double h = At<game::Vec3>(lead, off::kRefRotation).z;
+				g.x = lp.x - std::sin(h) * 12.0;
+				g.y = lp.y - std::cos(h) * 12.0;
+				g.stop = 3.0;
+				g.nav.speedLimit = 18.0f;
+			}
+			else if (j.task == 5) {  // supply run: out to the other place
 				g.x = j.taskX; g.y = j.taskY; g.stop = 6.0;
 				if (std::hypot(vp.x - j.taskX, vp.y - j.taskY) < kTransitArrive) {
 					j.task = 7;
@@ -3437,6 +3457,116 @@ namespace npcvehicles
 
 	bool StartTransit(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y) { return StartTask(actor, vehicle, 1, x, y); }
 	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y) { return StartTask(actor, vehicle, 5, x, y); }
+
+	bool StartConvoy(std::uintptr_t actor, std::uintptr_t vehicle, std::uint32_t leadVehicleId)
+	{
+		if (!StartTask(actor, vehicle, 8, 0, 0)) return false;
+		for (auto& j : g_jobs) {
+			if (j.phase != Phase::Idle && j.npc == At<std::uint32_t>(actor, off::kFormId)) j.lead = leadVehicleId;
+		}
+		return true;
+	}
+
+	bool HostileToPlayer(std::uintptr_t actor)
+	{
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		return player && actor && HostileTo(actor, player);
+	}
+
+	namespace
+	{
+		uptr CurrentPackageRaw(uptr actor)
+		{
+			__try {
+				return EngineFn<uptr (*)(uptr)>(0x018DDB70)(actor);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		// PerformAction as the console does it (FUN_140c74670): a BGSActionData on the stack, then FUN_141afdb10(actor, &data, &emptyString, 0, 0, emptyStringHolder).
+		// Layout from that handler: +0x00 vtable (BGSActionData, rva 4AFAE18), +0x08 source ref (counted), +0x10 target, +0x18 action form, +0x20 int,
+		// +0x28 second vtable (rva 4AFAE08), +0x30 / +0x38 strings (counted), +0x60 flags, +0x78 -> +0x28.
+		constexpr std::uint32_t kActionDataVtbl = 0x04AFAE18, kActionDataVtbl2 = 0x04AFAE08, kPerformAction = 0x01AFDB10, kEmptyString = 0x002B7DD0,
+			kStringRelease = 0x028CAEA0;
+		bool PerformActionRaw(uptr actor, uptr action)
+		{
+			alignas(16) std::uint8_t d[0x90] = {};
+			uptr strTemp = 0;
+			bool ok = false;
+			__try {
+				const uptr holder = EngineFn<uptr (*)()>(kEmptyString)();
+				auto add = [&](std::uint32_t off) {
+					const uptr e = holder ? *reinterpret_cast<uptr*>(holder) : 0;
+					*reinterpret_cast<uptr*>(d + off) = e;
+					if (e) _InterlockedIncrement(reinterpret_cast<volatile long*>(e + 0x10));
+				};
+				*reinterpret_cast<uptr*>(d + 0x00) = game::Base() + kActionDataVtbl;
+				_InterlockedExchangeAdd64(reinterpret_cast<volatile long long*>(actor + 8), 0x80000200001LL);
+				*reinterpret_cast<uptr*>(d + 0x08) = actor;
+				*reinterpret_cast<uptr*>(d + 0x18) = action;
+				*reinterpret_cast<uptr*>(d + 0x28) = game::Base() + kActionDataVtbl2;
+				add(0x30);
+				add(0x38);
+				*reinterpret_cast<uptr*>(d + 0x78) = reinterpret_cast<uptr>(d + 0x28);
+				strTemp = holder ? *reinterpret_cast<uptr*>(holder) : 0;
+				if (strTemp) _InterlockedIncrement(reinterpret_cast<volatile long*>(strTemp + 0x10));
+				ok = EngineFn<char (*)(uptr, uptr, uptr*, char, char, uptr)>(kPerformAction)(actor, reinterpret_cast<uptr>(d), &strTemp, 0, 0, holder) != 0;
+				EngineFn<void (*)(uptr*)>(kStringRelease)(&strTemp);
+				EngineFn<void (*)(uptr*)>(kStringRelease)(reinterpret_cast<uptr*>(d + 0x38));
+				EngineFn<void (*)(uptr*)>(kStringRelease)(reinterpret_cast<uptr*>(d + 0x30));
+				EngineFn<void (*)(uptr)>(addr::kRefRelease)(actor);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+			return ok;
+		}
+
+		bool g_witnessRead = false, g_witnessOn = true;
+		ULONGLONG g_witnessAt = 0;
+		std::unordered_map<std::uint32_t, ULONGLONG> g_witnessed;
+	}
+
+	std::uintptr_t CurrentPackage(std::uintptr_t actor) { return actor ? CurrentPackageRaw(actor) : 0; }
+
+	void WitnessCrash(double x, double y, double z, const char* why)
+	{
+		if (!g_witnessRead) {
+			g_witnessRead = true;
+			PWSTR docs = nullptr;
+			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				CoTaskMemFree(docs);
+				g_witnessOn = GetPrivateProfileIntW(L"witness", L"enabled", 1, ini.c_str()) != 0;
+			}
+		}
+		const ULONGLONG now = GetTickCount64();
+		if (!g_witnessOn || now - g_witnessAt < 3000) return;
+		g_witnessAt = now;
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		const uptr flee = RefById(0x00047188), cower = RefById(0x00047166);  // AACT ActionFleeStart / ActionCower (Starfield.esm)
+		if (!player || (!flee && !cower)) return;
+		int n = 0, fled = 0, cowered = 0;
+		for (const uptr r : modscene::LoadedRefs(8000)) {
+			if (n >= 6) break;
+			if (!r || r == player || !IsActorRef(r) || Dead(r) || InVehicle(r) || InCombat(r) || IsFollower(player, r)) continue;
+			if (At<std::uint32_t>(r, 0x378) & ((1u << 18) | (1u << 19))) continue;  // essential / protected
+			const auto p = At<game::Vec3>(r, off::kRefPosition);
+			const double d = std::sqrt(std::pow(p.x - x, 2) + std::pow(p.y - y, 2) + std::pow(p.z - z, 2));
+			if (d > 25.0) continue;
+			const std::uint32_t id = At<std::uint32_t>(r, off::kFormId);
+			const auto t = g_witnessed.find(id);
+			if (t != g_witnessed.end() && now - t->second < 20000) continue;
+			g_witnessed[id] = now;
+			++n;
+			const bool f = d < 10.0 && flee;
+			if (PerformActionRaw(r, f ? flee : cower)) ++(f ? fled : cowered);
+		}
+		if (n) logger::Write("NPC vehicles: witnesses of %s: %d near, %d flee, %d cower", why ? why : "a crash", n, fled, cowered);
+		if (g_witnessed.size() > 512) g_witnessed.clear();
+	}
 
 	void Recall(unsigned ms)
 	{

@@ -1224,6 +1224,59 @@ namespace vehicleflight
 		}
 
 		bool g_waitDoor = false;   // the player is indoors: the following rover waits where it is (following stays on)
+
+		// ---- Night and weather (2026-10-20, notes/VEHICLE_BEHAVIOUR_RESEARCH_20261020.md): the autopilot flies slower and higher at night (the game's
+		// IsTimeSpanNightAny condition, FUN_140c03480: planet-local hour against the night time span) and in rain, snow or dust (the current weather's
+		// keywords WeatherTypeRainy 5B844 / Snowy 5B843 / Dust 38C5EF through the game's own check FUN_140cfc3f0 on FUN_140cf7de0()). Read every 3 s.
+		struct EnvState { bool night = false, rain = false, snow = false, dust = false; ULONGLONG at = 0; bool told = false; } g_env;
+		constexpr double kNightSpeed = 0.75, kWeatherSpeed = 0.7, kEnvClimb = 2.0;
+
+		float ConditionFloat(std::uint32_t rva)
+		{
+			float r = 0.0f;
+			__try {
+				EngineFn<char (*)(void*, void*, void*, float*)>(rva)(nullptr, nullptr, nullptr, &r);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0.0f;
+			}
+			return r;
+		}
+
+		bool WeatherHas(std::uint32_t keywordId)
+		{
+			__try {
+				const std::uintptr_t w = EngineFn<std::uintptr_t (*)()>(0x00CF7DE0)();
+				if (!w) return false;
+				auto** vt = *reinterpret_cast<void***>(w);
+				if (reinterpret_cast<char (*)(std::uintptr_t)>(vt[0x28 / 8])(w) != 1) return false;
+				const std::uintptr_t kw = EngineFn<std::uintptr_t (*)(std::uint32_t)>(kLookupForm)(keywordId);
+				if (!kw) return false;
+				return EngineFn<unsigned (*)(std::uintptr_t, std::uintptr_t)>(0x00CFC3F0)(kw, w) != 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		void EnvTick()
+		{
+			const ULONGLONG now = GetTickCount64();
+			if (now - g_env.at < 3000) return;
+			g_env.at = now;
+			const EnvState was = g_env;
+			g_env.night = ConditionFloat(0x00C03480) > 0.5f;
+			g_env.rain = WeatherHas(0x0005B844);
+			g_env.snow = WeatherHas(0x0005B843);
+			g_env.dust = WeatherHas(0x0038C5EF);
+			if (!g_env.told || was.night != g_env.night || was.rain != g_env.rain || was.snow != g_env.snow || was.dust != g_env.dust) {
+				g_env.told = true;
+				logger::Write("Vehicles: conditions: %s%s%s%s", g_env.night ? "night" : "day", g_env.rain ? ", rain" : "", g_env.snow ? ", snow" : "", g_env.dust ? ", dust" : "");
+			}
+		}
+
+		double EnvSpeed() { return (g_env.night ? kNightSpeed : 1.0) * ((g_env.rain || g_env.snow || g_env.dust) ? kWeatherSpeed : 1.0); }
+		double EnvClimb() { return (g_env.night ? kEnvClimb : 0.0) + ((g_env.rain || g_env.snow || g_env.dust) ? kEnvClimb : 0.0); }
 		// Crew (2026-10-20, the user: "if I have any followers and I press those buttons ... they should enter the vehicle and do the behaviour I
 		// asked for"): Summon / Follow / the scanner marker with a follower free -> the vehicle is brought as usual, then the follower boards it
 		// as its driver (npcvehicles::CrewBoard) with the order; while a follower drives it, this autopilot leaves it alone.
@@ -2431,6 +2484,7 @@ namespace vehicleflight
 						// flying; the next half second of contacts is the same hit settling, not new crashes.
 						g.contactGraceUntil = nowMs + kHitGraceMs;
 						logger::Write("%s: hard hit %.0f m/s (side); still flying", wf, delta);
+						npcvehicles::WitnessCrash(pos.x, pos.y, pos.z, "a hard crash");
 						NoteContactAt(vehicle, false);
 					}
 				}
@@ -2571,7 +2625,7 @@ namespace vehicleflight
 						ag = g.gearCap;
 						g.shiftAt = nowMs;
 					}
-					const double want = std::min(desired, kAiGearTop[ag]);
+					const double want = std::min(desired, kAiGearTop[ag]) * EnvSpeed();  // night / bad weather: slower
 					apGear = ag;
 					g.aiGears = true;
 					g.throttle = std::clamp((want - sp) / 4.0, 0.0, 1.0);  // proportional: eases off as it nears the speed
@@ -3037,7 +3091,7 @@ namespace vehicleflight
 				}
 				else {
 					// Just over the highest ground in the corridor ahead (cast along the way it is going).
-					double want = kCallSkim;
+					double want = kCallSkim + (g.autopilot ? EnvClimb() : 0.0);  // night / bad weather: a little higher
 					for (int k = 0; k < 3; ++k) {
 						const auto& q = g.corr[k];
 						if (q.valid && !IsWallSample(g, q.h, q.d)) want = std::max(want, q.h + kTerrainClear - refGround);  // walls: the warning, not a climb
@@ -4093,6 +4147,7 @@ namespace vehicleflight
 	void Tick()
 	{
 		g_vsnapOk = world::Vehicles(g_vsnap);
+		EnvTick();
 		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
 			TrailTick(player);
 			PlayerAirTick(player);
