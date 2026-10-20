@@ -283,7 +283,7 @@ namespace vehicleflight
 		// Ceilings: two rays a frame per pilot (straight up kCeilUp, and up and ahead), the lowest hit above the vehicle caps the height hold
 		// kCeilClear under it, so it never presses itself into an underside; under an overhang it flies through at that height.
 		constexpr int kCeilSlot0 = 48;
-		constexpr double kCeilUp = 30.0, kCeilAhead = 15.0, kCeilAheadUp = 12.0, kCeilClear = 2.5, kVehicleTop = 2.0;
+		constexpr double kCeilUp = 30.0, kCeilAhead = 15.0, kCeilAheadUp = 12.0, kCeilClear = 5.0, kVehicleTop = 2.0;  // (kCeilClear 2026-10-20: was 2.5; the user still felt a pull toward ceilings)
 		constexpr double kSelfHitBand = 3.0;      // m: a front sample this close to the rover's own height is the rover
 		constexpr double kLandHeight = 1.0;       // m: settling under this (not climbing) for kLandMs ends the hover
 		constexpr ULONGLONG kLandMs = 1500;

@@ -159,7 +159,7 @@ Buttons only show when they can be used:
 **Ground** is the real terrain (hills and cliffs, seen from high above), or any surface **at or below the vehicle's flight level** (a
 street, platform or roof it can reach without climbing into anything). Everything **above** the flight level that is not terrain
 (building faces, overhangs, bridges, undersides) never lifts the hover: it is only a warning (below). Two rays look up (straight up and
-up-ahead): under a ceiling the height is capped 2.5 m below it, so the vehicle **flies through under bridges and overhangs** instead of
+up-ahead): under a ceiling the height is capped 5 m below it, so the vehicle **flies through under bridges and overhangs** instead of
 pressing into them.
 
 ### Walls (no more "magnet")
