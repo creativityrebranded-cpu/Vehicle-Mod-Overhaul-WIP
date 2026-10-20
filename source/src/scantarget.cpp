@@ -4,6 +4,7 @@
 #include "controlmap.h"
 #include "game.h"
 #include "mappoints.h"
+#include "scannercontext.h"
 #include "npcvehicles.h"
 #include "hoverui.h"
 #include "log.h"
@@ -46,19 +47,22 @@ namespace scantarget
 			bool valid = false, estimated = false, snapped = false, outpost = false;
 			float x = 0, y = 0, z = 0, dist = 0;
 			std::uint32_t formId = 0;
+			std::string name;
 		};
 
 		int g_key = 'T';
 		bool g_keyRead = false, g_keyDown = false;
 		ULONGLONG g_lastAsk = 0, g_setAt = 0;
 		float g_setDist = 0;
+		bool g_setEstimated = false;
+		std::string g_setName;
 
 		// Marker chain (2026-10-20, the user): a press while a trip to the current marker is on queues the point; when the player's vehicle is
 		// kSwapEtaS from the current marker (time to arrival from its speed) or kSwapNear metres, the game's marker moves to the next point and Auto,
 		// which follows the marker, flies on without stopping. Holding the key kReplaceMs replaces the whole chain with the new point.
 		constexpr double kSwapEtaS = 4.0, kSwapNear = 15.0, kArrivedNear = 20.0;
 		constexpr ULONGLONG kReplaceMs = 800;
-		struct Point { float x, y, z; };
+		struct Point { float x, y, z; std::string name; };
 		std::vector<Point> g_chain;      // queued points, next first
 		ULONGLONG g_downAt = 0;
 		bool g_held = false;             // this press already acted as a hold
@@ -111,7 +115,7 @@ namespace scantarget
 
 		// Pulls the target to a map point that lies on the view line (horizontal offset from the line <= max(80 m, 3% of its distance)), at any distance. A real hit that is
 		// clearly nearer than the point is an obstacle and wins. Only points of the planet the player is on exist here (mappoints::WorldPoints).
-		void SnapToMapPoint(Target& t, const game::Vec3& pp, float dx, float dy, ULONGLONG now)
+		void SnapToMapPoint(Target& t, const game::Vec3& pp, float dx, float dy, ULONGLONG now, const hoverui::ScannerDestination& selection)
 		{
 			const float hl = std::hypot(dx, dy);
 			if (hl < 0.02f) return;   // looking straight up or down
@@ -124,6 +128,7 @@ namespace scantarget
 				if (!g_poiHave) g_pois.clear();
 			}
 			if (g_pois.empty()) return;
+			const std::string& selected = selection.name;
 			const float ux = dx / hl, uy = dy / hl;
 			const float hitDist = t.valid && !t.estimated ? float(std::hypot(double(t.x) - pp.x, double(t.y) - pp.y)) : -1.0f;
 			const mappoints::Point* best = nullptr;
@@ -131,12 +136,9 @@ namespace scantarget
 			for (const auto& q : g_pois) {
 				const float rx = q.x - pp.x, ry = q.y - pp.y;
 				const float along = rx * ux + ry * uy;
-				if (along < 20.0f) continue;
 				const float lateral = std::fabs(rx * uy - ry * ux);
-				const float tol = std::max(80.0f, 0.03f * along);
-				if (lateral > tol) continue;
-				if (hitDist >= 0.0f && hitDist < along - tol) continue;   // something solid in front of it
-				const float score = lateral / tol;
+				const float score = float(scannercontext::PoiScore(q.name, selected, along, lateral, hitDist,
+					std::hypot(rx, ry), selection.distance));
 				if (score < bestLat) { bestLat = score; best = &q; }
 			}
 			if (!best) return;
@@ -148,6 +150,7 @@ namespace scantarget
 			t.y = best->y;
 			t.z = pp.z;
 			t.formId = 0;
+			t.name = best->name;
 		}
 
 		// The view line: the camera root's world transform (NiAVObject: rotation +0x80, 3 rows of 16 bytes; translate +0xB0, as shipmodel reads it).
@@ -230,7 +233,21 @@ namespace scantarget
 					if (s > 1.0f) t = { true, true, false, false, pp.x + dx / hl * s, pp.y + dy / hl * s, pp.z, 0, 0 };
 				}
 			}
-			SnapToMapPoint(t, pp, dx, dy, now);
+			const auto selected = hoverui::ScannerDestinationContext();
+			if (!selected.name.empty()) {
+				// The named marker owns the aim. Until map coordinates are available, use the
+				// game's measured range along the camera ray and label that projection as estimated.
+				if (selected.distance > 0) {
+					t = {true, true, false, false,
+						float(from[0] + dx * selected.distance), float(from[1] + dy * selected.distance),
+						float(from[2] + dz * selected.distance), 0, 0, selected.name};
+				} else {
+					// Retain a ray/estimate only as spatial context; its position is still uncertain.
+					t.estimated = true;
+					t.name = selected.name;
+				}
+			}
+			SnapToMapPoint(t, pp, dx, dy, now, selected);
 			if (t.valid) t.dist = float(std::hypot(double(t.x) - pp.x, double(t.y) - pp.y));
 			return t;
 		}
@@ -244,7 +261,8 @@ namespace scantarget
 			char d[32];
 			if (t.dist >= 1000.0f) std::snprintf(d, sizeof(d), "%s%.2f km", t.estimated ? "~" : "", t.dist / 1000.0f);
 			else std::snprintf(d, sizeof(d), "%s%.0f m", t.estimated ? "~" : "", t.dist);
-			std::snprintf(out, cap, marked ? "MARKER SET  %s" : "TARGET  %s%s", d, t.snapped ? (t.outpost ? "  (outpost)" : "  (map point)") : "");
+			std::snprintf(out, cap, "%s  %s%s%s", marked ? "MARKER SET" : "TARGET", d,
+				t.name.empty() && !t.snapped ? "" : "  ", t.name.empty() ? (t.snapped ? (t.outpost ? "(outpost)" : "(map point)") : "") : t.name.c_str());
 		}
 	}
 
@@ -282,7 +300,7 @@ namespace scantarget
 		{
 			const float pos[3] = { q.x, q.y, q.z };
 			const bool ok = readout::SetPlayerMarker(pos);
-			logger::Write("Scanner marker: %s (%.0f, %.0f, %.0f) -> %s; %zu more queued", why, q.x, q.y, q.z, ok ? "marker placed" : "FAILED", g_chain.size());
+			logger::Write("Scanner marker: %s [%s] (%.0f, %.0f, %.0f) -> %s; %zu more queued", why, q.name.c_str(), q.x, q.y, q.z, ok ? "marker placed" : "FAILED", g_chain.size());
 			if (ok) {
 				g_current = q;
 				g_haveCurrent = true;
@@ -389,13 +407,15 @@ namespace scantarget
 				logger::Write("Scanner marker: pressed, but the view hits nothing");
 			}
 			else {
-				const Point q{ t.x, t.y, t.z };
+				const Point q{ t.x, t.y, t.z, t.name };
 				double left = 0, eta = 0;
 				const bool trip = TripState(now, left, eta);
 				if (!hold && trip && left > kArrivedNear) {
 					g_chain.push_back(q);
 					g_setAt = now;
 					g_setDist = t.dist;
+					g_setEstimated = t.estimated;
+					g_setName = t.name;
 					logger::Write("Scanner marker: queued (%.0f, %.0f, %.0f) as stop %zu (current marker %.0f m from your vehicle)", t.x, t.y, t.z, g_chain.size() + 1, left);
 					char msg[48];
 					std::snprintf(msg, sizeof(msg), "Marker queued (%zu in the chain)", g_chain.size() + 1);
@@ -409,18 +429,26 @@ namespace scantarget
 					if (ok) {
 						g_setAt = now;
 						g_setDist = t.dist;
-						notify::Show("Marker set | your vehicle is coming");
+						g_setEstimated = t.estimated;
+						g_setName = t.name;
+						if (t.name.empty()) notify::Show("Marker set | your vehicle is coming");
+						else {
+							char named[256];
+							std::snprintf(named, sizeof(named), "Destination: %s | your vehicle is coming", t.name.c_str());
+							notify::Show(named);
+						}
 						vehicleflight::RequestScannerTrip();
 					}
 				}
 			}
 		}
-		char buf[96];
+		char buf[256];
 		if (g_setAt && now - g_setAt < 3000) {
 			Target shown = t;
 			shown.valid = true;
-			shown.estimated = false;
+			shown.estimated = g_setEstimated;
 			shown.dist = g_setDist;
+			shown.name = g_setName;
 			shown.snapped = false;
 			Text(shown, true, buf, sizeof(buf));
 		}
@@ -443,6 +471,7 @@ namespace scantarget
 	{
 		g_keyDown = false;
 		g_setAt = 0;
+		g_setName.clear();
 		g_chain.clear();
 		g_lastAt = 0;
 		g_downAt = 0;

@@ -27,7 +27,7 @@ namespace mappoints
 		using Publish_t = void (*)(void*, uptr);
 		Publish_t g_original = nullptr;
 
-		struct Rec { double lat, lon; bool outpost; };
+		struct Rec { double lat, lon; bool outpost; char name[192] = {}; };
 		std::mutex g_lock;
 		std::vector<Rec> g_pois;
 		std::uint32_t g_body = 0;
@@ -35,6 +35,22 @@ namespace mappoints
 
 		constexpr std::size_t kMaxRead = 4096;
 		Rec g_scratch[kMaxRead];
+
+		// BSFixedString entry, as globe.cpp reads kRecName (+0x08). Copy while records are alive.
+		void CopyName(uptr entry, char* out, std::size_t cap)
+		{
+			out[0] = 0;
+			__try {
+				int hops = 0;
+				while (entry && ((At<std::uint32_t>(entry, 0x14) >> 1) & 1) && hops++ < 8)
+					entry = At<uptr>(entry, 0x08);
+				if (!entry || hops >= 8) return;
+				const char* text = reinterpret_cast<const char*>(entry + 0x18);
+				std::size_t i = 0;
+				for (; i + 1 < cap && text[i]; ++i) out[i] = text[i];
+				out[i] = 0;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; }
+		}
 
 		// Reads the shown + visible records into g_scratch (no objects here: SEH only).
 		bool ReadRecords(uptr state, std::size_t& kept, std::size_t& outposts, std::size_t& n, std::uint32_t& body)
@@ -51,7 +67,9 @@ namespace mappoints
 					const double lat = *reinterpret_cast<const double*>(r + kRecLatitude);
 					const double lon = *reinterpret_cast<const double*>(r + kRecLongitude);
 					if (!std::isfinite(lat) || !std::isfinite(lon) || std::fabs(lat) > 1.571 || std::fabs(lon) > 6.284) continue;
-					g_scratch[kept++] = { lat, lon, r[0x73] != 0 };
+					g_scratch[kept] = { lat, lon, r[0x73] != 0 };
+					CopyName(*reinterpret_cast<const uptr*>(r + 0x08), g_scratch[kept].name, sizeof(g_scratch[kept].name));
+					++kept;
 					if (r[0x73]) ++outposts;
 				}
 				body = At<std::uint32_t>(state, kBody);
@@ -169,7 +187,7 @@ namespace mappoints
 		}
 		for (const auto& q : pois) {
 			double x = 0, y = 0;
-			if (Solve(mgr, q.lat, q.lon, playerPos, x, y)) out.push_back({ float(x), float(y), q.outpost });
+			if (Solve(mgr, q.lat, q.lon, playerPos, x, y)) out.push_back({ float(x), float(y), q.outpost, q.name });
 		}
 		return !out.empty();
 	}

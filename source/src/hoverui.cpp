@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <cmath>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -843,6 +845,9 @@ namespace hoverui
 		std::mutex g_callLock;
 		std::string g_callKey = "N", g_followKey = "U";
 		std::mutex g_scanLock;
+		std::string g_placeName;
+		ULONGLONG g_placeAt = 0;
+		double g_placeDistance = 0;
 		std::string g_scanText;  // the scanner screen status box text
 		struct MonoEl;
 		std::uint64_t MonoMessageDetour(uptr menu, void* msg)
@@ -1121,6 +1126,40 @@ namespace hoverui
 			if (g_ex.built) RefreshExtras();
 		}
 
+		// monoclemenu.swf: SetRightInfoDisplayState selects "MapMarker" only for an aimed POI.
+		// NearbyPOIDisplay is area context and must never select a destination on its own.
+		void CaptureScannerDestination(const Value& root)
+		{
+			std::string name;
+			Value panel, marker, description, text, range, rangeText;
+			double distance = 0;
+			if (GetMember(root, "RightInfoDisplay_mc", &panel) && IsObject(panel) &&
+				GetString(panel, "currentLabel") == "MapMarker" &&
+				GetMember(panel, "MapMarkerInfo_mc", &marker) && IsObject(marker) &&
+				GetMember(marker, "description_mc", &description) && IsObject(description) &&
+				GetMember(description, "description_tf", &text) && IsObject(text)) {
+				name = GetString(text, "text");
+				// The first description line is the location; subsequent lines describe its state.
+				name = name.substr(0, name.find_first_of("\r\n"));
+				const auto last = name.find_last_not_of(" \t");
+				name = last == std::string::npos ? "" : name.substr(0, last + 1);
+				const auto first = name.find_first_not_of(" \t");
+				if (first != std::string::npos) name.erase(0, first);
+				if (GetMember(root, "range_mc", &range) && IsObject(range) &&
+					GetMember(range, "range_tf", &rangeText) && IsObject(rangeText)) {
+					const auto shown = GetString(rangeText, "text");
+					distance = std::strtod(shown.c_str(), nullptr);
+					if (!std::isfinite(distance) || distance <= 0 || distance > 100000) distance = 0;
+				}
+			}
+			Release(rangeText); Release(range);
+			Release(text); Release(description); Release(marker); Release(panel);
+			std::lock_guard lk(g_scanLock);
+			g_placeName = name;
+			g_placeDistance = distance;
+			g_placeAt = GetTickCount64();
+		}
+
 		void MonoWorkBody(uptr menu)
 		{
 			const uptr movie = *reinterpret_cast<uptr*>(menu + 0x88);
@@ -1128,6 +1167,10 @@ namespace hoverui
 				g_mono = Mono{};  // a new scanner (menu or movie): the old objects went with the old one (13:57:54 AV)
 				g_mono.movie = movie;
 				g_mono.menu = menu;
+			}
+			if (movie) {
+				const auto& root = *reinterpret_cast<const Value*>(menu + 0x58);
+				if (IsObject(root)) CaptureScannerDestination(root);
 			}
 			if (!movie || g_mono.failed) return;
 			if (!g_mono.built) {
@@ -1213,6 +1256,8 @@ namespace hoverui
 			if (mono) {
 				g_monoMenu.store(0);
 				g_monoMovie.store(0);
+				std::lock_guard lk(g_scanLock);
+				g_placeName.clear(); g_placeAt = 0;
 			}
 			void* r = g_movieDtorOriginal(movie, flags);
 			// After the movie unlinked its values (they live in our memory): forget them, never release.
@@ -1284,6 +1329,11 @@ namespace hoverui
 	}
 
 	bool IsScannerOpen() { return ScannerOpen(); }
+	ScannerDestination ScannerDestinationContext()
+	{
+		std::lock_guard lk(g_scanLock);
+		return ScannerOpen() && GetTickCount64() - g_placeAt < 200 ? ScannerDestination{g_placeName, g_placeDistance} : ScannerDestination{};
+	}
 
 	void SetScan(const char* text)
 	{
@@ -1379,7 +1429,11 @@ namespace hoverui
 		}
 	}
 
-	void Reset() { g_reset = true; }
+	void Reset() {
+		g_reset = true;
+		std::lock_guard lk(g_scanLock);
+		g_placeName.clear(); g_placeAt = 0;
+	}
 
 	namespace
 	{

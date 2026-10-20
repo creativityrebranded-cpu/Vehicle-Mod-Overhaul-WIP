@@ -47,3 +47,6 @@ target_link_libraries(SeamlessVehicle PRIVATE sp_common Synchronization)
 
 add_executable(navfield_test tests/navfield_test.cpp src/navfield.cpp)
 sp_options(navfield_test)
+
+add_executable(scannercontext_test tests/scannercontext_test.cpp)
+sp_options(scannercontext_test)

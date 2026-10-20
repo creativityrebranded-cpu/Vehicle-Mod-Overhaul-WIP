@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 
 // Native hover buttons on the HUD's rover widget (hudmenu.swf: root.RightMeters_mc.HUDVehicle_mc, the widget that
 // shows "hold [E] Exit vehicle"). The buttons are the game's own BasicButton (ButtonClips.swf) with ButtonBaseData +
@@ -49,6 +50,9 @@ namespace hoverui
 	void EditTick(bool focused);
 	// The scanner (MonocleMenu) is open right now (it counts as open for 300 ms after its last frame). Main thread.
 	bool IsScannerOpen();
+	// Copied on the scanner movie thread. Empty unless the selected map-marker panel is active.
+	struct ScannerDestination { std::string name; double distance = 0; };
+	ScannerDestination ScannerDestinationContext();
 	// The text of the scanner screen's status box (the distance to what you look at); empty hides it. The box is movable with the F7 editor while the scanner is open.
 	void SetScan(const char* text);
 }
