@@ -30,6 +30,9 @@ namespace hoverui
 	void SetOccupied(bool facing, const char* key);
 	// Main thread: in the vehicle, the Auto button (its key; empty: hidden), whether Auto flies, and its status line.
 	void SetAuto(const char* key, bool on, const char* line);
+	// Main thread: the Auto behaviour button (in the vehicle and on foot): its key (empty: hidden), its label ("Auto: Orbit") and a press
+	// (the button flashes blue for a moment).
+	void SetAutoMode(const char* key, const char* label, bool pressed);
 	// Main thread: the gang line (NPC vehicles following: count, profile, the profile key); count 0 hides it.
 	void SetGang(int count, const char* profile, const char* key);
 	// Main thread: one line per NPC vehicle / rider under the gang line (at most kMaxRows; count 0 hides them). Placed relative to the gang element.
@@ -44,4 +47,8 @@ namespace hoverui
 	// default; Home / End space the WASD keys or the column's rows. While editing every element shows (sample text where
 	// empty). Saved to SFSE\Logs\SeamlessVehicle\hoverui.ini.
 	void EditTick(bool focused);
+	// The scanner (MonocleMenu) is open right now (it counts as open for 300 ms after its last frame). Main thread.
+	bool IsScannerOpen();
+	// The text of the scanner screen's status box (the distance to what you look at); empty hides it. The box is movable with the F7 editor while the scanner is open.
+	void SetScan(const char* text);
 }

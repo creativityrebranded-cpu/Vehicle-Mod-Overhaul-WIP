@@ -19,6 +19,9 @@ namespace readout
 	// where they are. Replaces any custom marker the player placed.
 	void TrackPlayerMarker();
 
+	// Places the player's custom map marker (the game's own, FUN_141A43220) at `pos` (world coordinates) in the current planet's world. False: no planet world yet.
+	bool SetPlayerMarker(const float pos[3]);
+
 	// Called after a successful re-centre.
 	void OnRecentre(int cellsX, int cellsY, unsigned objects);
 }

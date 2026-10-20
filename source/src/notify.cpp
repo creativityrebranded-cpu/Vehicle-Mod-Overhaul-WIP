@@ -173,6 +173,29 @@ namespace readout
 		}
 	}
 
+	bool SetPlayerMarker(const float pos[3])
+	{
+		const auto player = Ptr(addr::kPlayerCharacterPtr);
+		const auto mgr = Ptr(addr::kPlanetManagerPtr);
+		if (!player || !mgr) return false;
+		__try {
+			const auto holder = *reinterpret_cast<std::uintptr_t*>(mgr + off::kMgrMarkerWorld);
+			const auto form = holder ? *reinterpret_cast<std::uintptr_t*>(holder) : 0;
+			if (!form) return false;
+			const auto state = *reinterpret_cast<std::uint32_t*>(form + 0x14);
+			if ((((state & 0x70000000u) + 0xD0000000u) & 0xEFFFFFFFu) != 0) return false;
+			const auto worldspace = *reinterpret_cast<std::uintptr_t*>(form + 0x98);
+			if (!worldspace) return false;
+			float p[3] = { pos[0], pos[1], pos[2] };
+			const auto setMarker = reinterpret_cast<void (*)(const float*, std::uintptr_t, std::uint32_t*, std::uintptr_t)>(game::Base() + addr::kSetCustomMarker);
+			setMarker(p, worldspace, reinterpret_cast<std::uint32_t*>(player + off::kPlayerCustomMarker), player + off::kPlayerCustomMarkerData);
+			return true;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
 	void TrackPlayerMarker()
 	{
 		static ULONGLONG last = 0;

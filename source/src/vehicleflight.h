@@ -39,6 +39,18 @@ namespace vehicleflight
 	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out);
 	// The player's custom map marker as a point in `vehicle`'s world (false: none, not loaded, another worldspace, too far).
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y);
+	// The scanner marker button (scantarget): the player's own vehicle is summoned (as the call key does), and when the player gets in, Auto flies it to the
+	// marker. Driving already: Auto starts at once. Main thread.
+	void RequestScannerTrip();
+	// The vehicle hit counter (vehiclehits): this vehicle's autopilot is switched off now and refused for `ms` (its hover ends; the player can still
+	// drive it by hand). Main thread.
+	void DisableAutopilot(std::uint32_t vehicleFormId, unsigned ms, const char* why);
+	bool AutopilotDisabled(std::uint32_t vehicleFormId);
+	// What Auto does at the player's marker (the scanner's behaviour key cycles it): Stop there, Orbit it, or Patrol the scanner's marker chain
+	// in a loop (each point goes back to the end of the chain when it is passed). Main thread.
+	enum class AutoMode : int { Stop = 0, Orbit = 1, Patrol = 2 };
+	void SetAutoMode(AutoMode m);
+	AutoMode GetAutoMode();
 
 	// Direct control of an autopilot (pilot 1..3, or 0 = the player's rover while it flies itself): every channel in
 	// `set` overrides the autopilot's own for holdMs, then hands back. Channels left out stay with the autopilot.

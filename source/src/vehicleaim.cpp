@@ -6,6 +6,7 @@
 #include "log.h"
 #include "npcvehicles.h"
 #include "vehicleflight.h"
+#include "vehiclehits.h"
 
 #include <Windows.h>
 
@@ -97,7 +98,27 @@ namespace vehicleaim
 					if (!told) { told = true; logger::Write("Vehicle aim: exception reading the launch data; shot left as the game made it"); }
 				}
 			}
-			return g_original(out, data, a3, a4);
+			std::uint32_t shooter = 0;
+			if (data) {
+				__try {
+					const uptr s = *reinterpret_cast<uptr*>(reinterpret_cast<std::uint8_t*>(data) + kShooter);
+					shooter = s ? At<std::uint32_t>(s, off::kFormId) : 0;
+				}
+				__except (EXCEPTION_EXECUTE_HANDLER) {
+					shooter = 0;
+				}
+			}
+			void* r = g_original(out, data, a3, a4);
+			// The vehicle hit counter follows every projectile from its handle (the launch's out parameter).
+			std::uint32_t handle = 0;
+			__try {
+				handle = out ? *reinterpret_cast<std::uint32_t*>(out) : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				handle = 0;
+			}
+			if (handle) vehiclehits::NoteLaunch(handle, shooter);
+			return r;
 		}
 	}
 

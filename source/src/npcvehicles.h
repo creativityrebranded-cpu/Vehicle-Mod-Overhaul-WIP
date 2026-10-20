@@ -49,4 +49,34 @@ namespace npcvehicles
 	// Any thread (vehicleaim's projectile launch hook): the led world aim point (player chest + velocity x flight time,
 	// ref +0x8C frame) for a job allowed to fire whose vehicle or NPC is `shooterFormId`; false otherwise.
 	bool AimFor(std::uint32_t shooterFormId, double& x, double& y, double& z);
+	// The player's own vehicle's context behaviours (vehicleflight: overwatch, scout). The nearest enemy of the player around (x, y, z) within `range`:
+	// fighting actors hostile to the player, enemies in vehicles first; `count` = how many enemies there are; 0 when none.
+	std::uintptr_t EnemyNear(std::uintptr_t player, double x, double y, double z, double range, bool& inVehicle, int& count);
+	// The vehicle weapon of a vehicle no NPC job drives (the player's own rover on overwatch): held while `fire`; the shots are turned at (x, y, z).
+	bool FireVehicleWeapon(std::uint32_t vehicleId, bool fire, double x, double y, double z);
+	// Crew orders (2026-10-20, the user: with followers, the vehicle buttons send a follower to drive the player's own vehicle and do what was asked).
+	// Follow: the follower drives it after the player (an escort: it defends, rescues, scouts); Marker: it flies to the player's map marker and
+	// does the Auto behaviour there (vehicleflight::GetAutoMode: stop / orbit / patrol).
+	enum class CrewOrder : int { None = 0, Follow = 1, Marker = 2 };
+	// A follower free to drive (on foot, not busy, alive) within `range` metres of (x, y); 0 when none.
+	std::uintptr_t FreeFollower(std::uintptr_t player, double x, double y, double range);
+	// That follower walks to `vehicle` (the player's own one allowed) and drives it with `order`; false when nobody could be sent.
+	bool CrewBoard(std::uintptr_t player, std::uintptr_t vehicle, CrewOrder order);
+	CrewOrder CrewOrderOf(std::uint32_t vehicleId);       // None: no crew job on that vehicle
+	void SetCrewOrder(std::uint32_t vehicleId, CrewOrder order);
+	void ReleaseCrew(std::uint32_t vehicleId);             // the crew driver gets out
+	// Civil tasks (2026-10-20, the user: everyday traffic). The NPC walks to the vehicle, drives it and finally parks it in a clear spot and gets out:
+	//  transit: to (x, y), then it walks the rest of its way; patrol: two laps round the vehicle's parking place, then home; a fight ends any task.
+	bool StartTransit(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);
+	bool StartPatrol(std::uintptr_t actor, std::uintptr_t vehicle);
+	// Return home: a following job's vehicle flies back to where it was taken from and parks there (false: no home known, or already there).
+	bool SendHome(std::uint32_t vehicleId);
+	int CivilJobs();                                         // jobs running a civil task now
+	// The actor may take this vehicle: unowned, or owned by the actor or a faction it belongs to (never the player's).
+	bool MayUse(std::uintptr_t actor, std::uintptr_t vehicle);
+	bool ActorFree(std::uintptr_t actor);                    // alive, on foot, no job, not a follower
+	// Supply run: drives to (x, y) (another settlement / outpost), waits there, comes back, parks.
+	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);
+	// Recall: every escort drops its fight for `ms` and comes back into formation.
+	void Recall(unsigned ms);
 }

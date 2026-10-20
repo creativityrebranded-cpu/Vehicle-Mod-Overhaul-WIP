@@ -164,7 +164,11 @@ namespace profiles
 			unsigned long long tAt = 0;
 			double px = 0, py = 0, pz = 0, pvx = 0, pvy = 0, pvz = 0;  // the player's last position and smoothed velocity (climb lead)
 			unsigned long long pAt = 0;
+			bool convoy = false;                      // in the convoy column (hysteresis on the target's speed)
 		} g_track[kTracks];
+		// Convoy (2026-10-20, the user): the target moving faster than kConvoyOn, escorts line up in one column behind it (kFollowBack, then
+		// kConvoyGap more per slot), back to the side-by-side formation under kConvoyOff.
+		constexpr double kConvoyOn = 8.0, kConvoyOff = 4.0, kConvoyGap = 12.0;
 
 		uptr InVehicleOf(uptr actor)
 		{
@@ -228,8 +232,15 @@ namespace profiles
 			const double yaw = tsp > 3.0 ? std::atan2(t.tvx, t.tvy) : At<game::Vec3>(target, off::kRefRotation).z;  // moving: its track
 			// Formation: slot 0 left, 1 right, then rows further back, alternating sides.
 			const int slot = c.pilot - 1;
-			const double side = (slot % 2 ? -1.0 : 1.0) * (kFollowSide + 2.0 + 3.0 * (slot / 2));  // + left, - right
-			const double back = kFollowBack + kFollowSpread * (slot / 2);
+			if (!t.convoy && tsp > kConvoyOn) t.convoy = true;
+			else if (t.convoy && tsp < kConvoyOff) t.convoy = false;
+			double side = (slot % 2 ? -1.0 : 1.0) * (kFollowSide + 2.0 + 3.0 * (slot / 2));  // + left, - right
+			double back = kFollowBack + kFollowSpread * (slot / 2);
+			if (t.convoy) {
+				// One column: the slots in order behind the target, on its track.
+				side = 0.0;
+				back = kFollowBack + kConvoyGap * slot;
+			}
 			g.x = pp.x - std::sin(yaw) * back - std::cos(yaw) * side;
 			g.y = pp.y - std::cos(yaw) * back + std::sin(yaw) * side;
 			const double to = std::hypot(double(vp.x) - pp.x, double(vp.y) - pp.y);

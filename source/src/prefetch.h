@@ -26,7 +26,9 @@ namespace prefetch
 		kSlotRescue0 = kSlotCheck0 + kSlotCheckCount,
 		// SeamlessVehicle: NPC pilots 1..3, 16 each (7 model samples, then 9 avoidance corridors).
 		kSlotPilot0 = kSlotRescue0 + 2, kSlotPilotEach = 16, kSlotPilotCount = 6,
-		kSlotCount = kSlotPilot0 + kSlotPilotEach * kSlotPilotCount };
+		// SeamlessVehicle: the ground under the player (the rover's follow-from-below).
+		kSlotFollow = kSlotPilot0 + kSlotPilotEach * kSlotPilotCount,
+		kSlotCount = kSlotFollow + 1 };
 
 	// Also service probes when the engine updates the loaded grid around this reference (the flown ship).
 	void SetProbeAnchor(std::uintptr_t ref);

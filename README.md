@@ -240,6 +240,21 @@ Also not tested in game: the view distance setting, the 600 m leash, and the red
 Removed from this build: the follower-command Walk / Enter keys, the `,` send key, and followers taking vehicles when you get in
 (gang boarding).
 
+Added 2026-10-20, built, **not yet tested in game**:
+- Vehicles are no longer terrain to each other (no "magnet" between hovering vehicles); a silent proximity warning slows the autopilot,
+  with right of way by rank (parked > you > followers > neutral > hostile).
+- Scanner marker: aims along the camera, estimates out to 1 km, marker chains (tap T to queue, hold T to replace) swapped about 4 s before
+  arrival, and an **Auto: Stop / Orbit / Patrol** HUD button.
+- Your vehicle following you catches you from below when you are in the air, and keeps following when you go indoors.
+- Followers drive your vehicle when you press Summon / Follow / set a marker (crew driver); hold Follow to recall escorts.
+- Escorts defend you (enemy vehicles first): intercept, shield, overwatch, attack, convoy column, roles, threat level, rescue when your
+  health is low, scout ahead to your marker, wait at the door, pick up wounded followers.
+- Enemy vehicles: flank, intercept, block, overwatch, retreat near their hit limit (driver fights on foot), pick up their wounded, call
+  reinforcements; enemies run to free vehicles up to 150 m away in vehicle fights.
+- Hit counter: shots through a vehicle add up; at your health worth its autopilot switches off for 30 s (`[hits]` in seamless.ini).
+- Civil traffic (outside fights, at most 2 at once, never essential / protected NPCs): transit with drop-off, shared rides, offer a ride,
+  outpost patrols, supply runs, return home, parking in clear spots, fleeing hostile vehicles, slowing for people on foot.
+
 Logs to send when something goes wrong: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` (and
 `SeamlessVehicle.prev.log` for the previous session).
 

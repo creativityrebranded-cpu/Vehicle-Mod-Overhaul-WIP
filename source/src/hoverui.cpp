@@ -126,10 +126,10 @@ namespace hoverui
 		enum { kW, kA, kS, kD, kGearDown, kGearUp, kHover, kGear, kButtons };
 		// Editor selections: each element (W, A, S, D, Gear-, Gear+, Hover, Gear box, Auto, Auto line, Gang), each of the
 		// rover widget's own clips (kSelNative + i, e.g. the Exit button), then the groups.
-		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelNative = 100 };
-		constexpr int kFootEls = 8, kCarEls = 4;
-		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject", "vehicles" };
-		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh", "vehiclesinveh" };
+		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelRows, kSelMode, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelNative = 100 };
+		constexpr int kFootEls = 9, kCarEls = 5;
+		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject", "vehicles", "automode" };
+		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh", "vehiclesinveh", "automodeinveh" };
 		constexpr double kDefOff[kButtons][2] = { { 0.0, -31.0 }, { -23.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 0.0 }, { -2.0, 0.0 } };
 		struct Layout_t
 		{
@@ -153,8 +153,8 @@ namespace hoverui
 			bool oldRows = false;      // only the earlier per-row positions are known: derive the column from them
 			double oldX[3] = {}, oldY[3] = {};  // Gear+, Gear-, Hover (the earlier order)
 			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] }, { kDefOff[4][0], kDefOff[4][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
-			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang, Passenger, Eject, vehicles)
-			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang, vehicles)
+			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 }, { 0.0, -40.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang, Passenger, Eject, vehicles, Auto mode)
+			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 }, { 342.0, 226.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang, vehicles, Auto mode)
 			// The rover widget's own clips (found by name when the widget is first seen) and their nudges.
 			std::vector<std::string> natNames;
 			std::map<std::string, std::pair<double, double>> natOff;
@@ -300,6 +300,8 @@ namespace hoverui
 			bool own = false, nearOwn = false, autoOn = false, occupied = false;
 			std::string occKey;
 			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey;
+			std::string modeKey, modeLabel;
+			ULONGLONG modeFlashUntil = 0;
 			int gang = 0;
 			std::string rows[kMaxRows];
 			int rowCount = 0;
@@ -840,6 +842,8 @@ namespace hoverui
 		std::atomic<int> g_status{ 0 };  // 0 idle, 1 summoning, 2 following
 		std::mutex g_callLock;
 		std::string g_callKey = "N", g_followKey = "U";
+		std::mutex g_scanLock;
+		std::string g_scanText;  // the scanner screen status box text
 		struct MonoEl;
 		std::uint64_t MonoMessageDetour(uptr menu, void* msg)
 		{
@@ -934,13 +938,13 @@ namespace hoverui
 		{
 			uptr movie = 0;
 			Value meters, widget;          // RightMeters_mc (on foot) and HUDVehicle_mc (in the vehicle)
-			MonoEl fSummon, fFollow, fGetIn, fStatus, fGang, fPass, fEject, fRows;
-			MonoEl vAuto, vLine, vGang, vRows;  // fRows / vRows: the per-vehicle line (one box, movable in the F7 editor)
+			MonoEl fSummon, fFollow, fGetIn, fStatus, fGang, fPass, fEject, fRows, fMode;
+			MonoEl vAuto, vLine, vGang, vRows, vMode;  // fRows / vRows: the per-vehicle line (one box, movable in the F7 editor)
 			bool built = false, failed = false;
 		} g_ex;
 
-		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fGang, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows };
-		MonoEl* CarEls[kCarEls] = { &g_ex.vAuto, &g_ex.vLine, &g_ex.vGang, &g_ex.vRows };
+		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fGang, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows, &g_ex.fMode };
+		MonoEl* CarEls[kCarEls] = { &g_ex.vAuto, &g_ex.vLine, &g_ex.vGang, &g_ex.vRows, &g_ex.vMode };
 
 		bool IsOurExtra(void* object)
 		{
@@ -994,9 +998,11 @@ namespace hoverui
 			bool own, nearOwn, autoOn, occupied;
 			int gang, rowCount = 0;
 			std::string rows[kMaxRows];
-			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey, occKey;
+			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey, occKey, modeKey, modeLabel;
+			bool modeFlash = false;
 			{
 				std::lock_guard lk(g_ctx.lock);
+				modeKey = g_ctx.modeKey; modeLabel = g_ctx.modeLabel; modeFlash = GetTickCount64() < g_ctx.modeFlashUntil;
 				own = g_ctx.own; nearOwn = g_ctx.nearOwn; autoOn = g_ctx.autoOn; gang = g_ctx.gang;
 				occupied = g_ctx.occupied; occKey = g_ctx.occKey;
 				summonKey = g_ctx.summonKey; followKey = g_ctx.followKey; useKey = g_ctx.useKey; status = g_ctx.status;
@@ -1018,6 +1024,8 @@ namespace hoverui
 				if (autoLine.empty()) autoLine = "AUTO 120 m";
 				if (gangText.empty() || gang <= 0) { gangText = "Gang 2"; gangKey = "."; }
 				if (autoKey.empty()) autoKey = " ";
+				if (modeKey.empty()) modeKey = " ";
+				if (modeLabel.empty()) modeLabel = "Auto: Stop";
 			}
 			ElSet(g_ex.fSummon, foot && !summonKey.empty(), "Summon", summonKey);
 			ElSet(g_ex.fFollow, foot && !followKey.empty(), g_followOn.load() ? "Stop follow" : "Follow", followKey);
@@ -1038,7 +1046,12 @@ namespace hoverui
 			g_ex.fPass.scale = g_ex.fEject.scale = 0.5;
 			const bool occShow = !inVehicle && (occupied || (ed && foot));
 			ElSet(g_ex.fPass, occShow, "Passenger", occKey);
-			ElSet(g_ex.fEject, occShow, "Hold: eject", occKey);
+			ElSet(g_ex.fEject, occShow, "Double tap: eject", occKey);
+			// The Auto behaviour button: on foot (with a vehicle of your own) and in the vehicle; blue for a moment after a press.
+			ElSet(g_ex.fMode, foot && !modeKey.empty(), modeLabel.c_str(), modeKey);
+			MonoTint(g_ex.movie, g_ex.fMode, modeFlash);
+			ElSet(g_ex.vMode, inVehicle && !modeKey.empty(), modeLabel.c_str(), modeKey);
+			MonoTint(g_ex.movie, g_ex.vMode, modeFlash);
 			ElSet(g_ex.vAuto, inVehicle && !autoKey.empty(), autoOn ? "Auto on" : "Auto", autoKey);
 			MonoTint(g_ex.movie, g_ex.vAuto, autoOn);
 			ElSet(g_ex.vLine, inVehicle && (autoOn || ed) && !autoLine.empty(), " ", autoLine);
@@ -1073,7 +1086,7 @@ namespace hoverui
 			}
 			const bool blinkOff = edit && (GetTickCount64() / 300) % 2 == 0;
 			if (foot || gang > 0 || occupied) {
-				const double at[kFootEls][2] = { { fx, fy }, { fx + 120.0, fy }, { fx + 240.0, fy }, { fx + 80.0, fy + 52.0 }, { fx + 80.0, fy + 98.0 }, { fx + 240.0, fy + 52.0 }, { fx + 240.0, fy + 98.0 }, { fx + 80.0, fy + 98.0 } };
+				const double at[kFootEls][2] = { { fx, fy }, { fx + 120.0, fy }, { fx + 240.0, fy }, { fx + 80.0, fy + 52.0 }, { fx + 80.0, fy + 98.0 }, { fx + 240.0, fy + 52.0 }, { fx + 240.0, fy + 98.0 }, { fx + 80.0, fy + 98.0 }, { fx + 360.0, fy } };
 				for (int i = 0; i < kFootEls; ++i) {
 					if (!FootEls[i]->shown) continue;
 					if (FootEls[i]->scale != 1.0) {
@@ -1086,7 +1099,7 @@ namespace hoverui
 				}
 			}
 			if (inVehicle) {
-				const double at[kCarEls][2] = { { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey }, { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { cx + ex, cy + 1.7 * d + ey } };
+				const double at[kCarEls][2] = { { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey }, { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey } };
 				for (int i = 0; i < kCarEls; ++i) {
 					if (!CarEls[i]->shown) continue;
 					PlaceButtonKey(CarEls[i]->button, at[i][0] + co[i][0], at[i][1] + co[i][1], false);
@@ -1133,53 +1146,34 @@ namespace hoverui
 				g_mono.built = true;
 				logger::Write("Hover UI: scanner buttons added (Summon, Follow, status)");
 			}
-			const bool avail = g_callAvail.load();
-			const int state = g_status.load();  // 0 idle, 1 summoning, 2 following
-			std::string callKey, followKey;
+			// Only the status box is used now: it carries the scanner marker text (the distance to what you look at).
+			std::string scan;
 			{
-				std::lock_guard lk(g_callLock);
-				callKey = g_callKey;
-				followKey = g_followKey;
+				std::lock_guard lk(g_scanLock);
+				scan = g_scanText;
 			}
-			MonoShow(g_mono.summon, avail);
-			MonoShow(g_mono.follow, avail && !followKey.empty());
-			MonoShow(g_mono.status, avail && state != 0);
-			if (!avail) return;
-			MonoSetData(movie, g_mono.summon, "Summon");
-			MonoSetKey(g_mono.summon, callKey);
-			MonoSetData(movie, g_mono.follow, "Follow");
-			MonoSetKey(g_mono.follow, followKey);
-			MonoSetData(movie, g_mono.status, " ");
-			MonoSetKey(g_mono.status, state == 2 ? std::string("FOLLOWING") : state == 1 ? std::string("SUMMONING") : std::string(" "));
-			MonoTint(movie, g_mono.status, state != 0);
-			double x[3], y[3];
 			bool edit;
 			int sel;
+			double x, y;
 			{
 				std::lock_guard lk(g_lay.lock);
-				if (g_lay.scannerOld) {
-					// The earlier top-left corner (label beside the key): keep the key where the player put it.
-					double px, py, pw, ph;
-					KeyBox(g_mono.summon.button, px, py, pw, ph);
-					if (pw > 0.0) {
-						g_lay.sx += px + pw / 2.0;
-						g_lay.sy += py + ph / 2.0;
-						g_lay.scannerOld = false;
-						SaveLayout();
-					}
-				}
-				x[0] = g_lay.sx; y[0] = g_lay.sy;
-				x[1] = g_lay.fx; y[1] = g_lay.fy;
-				x[2] = g_lay.tx; y[2] = g_lay.ty;
+				x = g_lay.tx;
+				y = g_lay.ty;
 				edit = g_lay.edit;
 				sel = g_lay.msel;
 			}
-			MonoEl* els[3] = { &g_mono.summon, &g_mono.follow, &g_mono.status };
+			MonoShow(g_mono.summon, false);
+			MonoShow(g_mono.follow, false);
+			if (scan.empty() && edit) scan = "TARGET  1240 m";  // shown with a sample while editing, so it can be placed
+			const bool show = !scan.empty();
+			MonoShow(g_mono.status, show);
+			if (!show) return;
+			MonoSetData(movie, g_mono.status, " ");
+			MonoSetKey(g_mono.status, scan);
+			MonoTint(movie, g_mono.status, true);
 			const bool blinkOff = edit && (GetTickCount64() / 300) % 2 == 0;
-			for (int i = 0; i < 3; ++i) {
-				PlaceButtonKey(els[i]->button, x[i], y[i], false);
-				SetMember(els[i]->button, "alpha", Num(blinkOff && (sel == 3 || sel == i) ? 0.35 : 1.0));
-			}
+			PlaceButtonKey(g_mono.status.button, x, y, false);
+			SetMember(g_mono.status.button, "alpha", Num(blinkOff && (sel == 3 || sel == 2) ? 0.35 : 1.0));
 		}
 
 		void MonoWork(uptr menu)
@@ -1202,8 +1196,9 @@ namespace hoverui
 			if (menu && movie == g_hudMovie.load()) {
 				Work(menu);
 			}
-			// The scanner's Summon / Follow buttons are retired (2026-10-17): the HUD panel shows them in every context.
-			(void)&MonoWork;
+			// The scanner screen: only its status box is used (2026-10-18: the scanner marker distance).
+			const uptr mm = g_monoMenu.load();
+			if (mm && movie == g_monoMovie.load()) MonoWork(mm);
 			return r;
 		}
 
@@ -1237,7 +1232,13 @@ namespace hoverui
 		bool PatchSlot(std::uint32_t vtblRva, int slot, std::uint32_t expectRva, void* detour, void** original)
 		{
 			auto** p = reinterpret_cast<void**>(game::Base() + vtblRva) + slot;
-			if (reinterpret_cast<uptr>(*p) != game::Base() + expectRva) return false;
+			// The slot holds the game's own function, or another plugin's detour (Gravspace patches the same HUD slots and loads first): chain to it.
+			if (reinterpret_cast<uptr>(*p) != game::Base() + expectRva) {
+				MEMORY_BASIC_INFORMATION mbi{};
+				const bool foreign = VirtualQuery(*p, &mbi, sizeof(mbi)) && mbi.AllocationBase && reinterpret_cast<uptr>(mbi.AllocationBase) != game::Base();
+				if (!foreign) return false;
+				logger::Write("Hover UI: vtable slot %d (rva %08X) was already patched by another plugin; chaining to it", slot, vtblRva);
+			}
 			DWORD old = 0;
 			if (!VirtualProtect(p, sizeof(void*), PAGE_READWRITE, &old)) return false;
 			*original = *p;
@@ -1280,6 +1281,14 @@ namespace hoverui
 		}
 		logger::Write("Hover UI: HUD menu and movie advance hooked (main thread %lu)", GetCurrentThreadId());
 		return true;
+	}
+
+	bool IsScannerOpen() { return ScannerOpen(); }
+
+	void SetScan(const char* text)
+	{
+		std::lock_guard lk(g_scanLock);
+		g_scanText = text ? text : "";
 	}
 
 	void SetState(bool inVehicle, bool hovering, int gear, bool accelHeld)
@@ -1340,6 +1349,14 @@ namespace hoverui
 		if (g_ctx.autoLine != line) g_ctx.autoLine = line;
 	}
 
+	void SetAutoMode(const char* key, const char* label, bool pressed)
+	{
+		std::lock_guard lk(g_ctx.lock);
+		if (g_ctx.modeKey != key) g_ctx.modeKey = key;
+		if (g_ctx.modeLabel != label) g_ctx.modeLabel = label;
+		if (pressed) g_ctx.modeFlashUntil = GetTickCount64() + 450;
+	}
+
 	void SetGang(int count, const char* profile, const char* key)
 	{
 		char t[64];
@@ -1369,7 +1386,7 @@ namespace hoverui
 		std::vector<int> SelOrder()
 		{
 			std::vector<int> o;
-			for (int i = 0; i <= kSelRows; ++i) o.push_back(i);
+			for (int i = 0; i <= kSelMode; ++i) o.push_back(i);
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) o.push_back(kSelNative + i);
 			for (int i : { int(kSelCluster), int(kSelColumn), int(kSelExtras), int(kSelAll) }) o.push_back(i);
 			return o;
@@ -1379,11 +1396,11 @@ namespace hoverui
 		std::string SelName(bool inVehicle)
 		{
 			if (!inVehicle) {
-				const char* foot[kFootEls + 1] = { "Summon", "Follow", "Get in", "Status", "Gang", "Passenger", "Eject", "Vehicles", "Panel" };
+				const char* foot[kFootEls + 1] = { "Summon", "Follow", "Get in", "Status", "Gang", "Passenger", "Eject", "Vehicles", "Auto mode", "Panel" };
 				return foot[std::clamp(g_lay.fsel, 0, kFootEls)];
 			}
 			const int s = g_lay.sel;
-			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Gear-", "Gear+", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "WASD", "Column", "Extras",
+			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Gear-", "Gear+", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "Auto mode", "WASD", "Column", "Extras",
 				"All" };
 			if (s >= 0 && s <= kSelAll) return names[s];
 			if (s >= kSelNative && s - kSelNative < int(g_lay.natNames.size())) return g_lay.natNames[s - kSelNative];
@@ -1470,7 +1487,7 @@ namespace hoverui
 			if (all || sel == kGear) { g_lay.gx += dx; g_lay.gy += dy; }
 			if (all || sel == kSelExtras) { g_lay.eox += dx; g_lay.eoy += dy; }
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] += dx; g_lay.off[sel][1] += dy; }
-			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] += dx; g_lay.carOff[sel - kSelAuto][1] += dy; }
+			if (sel >= kSelAuto && sel <= kSelMode) { g_lay.carOff[sel - kSelAuto][0] += dx; g_lay.carOff[sel - kSelAuto][1] += dy; }
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) {
 				if (all || sel == kSelNative + i) {
 					auto& o = g_lay.natOff[g_lay.natNames[i]];
@@ -1483,7 +1500,7 @@ namespace hoverui
 		if (press[9]) {
 			// Delete: the picked element back to its default place.
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] = kDefOff[sel][0]; g_lay.off[sel][1] = kDefOff[sel][1]; changed = true; }
-			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] = g_lay.carOff[sel - kSelAuto][1] = 0.0; changed = true; }
+			if (sel >= kSelAuto && sel <= kSelMode) { g_lay.carOff[sel - kSelAuto][0] = g_lay.carOff[sel - kSelAuto][1] = 0.0; changed = true; }
 			if (sel >= kSelNative && sel - kSelNative < int(g_lay.natNames.size())) { g_lay.natOff.erase(g_lay.natNames[sel - kSelNative]); changed = true; }
 		}
 		if (dd != 0.0) {

@@ -15,6 +15,8 @@
 #include "prefetch.h"
 #include "routeplan.h"
 #include "telemetry.h"
+#include "vehicleworld.h"
+#include "vehiclehits.h"
 
 #include <Windows.h>
 
@@ -1080,8 +1082,272 @@ namespace vehicleflight
 			double steerSecs = 0, stuckGX = 0, stuckGY = 0;
 			int aiGear = 1;
 			ULONGLONG shiftAt = 0;
+			bool taxiOrbit = false;        // Auto's orbit around the marker is on (AutoMode::Orbit)
+			bool personAhead = false;      // someone on foot in the way (checked every kPersonEveryMs)
+			double personDist = 1e9;
+			ULONGLONG personAt = 0;
+			// Another vehicle close by (2026-10-20, the user: hovering vehicles "magnetized" into each other). Vehicles are no terrain to the assist:
+			// probe hits inside one are dropped and a contact with one is no floor or bump; instead this silent warning steers the autopilot.
+			bool vehWarn = false;          // a vehicle within the warning range
+			bool vehTouch = false;         // close enough that a contact is most likely with it
+			double vehGap = 1e9;           // m between the hulls (centres minus footprint radii)
+			double vehBearing = 0;         // from this vehicle to the other
+			double vehClosing = 0;         // m/s the gap shrinks
+			std::uint32_t vehId = 0;
+			bool vehYield = true;          // this vehicle gives way to that one (right of way by rank)
+			ULONGLONG vehLogAt = 0;
+			unsigned vehDropped = 0;       // probe samples dropped as "a vehicle, not ground" (logged)
 		};
 		State g_gs[kPilots];
+		world::Snapshot g_vsnap;       // this frame's vehicle list (main thread)
+		bool g_vsnapOk = false;
+
+		float VehRadius(const world::VehicleInfo& v) { return std::max(v.half[0], v.half[1]) > 0.4f ? std::max(v.half[0], v.half[1]) : 2.5f; }
+		float VehHalfZ(const world::VehicleInfo& v) { return v.half[2] > 0.3f ? v.half[2] : 1.5f; }
+
+		// A probe point inside another vehicle's space (a vertical cylinder around it, 1 m of slack): that vehicle, not terrain or a wall.
+		// ground = a vertical ground probe: only a hit above the vehicle's origin is its body (the terrain right under a parked vehicle is ground).
+		bool InVehicleSpace(std::uint32_t self, double x, double y, double z, bool ground = false)
+		{
+			if (!g_vsnapOk) return false;
+			for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
+				const auto& v = g_vsnap.v[i];
+				if (!v.formId || v.formId == self) continue;
+				const double r = VehRadius(v) + 1.0, hz = VehHalfZ(v);
+				if (std::hypot(x - v.pos[0], y - v.pos[1]) > r) continue;
+				if (z < (ground ? v.pos[2] + 0.5 : v.pos[2] - hz - 1.0) || z > v.pos[2] + 2.0 * hz + 1.0) continue;
+				return true;
+			}
+			return false;
+		}
+
+		// ---- Follow from below (2026-10-20, the user): the player in the air (over the ground under them, the terrain assist's ground, by more than
+		// kAirOn; back down under kAirOff for kAirOffMs: hysteresis) -> the following rover flies kUnderBy under the player's feet at the point where
+		// their fall (their 3D velocity and the vehicle's measured gravity) reaches that height, so it can catch them; the goal moves with a
+		// deadband and a low-pass so it does not wiggle. On the ground: the normal follow point.
+		constexpr double kAirOn = 4.0, kAirOff = 2.0;
+		constexpr ULONGLONG kAirOffMs = 400;
+		constexpr double kUnderBy = 7.0;           // m under the player's feet
+		constexpr double kUnderLeadMax = 2.5;      // s of fall predicted at most
+		constexpr double kUnderLeadDist = 40.0;    // m: the prediction never leads farther
+		constexpr double kUnderDeadband = 1.5;     // m: a smaller change of the prediction does not move the goal
+		struct PlayerAir
+		{
+			bool air = false, groundOk = false;
+			double ground = 0;
+			ULONGLONG groundAt = 0, offSince = 0;
+			double px = 0, py = 0, pz = 0, vx = 0, vy = 0, vz = 0;
+			ULONGLONG at = 0;
+			double gx = 0, gy = 0, wx = 0, wy = 0;  // the goal (smoothed) and the last prediction it moved for
+			bool haveGoal = false;
+			ULONGLONG goalAt = 0;
+		} g_air;
+
+		bool InVehicleSpace(std::uint32_t self, double x, double y, double z, bool ground);
+
+		// Autopilots switched off by the hit counter (vehiclehits): vehicle form id -> refused until.
+		struct DisabledAp { std::uint32_t id = 0; ULONGLONG until = 0; } g_disabled[16];
+		AutoMode g_autoMode = AutoMode::Stop;
+		constexpr double kOrbitRadius = 25.0;      // m: Auto's orbit around the marker
+
+		bool IsDisabled(std::uint32_t id)
+		{
+			if (!id) return false;
+			const ULONGLONG now = GetTickCount64();
+			for (const auto& d : g_disabled) {
+				if (d.id == id && now < d.until) return true;
+			}
+			return false;
+		}
+
+		void PlayerAirTick(std::uintptr_t player)
+		{
+			const ULONGLONG now = GetTickCount64();
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			if (g_air.at && now > g_air.at && now - g_air.at < 1000) {
+				const double dt = (now - g_air.at) / 1000.0;
+				const double ix = (pp.x - g_air.px) / dt, iy = (pp.y - g_air.py) / dt, iz = (pp.z - g_air.pz) / dt;
+				if (std::sqrt(ix * ix + iy * iy + iz * iz) < 150.0) {
+					const double a = std::min(1.0, dt * 6.0);
+					g_air.vx += (ix - g_air.vx) * a;
+					g_air.vy += (iy - g_air.vy) * a;
+					g_air.vz += (iz - g_air.vz) * a;
+				}
+			}
+			else {
+				g_air.vx = g_air.vy = g_air.vz = 0;
+			}
+			g_air.px = pp.x; g_air.py = pp.y; g_air.pz = pp.z; g_air.at = now;
+			float h = 0;
+			unsigned age = 0;
+			if (prefetch::LatestGround(prefetch::kSlotFollow, h, age) && age <= 4 && h > -1e30f && h != -500.0f && h <= pp.z + 0.5f && !InVehicleSpace(0, pp.x, pp.y, h, true)) {
+				g_air.ground = h;
+				g_air.groundOk = true;
+				g_air.groundAt = now;
+			}
+			if (now - g_air.groundAt > 1500) g_air.groundOk = false;
+			prefetch::RequestGround(prefetch::kSlotFollow, pp.x, pp.y, pp.z + 0.5f, 0.0f, 3000.0f);
+			const bool onVehicle = InVehicleSpace(0, pp.x, pp.y, pp.z, false);  // standing on (or in) a vehicle: not in the air
+			const double above = pp.z - g_air.ground;
+			if (!g_air.air) {
+				if (g_air.groundOk && !onVehicle && above > kAirOn) {
+					g_air.air = true;
+					g_air.offSince = 0;
+					g_air.haveGoal = false;
+					logger::Write("Rover follow: you are in the air (%.1f m over the ground, falling %.1f m/s); the rover goes under you", above, -g_air.vz);
+				}
+			}
+			else if (onVehicle || (g_air.groundOk && above < kAirOff)) {
+				if (!g_air.offSince) g_air.offSince = now;
+				if (now - g_air.offSince >= kAirOffMs) {
+					g_air.air = false;
+					logger::Write("Rover follow: you are down (%.1f m over the ground%s); normal follow", above, onVehicle ? ", on a vehicle" : "");
+				}
+			}
+			else {
+				g_air.offSince = 0;
+			}
+		}
+
+		bool g_waitDoor = false;   // the player is indoors: the following rover waits where it is (following stays on)
+		// Crew (2026-10-20, the user: "if I have any followers and I press those buttons ... they should enter the vehicle and do the behaviour I
+		// asked for"): Summon / Follow / the scanner marker with a follower free -> the vehicle is brought as usual, then the follower boards it
+		// as its driver (npcvehicles::CrewBoard) with the order; while a follower drives it, this autopilot leaves it alone.
+		npcvehicles::CrewOrder g_crewPending = npcvehicles::CrewOrder::None;
+		ULONGLONG g_crewAt = 0;
+		constexpr ULONGLONG kCrewWaitMs = 60000;   // the vehicle must be near within this long
+		constexpr double kCrewNear = 30.0;         // m: the vehicle this close to the player: the follower boards
+
+		// The catch point under the falling player (smoothed, with a deadband).
+		void UnderGoal(double gravity, double& gx, double& gy, double& gz)
+		{
+			const ULONGLONG now = GetTickCount64();
+			const double g = std::clamp(gravity, 1.0, 30.0);
+			const double catchZ = std::max(g_air.groundOk ? g_air.ground + kTerrainClear : -1e9, g_air.pz - kUnderBy);
+			const double drop = std::max(0.0, g_air.pz - catchZ);
+			double t = (g_air.vz + std::sqrt(std::max(0.0, g_air.vz * g_air.vz + 2.0 * g * drop))) / g;  // when the fall reaches catchZ
+			t = std::clamp(t, 0.0, kUnderLeadMax);
+			double lx = g_air.vx * t, ly = g_air.vy * t;
+			const double ll = std::hypot(lx, ly);
+			if (ll > kUnderLeadDist) { lx *= kUnderLeadDist / ll; ly *= kUnderLeadDist / ll; }
+			const double px = g_air.px + lx, py = g_air.py + ly;
+			if (!g_air.haveGoal) {
+				g_air.gx = g_air.wx = px;
+				g_air.gy = g_air.wy = py;
+				g_air.haveGoal = true;
+			}
+			else if (std::hypot(px - g_air.wx, py - g_air.wy) > kUnderDeadband) {
+				g_air.wx = px;
+				g_air.wy = py;
+			}
+			const double dt = g_air.goalAt && now > g_air.goalAt ? std::min(0.5, (now - g_air.goalAt) / 1000.0) : 0.0;
+			const double a = std::min(1.0, dt * 4.0);
+			g_air.gx += (g_air.wx - g_air.gx) * a;
+			g_air.gy += (g_air.wy - g_air.gy) * a;
+			g_air.goalAt = now;
+			gx = g_air.gx;
+			gy = g_air.gy;
+			gz = g_air.pz - kUnderBy;
+		}
+
+		// Someone on foot in the way of an autopilot (2026-10-20, avoid people): within kPersonRange ahead along the travel direction, kPersonCone
+		// either side, near the vehicle's height. Checked every kPersonEveryMs (the shared reference scan); the player counts too.
+		constexpr double kPersonRange = 14.0, kPersonCone = 0.6;
+		constexpr ULONGLONG kPersonEveryMs = 200;
+		void PersonAhead(int idx, std::uintptr_t vehicle)
+		{
+			State& g = g_gs[idx];
+			const ULONGLONG now = GetTickCount64();
+			if (now - g.personAt < kPersonEveryMs) return;
+			g.personAt = now;
+			g.personAhead = false;
+			g.personDist = 1e9;
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			const Shared& s = g_shs[idx];
+			const double vx = s.v[0], vy = s.v[1], sp = std::hypot(vx, vy);
+			if (sp < 3.0) return;
+			const double travel = std::atan2(vx, vy);
+			for (const auto r : modscene::LoadedRefs()) {
+				if (!r || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r)) continue;
+				if (EngineFn<std::uintptr_t (*)(std::uintptr_t)>(addr::kPlayerVehicle)(r) == vehicle) continue;  // aboard
+				const auto p = At<game::Vec3>(r, off::kRefPosition);
+				if (std::fabs(double(p.z) - vp.z) > 5.0) continue;
+				const double dx = double(p.x) - vp.x, dy = double(p.y) - vp.y, d = std::hypot(dx, dy);
+				if (d > kPersonRange || d < 0.5) continue;
+				if (std::fabs(Wrap(std::atan2(dx, dy) - travel)) > kPersonCone) continue;
+				if (d < g.personDist) { g.personDist = d; g.personAhead = true; }
+			}
+		}
+
+		std::uint32_t SelfId(int idx)
+		{
+			const std::uintptr_t v = g_hoverVehicles[idx].load();
+			return v ? At<std::uint32_t>(v, off::kFormId) : 0;
+		}
+
+		// Right of way (2026-10-20, the user): the lower rank gives way, equal ranks both do. 4 parked (cannot move), 3 the player's vehicle or the one
+		// they drive, 2 a follower's (escort), 1 any other NPC's, 0 a hostile's (pursuit).
+		int RankOf(const world::VehicleInfo& v)
+		{
+			if (v.who == world::VehicleInfo::Who::Player || v.formId == OwnRoverId()) return 3;
+			npcvehicles::JobInfo jobs[8];
+			const int n = npcvehicles::Jobs(jobs, 8);
+			for (int i = 0; i < n; ++i) {
+				if (jobs[i].vehicle == v.formId) return jobs[i].pursuit ? 0 : 2;
+			}
+			if (v.who == world::VehicleInfo::Who::Npc) return 1;
+			return 4;
+		}
+
+		// The nearest other vehicle: the warning the autopilot steers by (never a notification: the log only, verbose).
+		void VehicleWarning(int idx, std::uintptr_t vehicle, const char* who)
+		{
+			State& g = g_gs[idx];
+			g.vehWarn = g.vehTouch = false;
+			g.vehGap = 1e9;
+			g.vehClosing = 0;
+			g.vehId = 0;
+			if (!g_vsnapOk || !vehicle) return;
+			const std::uint32_t self = At<std::uint32_t>(vehicle, off::kFormId);
+			const world::VehicleInfo* me = nullptr;
+			for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
+				if (g_vsnap.v[i].formId == self) me = &g_vsnap.v[i];
+			}
+			const auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
+			const double myR = me ? VehRadius(*me) : 2.5, myVx = me ? me->vel[0] : 0.0, myVy = me ? me->vel[1] : 0.0;
+			const double sp = std::hypot(myVx, myVy);
+			for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
+				const auto& v = g_vsnap.v[i];
+				if (!v.formId || v.formId == self) continue;
+				const double dx = v.pos[0] - pos.x, dy = v.pos[1] - pos.y, dz = v.pos[2] - pos.z;
+				if (std::fabs(dz) > 2.0 * (VehHalfZ(v) + 2.0)) continue;  // well above or below: no conflict
+				const double d = std::hypot(dx, dy);
+				const double gap = d - myR - VehRadius(v);
+				if (gap >= g.vehGap) continue;
+				g.vehGap = gap;
+				g.vehBearing = std::atan2(dx, dy);
+				g.vehClosing = d > 0.1 ? -((v.vel[0] - myVx) * dx + (v.vel[1] - myVy) * dy) / d : 0.0;
+				g.vehId = v.formId;
+			}
+			if (!g.vehId) return;
+			{
+				int myRank = idx == 0 ? 3 : 1;
+				if (me) myRank = std::min(3, RankOf(*me));  // flying: never "parked"
+				int other = 4;
+				for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
+					if (g_vsnap.v[i].formId == g.vehId) other = RankOf(g_vsnap.v[i]);
+				}
+				g.vehYield = myRank <= other;
+			}
+			g.vehWarn = g.vehGap < 6.0 + sp * 1.2;
+			g.vehTouch = g.vehGap < 2.5;
+			const ULONGLONG now = GetTickCount64();
+			if (g.vehWarn && logger::Verbose() && now - g.vehLogAt >= 2000) {
+				g.vehLogAt = now;
+				logger::Write("%s: vehicle warning: %08X %.1f m (hull gap), closing %.1f m/s%s, %s; %u probe samples on vehicles dropped", who, g.vehId, g.vehGap, g.vehClosing,
+					g.vehTouch ? ", touching range" : "", g.vehYield ? "giving way" : "it gives way", g.vehDropped);
+			}
+		}
 		// Kept across relaunches: a pilot stuck again soon after climbing out is moved instead.
 		struct Escape { int count = 0; ULONGLONG at = 0; } g_escape[kPilots];
 		struct Bumps { int count = 0; ULONGLONG at = 0; ULONGLONG ev = 0; } g_bumps[kPilots];
@@ -1287,6 +1553,8 @@ namespace vehicleflight
 
 		// ---- The player's rover, remembered by form id (resolved through the form map, never a stale pointer) ----
 		std::uint32_t g_roverId = 0;
+		std::atomic<bool> g_scanCall{ false }, g_goOnBoard{ false };  // the scanner marker button: summon, then Auto on boarding
+		std::atomic<ULONGLONG> g_goAt{ 0 };
 		bool g_remote = false;                                // HOOK 2b: the autopilot is running a vcontract profile for the player's EMPTY vehicle
 		const vcontract::Profile* g_remoteDone = nullptr;     // the profile that finished / parked; not restarted until the assignment changes
 		bool g_follow = false;            // follow mode (outlives hover starts / stops)
@@ -1640,6 +1908,10 @@ namespace vehicleflight
 				unsigned age = 0;
 				g.asked[i].valid = prefetch::LatestGround(ModelSlot(idx, i), h, age) && age <= kProbeMaxAge && h > -1e30f && h != -500.0f;
 				g.asked[i].h = h;
+				if (g.asked[i].valid && InVehicleSpace(SelfId(idx), g.asked[i].x, g.asked[i].y, h, true)) {  // another vehicle's roof is no ground
+					g.asked[i].valid = false;
+					++g.vehDropped;
+				}
 			}
 			// The centre ray starts 1.5 m under the rover (never its own body). On a raised floor (a city platform) that start
 			// is already under the floor and the ray finds the terrain far below (2026-10-17 15:08: "climbed to 245 m" at once,
@@ -1802,6 +2074,10 @@ namespace vehicleflight
 				unsigned age = 0;
 				g.corr[i].valid = prefetch::LatestGround(CorridorSlot(idx, i), h, age) && age <= kProbeMaxAge && h > -1e30f && h != -500.0f;
 				g.corr[i].h = h;
+				if (g.corr[i].valid && InVehicleSpace(SelfId(idx), g.corr[i].x, g.corr[i].y, h, true)) {
+					g.corr[i].valid = false;
+					++g.vehDropped;
+				}
 				if (g.corr[i].valid) navmap::NoteGround(g.corr[i].x, g.corr[i].y, h);
 			}
 			// A hit on the player (their character controller) is where the vehicle is going, not a wall.
@@ -1813,7 +2089,13 @@ namespace vehicleflight
 				auto& h = g.ray[c];
 				const bool rawHit = h.hit;
 				if (g.rayValid[c] && h.hit && player && std::hypot(h.x - pp.x, h.y - pp.y) < 2.5 && h.z > pp.z - 1.0 && h.z < pp.z + 3.0) h.hit = false;
-				if (g.rayValid[c]) navmap::NoteRay(h.from, h.to, rawHit, h.x, h.y, h.z, h.layer, h.normalOk);  // characters are free space to the map, not walls
+				bool onVehicle = false;
+				if (g.rayValid[c] && h.hit && InVehicleSpace(SelfId(idx), h.x, h.y, h.z)) {  // a vehicle: the warning's job, not a wall
+					h.hit = false;
+					onVehicle = true;
+					++g.vehDropped;
+				}
+				if (g.rayValid[c]) navmap::NoteRay(h.from, h.to, rawHit && !onVehicle, h.x, h.y, h.z, h.layer, h.normalOk);  // characters and vehicles are free space to the map, not walls
 			}
 			g.hullValid = g.hullHit = false;
 			if (g.autopilot && navmap::HullEnabled()) {
@@ -1823,6 +2105,11 @@ namespace vehicleflight
 				if (g.hullValid) {
 					g.hullDist = sw.distance;
 					g.hullHit = sw.hit && sw.distance >= 1.0f;  // (a hit inside the first metre is the vehicle's own surroundings)
+					if (sw.hit && InVehicleSpace(SelfId(idx), sw.x, sw.y, sw.z)) {
+						g.hullHit = false;
+						sw.hit = false;
+						++g.vehDropped;
+					}
 					if (!sw.hit || g.hullHit) navmap::NoteRay(sw.from, sw.to, sw.hit, sw.x, sw.y, sw.z, sw.layer, false);
 					const bool rayBlocked = g.rayValid[0] && g.ray[0].hit && g.ray[0].distance < g.rayRange[0];
 					navmap::NoteHull(rayBlocked, g.hullHit && g.hullDist < g.hullRange);
@@ -1837,7 +2124,10 @@ namespace vehicleflight
 				for (int k = 0; k < kSweepRays; ++k) {
 					prefetch::RayHit sh;
 					unsigned age = 0;
-					if (prefetch::LatestRay(kSweepSlot0 + idx * kSweepRays + k, sh, age) && age <= kProbeMaxAge) navmap::NoteRay(sh.from, sh.to, sh.hit, sh.x, sh.y, sh.z, sh.layer, sh.normalOk);
+					if (prefetch::LatestRay(kSweepSlot0 + idx * kSweepRays + k, sh, age) && age <= kProbeMaxAge) {
+						if (sh.hit && InVehicleSpace(SelfId(idx), sh.x, sh.y, sh.z)) sh.hit = false;  // vehicles move: never walls in the map
+						navmap::NoteRay(sh.from, sh.to, sh.hit, sh.x, sh.y, sh.z, sh.layer, sh.normalOk);
+					}
 				}
 			}
 			if (g.autopilot && g.rayValid[0] && g.ray[0].hit && logger::Verbose()) NameBlocker(idx);
@@ -2000,18 +2290,31 @@ namespace vehicleflight
 			Shared& g_sh = g_shs[idx];
 			const char* wf = idx ? Who(idx) : "Rover flight";
 			const char* wc = idx ? Who(idx) : "Rover call";
+			VehicleWarning(idx, vehicle, wc);
+			if (g.autopilot) PersonAhead(idx, vehicle);
+			if (g.autopilot && IsDisabled(At<std::uint32_t>(vehicle, off::kFormId))) {
+				Stop(idx, "autopilot off: too many hits");
+				return;
+			}
 			{
 				bool hit, up;
 				float delta;
 				{
 					std::lock_guard lk(g_sh.lock);
 					hit = g_sh.collided; delta = g_sh.collisionDelta; up = g_sh.collisionUp;
-					if (hit && g.autopilot) {
+					if (hit && (g.autopilot || g.vehTouch)) {
 						g_sh.collided = false;
 						g_sh.collisionUp = false;
 					}
 				}
-				if (hit && g.autopilot && GetTickCount64() - g_bumps[idx].ev < kBumpDebounceMs) {
+				if (hit && g.vehTouch) {
+					// A contact with another vehicle: a plain collision (Havok resolves it); no floor, bump, detour or drive-mode score.
+					if (logger::Verbose() && GetTickCount64() - g_bumps[idx].ev >= kBumpDebounceMs) {
+						g_bumps[idx].ev = GetTickCount64();
+						logger::Write("%s: contact %.0f m/s %s with vehicle %08X: a vehicle collision, not ground (no hold, no bump)", wc, delta, up ? "up" : "side", g.vehId);
+					}
+				}
+				else if (hit && g.autopilot && GetTickCount64() - g_bumps[idx].ev < kBumpDebounceMs) {
 					// the same contact episode: counted once
 				}
 				else if (hit && g.autopilot) {
@@ -2735,6 +3038,32 @@ namespace vehicleflight
 					pitchAim = 0.0;
 				}
 				if (g.detourAng != 0 && !g.apClimb) strafe = g.detourAng > 0 ? 0.4 : -0.4;  // slide toward the open side
+				if (g.personAhead && !g.apClimb) {
+					// Someone on foot ahead (2026-10-20): slow to a speed that stops short of them.
+					const double safe = std::max(2.0, std::sqrt(2.0 * 6.0 * std::max(0.0, g.personDist - 4.0)));
+					if (sp > safe) {
+						thrustAcc = std::min(thrustAcc, 0.0);
+						thrust = thrustAcc != 0.0;
+						braking = sp > safe + 2.0;
+					}
+				}
+				if (g.vehWarn && g.vehYield && !g.apClimb) {
+					// Another vehicle close: ease off when it is ahead and closing, slide away from it (never a climb over it).
+					const double travel = sp > 2.0 ? std::atan2(v[0], v[1]) : bodyHeading;
+					if (std::fabs(Wrap(g.vehBearing - travel)) < 1.1 && g.vehClosing > 0.5) {
+						const double room = std::max(0.0, g.vehGap - 1.5);
+						const double safe = std::max(2.0, std::sqrt(2.0 * 6.0 * room));  // a speed that can stop in the gap at 6 m/s^2
+						if (sp > safe) {
+							thrustAcc = std::min(thrustAcc, 0.0);
+							thrust = thrustAcc != 0.0;
+							braking = sp > safe + 3.0;
+						}
+					}
+					if (g.vehGap < 4.0) {
+						const double side = Wrap(g.vehBearing - bodyHeading);  // + : it is to the right
+						strafe = std::clamp(strafe + (side > 0 ? -0.5 : 0.5), -1.0, 1.0);
+					}
+				}
 				rollAim = std::clamp(kApBankPerYaw * yawWant * std::clamp(sp / 15.0, 0.0, 1.0), -kApBankMax, kApBankMax);
 				rollAimOn = true;
 				const auto& hc = g_cmds[idx];
@@ -2885,8 +3214,13 @@ namespace vehicleflight
 			const bool ak = focused && g_keys.autoKey && Held(g_keys.autoKey);
 			const bool autoPressed = ak && !autoDown;
 			autoDown = ak;
-			if (autoPressed) {
-				if (g.playerAuto) {
+			const bool goBoard = g_goOnBoard.load() && !g.playerAuto && GetTickCount64() - g_goAt.load() < 900000 && At<std::uint32_t>(driven, 0x28) == g_roverId;
+			if (goBoard) {
+				g_goOnBoard.store(false);
+				logger::Write("Rover scanner trip: you boarded; Auto starts toward your marker");
+			}
+			if (autoPressed || goBoard) {
+				if (g.playerAuto && !goBoard) {
 					g.playerAuto = false;
 					g.autopilot = false;
 					notify::Log("Auto off");
@@ -2930,17 +3264,61 @@ namespace vehicleflight
 				}
 			}
 		}
+		// A follower drives the vehicle (a crew job): this autopilot stands down.
+		const bool crewDrives = g_roverId && npcvehicles::UsesVehicle(g_roverId) && !driven;
+		if (crewDrives) {
+			if (g.autopilot) Stop("a follower drives it");
+			if (g_follow) {
+				g_follow = false;
+				logger::Write("Rover follow: off (a follower drives the vehicle)");
+			}
+		}
 		// The call key (on foot): far -> move next to the player; close -> autopilot; again -> cancel.
 		{
 			static bool callDown = false;
 			const bool c = focused && Held(g_keys.call);
-			const bool callPressed = c && !callDown;
+			const bool scanCall = g_scanCall.exchange(false);  // the scanner marker button counts as the call key
+			bool callPressed = (c && !callDown) || scanCall;
 			callDown = c;
 			// The follow key (on foot): follow on / off.
 			static bool followDown = false;
 			const bool fk = focused && Held(g_keys.follow);
-			const bool followPressed = fk && !followDown;
+			bool followPressed = fk && !followDown;
+			// Hold Follow (kFollowHoldMs): every escort drops its fight and comes back into formation for 15 s.
+			static ULONGLONG followAt = 0;
+			static bool recalled = false;
+			if (followPressed) { followAt = GetTickCount64(); recalled = false; }
+			if (fk && !recalled && followAt && GetTickCount64() - followAt >= kFollowHoldMs) {
+				recalled = true;
+				npcvehicles::Recall(15000);
+			}
 			followDown = fk;
+			// Crew: with a follower driving or free, the buttons go to the follower.
+			if (!driven && (callPressed || followPressed) && g_roverId) {
+				const auto order = npcvehicles::CrewOrderOf(g_roverId);
+				const auto ppos = At<game::Vec3>(player, off::kRefPosition);
+				if (order != npcvehicles::CrewOrder::None) {
+					if (followPressed && order == npcvehicles::CrewOrder::Follow) npcvehicles::ReleaseCrew(g_roverId);  // follow off: the follower gets out
+					else npcvehicles::SetCrewOrder(g_roverId, scanCall ? npcvehicles::CrewOrder::Marker : npcvehicles::CrewOrder::Follow);
+					g_goOnBoard.store(false);
+					callPressed = followPressed = false;
+				}
+				else if (g_crewPending != npcvehicles::CrewOrder::None && followPressed) {
+					g_crewPending = npcvehicles::CrewOrder::None;
+					logger::Write("Rover crew: cancelled");
+					notify::Show("Follower order cancelled");
+					followPressed = false;
+				}
+				else if (Rover() && !g_follow && npcvehicles::FreeFollower(player, ppos.x, ppos.y, 60.0)) {
+					g_crewPending = scanCall ? npcvehicles::CrewOrder::Marker : npcvehicles::CrewOrder::Follow;
+					g_crewAt = GetTickCount64();
+					g_goOnBoard.store(false);
+					logger::Write("Rover crew: %s; bringing the vehicle for a follower", scanCall ? "marker" : "follow");
+					notify::Show("A follower will drive your vehicle");
+					callPressed = true;    // the vehicle is brought as a summon brings it
+					followPressed = false; // the follower follows, not the empty vehicle
+				}
+			}
 			if (followPressed && !driven) {
 				if (g_follow) {
 					g_follow = false;
@@ -3007,6 +3385,32 @@ namespace vehicleflight
 				}
 			}
 			FinishMove(player);
+			// Crew: the vehicle is near and parked -> the follower boards it with the order.
+			if (g_crewPending != npcvehicles::CrewOrder::None) {
+				const auto rover = Rover();
+				const ULONGLONG cNow = GetTickCount64();
+				const double d = rover ? std::hypot(double(At<game::Vec3>(rover, off::kRefPosition).x) - At<game::Vec3>(player, off::kRefPosition).x,
+					double(At<game::Vec3>(rover, off::kRefPosition).y) - At<game::Vec3>(player, off::kRefPosition).y) : 1e9;
+				if (!rover || driven || cNow - g_crewAt > kCrewWaitMs) {
+					logger::Write("Rover crew: given up (%s)", !rover ? "no vehicle" : driven ? "you got in" : "the vehicle did not come");
+					g_crewPending = npcvehicles::CrewOrder::None;
+				}
+				else if (!g.autopilot && !g_move.pending && d < kCrewNear) {
+					const auto order = g_crewPending;
+					g_crewPending = npcvehicles::CrewOrder::None;
+					if (!npcvehicles::CrewBoard(player, rover, order)) {
+						logger::Write("Rover crew: no follower could board; the vehicle %s", order == npcvehicles::CrewOrder::Follow ? "follows by itself" : "waits for you");
+						if (order == npcvehicles::CrewOrder::Follow) {
+							g_follow = true;
+							g_followStill = 0;
+						}
+						else {
+							g_goOnBoard.store(true);
+							g_goAt.store(cNow);
+						}
+					}
+				}
+			}
 		}
 		// ---- Follow: the rover trails the player (a point kFollowBack behind, kFollowSide to the side) ----
 		if (g_follow) {
@@ -3024,11 +3428,18 @@ namespace vehicleflight
 				logger::Write("Rover follow: off (no rover)");
 			}
 			else if (!outdoors) {
-				g_follow = false;
-				if (g.autopilot) Stop("player went indoors");
-				logger::Write("Rover follow: off (player indoors; the rover parks where it is)");
+				// Wait at the door: following stays on; the rover parks where it is (it trailed the player to the entrance) until they come out.
+				if (!g_waitDoor) {
+					g_waitDoor = true;
+					if (g.autopilot) Stop("player went indoors; waiting at the door");
+					logger::Write("Rover follow: you went indoors; the rover waits at the door");
+				}
 			}
 			else {
+				if (g_waitDoor) {
+					g_waitDoor = false;
+					logger::Write("Rover follow: you are outside again; following");
+				}
 				const auto rp = At<game::Vec3>(rover, off::kRefPosition), pp = At<game::Vec3>(player, off::kRefPosition);
 				const double distP = std::hypot(double(rp.x) - pp.x, double(rp.y) - pp.y);
 				const auto loaded = At<std::uintptr_t>(rover, off::kRefLoadedData);
@@ -3051,15 +3462,15 @@ namespace vehicleflight
 					}
 				}
 				else if (!g.autopilot) {
-					if (distP > kFollowRelaunch && nowMs >= g_relaunchAt) {
+					if ((distP > kFollowRelaunch || g_air.air) && nowMs >= g_relaunchAt && !IsDisabled(g_roverId)) {
 						Start(rover);
 						g.autopilot = true;
-						g.apClimb = true;
+						g.apClimb = !g_air.air;  // in the air: straight to the catch point
 						g.autopilotSince = nowMs;
-						logger::Write("Rover follow: launching (%.0f m from the player)", distP);
+						logger::Write("Rover follow: launching (%.0f m from the player%s)", distP, g_air.air ? ", you are in the air" : "");
 					}
 				}
-				else if (playerStill && distP < kFollowFar) {
+				else if (playerStill && distP < kFollowFar && !g_air.air) {
 					Stop("follow: player stopped; parked");
 				}
 			}
@@ -3253,6 +3664,17 @@ namespace vehicleflight
 					goal.x = mx;
 					goal.y = my;
 					goal.stop = kTaxiStop;
+					if (g_autoMode == AutoMode::Orbit && g.taxiLeft < kOrbitRadius + 20.0) {
+						// Orbit: a point a little ahead round the circle (clockwise), kept going instead of holding over the marker.
+						const double ang = std::atan2(pos.x - mx, pos.y - my) + 0.45;
+						goal.x = mx + std::sin(ang) * kOrbitRadius;
+						goal.y = my + std::cos(ang) * kOrbitRadius;
+						goal.stop = 1.0;
+						g.taxiOrbit = true;
+					}
+					else {
+						g.taxiOrbit = false;
+					}
 					if (!g.taxiArrived && g.taxiLeft <= kTaxiStop + 4.0) {
 						g.taxiArrived = true;
 						notify::Log("Auto: arrived");
@@ -3274,7 +3696,7 @@ namespace vehicleflight
 					goal.y = g.taxiWaitY;
 					goal.stop = 1.5;
 				}
-				goal.hold = true;
+				goal.hold = !g.taxiOrbit || g.taxiWait;
 			}
 		}
 		else if (g.autopilot && g_remote) {
@@ -3343,12 +3765,21 @@ namespace vehicleflight
 				const double ax = pp.x + (moving ? vx * kFollowLead : 0.0), ay = pp.y + (moving ? vy * kFollowLead : 0.0);
 				goal.x = ax - std::sin(yaw) * kFollowBack + std::cos(yaw) * kFollowSide;
 				goal.y = ay - std::cos(yaw) * kFollowBack - std::sin(yaw) * kFollowSide;
-				if (toPlayer < kFollowNear && toPlayer > 0.1) {
+				if (g_air.air) {
+					// In the air: under the player, where their fall will be.
+					UnderGoal(g_shs[0].gEst, goal.x, goal.y, goal.z);
+					goal.stop = 1.0;
+					goal.keepGoing = true;
+				}
+				else if (toPlayer < kFollowNear && toPlayer > 0.1) {
 					// too close: back off along the line from the player
 					goal.x = pp.x + (pos.x - pp.x) / toPlayer * kFollowBack;
 					goal.y = pp.y + (pos.y - pp.y) / toPlayer * kFollowBack;
 				}
-				goal.stop = 3.0;
+				if (!g_air.air) {
+					g_air.haveGoal = false;
+					goal.stop = 3.0;
+				}
 				goal.keepGoing = true;
 			}
 		}
@@ -3398,7 +3829,8 @@ namespace vehicleflight
 	{
 		if (pilot < 1 || pilot >= kPilots || !vehicle) return false;
 		const std::uint32_t id = At<std::uint32_t>(vehicle, 0x28);
-		if (vehicle == g_hoverVehicle.load() || id == g_roverId) return false;  // never the player's rover
+		if (vehicle == g_hoverVehicle.load() || (id == g_roverId && npcvehicles::CrewOrderOf(id) == npcvehicles::CrewOrder::None)) return false;  // the player's rover only for a crew job
+		if (IsDisabled(id)) return false;  // the hit counter switched its autopilot off
 		for (int i = 1; i < kPilots; ++i) {
 			if (i != pilot && g_gs[i].active && g_jobs[i].vehicleId == id) return false;  // one pilot per vehicle
 		}
@@ -3448,6 +3880,45 @@ namespace vehicleflight
 	}
 
 	bool ViewHeading(double& yaw) { return CameraHeading(yaw); }
+
+	void RequestScannerTrip()
+	{
+		g_scanCall.store(true);
+		g_goOnBoard.store(true);
+		g_goAt.store(GetTickCount64());
+		logger::Write("Rover scanner trip: asked (summon now, Auto to the marker when you board)");
+	}
+
+	void DisableAutopilot(std::uint32_t vehicleFormId, unsigned ms, const char* why)
+	{
+		if (!vehicleFormId) return;
+		const ULONGLONG until = GetTickCount64() + ms;
+		DisabledAp* slot = nullptr;
+		for (auto& d : g_disabled) {
+			if (d.id == vehicleFormId) { slot = &d; break; }
+		}
+		if (!slot) {
+			slot = &g_disabled[0];
+			for (auto& d : g_disabled) if (d.until < slot->until) slot = &d;
+		}
+		slot->id = vehicleFormId;
+		slot->until = until;
+		logger::Write("Vehicle %08X: autopilot off for %.0f s (%s)", vehicleFormId, ms / 1000.0, why ? why : "");
+		// A flight in progress ends on its next frame (Fly); NPC pilots now.
+		for (int i = 1; i < kPilots; ++i) {
+			if (g_gs[i].active && g_jobs[i].vehicleId == vehicleFormId) Stop(i, "autopilot off: too many hits");
+		}
+	}
+
+	bool AutopilotDisabled(std::uint32_t vehicleFormId) { return IsDisabled(vehicleFormId); }
+
+	void SetAutoMode(AutoMode m)
+	{
+		g_autoMode = m;
+		logger::Write("Rover taxi: Auto behaviour %s", m == AutoMode::Orbit ? "orbit the marker" : m == AutoMode::Patrol ? "patrol the marker chain" : "stop at the marker");
+	}
+
+	AutoMode GetAutoMode() { return g_autoMode; }
 
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y)
 	{
@@ -3556,7 +4027,11 @@ namespace vehicleflight
 
 	void Tick()
 	{
-		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) TrailTick(player);
+		g_vsnapOk = world::Vehicles(g_vsnap);
+		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
+			TrailTick(player);
+			PlayerAirTick(player);
+		}
 		PlayerTick();
 		PilotsTick();
 		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {

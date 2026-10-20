@@ -14,7 +14,10 @@
 #include "traffic.h"
 #include "profiles.h"
 #include "routeplan.h"
+#include "scantarget.h"
+#include "mappoints.h"
 #include "vehicleworld.h"
+#include "vehiclehits.h"
 #include "vehicleaim.h"
 #include "plugininfo.h"
 #include "shipmodel.h"
@@ -53,12 +56,14 @@ namespace
 		realvehicles::Reset();
 		npcvehicles::Reset();
 		passenger::Reset();
+		scantarget::Reset();
 		traffic::Reset();
 		context::Reset();
 		viewdist::Reset();
 		profiles::Reset();
 		routeplan::Reset();
 		world::Reset();
+		vehiclehits::Reset();
 		navmap::Reset();
 	}
 
@@ -66,6 +71,7 @@ namespace
 	{
 		modscene::NewFrame();  // the shared scan of loaded references starts over
 		world::Publish();      // the shared vehicle list (positions, velocities, sizes), once per frame
+		vehiclehits::Tick();   // projectiles through vehicles: the hit counter (needs this frame's vehicle list)
 		routeplan::Frame();    // its copy for the lane planner
 		vehicleflight::Tick();
 		navmap::Tick();
@@ -73,6 +79,7 @@ namespace
 		realvehicles::Tick();
 		npcvehicles::Tick();
 		passenger::Tick();
+		scantarget::Tick();
 		traffic::Tick();
 		context::Tick();
 		viewdist::Tick();
@@ -109,6 +116,7 @@ namespace
 			return;
 		}
 		hoverui::Install();
+		mappoints::Install();
 		npcvehicles::Install();
 		profiles::Install();
 		vehicleaim::Install();
@@ -132,6 +140,7 @@ namespace
 		}
 		g_standalone = true;
 		hoverui::Install();
+		mappoints::Install();
 		npcvehicles::Install();
 		profiles::Install();
 		vehicleaim::Install();

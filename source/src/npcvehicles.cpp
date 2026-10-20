@@ -14,6 +14,8 @@
 #include "pilotquest.h"
 #include "vcontract.h"
 #include "vehicleflight.h"
+#include "vehiclehits.h"
+#include "vehicleworld.h"
 
 #include <Windows.h>
 #include <intrin.h>
@@ -24,6 +26,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -118,6 +121,24 @@ namespace npcvehicles
 			double aimX = 0, aimY = 0, aimZ = 0, aimVx = 0, aimVy = 0, aimVz = 0;  // the player's last position and smoothed velocity (aim lead)
 			ULONGLONG aimAt = 0;
 			ULONGLONG tAt = 0;
+			std::uint32_t foe = 0;             // the combat target (an actor; its vehicle is aimed at when it sits in one), 0 = none
+			int foeTier = -1;                  // 0 = in a vehicle, 1 = on foot
+			ULONGLONG foeAt = 0;               // last pick
+			double foeX = 0, foeY = 0, foeVx = 0, foeVy = 0;  // the target's last position and smoothed velocity (intercept)
+			ULONGLONG foeSeenAt = 0;
+			int defMode = -1;                  // escort in a fight: 0 attack, 1 shield, 2 intercept, 3 overwatch
+			int order = 0;                     // npcvehicles::CrewOrder: a crew job on the player's own vehicle (0 none)
+			bool rescueParked = false;         // rescue: landed beside the player
+			bool scoutReported = false;        // scout: the enemies at the marker were reported
+			bool waiting = false;              // the player is indoors: parked, waiting at the door
+			int pMode = -1;                    // pursuer in a fight: 10 attack / flank, 12 intercept, 13 overwatch, 14 retreat, 15 block
+			int task = 0;                      // civil task: 0 none, 1 transit, 2 patrol, 3 return home, 4 parking
+			double taskX = 0, taskY = 0;       // transit: where to; parking: the clear spot
+			double homeX = 0, homeY = 0;       // where the vehicle was taken from
+			bool haveHome = false;
+			int taskStep = 0;
+			ULONGLONG taskAt = 0;
+			bool retreating = false;           // pursuer near its hit limit: pulling back to get out and fight on foot
 		} g_jobs[kJobs];
 		// Boarding steps (2026-10-17 15:21-15:22: the walk package was accepted, board -> 1, but 5 of 6 NPCs never moved):
 		// 1 walk (FUN_141951FB0); 2 no 2 m of progress after kWalkMs: direct board (FUN_141993710); 3 still out kDirectMs
@@ -592,6 +613,8 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: [%d] %s -> %s (NPC %08X, vehicle %08X)", j.pilot, Name(j.phase), Name(p), j.npc, j.vehicle);
 			j.phase = p;
 			j.since = GetTickCount64();
+			if (p != Phase::Following) { j.foe = 0; j.foeTier = -1; j.foeAt = 0; j.rescueParked = j.scoutReported = j.waiting = j.retreating = false; j.pMode = -1; }
+			if (p == Phase::Idle) { j.order = 0; j.task = 0; j.haveHome = false; }
 			if (p == Phase::Idle && j.vehicle && !j.passenger) {  // the job is over: an escort / pursuit assignment ends with it (other profiles are left alone)
 				const vcontract::Profile* ap = vcontract::AssignedTo(j.vehicle);
 				if (ap && (std::strcmp(ap->name, "escort") == 0 || std::strcmp(ap->name, "pursuit") == 0)) vcontract::Unassign(j.vehicle);
@@ -821,7 +844,7 @@ namespace npcvehicles
 		}
 
 		// The input block the vehicle reads (a handler-shaped buffer: the submit reads +0x80..+0xA0 and +0xAF).
-		alignas(16) std::uint8_t g_fireHandler[kJobs][0xC0] = {};
+		alignas(16) std::uint8_t g_fireHandler[kJobs + 1][0xC0] = {};  // the last one: the player's own rover (FireVehicleWeapon)
 
 		bool SubmitFire(int slot, std::uint32_t vehicleId, bool fire)
 		{
@@ -919,6 +942,541 @@ namespace npcvehicles
 			c.gear = 2;
 			c.holdMs = 300;
 			vehicleflight::PilotCommand(j.pilot, c);
+		}
+
+		// ---- Combat targets (the user, 2026-10-19: "fighting enemies on vehicles is the number 1 priority"; escorts defend the player). Every armed NPC
+		// vehicle picks its target in tiers: 0 an enemy sitting in a vehicle (the vehicle is in the fight), 1 an enemy on foot; the closest within a tier.
+		// Escort = defender: the player's side; enemies are fighting actors hostile to the player or to the driver, never the player or a follower; only
+		// while the player or the driver is in combat, and never farther than kDefendLeash from the player. Pursuit: the player's enemy; the player and
+		// the followers, or anyone fighting the driver; with nothing picked it attacks the player (the old behaviour).
+		bool HostileTo(uptr actor, uptr target);
+		bool IsFollower(uptr player, uptr actor);
+		ULONGLONG g_recallUntil = 0;             // escorts recalled into formation until then
+		constexpr double kFoeRange = 150.0;      // m from the vehicle
+		constexpr double kDefendLeash = 250.0;   // m: a defender's target stays this close to the player
+		constexpr ULONGLONG kFoePickMs = 500;
+
+		bool IsFoe(const Job& j, uptr npc, uptr player, uptr cand)
+		{
+			if (cand == npc || !IsActorRef(cand) || Dead(cand)) return false;
+			if (j.profile == Profile::Escort) {
+				if (cand == player || IsFollower(player, cand)) return false;
+				if (!InCombat(cand)) return false;
+				return HostileTo(cand, player) || HostileTo(cand, npc) || HostileTo(npc, cand);
+			}
+			if (cand == player || IsFollower(player, cand)) return true;
+			return InCombat(cand) && HostileTo(npc, cand) && HostileTo(cand, npc);
+		}
+
+		// (no __try here: the scan holds a vector)
+		uptr PickFoe(Job& j, uptr npc, uptr vehicle, uptr player, ULONGLONG now)
+		{
+			const bool defend = j.profile == Profile::Escort;
+			if (defend && now < g_recallUntil) {
+				if (j.foe) { logger::Write("NPC vehicles: [%d] recalled: target %08X dropped", j.pilot, j.foe); j.foe = 0; }
+				return 0;
+			}
+			const uptr cur = RefById(j.foe);
+			const bool curOk = cur && IsFoe(j, npc, player, cur) && Dist3(vehicle, cur) < kFoeRange * 1.2 && (!defend || Dist(cur, player) < kDefendLeash);
+			if (now - j.foeAt < kFoePickMs) return curOk ? cur : 0;
+			j.foeAt = now;
+			uptr best = 0;
+			int bestTier = 9;
+			double bestD = 1e9;
+			if (!defend || InCombat(player) || InCombat(npc)) {
+				for (const uptr r : modscene::LoadedRefs(8000)) {
+					if (!r || r == vehicle || !IsActorRef(r)) continue;
+					const double d = Dist3(vehicle, r);
+					if (d > kFoeRange) continue;
+					if (defend && Dist(r, player) > kDefendLeash) continue;
+					const uptr in = InVehicle(r);
+					if (in == vehicle) continue;  // riding with us
+					if (!IsFoe(j, npc, player, r)) continue;
+					const int tier = in ? 0 : 1;
+					// Spread (2026-10-20): every other vehicle of this side on the same target adds 25 m, so two do not pile on one while another is free.
+					const std::uint32_t rid = At<std::uint32_t>(r, off::kFormId);
+					double score = d;
+					for (const auto& o : g_jobs) {
+						if (&o != &j && o.phase == Phase::Following && o.profile == j.profile && o.foe == rid) score += 25.0;
+					}
+					if (tier < bestTier || (tier == bestTier && score < bestD)) { best = r; bestTier = tier; bestD = score; }
+				}
+			}
+			// Sticky: the current target stays unless a higher tier appears (a closer one of the same tier is not worth the turn).
+			if (curOk && best && best != cur) {
+				const int curTier = InVehicle(cur) ? 0 : 1;
+				if (curTier <= bestTier) { best = cur; bestTier = curTier; bestD = Dist3(vehicle, cur); }
+			}
+			const std::uint32_t id = best ? At<std::uint32_t>(best, off::kFormId) : 0;
+			if (id != j.foe) {
+				if (id) logger::Write("NPC vehicles: [%d] %s target -> %08X (%s, %.0f m)", j.pilot, kProfiles[int(j.profile)].name, id, bestTier == 0 ? "in a vehicle" : "on foot", bestD);
+				else logger::Write("NPC vehicles: [%d] %s target %08X dropped (no enemy within %.0f m)", j.pilot, kProfiles[int(j.profile)].name, j.foe, kFoeRange);
+				j.foe = id;
+				j.aimAt = 0;  // the aim lead starts again on the new target
+				j.aimVx = j.aimVy = j.aimVz = 0;
+			}
+			j.foeTier = best ? bestTier : -1;
+			return best;
+		}
+
+		// The orbit around a target that is not the player (the pursuit goal circles the player only).
+		void OrbitGoal(const Job& j, uptr target, uptr vehicle, vcontract::Goal& g)
+		{
+			const auto tp = At<game::Vec3>(target, off::kRefPosition);
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			const double dir = (j.pilot % 2) ? 1.0 : -1.0;
+			const double ang = std::atan2(double(vp.x) - tp.x, double(vp.y) - tp.y) + dir * 0.6;
+			g.x = tp.x + std::sin(ang) * kAttackRadius;
+			g.y = tp.y + std::cos(ang) * kAttackRadius;
+			g.z = tp.z + kAttackAbove;
+			g.stop = 3.0;
+			g.hold = false;
+		}
+
+		// The escort's place in a fight (2026-10-20, the user picked shield and intercept): an enemy vehicle closing on the player from farther than
+		// kInterceptMin -> intercept (a point between the player and where it will be in kInterceptLead); the target out of weapon range -> shield
+		// (kShieldDist from the player toward it, a little above); in range -> attack (orbit it). Returns the mode.
+		constexpr double kInterceptMin = 45.0, kInterceptLead = 2.0, kInterceptShare = 0.4, kShieldDist = 14.0;
+		constexpr double kOverwatchUp = 18.0, kOverwatchBack = 10.0;
+
+		// ---- Escort context (2026-10-20, the user: these are for NPCs in vehicles, not for the empty vehicle). Once a frame for all escorts:
+		//  - Rescue: the player's health under 30% of the highest seen -> the escort nearest the player flies to them and lands beside them (off over 55%).
+		//  - Scout: the player walks toward their map marker (over kScoutMin away, within kScoutCone for kScoutMs) -> one escort flies ahead, holds over
+		//    the marker and says how many enemies are there; ends within kScoutDone of it, on turning away, or in a fight.
+		//  - Wait at the door (the Following case): the player indoors -> parked, waiting aboard; following again when they come out.
+		//  - Overwatch is the fight mode against an enemy on foot (DefendGoal mode 3).
+		enum class EscMode { None, Rescue, Scout };
+		constexpr int kThreatHigh = 4;
+		constexpr double kScoutMin = 120.0, kScoutCone = 0.6, kScoutDone = 40.0, kScoutHold = 8.0;
+		constexpr ULONGLONG kScoutMs = 3000;
+		struct EscCtx
+		{
+			EscMode mode = EscMode::None;
+			int rescuer = 0, scout = 0;         // the pilots doing it
+			int threat = 0;                     // enemies of the player within 150 m (counted once a second in a fight)
+			ULONGLONG threatAt = 0;
+			double sx = 0, sy = 0;              // the marker (scout)
+			ULONGLONG towardSince = 0, awaySince = 0;
+			double px = 0, py = 0, vx = 0, vy = 0;
+			ULONGLONG at = 0;
+		} g_ec;
+
+		void SetEscMode(EscMode m, const char* why)
+		{
+			if (m == g_ec.mode) return;
+			logger::Write("NPC vehicles: escorts: %s -> %s (%s)", g_ec.mode == EscMode::Rescue ? "rescue" : g_ec.mode == EscMode::Scout ? "scout" : "follow",
+				m == EscMode::Rescue ? "rescue" : m == EscMode::Scout ? "scout" : "follow", why);
+			if (m == EscMode::Rescue) notify::Show("A follower is coming to pick you up");
+			else if (m == EscMode::Scout) notify::Show("A follower scouts ahead to your marker");
+			g_ec.mode = m;
+			for (auto& j : g_jobs) j.rescueParked = j.scoutReported = false;
+		}
+
+		void EscortContextTick(uptr player, ULONGLONG now)
+		{
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			if (g_ec.at && now > g_ec.at && now - g_ec.at < 1000) {
+				const double dt = (now - g_ec.at) / 1000.0, a = std::min(1.0, dt * 3.0);
+				g_ec.vx += ((pp.x - g_ec.px) / dt - g_ec.vx) * a;
+				g_ec.vy += ((pp.y - g_ec.py) / dt - g_ec.vy) * a;
+			}
+			else {
+				g_ec.vx = g_ec.vy = 0;
+			}
+			g_ec.px = pp.x; g_ec.py = pp.y; g_ec.at = now;
+			if (now - g_ec.threatAt >= 1000) {
+				g_ec.threatAt = now;
+				int n = 0;
+				bool inVeh = false;
+				if (InCombat(player)) EnemyNear(player, pp.x, pp.y, pp.z, 150.0, inVeh, n);
+				if ((n >= kThreatHigh) != (g_ec.threat >= kThreatHigh)) logger::Write("NPC vehicles: escorts: %d enemies around -> %s", n, n >= kThreatHigh ? "defensive" : "normal");
+				g_ec.threat = n;
+			}
+			// The escorts following now (the nearest to the player rescues; the first scouts).
+			int nearest = 0, first = 0;
+			uptr firstVeh = 0;
+			double best = 1e9;
+			for (auto& j : g_jobs) {
+				if (j.phase != Phase::Following || j.profile != Profile::Escort || j.order == int(CrewOrder::Marker)) continue;
+				const uptr v = RefById(j.vehicle);
+				if (!v) continue;
+				const double d = Dist(v, player);
+				if (d < best) { best = d; nearest = j.pilot; }
+				if (!first) { first = j.pilot; firstVeh = v; }
+			}
+			float share = 1.0f;
+			const bool haveHealth = vehiclehits::PlayerHealthShare(share);
+			if (g_ec.mode == EscMode::Rescue) {
+				if (!haveHealth || share > 0.55f) SetEscMode(EscMode::None, "health back");
+				else if (!g_ec.rescuer || !nearest) g_ec.rescuer = nearest;
+				return;
+			}
+			if (haveHealth && share < 0.30f && nearest) {
+				g_ec.rescuer = nearest;
+				SetEscMode(EscMode::Rescue, "your health is low");
+				return;
+			}
+			double mx = 0, my = 0;
+			const bool marker = firstVeh && vehicleflight::MarkerPoint(firstVeh, mx, my);
+			const double toMarker = marker ? std::hypot(mx - pp.x, my - pp.y) : 0.0;
+			const double sp = std::hypot(g_ec.vx, g_ec.vy);
+			const double off = marker ? std::fabs(WrapAngle(std::atan2(g_ec.vx, g_ec.vy) - std::atan2(mx - pp.x, my - pp.y))) : 9.0;
+			if (g_ec.mode == EscMode::Scout) {
+				if (sp > 2.0 && off > 1.6) { if (!g_ec.awaySince) g_ec.awaySince = now; }
+				else g_ec.awaySince = 0;
+				if (!marker || !first || InCombat(player) || toMarker < kScoutDone || (g_ec.awaySince && now - g_ec.awaySince >= kScoutMs)) {
+					SetEscMode(EscMode::None, !marker ? "marker gone" : InCombat(player) ? "a fight" : toMarker < kScoutDone ? "you reached the marker" : "you turned away");
+				}
+				else {
+					g_ec.sx = mx; g_ec.sy = my;
+					if (g_ec.scout != first && !RefById(g_ec.scout ? g_jobs[g_ec.scout - 1].vehicle : 0)) g_ec.scout = first;
+				}
+				return;
+			}
+			if (marker && first && !InCombat(player) && sp > 2.0 && off < kScoutCone && toMarker > kScoutMin) {
+				if (!g_ec.towardSince) g_ec.towardSince = now;
+				if (now - g_ec.towardSince >= kScoutMs) {
+					g_ec.scout = first;
+					g_ec.sx = mx; g_ec.sy = my;
+					g_ec.awaySince = 0;
+					SetEscMode(EscMode::Scout, "you walk toward your marker");
+				}
+			}
+			else {
+				g_ec.towardSince = 0;
+			}
+		}
+
+		// ---- Enemy context (2026-10-20, the user: "add for them based on contexts"): what a pursuer does, from the fight's state. In order:
+		//  - Retreat: its vehicle carries over kRetreatShare of the hit limit -> it pulls kRetreatDist away from the target, lands, and the driver gets
+		//    out to fight on foot (that vehicle's autopilot stays off a while, so nobody boards it again at once).
+		//  - Block: the target sits in a vehicle that is slow (under kBlockSlow) and this is the first pursuer -> it lands kBlockAhead in front of it.
+		//  - Intercept: the target drives away faster than kInterceptFast -> it flies at where the target will be in kInterceptLead.
+		//  - Overwatch: the target is on foot and there are two pursuers or more -> the first hovers kOverwatchUp over it and fires down.
+		//  - Flank: two pursuers or more -> each takes its own slot round the target (the slots turn slowly), so they come from different sides.
+		//  - Attack: one pursuer -> the orbit and attack runs as before.
+		constexpr float kRetreatShare = 0.7f;
+		constexpr double kRetreatDist = 90.0, kBlockSlow = 4.0, kBlockAhead = 9.0, kInterceptFast = 12.0;
+		int PursueGoal(Job& j, uptr target, bool inVehicle, uptr vehicle, ULONGLONG now, vcontract::Goal& g)
+		{
+			const auto tp = At<game::Vec3>(target, off::kRefPosition);
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			if (j.foeSeenAt && now > j.foeSeenAt && now - j.foeSeenAt < 1000) {
+				const double dt = (now - j.foeSeenAt) / 1000.0;
+				const double ix = (tp.x - j.foeX) / dt, iy = (tp.y - j.foeY) / dt;
+				if (std::hypot(ix, iy) < 150.0) {
+					const double a = std::min(1.0, dt * 3.0);
+					j.foeVx += (ix - j.foeVx) * a;
+					j.foeVy += (iy - j.foeVy) * a;
+				}
+			}
+			else {
+				j.foeVx = j.foeVy = 0;
+			}
+			j.foeX = tp.x; j.foeY = tp.y; j.foeSeenAt = now;
+			int idx = 0, count = 0;
+			for (const auto& o : g_jobs) {
+				if (o.phase != Phase::Following || o.profile != Profile::Pursuit) continue;
+				++count;
+				if (o.pilot < j.pilot) ++idx;
+			}
+			float dmg = 0, lim = 0;
+			if (vehiclehits::DamageOf(j.vehicle, dmg, lim) && lim > 0 && dmg >= kRetreatShare * lim) j.retreating = true;
+			const double dx = double(tp.x) - vp.x, dy = double(tp.y) - vp.y, d = std::hypot(dx, dy);
+			const double tsp = std::hypot(j.foeVx, j.foeVy);
+			const double away = d > 0.1 && tsp > 0.1 ? (j.foeVx * dx + j.foeVy * dy) / (d * tsp) : 0.0;  // 1: the target moves straight away from us
+			int mode = 10;
+			g.hold = false;
+			if (j.retreating) {
+				const double ux = d > 0.1 ? -dx / d : 0.0, uy = d > 0.1 ? -dy / d : 1.0;
+				g.x = tp.x + ux * kRetreatDist;
+				g.y = tp.y + uy * kRetreatDist;
+				g.z = std::numeric_limits<double>::quiet_NaN();
+				g.stop = 4.0;
+				mode = 14;
+			}
+			else if (inVehicle && tsp < kBlockSlow && idx == 0 && d < 60.0) {
+				const double h = At<game::Vec3>(target, off::kRefRotation).z;
+				g.x = tp.x + std::sin(h) * kBlockAhead;
+				g.y = tp.y + std::cos(h) * kBlockAhead;
+				g.z = std::numeric_limits<double>::quiet_NaN();
+				g.stop = 1.5;
+				g.hold = true;
+				mode = 15;
+			}
+			else if (inVehicle && tsp > kInterceptFast && away > 0.5) {
+				g.x = tp.x + j.foeVx * kInterceptLead;
+				g.y = tp.y + j.foeVy * kInterceptLead;
+				g.z = tp.z + 4.0;
+				g.stop = 2.0;
+				mode = 12;
+			}
+			else if (!inVehicle && idx == 0 && count >= 2) {
+				g.x = d > 0.1 ? tp.x - dx / d * 12.0 : tp.x;
+				g.y = d > 0.1 ? tp.y - dy / d * 12.0 : tp.y;
+				g.z = tp.z + kOverwatchUp + 2.0;
+				g.stop = 2.0;
+				mode = 13;
+			}
+			else if (count >= 2) {
+				const double slot = 6.283185307179586 * double(idx) / double(count) + std::fmod(double(now) * 0.0003, 6.283185307179586);
+				g.x = tp.x + std::sin(slot) * kAttackRadius;
+				g.y = tp.y + std::cos(slot) * kAttackRadius;
+				g.z = tp.z + kAttackAbove;
+				g.stop = 3.0;
+			}
+			else {
+				OrbitGoal(j, target, vehicle, g);
+			}
+			if (mode != j.pMode || (mode == 10 && (count >= 2) != (j.pMode == 10 && count >= 2))) {
+				logger::Write("NPC vehicles: [%d] pursuer: %s %08X (%.0f m%s)", j.pilot,
+					mode == 14 ? "retreating from" : mode == 15 ? "blocking" : mode == 12 ? "intercepting" : mode == 13 ? "overwatch over" : count >= 2 ? "flanking" : "attacking",
+					At<std::uint32_t>(target, off::kFormId), d, mode == 14 ? ", hit limit near" : "");
+				j.pMode = mode;
+			}
+			return mode;
+		}
+
+		// ---- Civil tasks (2026-10-20, the user: transit, drop-off and walk, return home, parking etiquette, outpost patrol) ----
+		constexpr double kPatrolR = 60.0, kTaskReach = 14.0, kTransitArrive = 25.0, kHomeArrive = 20.0;
+		constexpr double kParkClear = 7.0;     // m: no other vehicle this close to a parking spot
+		constexpr int kPatrolCorners = 8;      // two laps of four corners
+		constexpr ULONGLONG kTaskMaxMs = 240000;
+		constexpr double kFleeNear = 80.0, kFleeDist = 150.0, kOfferNear = 15.0;
+		constexpr ULONGLONG kOfferMs = 10000, kSupplyWaitMs = 20000;
+		void CallReinforcements(uptr player, uptr at);  // (one unnamed namespace per file: defined further down)
+		void PickUps(uptr player, ULONGLONG now);
+
+		// Parking etiquette: a clear spot near (x, y): the point itself, else rings of 8, 14 and 20 m (8 directions); no other vehicle within
+		// kParkClear, never on top of the player.
+		void ParkSpot(std::uint32_t self, uptr player, double x, double y, double& ox, double& oy)
+		{
+			static world::Snapshot snap;
+			const bool have = world::Vehicles(snap);
+			const auto pp = player ? At<game::Vec3>(player, off::kRefPosition) : game::Vec3{};
+			const double rings[4] = { 0.0, 8.0, 14.0, 20.0 };
+			for (const double r : rings) {
+				for (int k = 0; k < (r == 0.0 ? 1 : 8); ++k) {
+					const double a = k * 0.7853981633974483;
+					const double cx = x + std::sin(a) * r, cy = y + std::cos(a) * r;
+					bool clear = !player || std::hypot(cx - pp.x, cy - pp.y) > 6.0;
+					for (std::uint32_t i = 0; clear && have && i < snap.count && i < 64; ++i) {
+						const auto& v = snap.v[i];
+						if (v.formId && v.formId != self && std::hypot(cx - v.pos[0], cy - v.pos[1]) < kParkClear) clear = false;
+					}
+					if (clear) { ox = cx; oy = cy; return; }
+				}
+			}
+			ox = x; oy = y;
+		}
+
+		void BeginPark(Job& j, uptr player, double x, double y, const char* why)
+		{
+			ParkSpot(j.vehicle, player, x, y, j.taskX, j.taskY);
+			j.task = 4;
+			j.taskAt = GetTickCount64();
+			logger::Write("NPC vehicles: [%d] %s; parking at a clear spot (%.0f, %.0f)", j.pilot, why, j.taskX, j.taskY);
+		}
+
+		// One frame of a civil task (a Following job with j.task set).
+		void TaskTick(Job& j, uptr npc, uptr vehicle, uptr player, bool aboard, ULONGLONG now)
+		{
+			if (!aboard) {
+				logger::Write("NPC vehicles: [%d] NPC %08X left the vehicle (task)", j.pilot, j.npc);
+				vehicleflight::PilotStop(j.pilot, "driver got out");
+				Set(j, Phase::Idle);
+				return;
+			}
+			if (InCombat(npc) || (player && InCombat(player) && Dist(vehicle, player) < 120.0)) {
+				// A fight: the task ends; the NPC gets out (the fight rules may put it back in a vehicle with a combat profile).
+				vehicleflight::PilotStop(j.pilot, "a fight");
+				logger::Write("NPC vehicles: [%d] task ended by a fight; NPC %08X gets out", j.pilot, j.npc);
+				j.task = 0;
+				Set(j, Phase::Settling);
+				return;
+			}
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			// Flee (2026-10-20): a hostile vehicle (a pursuer) within kFleeNear -> drive kFleeDist away from it, then park.
+			if (j.task != 4 && j.taskStep >= 0) {
+				for (const auto& o : g_jobs) {
+					if (o.phase != Phase::Following || o.profile != Profile::Pursuit || o.task) continue;
+					const uptr ov = RefById(o.vehicle);
+					if (!ov || Dist(ov, vehicle) > kFleeNear) continue;
+					const auto op = At<game::Vec3>(ov, off::kRefPosition);
+					const double ex = vp.x - op.x, ey = vp.y - op.y, ed = std::max(0.1, std::hypot(ex, ey));
+					j.task = 1;
+					j.taskStep = -1;  // fleeing: no second flight, no ride offers
+					j.taskX = vp.x + ex / ed * kFleeDist;
+					j.taskY = vp.y + ey / ed * kFleeDist;
+					logger::Write("NPC vehicles: [%d] civil driver flees from hostile vehicle %08X (%.0f m)", j.pilot, o.vehicle, Dist(ov, vehicle));
+					break;
+				}
+			}
+			// Offer a ride (2026-10-20): a transit passing the player on foot within kOfferNear stops for kOfferMs once (tap it to ride along).
+			if (j.task == 1 && j.taskStep == 0 && player && !InVehicle(player) && Dist(vehicle, player) < kOfferNear) {
+				j.taskStep = 1;  // offered
+				j.task = 6;
+				j.taskAt = now;
+				vehicleflight::PilotStop(j.pilot, "stopping for you");
+				notify::Show("A driver stops for you - tap the vehicle to ride along");
+				logger::Write("NPC vehicles: [%d] transit stops for you (%.0f m)", j.pilot, Dist(vehicle, player));
+				return;
+			}
+			if (j.task == 6) {  // waiting for the player: they ride along (passenger) or it drives on
+				if (now - j.taskAt < kOfferMs && passenger::RidingVehicle() != j.vehicle) return;
+				j.task = 1;
+			}
+			vcontract::Goal g;
+			g.nav.speedLimit = 22.0f;
+			g.nav.priority = 10;
+			if (j.task == 5) {  // supply run: out to the other place
+				g.x = j.taskX; g.y = j.taskY; g.stop = 6.0;
+				if (std::hypot(vp.x - j.taskX, vp.y - j.taskY) < kTransitArrive) {
+					j.task = 7;
+					j.taskAt = now;
+					vehicleflight::PilotStop(j.pilot, "supply run: unloading");
+					logger::Write("NPC vehicles: [%d] supply run: arrived; waiting %.0f s", j.pilot, kSupplyWaitMs / 1000.0);
+					return;
+				}
+			}
+			else if (j.task == 7) {  // supply run: waiting at the far end
+				if (now - j.taskAt < kSupplyWaitMs) return;
+				j.task = 3;
+				logger::Write("NPC vehicles: [%d] supply run: going home", j.pilot);
+				return;
+			}
+			if (j.task == 1) {  // transit
+				g.x = j.taskX; g.y = j.taskY; g.stop = 6.0;
+				if (std::hypot(vp.x - j.taskX, vp.y - j.taskY) < kTransitArrive) { BeginPark(j, player, j.taskX, j.taskY, "transit: arrived"); return; }
+			}
+			else if (j.task == 2) {  // patrol: corners round home
+				static const double kCorner[4][2] = { { 1, 1 }, { 1, -1 }, { -1, -1 }, { -1, 1 } };
+				const int k = j.taskStep & 3;
+				g.x = j.homeX + kCorner[k][0] * kPatrolR;
+				g.y = j.homeY + kCorner[k][1] * kPatrolR;
+				g.stop = 5.0;
+				g.nav.passThrough = true;
+				g.nav.speedLimit = 15.0f;
+				if (std::hypot(vp.x - g.x, vp.y - g.y) < kTaskReach) {
+					++j.taskStep;
+					if (j.taskStep >= kPatrolCorners) {
+						j.task = 3;
+						logger::Write("NPC vehicles: [%d] patrol done; going home", j.pilot);
+					}
+				}
+			}
+			else if (j.task == 3) {  // return home
+				g.x = j.homeX; g.y = j.homeY; g.stop = 6.0;
+				if (std::hypot(vp.x - j.homeX, vp.y - j.homeY) < kHomeArrive) { BeginPark(j, player, j.homeX, j.homeY, "home"); return; }
+			}
+			else if (j.task == 4) {  // parking: to the clear spot, land, get out
+				g.x = j.taskX; g.y = j.taskY; g.stop = 1.5; g.hold = true;
+				g.nav.landOnArrival = true;
+				g.nav.speedLimit = 8.0f;
+				if (std::hypot(vp.x - j.taskX, vp.y - j.taskY) < 4.0 || now - j.taskAt > 30000) {
+					vehicleflight::PilotStop(j.pilot, "parked");
+					const int out = UnloadVehicle(vehicle, vcontract::ExitRequest{}, false);  // passengers (a shared ride) get out too
+					if (out) logger::Write("NPC vehicles: [%d] %d passenger(s) get out", j.pilot, out);
+					logger::Write("NPC vehicles: [%d] parked; NPC %08X gets out%s", j.pilot, j.npc, j.taskStep < 0 ? "" : "");
+					j.task = 0;
+					Set(j, Phase::Settling);
+					return;
+				}
+			}
+			if (j.task != 4 && now - j.since > kTaskMaxMs) {
+				BeginPark(j, player, vp.x, vp.y, "task took too long");
+				return;
+			}
+			vehicleflight::PilotFly(j.pilot, vehicle, g);
+		}
+
+		// A crew job's marker goal: the player's map marker, held over (stop) or circled (orbit); patrol: the scanner moves the marker along the chain.
+		bool MarkerGoal(Job& j, uptr vehicle, vcontract::Goal& g)
+		{
+			double mx = 0, my = 0;
+			if (!vehicleflight::MarkerPoint(vehicle, mx, my)) return false;
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			const double left = std::hypot(mx - vp.x, my - vp.y);
+			g.x = mx;
+			g.y = my;
+			g.z = std::numeric_limits<double>::quiet_NaN();
+			g.stop = 6.0;
+			g.hold = true;
+			if (vehicleflight::GetAutoMode() == vehicleflight::AutoMode::Orbit && left < 45.0) {
+				const double ang = std::atan2(vp.x - mx, vp.y - my) + 0.45;
+				g.x = mx + std::sin(ang) * 25.0;
+				g.y = my + std::cos(ang) * 25.0;
+				g.stop = 1.0;
+				g.hold = false;
+			}
+			(void)j;
+			return true;
+		}
+		int DefendGoal(Job& j, uptr aimRef, bool inVehicle, uptr player, uptr vehicle, ULONGLONG now, vcontract::Goal& g)
+		{
+			const auto fp = At<game::Vec3>(aimRef, off::kRefPosition);
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			if (j.foeSeenAt && now > j.foeSeenAt && now - j.foeSeenAt < 1000) {
+				const double dt = (now - j.foeSeenAt) / 1000.0;
+				const double ix = (fp.x - j.foeX) / dt, iy = (fp.y - j.foeY) / dt;
+				if (std::hypot(ix, iy) < 150.0) {
+					const double a = std::min(1.0, dt * 3.0);
+					j.foeVx += (ix - j.foeVx) * a;
+					j.foeVy += (iy - j.foeVy) * a;
+				}
+			}
+			else {
+				j.foeVx = j.foeVy = 0;
+			}
+			j.foeX = fp.x; j.foeY = fp.y; j.foeSeenAt = now;
+			const double dx = double(pp.x) - fp.x, dy = double(pp.y) - fp.y, d = std::hypot(dx, dy);
+			const double closing = d > 0.1 ? (j.foeVx * dx + j.foeVy * dy) / d : 0.0;
+			// Roles and threat (2026-10-20): with several escorts in the fight the second one always shields the player; with many enemies around
+			// (g_ec.threat, kThreatHigh) every escort stays defensive (shield or intercept only).
+			int role = 0, escorts = 0;
+			for (const auto& o : g_jobs) {
+				if (o.phase != Phase::Following || o.profile != Profile::Escort || !o.foe) continue;
+				if (o.pilot < j.pilot) ++role;
+				++escorts;
+			}
+			const bool defensive = g_ec.threat >= kThreatHigh || (escorts >= 2 && role == 1);
+			int mode = 0;
+			if (inVehicle && d > kInterceptMin && closing > 3.0) {
+				const double px = fp.x + j.foeVx * kInterceptLead, py = fp.y + j.foeVy * kInterceptLead;
+				g.x = pp.x + (px - pp.x) * kInterceptShare;
+				g.y = pp.y + (py - pp.y) * kInterceptShare;
+				g.z = pp.z + 5.0;
+				g.stop = 2.0;
+				g.hold = false;
+				mode = 2;
+			}
+			else if (!inVehicle && !defensive) {
+				// Overwatch (an enemy on foot): high behind the player, away from the enemy; the nose is put on it from there (the combat branch).
+				g.x = d > 0.1 ? pp.x + dx / d * kOverwatchBack : pp.x;
+				g.y = d > 0.1 ? pp.y + dy / d * kOverwatchBack : pp.y;
+				g.z = pp.z + kOverwatchUp;
+				g.stop = 2.0;
+				g.hold = false;
+				mode = 3;
+			}
+			else if (defensive || Dist3(vehicle, aimRef) > kFireRange) {
+				const double ux = d > 0.1 ? -dx / d : 0.0, uy = d > 0.1 ? -dy / d : 1.0;  // from the player toward the target
+				g.x = pp.x + ux * kShieldDist;
+				g.y = pp.y + uy * kShieldDist;
+				g.z = pp.z + 4.0;
+				g.stop = 2.0;
+				g.hold = false;
+				mode = 1;
+			}
+			else {
+				OrbitGoal(j, aimRef, vehicle, g);
+			}
+			if (mode != j.defMode) {
+				logger::Write("NPC vehicles: [%d] escort in the fight: %s %08X (%.0f m from you%s)", j.pilot, mode == 3 ? "overwatch over you against" : mode == 2 ? "intercepting" : mode == 1 ? "shielding you from" : "attacking",
+					j.foe, d, closing > 3.0 ? ", closing on you" : "");
+				j.defMode = mode;
+			}
+			return mode;
 		}
 
 		// ---- Exit (2026-10-18). The game's dismount FUN_141952530(actor) mirrors the mount: it refuses (returns 0) when actor +0x378 bit 1 is set, when the
@@ -1337,6 +1895,10 @@ namespace npcvehicles
 				}
 				break;
 			case Phase::Following: {
+				if (j.task) {
+					TaskTick(j, npc, vehicle, player, aboard, now);
+					break;
+				}
 				SyncProfile(j, player);
 				// Following, as the player's rover follow (U): trail behind the player, park when the player stands still,
 				// lift off again when the player moves away; the NPC stays aboard throughout.
@@ -1352,15 +1914,74 @@ namespace npcvehicles
 				const bool have = vcontract::GoalFor(vcontract::User::Npc, j.pilot, vehicle, player, pg);
 				const vcontract::Profile* ap = vcontract::AssignedTo(j.vehicle);
 				const bool owned = ap && (std::strcmp(ap->name, "escort") == 0 || std::strcmp(ap->name, "pursuit") == 0);
+				// The combat target: escorts defend the player (vehicles in the fight first), pursuers attack the player's side; nothing picked: a pursuer attacks the player.
+				uptr foe = 0;
+				if (aboard && have && owned && Outdoors(player)) foe = PickFoe(j, npc, vehicle, player, now);
+				const bool defending = foe && j.profile == Profile::Escort;
+				if (!defending) j.defMode = -1;
+				if (!foe && j.profile == Profile::Pursuit) foe = player;
+				const uptr foeVeh = foe ? InVehicle(foe) : 0;
+				const uptr aimRef = foeVeh ? foeVeh : foe;
+				const double toFoe = aimRef ? Dist(vehicle, aimRef) : 1e9;
+				int defMode = 0, pMode = -1;
+				if (foe && have && owned && j.profile == Profile::Pursuit) pMode = PursueGoal(j, aimRef, foeVeh != 0, vehicle, now, pg);
+				else if (foe && foe != player && have) {
+					if (defending) defMode = DefendGoal(j, aimRef, foeVeh != 0, player, vehicle, now, pg);
+					else OrbitGoal(j, aimRef, vehicle, pg);
+				}
+				// Orders and context for escorts: rescue wins over everything, a fight over the rest; then a crew marker order, then scouting.
+				const bool escortJob = j.profile == Profile::Escort && have && owned;
+				const bool rescuer = escortJob && g_ec.mode == EscMode::Rescue && g_ec.rescuer == j.pilot;
+				const bool scouting = escortJob && !defending && !rescuer && g_ec.mode == EscMode::Scout && g_ec.scout == j.pilot && j.order != int(CrewOrder::Marker);
+				bool toMarker = false;
+				if (!rescuer) j.rescueParked = false;
+				if (rescuer) {
+					pg.x = pp.x;
+					pg.y = pp.y;
+					pg.z = std::numeric_limits<double>::quiet_NaN();
+					pg.stop = 4.0;
+					pg.hold = false;
+				}
+				else if (escortJob && !defending && j.order == int(CrewOrder::Marker)) {
+					toMarker = MarkerGoal(j, vehicle, pg);
+				}
+				else if (scouting) {
+					pg.x = g_ec.sx;
+					pg.y = g_ec.sy;
+					pg.z = std::numeric_limits<double>::quiet_NaN();
+					pg.stop = kScoutHold;
+					pg.hold = true;
+					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+					if (!j.scoutReported && std::hypot(g_ec.sx - vp.x, g_ec.sy - vp.y) < kScoutHold + 6.0) {
+						j.scoutReported = true;
+						bool inVeh = false;
+						int n = 0;
+						EnemyNear(player, vp.x, vp.y, vp.z, 80.0, inVeh, n);
+						if (n) notify::Show("Scout: %d %s at your marker", n, n == 1 ? "enemy" : "enemies");
+						else notify::Show("Scout: your marker looks clear");
+						logger::Write("NPC vehicles: [%d] scouted the marker: %d enemies within 80 m", j.pilot, n);
+					}
+				}
+				const bool busyGoal = rescuer || toMarker || scouting;
+				const bool attackRun = defMode == 0 && (pMode < 0 || pMode == 10) && toFoe < kAttackRun && !rescuer;
 				if (!aboard) {
 					logger::Write("NPC vehicles: [%d] NPC %08X left the vehicle", j.pilot, j.npc);
 					vehicleflight::PilotStop(j.pilot, "driver got out");
 					Set(j, Phase::Idle);
 				}
-				else if (passenger::RidingVehicle() == j.vehicle) {
-					passenger::Steer(j.pilot, vehicle);  // taxi: the map marker, else where the passenger looks
+				else if (passenger::RidingVehicle() == j.vehicle && !defending) {
+					passenger::Steer(j.pilot, vehicle);  // taxi: the map marker, else where the passenger looks (a fight: the escort defends)
 				}
-				else if (!Outdoors(player) || (j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) > kLeash : toPlayer > kGiveUp)) {
+				else if (!Outdoors(player)) {
+					// Wait at the door: parked, aboard; following again when the player comes out (the relaunch below).
+					if (!j.waiting) {
+						j.waiting = true;
+						if (vehicleflight::PilotActive(j.pilot)) vehicleflight::PilotStop(j.pilot, "you went indoors; waiting at the door");
+						j.parked = true;
+						logger::Write("NPC vehicles: [%d] you went indoors; NPC %08X waits at the door", j.pilot, j.npc);
+					}
+				}
+				else if (!j.order && (j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) > kLeash : toPlayer > kGiveUp)) {
 					logger::Write("NPC vehicles: [%d] stopped following (%s, %.0f m from you, %.0f m from where it started)", j.pilot, Outdoors(player) ? "too far from its origin" : "you went indoors", toPlayer,
 						j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) : 0.0);
 					vehicleflight::PilotStop(j.pilot, "gave up");
@@ -1370,31 +1991,57 @@ namespace npcvehicles
 					// HOOK 1 of the vehicle contract: another assigned profile (patrol, hauler, ...) drives.
 					vehicleflight::PilotFly(j.pilot, vehicle, pg);
 				}
-				else if (have && vehicleflight::PilotActive(j.pilot) && kProfiles[int(j.profile)].orbit) {
-					if (kProfiles[int(j.profile)].hostile && !InCombat(npc) && now - j.aggroAt >= kReaggroMs) {
+				else if (pMode == 14 && toFoe > kRetreatDist - 20.0) {
+					// Retreated far enough: land, the driver gets out and fights on foot; the vehicle's autopilot stays off a minute.
+					vehicleflight::PilotStop(j.pilot, "retreated");
+					vehicleflight::DisableAutopilot(j.vehicle, 60000, "retreated (hit limit near)");
+					logger::Write("NPC vehicles: [%d] pursuer retreated %.0f m; NPC %08X gets out to fight on foot", j.pilot, toFoe, j.npc);
+					CallReinforcements(player, vehicle);
+					Set(j, Phase::Settling);
+				}
+				else if (rescuer && (j.rescueParked || toPlayer < 7.0)) {
+					if (!j.rescueParked) {
+						j.rescueParked = true;
+						j.parked = true;
+						vehicleflight::PilotStop(j.pilot, "rescue: landed beside you");
+						notify::Show("Your follower is here - get in");
+						logger::Write("NPC vehicles: [%d] rescue: landed %.0f m from you", j.pilot, toPlayer);
+					}
+				}
+				else if (have && vehicleflight::PilotActive(j.pilot) && foe) {
+					if ((kProfiles[int(j.profile)].hostile || defending) && !InCombat(npc) && now - j.aggroAt >= kReaggroMs) {
 						j.aggroAt = now;
-						const bool ok = Aggro(npc, player);
-						logger::Write("NPC vehicles: [%d] NPC %08X attack: combat with you -> %s", j.pilot, j.npc, ok ? "asked" : "failed");
+						const bool ok = Aggro(npc, foe);
+						logger::Write("NPC vehicles: [%d] NPC %08X attack: combat with %08X -> %s", j.pilot, j.npc, At<std::uint32_t>(foe, off::kFormId), ok ? "asked" : "failed");
 					}
 					vehicleflight::PilotFly(j.pilot, vehicle, pg);
-					if (toPlayer < kAttackRun) AttackRun(j, player, vehicle);
-					// Vehicle weapon: bursts with the nose on the player and in range.
+					if (attackRun) AttackRun(j, aimRef, vehicle);
+					// Vehicle weapon: bursts with the nose on the target and in range.
 					double axp = 0, ayp = 0, azp = 0;
-					if (toPlayer >= kAttackRun) AimPoint(j, player, vehicle, axp, ayp, azp);  // (inside, AttackRun updated it)
+					if (!attackRun) AimPoint(j, aimRef, vehicle, axp, ayp, azp);  // (inside, AttackRun updated it)
 					else {
-						const auto ppl = At<game::Vec3>(player, off::kRefPosition);
-						const double t = Dist3(vehicle, player) / kShotSpeed;
+						const auto ppl = At<game::Vec3>(aimRef, off::kRefPosition);
+						const double t = Dist3(vehicle, aimRef) / kShotSpeed;
 						axp = ppl.x + j.aimVx * t; ayp = ppl.y + j.aimVy * t; azp = ppl.z + kAimHeight + j.aimVz * t;
 					}
 					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 					const auto vr = At<game::Vec3>(vehicle, off::kRefRotation);
+					if ((defMode == 3 || pMode == 13) && std::hypot(pg.x - vp.x, pg.y - vp.y) < 12.0) {
+						// Overwatch: in place, the nose on the enemy (yaw and pitch), the autopilot holds the spot.
+						vehicleflight::Command c;
+						c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kPitch;
+						c.yawRate = std::clamp(1.6 * WrapAngle(std::atan2(axp - vp.x, ayp - vp.y) - vr.z), -1.2, 1.2);
+						c.pitch = std::clamp(std::atan2(azp - vp.z, std::max(5.0, std::hypot(axp - vp.x, ayp - vp.y))), -0.6, 0.6);
+						c.holdMs = 300;
+						vehicleflight::PilotCommand(j.pilot, c);
+					}
 					const double aimErr = std::fabs(WrapAngle(std::atan2(axp - vp.x, ayp - vp.y) - vr.z));
 					// The weapon fires along the nose (the projectile turn never took: 19:58 run, 0 aimed): yaw and pitch
 					// both on the led aim point, in 3D range. Rotation x is nose down +.
 					const double pitchWant = std::atan2(azp - vp.z, std::max(1.0, std::hypot(axp - vp.x, ayp - vp.y)));
 					const double pitchErr = std::fabs(pitchWant + vr.x);
 					const bool onTarget = aimErr < kFireCone && pitchErr < kFireCone * 1.5;
-					const bool inRange = kProfiles[int(j.profile)].fire && Dist3(vehicle, player) < kFireRange;
+					const bool inRange = (kProfiles[int(j.profile)].fire || defending) && Dist3(vehicle, aimRef) < kFireRange;
 					const bool canFire = inRange && onTarget;
 					StoreAim(j.pilot - 1, AimSnap{ j.vehicle, j.npc, axp, ayp, azp, inRange, now });
 					const int slot = j.pilot - 1;
@@ -1413,13 +2060,13 @@ namespace npcvehicles
 						j.firing = true;
 						j.fireAt = now;
 						if (j.bursts++ % 10 == 0) {
-							logger::Write("NPC vehicles: [%d] vehicle %08X weapon burst %u (%.0f m, aim off %.0f deg, pitch off %.0f deg) -> %s", j.pilot, j.vehicle, j.bursts, toPlayer, aimErr * 57.2958, pitchErr * 57.2958,
+							logger::Write("NPC vehicles: [%d] vehicle %08X weapon burst %u (%.0f m, aim off %.0f deg, pitch off %.0f deg) -> %s", j.pilot, j.vehicle, j.bursts, toFoe, aimErr * 57.2958, pitchErr * 57.2958,
 								ok ? "input sent" : "input FAILED");
 						}
 					}
 				}
 				else if (have && vehicleflight::PilotActive(j.pilot)) {
-					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar) {
+					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar && !busyGoal) {
 						vehicleflight::PilotStop(j.pilot, "follow: player stopped; parked");
 						j.parked = true;
 						logger::Write("NPC vehicles: [%d] parked %.0f m from you (NPC stays aboard)", j.pilot, toPlayer);
@@ -1436,7 +2083,11 @@ namespace npcvehicles
 						j.relaunchAt = now + kRelaunchWaitMs;
 					}
 					const bool waitOver = j.parked || now >= j.relaunchAt;
-					const bool orbit = kProfiles[int(j.profile)].orbit;
+					const bool orbit = kProfiles[int(j.profile)].orbit || defending || toMarker || scouting || (rescuer && !j.rescueParked);
+					if (j.waiting) {
+						j.waiting = false;
+						logger::Write("NPC vehicles: [%d] you are outside again; following", j.pilot);
+					}
 					if (waitOver && (toPlayer > kFollowRelaunch || orbit)) {
 						if (vehicleflight::PilotFly(j.pilot, vehicle, pg)) {
 							logger::Write("NPC vehicles: [%d] following again (%.0f m from you)", j.pilot, toPlayer);
@@ -1528,7 +2179,8 @@ namespace npcvehicles
 		// Papyrus natives' cores: Actor.SendAssaultAlarm FUN_141FC9770(_, _, victim), ObjectReference.SendStealAlarm
 		// FUN_14207F050(_, _, ref, thief).
 		constexpr std::uint32_t kEndInteraction = 0x01A9C530, kAssaultAlarm = 0x01FC9770, kStealAlarm = 0x0207F050;
-		constexpr ULONGLONG kPullMs = 1000;        // hold Activate this long to pull a driver out
+		constexpr ULONGLONG kDoubleMs = 400;       // a second Activate press this soon after the first (an occupied vehicle) = pull the occupant out
+		// (2026-10-18: a single tap on an occupied vehicle is the PASSENGER seat for anyone; a double tap pulls the occupant out. It was: tap = passenger, hold = pull out.)
 		constexpr ULONGLONG kIntentMs = 2500;      // a player-seat call this soon after the press is the player's
 		constexpr double kReachRange = 5.0;        // m: the vehicle in front of the player
 		constexpr double kReachCone = 0.8;         // rad
@@ -1546,6 +2198,7 @@ namespace npcvehicles
 		} g_intent;
 		bool g_activateDown = false;
 		int g_activateKey = 0;
+		struct Tap { bool pending = false; ULONGLONG at = 0; std::uint32_t vehicle = 0, occupant = 0; Relation relation = Relation::None; } g_tap;  // a tap waiting out the double-tap window
 
 		bool IsFollower(uptr player, uptr actor);
 
@@ -1950,37 +2603,43 @@ namespace npcvehicles
 					shown = occupied;
 				}
 			}
-			if (InVehicle(player)) return;
+			if (InVehicle(player)) { g_tap.pending = false; return; }
+			// A single tap waits out the double-tap window, then takes the passenger seat.
+			if (g_tap.pending && now - g_tap.at >= kDoubleMs) {
+				g_tap.pending = false;
+				const uptr v = RefById(g_tap.vehicle);
+				if (v && Dist(player, v) <= kReachRange + 1.0) {
+					const bool ok = passenger::BoardVehicle(player, v);
+					logger::Write("NPC vehicles: seat rules: tap on occupied vehicle %08X (%s driver %08X) -> passenger seat %s", g_tap.vehicle, RelationName(g_tap.relation),
+						g_tap.occupant, ok ? "taken" : "NOT taken");
+				}
+			}
 			if (pressed) {
+				const Tap tap = g_tap;
 				g_intent = Intent{};
 				const uptr v = FacingVehicle(player);
-				if (!v) return;
+				if (!v) { g_tap.pending = false; return; }
 				const uptr occ = DriverOf(v, player);
 				g_intent.vehicle = At<std::uint32_t>(v, off::kFormId);
 				g_intent.pressAt = now;
-				if (!occ) return;  // empty: the game's own get-in (and its theft rules)
+				if (!occ) { g_tap.pending = false; return; }  // empty: the game's own get-in (and its theft rules)
 				g_intent.occupant = At<std::uint32_t>(occ, off::kFormId);
 				g_intent.relation = RelationOf(player, occ);
-				// A tap (released before kPullMs) = the passenger seat; holding = pull the driver out (below).
-				return;
-			}
-			if (released && g_intent.occupant && !g_intent.acted && now - g_intent.pressAt < kPullMs) {
-				g_intent.acted = true;
-				const uptr v = RefById(g_intent.vehicle);
-				if (v && Dist(player, v) <= kReachRange + 1.0) {
-					const bool ok = passenger::BoardVehicle(player, v);
-					logger::Write("NPC vehicles: seat rules: tap on occupied vehicle %08X (%s driver %08X) -> passenger seat %s", g_intent.vehicle, RelationName(g_intent.relation),
-						g_intent.occupant, ok ? "taken" : "NOT taken");
+				if (tap.pending && tap.vehicle == g_intent.vehicle && now - tap.at < kDoubleMs) {
+					// The second press: pull the occupant out (a gang member hands over the wheel).
+					g_tap.pending = false;
+					g_intent.acted = true;
+					if (Dist(player, v) > kReachRange + 1.0) return;
+					TakeSeat(player, v, occ, g_intent.relation == Relation::Gang ? "hand-over" : g_intent.relation == Relation::Hostile ? "hijack" : "pulled out");
+					if (g_intent.relation != Relation::Gang) CrimeAlarms(occ, v, player, g_intent.relation == Relation::Neutral);
+					if (g_intent.relation == Relation::Hostile) Aggro(occ, player);
+					notify::Show(g_intent.relation == Relation::Gang ? "They hand you the wheel" : g_intent.relation == Relation::Hostile ? "Hijacked" : "You pulled them out");
 				}
 				return;
 			}
-			if (down && g_intent.occupant && !g_intent.acted && now - g_intent.pressAt >= kPullMs) {
-				const uptr v = RefById(g_intent.vehicle), occ = RefById(g_intent.occupant);
-				if (!v || !occ || InVehicle(occ) != v || Dist(player, v) > kReachRange + 1.0) return;
-				TakeSeat(player, v, occ, g_intent.relation == Relation::Gang ? "hand-over" : g_intent.relation == Relation::Hostile ? "hijack" : "pulled out");
-				if (g_intent.relation != Relation::Gang) CrimeAlarms(occ, v, player, g_intent.relation == Relation::Neutral);
-				if (g_intent.relation == Relation::Hostile) Aggro(occ, player);
-				notify::Show(g_intent.relation == Relation::Gang ? "They hand you the wheel" : g_intent.relation == Relation::Hostile ? "Hijacked" : "You pulled them out");
+			if (released && g_intent.occupant && !g_intent.acted) {
+				// The first tap is over: wait for a second one (the passenger seat is taken when the window closes, above).
+				g_tap = Tap{ true, now, g_intent.vehicle, g_intent.occupant, g_intent.relation };
 			}
 		}
 
@@ -2197,6 +2856,8 @@ namespace npcvehicles
 			return;
 		}
 		deadDone = false;
+		EscortContextTick(player, GetTickCount64());
+		PickUps(player, GetTickCount64());
 		ChooseKey();
 		const bool wdown = g_walkKey && Focused() && (GetAsyncKeyState(g_walkKey) & 0x8000) != 0;
 		if (wdown && !g_walkDown) Force(player);
@@ -2322,7 +2983,7 @@ namespace npcvehicles
 		void ApplyInputDetour(uptr component, uptr input)
 		{
 			bool ours = false;
-			for (int i = 0; i < kJobs; ++i) {
+			for (int i = 0; i < kJobs + 1; ++i) {
 				if (input == reinterpret_cast<uptr>(g_fireHandler[i]) + 0x80) { ours = true; break; }
 			}
 			if (!ours && component && input) {
@@ -2645,9 +3306,175 @@ namespace npcvehicles
 		for (auto& j : g_jobs) {
 			if (j.phase != Phase::Idle) continue;
 			j.pilot = int(&j - g_jobs) + 1;
-			return StartWalkBoard(&j, actor, vehicle);
+			if (!StartWalkBoard(&j, actor, vehicle)) return false;
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			j.homeX = vp.x; j.homeY = vp.y; j.haveHome = true;
+			return true;
 		}
 		return false;
+	}
+
+	bool MayUse(std::uintptr_t actor, std::uintptr_t vehicle)
+	{
+		if (!actor || !vehicle) return false;
+		if (At<std::uint32_t>(vehicle, off::kFormId) == vehicleflight::OwnRoverId()) return false;
+		const uptr owner = OwnerForm(vehicle);
+		if (!owner) return true;
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		if (player && owner == At<uptr>(player, 0x98)) return false;
+		const uptr base = At<uptr>(actor, 0x98);
+		return base == owner || (At<std::uint8_t>(owner, 0x2E) == 0x0D && InFaction(actor, owner));
+	}
+
+	bool ActorFree(std::uintptr_t actor)
+	{
+		if (!actor || !IsActorRef(actor) || Dead(actor) || InVehicle(actor)) return false;
+		// Quest NPCs are never taken for civil traffic: essential (actor +0x378 bit 18) or protected (bit 19), the bits the game's own
+		// IsEssential / IsProtected conditions read (FUN_140bed740, FUN_140c566a0; 2026-10-20 research). A quest alias that makes an actor essential most likely sets the same bit (unproven).
+		if (At<std::uint32_t>(actor, 0x378) & ((1u << 18) | (1u << 19))) return false;
+		const std::uint32_t id = At<std::uint32_t>(actor, off::kFormId);
+		if (Locked(id) || Busy(id)) return false;
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		return !(player && IsFollower(player, actor));
+	}
+
+	namespace
+	{
+		// Reinforcements (2026-10-20): a pursuer pulled out; up to 3 calm NPCs within 150 m who are hostile to the player join the fight
+		// (the fight rules then put them into vehicles near them).
+		void CallReinforcements(uptr player, uptr at)
+		{
+			if (!player || !at) return;
+			int n = 0;
+			for (const uptr r : modscene::LoadedRefs(8000)) {
+				if (n >= 3) break;
+				if (!r || r == player || !IsActorRef(r) || Dead(r) || InCombat(r) || IsFollower(player, r)) continue;
+				if (Dist(r, at) > 150.0 || !HostileTo(r, player)) continue;
+				if (!CanMount(r, at)) continue;  // people only (the game's own mount check: creatures cannot ride)
+				if (Aggro(r, player)) {
+					++n;
+					logger::Write("NPC vehicles: reinforcement: NPC %08X joins the fight (%.0f m)", At<std::uint32_t>(r, off::kFormId), Dist(r, at));
+				}
+			}
+		}
+
+		// Pick-ups (2026-10-20), every 2 s: a crew job following the player takes free followers within 40 m as passengers (squad); any vehicle in
+		// a fight takes a wounded ally on foot within 50 m (health under 30%) as a passenger: escorts a follower, pursuers a hostile, who then retreats.
+		ULONGLONG g_pickAt = 0;
+		void PickUps(uptr player, ULONGLONG now)
+		{
+			if (now - g_pickAt < 2000) return;
+			g_pickAt = now;
+			for (auto& j : g_jobs) {
+				if (j.phase != Phase::Following || j.task) continue;
+				const uptr v = RefById(j.vehicle), npc = RefById(j.npc);
+				if (!v || !npc || InVehicle(npc) != v) continue;
+				uptr gang[32];
+				const int n = Followers(player, gang, 32);
+				if (j.order == int(CrewOrder::Follow)) {
+					for (int i = 0; i < n; ++i) {
+						const uptr f = gang[i];
+						if (!f || f == npc || Dead(f) || InVehicle(f) || Dist(f, v) > 40.0) continue;
+						if (BoardNpc(f, v, false)) {
+							logger::Write("NPC vehicles: [%d] squad: follower %08X boards as a passenger", j.pilot, At<std::uint32_t>(f, off::kFormId));
+							return;  // one a round
+						}
+					}
+				}
+				if (!InCombat(player) && !InCombat(npc)) continue;
+				if (j.profile == Profile::Escort) {
+					for (int i = 0; i < n; ++i) {
+						const uptr f = gang[i];
+						float share = 1.0f;
+						if (!f || f == npc || Dead(f) || InVehicle(f) || Dist(f, v) > 50.0 || !vehiclehits::ActorHealthShare(f, share) || share >= 0.3f) continue;
+						if (!CanMount(f, v)) continue;
+						if (BoardNpc(f, v, false)) {
+							logger::Write("NPC vehicles: [%d] picks up wounded follower %08X (%.0f%%)", j.pilot, At<std::uint32_t>(f, off::kFormId), share * 100.0f);
+							notify::Show("A follower vehicle picks up a wounded follower");
+							return;
+						}
+					}
+				}
+				else if (j.profile == Profile::Pursuit && !j.retreating) {
+					for (const uptr r : modscene::LoadedRefs(8000)) {
+						if (!r || r == npc || r == player || !IsActorRef(r) || Dead(r) || InVehicle(r) || Dist(r, v) > 50.0) continue;
+						if (IsFollower(player, r) || !HostileTo(r, player) || !CanMount(r, v)) continue;  // people only
+						float share = 1.0f;
+						if (!vehiclehits::ActorHealthShare(r, share) || share >= 0.3f) continue;
+						if (BoardNpc(r, v, false)) {
+							j.retreating = true;
+							logger::Write("NPC vehicles: [%d] pursuer picks up wounded %08X (%.0f%%) and pulls out", j.pilot, At<std::uint32_t>(r, off::kFormId), share * 100.0f);
+							return;
+						}
+					}
+				}
+			}
+		}
+
+		bool StartTask(uptr actor, uptr vehicle, int task, double x, double y)
+		{
+			if (!ActorFree(actor) || !vehicle) return false;
+			const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId);
+			if (Busy(vehId) || vehicleflight::AutopilotDisabled(vehId)) return false;
+			if (!DriverSeatKeyword(vehicle) && !CanMount(actor, vehicle)) return false;
+			for (auto& j : g_jobs) {
+				if (j.phase != Phase::Idle) continue;
+				j.pilot = int(&j - g_jobs) + 1;
+				if (!StartWalkBoard(&j, actor, vehicle)) return false;
+				const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+				j.homeX = vp.x; j.homeY = vp.y; j.haveHome = true;
+				j.task = task;
+				j.taskX = x; j.taskY = y;
+				j.taskStep = 0;
+				j.taskAt = GetTickCount64();
+				logger::Write("NPC vehicles: [%d] civil task %s: NPC %08X takes vehicle %08X%s", j.pilot, task == 1 ? "transit" : task == 5 ? "supply run" : "patrol",
+					At<std::uint32_t>(actor, off::kFormId), vehId, task == 1 ? " for a long walk" : task == 5 ? " to the next settlement" : " round its post");
+				return true;
+			}
+			return false;
+		}
+	}
+
+	bool StartTransit(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y) { return StartTask(actor, vehicle, 1, x, y); }
+	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y) { return StartTask(actor, vehicle, 5, x, y); }
+
+	void Recall(unsigned ms)
+	{
+		g_recallUntil = GetTickCount64() + ms;
+		for (auto& j : g_jobs) {
+			if (j.profile == Profile::Escort) j.foeAt = 0;
+		}
+		logger::Write("NPC vehicles: escorts recalled for %.0f s", ms / 1000.0);
+		notify::Show("Followers: back to formation");
+	}
+	bool StartPatrol(std::uintptr_t actor, std::uintptr_t vehicle) { return StartTask(actor, vehicle, 2, 0, 0); }
+
+	bool SendHome(std::uint32_t vehicleId)
+	{
+		for (auto& j : g_jobs) {
+			if (!vehicleId || j.phase != Phase::Following || j.vehicle != vehicleId || !j.haveHome || j.task || j.order) continue;
+			const uptr player = Ptr(addr::kPlayerCharacterPtr), npc = RefById(j.npc);
+			if (player && npc && IsFollower(player, npc)) return false;  // followers get out by the player, as before
+			const uptr v = RefById(j.vehicle);
+			if (!v) return false;
+			const auto vp = At<game::Vec3>(v, off::kRefPosition);
+			if (std::hypot(vp.x - j.homeX, vp.y - j.homeY) < kHomeArrive) return false;
+			j.task = 3;
+			j.taskAt = GetTickCount64();
+			j.since = GetTickCount64();
+			logger::Write("NPC vehicles: [%d] fight over; vehicle %08X goes home (%.0f m)", j.pilot, j.vehicle, std::hypot(vp.x - j.homeX, vp.y - j.homeY));
+			return true;
+		}
+		return false;
+	}
+
+	int CivilJobs()
+	{
+		int n = 0;
+		for (const auto& j : g_jobs) {
+			if (j.phase != Phase::Idle && j.task) ++n;
+		}
+		return n;
 	}
 
 	bool IsInCombat(std::uintptr_t actor) { return actor && InCombat(actor); }
@@ -2731,6 +3558,103 @@ namespace npcvehicles
 		g_riders.clear();
 		g_seatLogged.clear();
 		g_told = false;
+	}
+
+	std::uintptr_t EnemyNear(std::uintptr_t player, double x, double y, double z, double range, bool& inVehicle, int& count)
+	{
+		inVehicle = false;
+		count = 0;
+		if (!player) return 0;
+		uptr best = 0;
+		int bestTier = 9;
+		double bestD = 1e9;
+		for (const uptr r : modscene::LoadedRefs(8000)) {
+			if (!r || r == player || !IsActorRef(r) || Dead(r)) continue;
+			const auto p = At<game::Vec3>(r, off::kRefPosition);
+			const double d = std::sqrt(std::pow(p.x - x, 2) + std::pow(p.y - y, 2) + std::pow(p.z - z, 2));
+			if (d > range) continue;
+			if (IsFollower(player, r) || !InCombat(r)) continue;
+			if (!HostileTo(r, player) && !HostileTo(player, r)) continue;
+			++count;
+			const int tier = InVehicle(r) ? 0 : 1;
+			if (tier < bestTier || (tier == bestTier && d < bestD)) { best = r; bestTier = tier; bestD = d; }
+		}
+		inVehicle = best && bestTier == 0;
+		return best;
+	}
+
+	std::uintptr_t FreeFollower(std::uintptr_t player, double x, double y, double range)
+	{
+		if (!player) return 0;
+		uptr gang[32];
+		const int n = Followers(player, gang, 32);
+		uptr best = 0;
+		double bestD = range;
+		for (int i = 0; i < n; ++i) {
+			const uptr a = gang[i];
+			if (!a || Dead(a) || InVehicle(a)) continue;
+			const std::uint32_t id = At<std::uint32_t>(a, off::kFormId);
+			if (Locked(id) || Busy(id)) continue;
+			const auto p = At<game::Vec3>(a, off::kRefPosition);
+			const double d = std::hypot(p.x - x, p.y - y);
+			if (d < bestD) { bestD = d; best = a; }
+		}
+		return best;
+	}
+
+	bool CrewBoard(std::uintptr_t player, std::uintptr_t vehicle, CrewOrder order)
+	{
+		if (!player || !vehicle) return false;
+		const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+		const uptr actor = FreeFollower(player, vp.x, vp.y, 80.0);
+		const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId);
+		if (!actor || Busy(vehId)) return false;
+		for (auto& j : g_jobs) {
+			if (j.phase != Phase::Idle) continue;
+			j.pilot = int(&j - g_jobs) + 1;
+			if (!StartWalkBoard(&j, actor, vehicle)) return false;
+			j.order = int(order);
+			logger::Write("NPC vehicles: [%d] crew: follower %08X drives your vehicle %08X (%s)", j.pilot, At<std::uint32_t>(actor, off::kFormId), vehId,
+				order == CrewOrder::Marker ? "to your marker" : "following you");
+			notify::Show(order == CrewOrder::Marker ? "A follower takes your vehicle to the marker" : "A follower drives your vehicle");
+			return true;
+		}
+		return false;
+	}
+
+	CrewOrder CrewOrderOf(std::uint32_t vehicleId)
+	{
+		for (const auto& j : g_jobs) {
+			if (vehicleId && j.phase != Phase::Idle && j.vehicle == vehicleId && j.order) return CrewOrder(j.order);
+		}
+		return CrewOrder::None;
+	}
+
+	void SetCrewOrder(std::uint32_t vehicleId, CrewOrder order)
+	{
+		for (auto& j : g_jobs) {
+			if (!vehicleId || j.phase == Phase::Idle || j.vehicle != vehicleId || !j.order || j.order == int(order)) continue;
+			j.order = int(order);
+			logger::Write("NPC vehicles: [%d] crew order: %s", j.pilot, order == CrewOrder::Marker ? "to your marker" : "follow you");
+			notify::Show(order == CrewOrder::Marker ? "Your follower drives to the marker" : "Your follower follows you");
+		}
+	}
+
+	void ReleaseCrew(std::uint32_t vehicleId)
+	{
+		for (auto& j : g_jobs) {
+			if (!vehicleId || j.phase != Phase::Following || j.vehicle != vehicleId || !j.order) continue;
+			vehicleflight::PilotStop(j.pilot, "crew released");
+			logger::Write("NPC vehicles: [%d] crew released; NPC %08X gets out", j.pilot, j.npc);
+			Set(j, Phase::Settling);
+		}
+	}
+
+	bool FireVehicleWeapon(std::uint32_t vehicleId, bool fire, double x, double y, double z)
+	{
+		if (!vehicleId) return false;
+		StoreAim(7, AimSnap{ vehicleId, 0, x, y, z, fire, GetTickCount64() });  // vehicleaim turns the shot at launch
+		return SubmitFire(kJobs, vehicleId, fire);
 	}
 
 	bool AimFor(std::uint32_t shooterFormId, double& x, double& y, double& z)

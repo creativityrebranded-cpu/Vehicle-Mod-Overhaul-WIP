@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 namespace seamless
 {
