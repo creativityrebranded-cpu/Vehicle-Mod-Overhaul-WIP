@@ -282,8 +282,17 @@ namespace profiles
 			return true;
 		}
 
+		constexpr std::uint8_t kAll = std::uint8_t(kNpc | kRemote | kDriving);
+		using vcontract::Class;
 		const vcontract::Profile kEscort{ "escort", kNpc, &EscortGoal, false };
-		const vcontract::Profile kPursuit{ "pursuit", kNpc, &PursuitGoal, false };
+		// Combat (npcvehicles reads the selection; attack also gives a hostile pursuer, which has no navigation, its orbit round the player).
+		const vcontract::Profile kAttack{ "attack", kNpc, &PursuitGoal, false, Class::Combat };
+		const vcontract::Profile kDefend{ "defend", kAll, nullptr, false, Class::Combat };
+		// Weapons (selectors; free fire is the default; the player's seat is "never" in npcvehicles' fire gate).
+		const vcontract::Profile kFreeFire{ "free fire", kAll, nullptr, false, Class::Weapons };
+		const vcontract::Profile kOpportunistic{ "opportunistic", kAll, nullptr, false, Class::Weapons };
+		const vcontract::Profile kHoldFire{ "hold fire", kAll, nullptr, false, Class::Weapons };
+		const vcontract::Profile kNever{ "never", kAll, nullptr, false, Class::Weapons };
 		const vcontract::Profile kHold{ "hold", std::uint8_t(kNpc | kRemote), &HoldGoal, false };
 		const vcontract::Profile kReturnHome{ "return home", std::uint8_t(kNpc | kRemote), &ReturnHomeGoal, false };
 		const vcontract::Profile kPatrol{ "patrol", kNpc, &PatrolGoal, false };
@@ -373,8 +382,10 @@ namespace profiles
 
 	void Install()
 	{
-		for (const auto* p : { &kEscort, &kPursuit, &kHold, &kReturnHome, &kPatrol, &kHauler, &kCourier, &kScout, &kCruise }) vcontract::Register(p);
-		logger::Write("Profiles: %d registered (escort, pursuit, hold, return home, patrol, hauler, courier, scout, cruise)", vcontract::Count());
+		for (const auto* p : { &kEscort, &kHold, &kReturnHome, &kPatrol, &kHauler, &kCourier, &kScout, &kCruise, &kAttack, &kDefend,
+			&kFreeFire, &kOpportunistic, &kHoldFire, &kNever }) vcontract::Register(p);
+		logger::Write("Profiles: %d registered (navigation: escort, hold, return home, patrol, hauler, courier, scout, cruise; combat: attack, defend; "
+			"weapons: free fire, opportunistic, hold fire, never)", vcontract::Count());
 	}
 
 	void Tick()

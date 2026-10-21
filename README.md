@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it follow you, send it to a
+Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
 map marker, or let a follower drive it. Followers jump into vehicles to defend you, enemies take vehicles to hunt you down, and
 outside a fight the people around you drive, patrol and run errands on their own.
 
@@ -17,11 +17,14 @@ outside a fight the people around you drive, patrol and run errands on their own
 | Feature | What you get | State |
 |---|---|---|
 | **Hover flight** | Double-tap Space to hover; gears, boost, climb and descend, terrain assist | Tested |
-| **Summon and Follow** | Call your vehicle to you, or let it trail you and park when you stop | Tested |
-| **Auto to the map marker** | The autopilot flies you to your marker; any movement key takes over | Untested |
+| **Summon / Recall and Cover** | N brings your vehicle to you over anything it is doing; U makes it follow and defend you | Summon/follow tested; Recall/Cover untested |
+| **Guard point and ram** | While covering, T sets a point to guard; hold T to arm a ram, then tap T on the exact target | Untested |
+| **Your vehicle defends you** | Under Cover or on a guard point your empty vehicle takes a defensive spot and fires its weapon; never while you drive it | Untested in game; offline checks pass |
+| **Navigation / Combat / Weapons profiles** | Each vehicle keeps where it goes, how it fights and when it shoots separately; a fight picks the combat profile from the trip | Untested in game; offline checks pass |
+| **Auto to the map marker** | Selecting a destination starts the autopilot; any movement key takes over | Untested |
 | **Scanner markers** | Mark what you look at up to ~1 km away; **chain** several markers into a route | Untested |
 | **Catch from below** | Jump or fall from a height and your following vehicle flies under you to catch you | Untested |
-| **Follower drivers** | With a follower nearby, Summon / Follow / a marker sends the follower to drive your vehicle for you | Untested |
+| **Follower drivers** | With a follower nearby, Cover or a marker sends the follower to drive your vehicle for you | Untested |
 | **Escorts defend you** | Followers in vehicles intercept, shield, give overwatch and attack - enemy vehicles first | Untested |
 | **Rescue, scout, wait** | A follower vehicle picks you up when you are hurt, scouts your marker, waits at the door | Untested |
 | **Smarter enemies** | Enemy vehicles flank, intercept, block, hover overhead, retreat when damaged and call for help | Untested |
@@ -29,7 +32,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
 | **Vehicles respect each other** | No more vehicles "magnetised" together; right of way decides who gives way | Untested |
 | **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
-| **Shared 3D navigation** | Altitude cost fields guide local trajectory plans; bounded recovery holds failed trips with Retry / Skip / Clear controls | Untested in game; offline checks pass |
+| **Shared 3D navigation** | Altitude cost fields guide local trajectory plans; bounded recovery holds failed trips with Retry / Skip and T T (clear) | Untested in game; offline checks pass |
 | **Environment-aware traffic and combat** | Traffic detours check the world map; combat positions consider cover and automated fire requires a clear-shot probe | Untested in game; offline checks pass |
 | **Checked boarding and drop-off** | Vehicle footprint, slope, water, headroom, standing space, and stopped arrival are checked before boarding or exit | Untested in game; offline checks pass |
 | **Flies under things** | Overhangs and bridges are flown under; ceilings cap the height | Untested |
@@ -82,25 +85,29 @@ before installing or upgrading.
 
 ## Controls
 
-The plugin only takes keys the game leaves free, so it never clashes with your bindings. The keys it picked are written to the
-log at start-up (lines such as `Rover call key: …`, `Scanner marker: Auto behaviour key …`, `Passenger: key …`). Defaults on a
-standard layout:
+**N, U and T are fixed** (your choice of keys: no fallback moves them). If the game also binds one of them, the log says so
+(`Rover keys: … is also bound by the game`). Other keys are only taken where the game leaves them free; the ones picked are written
+to the log at start-up (`Rover flight keys: …`, `Passenger: key …`).
 
 ### On foot
 
 | Key | Action |
 |---|---|
-| **N** | **Summon** your vehicle. Far away: it is moved in behind you, out of sight. Close: it flies to you. Press again to cancel. |
-| **U** | **Follow** on / off: it trails you, parks when you stand still, lifts off when you move on, catches you when you fall. |
-| **Hold U (1 s)** | **Recall**: every follower vehicle drops the fight and comes back into formation for 15 s. |
+| **N** | **Summon / Recall.** Your vehicle comes to you whatever it is doing - covering, guarding, holding, ramming or fighting. Far away: it is moved in behind you, out of sight. Closer: it flies to you. Pressing N again sends it again; it never cancels. With a follower driving, they bring it over without firing, park beside you and get out so you can drive. Your other followers' vehicles also drop their fights and fall back to you for 15 s. |
+| **U** | **Cover** on / off: your vehicle follows you and defends you (see [Your vehicle defends you](#your-vehicle-defends-you)). While on a guard point, U makes it cover you again. With a free follower near, U hands them your vehicle to cover you; U again and they get out. |
 | **E** (Activate) | **Get in** (shown within 6 m of your vehicle). At an occupied vehicle: tap = passenger seat, hold = take the wheel / pull the driver out. |
 
-### Hand scanner open
+The button names follow the context: N reads **Summon** when your vehicle is idle and **Recall** when it is busy; U reads **Cover** or
+**Stop cover**.
 
-| Key | Action |
+### T: tap, double tap, hold (hand scanner open, or while driving)
+
+| T | Action |
 |---|---|
-| **T** (tap) | Puts the game's map marker where you look, up to ~1 km away (past the loaded area the distance is an estimate, shown with `~`). Your vehicle is summoned, and Auto flies you there when you get in. **While a trip is already on, a tap adds the point to a chain** (`+N queued` on screen). |
-| **T** (hold 0.8 s) | Throws the chain away and sets just this point. |
+| **Tap** | Selects what you aim at. It acts once a short double-tap window (0.3 s) has passed, so a double tap never starts anything first. A place becomes the destination and starts navigation: up to ~1 km away (past the loaded area the distance is an estimate, shown with `~`). Driving, the autopilot starts at once; on foot, your vehicle is summoned and drives you there when you get in. **While a trip is already on, a tap adds the point to a chain** (`+N queued`). A tap does nothing outside the scanner. |
+| **Tap while covering** | The aimed place becomes your vehicle's **guard point**: it holds there, even in a fight, and defends from it. |
+| **Double tap** | Clears the route and holds the vehicle where it is (it stays hovering). Also cancels an armed ram. |
+| **Hold (1 s or more)** | **Arms a ram**: your vehicle hovers in place and waits (`RAM READY · SELECT TARGET`). If you drive it you keep driving and shooting. The next tap on a highlighted person or vehicle rams exactly that target; a tap on a place does not send the vehicle away. Releasing the hold selects nothing. The ram waits up to 60 s. |
 
 Chained markers swap automatically: about 4 s before your vehicle reaches the current marker, the next one takes its place and
 the vehicle flies on without stopping. The final point keeps normal arrival braking.
@@ -116,21 +123,27 @@ the vehicle flies on without stopping. The final point keeps normal arrival brak
 | **Alt** (hold) | Descend after 0.3 seconds; releasing a hold does not change gear |
 | **A / D**, mouse | Turn / roll; the mouse aims |
 | **Q / Z** | Up / down |
-| **T** | **Auto** on / off: the autopilot flies you to your map marker. Any of W / A / S / D takes control back. |
-| **]** (when free) | While Auto is on: **Cruise** (fly where you look at your gear's speed) |
+| **T** | See [T: tap, double tap, hold](#t-tap-double-tap-hold-hand-scanner-open-or-while-driving). There is no separate Auto toggle: selecting a destination starts the autopilot. Any of W / A / S / D takes control back. |
+| **]** (when free) | While the autopilot drives: **Cruise** (fly where you look at your gear's speed) |
+| *Shooting* | Always yours. A vehicle you drive never fires or aims by itself. |
 | *Leave the vehicle* | The old destination and queued route are discarded. Set a fresh target for the next trip; an unattended Auto vehicle holds position. |
 | **F7** | Move any on-screen button (Page Up / Down pick, arrows move, Ctrl ×10, Delete resets). Saved to `hoverui.ini`. |
 
 ### On-screen buttons
 
-Added prompts use the game's native BasicButton style at a uniform 75% scale. The Auto destination-mode UI is removed. Ambient NPC notices and rows are suppressed; only your followers appear.
+Added prompts use the game's native BasicButton style at a uniform 75% scale. There is no Auto button or Auto destination-mode UI. Ambient NPC notices and rows are suppressed; only your followers appear.
 
 Buttons only show when they can be used:
-- **On foot** (if you own a vehicle): Summon, Follow, Get in (near your vehicle), a
-  status box (*SUMMONING 120 m*, *FOLLOWING 42 m*…), and when your followers use vehicles, who is in them (*Sarah, Barrett +1*) and a line
-  per follower (*Sarah  escort  42 m*).
-- **In the vehicle:** W / A / S / D, Alt hold to descend / Alt tap for gear / Hover, the gear box, **Auto**, and follower vehicle lines.
-- **Route display on the HUD/scanner:** native status boxes for the destination and queued stops, with native **Retry / Skip / Clear** key prompts. Select **Route** in the F7 editor to move the group.
+- **On foot** (if you own a vehicle): Summon / Recall, Cover / Stop cover, Get in (near your vehicle), and a status box:
+  *SUMMONING 120 m*, *COVER 42 m*, *COVER · DEFEND 42 m* (fighting), *GUARD POINT*, *GUARD POINT · DEFEND*, *HOLDING*, or the empty
+  vehicle's navigation profile (*SCOUT*, *RETURN HOME*).
+- **Follower rows**, one per follower in a vehicle: an active order shows alone (*Sarah  RECALL  85 m*, *COVER*, *GUARD POINT*,
+  *HOLDING*, *Sarah  RAM READY*, *RAMMING*); otherwise the navigation profile, the combat profile during a fight, and *HOLD FIRE* only when
+  the weapons are held (*Sarah  PATROL  120 m*, *Sarah  PATROL · ATTACK  120 m*, *Sarah  HAULER · DEFEND · HOLD FIRE  200 m*).
+- **In the vehicle:** W / A / S / D, Alt hold to descend / Alt tap for gear / Hover, the gear box, the trip line (trip states,
+  *AIM + T* with no destination, *RAM READY · SELECT TARGET*, *RAMMING*) and the follower rows.
+- **Target:** the scanner readout uses the former Gang box's saved position, with the same native style and size. Select **Target** in F7 to move it. The Gang summary is removed.
+- **Route display on the HUD/scanner:** native status boxes for the destination and queued stops, with native **Retry / Skip** key prompts and *T T: clear route*. Select **Route** in the F7 editor to move the group.
 
 ---
 
@@ -140,7 +153,7 @@ Buttons only show when they can be used:
 - Flight rates, acceleration, braking distance and swept clearance use each vehicle's width, length, height and live scale. Long hulls turn/pitch more slowly; wide hulls roll more slowly; faster turns are limited by lateral acceleration. Valid large bounds are retained. This applies to compatible native vehicles without a model-name list; missing bounds use a conservative fallback.
 - Only your own vehicle follows you. Other NPC vehicles keep their schedule/combat behavior and hold their own position between fights instead of forming up behind you.
 - Traffic checks the actor's native path before boarding: interior points, changes of worldspace, paths near doors, short walks, and unresolved path context stay on foot.
-- In combat, **T while the scanner highlights an actor** orders your driven vehicle, or your own vehicle, to ram that exact actor. It reads the scanner's selected reference handle rather than guessing from a viewing cone. The order tracks the actor, exempts only the selected target from avoidance, and ends on impact, target loss, combat end or a 15-second timeout. Ground approach is used for an actor on foot nearby; terrain and unrelated traffic remain obstacles. Movement controls take over as usual.
+- **Ram:** hold T (1 s) to arm, then tap T while the scanner highlights a person or vehicle. Your driven vehicle, or your own vehicle, rams that exact target. The target comes from the scanner's own pick data (the public `MonoclePickRefData` provider), never from a guess based on a viewing cone. The order tracks the target and exempts only it from avoidance. It ends on impact, when the target is lost, or after 15 s; it no longer depends on your combat flag. Refusals are logged with their reason. A ground approach is used for a target on foot nearby, and terrain and unrelated traffic remain obstacles. Movement controls take over as usual.
 - Scanner target range reads m/km and includes elevation; a selected place uses the number displayed by the scanner. Exiting a driver/passenger seat clears the route and consumes the previous target until a new selection is made.
 - Native NPC dismount requests are allowed. Repeated requests preserve their first timeout; unsafe or failed exits release mod control instead of retrying forever. The near-goal trail escape loop found in the organic-play log is also corrected.
 
@@ -193,6 +206,28 @@ makes the lower-ranked vehicle give way (it slows and slides aside). **Right of 
 neutral NPCs > hostiles. A longer-range lane planner also predicts every vehicle's path about 10 s ahead and changes height, side or
 speed to keep paths apart.
 
+### Your vehicle defends you
+Under **Cover** (U) or on a **guard point** (T while covering), your **empty** vehicle fights for you:
+- **Enemy awareness:** twice a second it looks for your enemies within 120 m of you (or of the guard point), enemies in vehicles first, and keeps its target out to about 156 m.
+- **Defend positioning:** under Cover it moves to a spot between you and the threat (12 m from you, never past the enemy). On a guard point it stays at the point. Either way it then picks the nearby spot with the best cover and line of fire. A parked vehicle lifts off to fight, and it does not park while a fight is on.
+- **Its weapon:** at its spot it turns to face the threat and fires short bursts, only with the nose on target, within 80 m and with a clear line of fire.
+- **Never while you drive it,** and not while a follower drives it (they fight as escorts). The fight ends 8 s after the last enemy, and the trigger is always released.
+
+### Profiles: Navigation, Combat, Weapons
+Each vehicle holds one profile of each class, so choosing where it goes never replaces how it fights or when it shoots:
+
+| Class | Profiles |
+|---|---|
+| Navigation | escort, hold, return home, patrol, hauler, courier, scout, cruise |
+| Combat | attack, defend (a ram is a one-shot order, not a profile) |
+| Weapons | free fire (default), opportunistic (shoots only what is in front, never turns for a shot), hold fire, never |
+
+When a fight starts, the combat profile follows from the navigation profile: escort, scout, cruise, hauler, courier and return home
+**defend**; patrol and hold **attack**. It ends again 20 s after the last enemy. Your orders sit above the profiles for as long as they
+run: **Recall** has no combat and holds fire; **Cover** defends without chasing and shoots opportunistically; a **guard point** holds the
+point and defends from it; an armed ram defends, then holds fire while ramming. The player's seat is always "never": a vehicle you drive
+never shoots by itself.
+
 ### Catch from below
 When you are more than 4 m above the ground (jumping off a ledge, jetpacking, falling), your following vehicle flies to a point about
 7 m under where your fall will take you, so it can catch you. It moves smoothly (no wobbling) and goes back to normal following once
@@ -205,16 +240,18 @@ you land.
 Followers are read from the game's own follower list.
 
 ### Follower drivers (crew)
-If a follower is free (on foot, within 60 m) when you press **Summon**, **Follow**, set a **scanner marker** or press the **Auto
-behaviour** key, your vehicle is brought to you and **the follower gets in and drives it**:
+If a follower is free (on foot, within 60 m) when you press **Cover** or set a **scanner marker**, your vehicle is brought to you and
+**the follower gets in and drives it**. **N** never hands your vehicle over, because N means you want to drive.
 
 | You press | The follower… |
 |---|---|
-| Summon / Follow | drives your vehicle after you, defends you in a fight, picks up other followers as passengers |
+| Cover (U) | drives your vehicle after you and defends you without chasing enemies away; picks up other followers as passengers |
+| T while covering | holds the aimed guard point, even in a fight, and defends from it |
 | Scanner marker | drives to your marker and stops there |
-| Follow again | gets out |
+| N | brings your vehicle to you without firing, parks within 10 m and gets out so you can drive |
+| U again | gets out |
 
-No follower free? The buttons work as before. Your vehicle's own autopilot leaves it alone while a follower drives.
+No follower free? The buttons drive your empty vehicle instead. Your vehicle's own autopilot leaves it alone while a follower drives.
 
 ### Escorts
 When a fight starts near you, followers take free vehicles close to them and become **escorts**:
@@ -232,7 +269,7 @@ When a fight starts near you, followers take free vehicles close to them and bec
 | **Pick up wounded** | a follower is under 30 % health | An escort picks them up as a passenger |
 
 Escorts target **enemy vehicles first**, spread their targets so two don't pile onto one enemy, and never target you or other followers.
-Hold **U** to recall them.
+Press **N** to recall them for 15 s.
 
 ---
 
@@ -317,7 +354,9 @@ All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 
 **Previously tested in game:** older hover flight, gears, HUD buttons and summon/follow builds. The current changes below still need organic gameplay verification.
 
-**Built, not yet tested in game** (everything else), including: Auto and Cruise, scanner markers
+**Built, not yet tested in game** (everything else), including: the T tap / double tap / hold controls, the armed ram and its scanner
+pick data, N Recall, U Cover and guard points, your empty vehicle's defence, the Navigation / Combat / Weapons profiles and their row
+texts, the Target readout in the former Gang slot, Auto and Cruise, scanner markers
 and chains, catch from below, follower drivers, every escort and enemy behaviour, the hit counter, everyday traffic, vehicle-to-vehicle
 right of way, the wall warning, night and weather, bystander reactions, passenger / taxi / take the wheel, the seat rules and forced
 exits, drive mode, metered boost, view distance and the vehicle registry.

@@ -29,11 +29,12 @@ passed through small locked structs or atomics (see `prefetch.h`).
 
 | Module | Owns |
 |---|---|
-| `vehicleflight.*` | Hover flight model, autopilot (`Fly`), terrain assist / avoidance corridors, summon / follow / Auto, drive mode, flip recovery, native-meter boost, `PilotFly(pilot, vehicle, Goal)` |
+| `vehicleflight.*` | Hover flight model, autopilot (`Fly`), terrain assist / avoidance corridors, N summon / recall, U cover and guard points, the empty own vehicle's cover combat (`CoverFightTick`), ram arming and orders, drive mode, flip recovery, native-meter boost, `PilotFly(pilot, vehicle, Goal)` |
 | `npcvehicles.*` | NPC jobs: walk to a vehicle (quest package), instant seat, follow / orbit actions, park / relaunch, attack run and vehicle weapon, exit service, riders (passengers), leash, occupied-vehicle rules (tap / hold E), forced exits |
 | `context.*` | The rules engine: who boards what, which profile, when to get out |
-| `vcontract.*` | The contract between profile code and the owners: `Goal`, `Profile`, assignment per vehicle, `SeatProvider`, `ExitRequest` |
-| `profiles.*` | The profile table: escort, pursuit (goal code), hold, return home, patrol, hauler, courier, scout, cruise |
+| `vcontract.*` | The contract between profile code and the owners: `Goal`, `Profile`, one assignment per vehicle **per class** (Navigation / Combat / Weapons), `SeatProvider`, `ExitRequest` |
+| `profiles.*` | The profile table. Navigation: escort, hold, return home, patrol, hauler, courier, scout, cruise. Combat: attack (the former pursuit goal), defend. Weapons: free fire, opportunistic, hold fire, never |
+| `overrides.h`, `profileclass.h`, `coverfight.h`, `targetinput.h`, `ramlogic.h` | Pure rules (offline-tested): the player's N / U / T overrides, class defaults, the weapons gate and row texts, own-vehicle cover combat, the T gestures, ram arming / ending |
 | `navmap.*` | Shared world map (4 m cells: ground, floors, solid, free, contacts), `PathClear`, heading sampler |
 | `vehicle_probe.*`, `prefetch.h` | Ground probes, forward rays and hull-sized shape sweeps run inside the game's update; request / result slots |
 | `routeplan.*` | 3D lane planner: predicts every vehicle about 10 s ahead and picks a lane / side / speed so they do not meet |
@@ -55,8 +56,14 @@ passed through small locked structs or atomics (see `prefetch.h`).
 1. **Boarding.** `BoardNpc(actor, vehicle, asDriver)` takes a free slot. The NPC is given the vehicle's seat keyword and walks (or runs in combat or when the
    vehicle is over 40 m away) with a quest package from `SeamlessPilots.esm`. When it stands within about 3.5 m it is seated with the game's instant
    seat (`kAnimatedEntry` is off). A passenger job (`seat >= 1`) frees its slot once seated and is kept in `g_riders`.
-2. **Following.** The vehicle's profile gives the goal each frame (`vcontract::GoalFor`). Escort and pursuit goals live in `profiles.cpp`; this file keeps the
-   actions: park when you stand still, relaunch, attack run, aim and burst fire (pursuit), re-aggro.
+2. **Following.** Each frame the Navigation profile gives the goal (`vcontract::GoalFor`; escort is a follower's default). A hostile pursuer has no
+   navigation profile; its Combat profile `attack` gives the goal instead. When `PickFoe` finds an enemy and no Combat profile is set, one is chosen from
+   the navigation profile (`profileclass::DefaultCombat`: patrol / hold attack, the rest defend) and cleared 20 s after the last enemy. `attack` runs
+   `PursueGoal` and attack runs; `defend` runs `DefendGoal`; `CombatPosition` refines both. The crew orders (Recall, Cover, Guard, Hold, Marker;
+   `overrides.h`) sit above the classes: Recall drops the fight and holds fire, Cover defends without chasing, Guard holds its point over a fight.
+   The Weapons profile (and the override) decides `MayFire` / `MayAim`. Hostility comes only from `ApplyProfile` (escort / pursuit switch), never from
+   a navigation profile. This file keeps the actions: park when you stand still, relaunch, attack run, aim and burst fire, re-aggro.
+   `SubmitFire` is the single weapons gate: a vehicle the player drives never fires by itself.
 3. **Leaving.** The exit service (`RequestExit`, `UnloadVehicle`, `ExitStateOf`): the game's animated dismount, then the instant exit. The leash (600 m
    from where the NPC started) and going indoors also end following.
 
@@ -68,7 +75,7 @@ About every 0.5 s (the actor scan every 1 s, up to 8000 loaded references):
 
 - **Fight:** an NPC in combat within 80 m of you, not in a vehicle, with a free vehicle within 40 m of it (never your own rover) is sent with `BoardNpc`.
   Followers become escort, everyone else pursuit. A follower with no free vehicle near boards a vehicle an NPC drives as a passenger.
-- **Profile:** once a job is following, `SetVehicleProfile` assigns escort or pursuit through `vcontract`.
+- **Profile:** once a job is following, `SetVehicleProfile` switches escort / pursuit through `ApplyProfile`, which assigns the classes (pursuit: Combat `attack`, no escort navigation).
 - **Calm:** the player and the driver not in combat, and the vehicle under 2 m/s for 60 s: `UnloadVehicle` (everyone out).
 - Off switch: `seamless.ini [context] enabled=0`.
 
@@ -107,4 +114,4 @@ Physics callbacks have no default player owner. Each controller receives a bound
 
 `traffic::Destination` carries a conservative vehicle-suitability decision from the counted native path: every point must resolve to the current exterior world, without a nearby door. Context and the transit entry point both enforce it. Vehicle projectile intersections notify native driver/owner combat and interrupt civil tasks, with only the explicit aggressor prioritized for retaliation. Ambient behavior is logged; HUD notices/rows require an actual follower.
 
-`targetsession` invalidates consumed marker coordinates/handles at seat exit; new scanner selection re-arms them. Scanner-selected actor handles feed bounded ram orders. A ram exempts its chosen vehicle only, preserving environmental and other-traffic checks. Native exits are forwarded and queued for bounded cleanup; polling cannot restart a deadline.
+`targetsession` invalidates consumed marker coordinates/handles at seat exit; new scanner selection re-arms them. A T hold (`targetinput`, 1 s) arms a ram (`ArmRam`); the next tap's scanner-picked actor (`MonoclePickRefData`) feeds a bounded ram order (`RequestRam`, `ramlogic`). A ram exempts its chosen vehicle only, preserving environmental and other-traffic checks. Native exits are forwarded and queued for bounded cleanup; polling cannot restart a deadline.

@@ -63,13 +63,21 @@ namespace vcontract
 		bool done = false;               // set by the profile: finished; the owner's default takes over again
 	};
 
-	// A profile: a goal source. goal() returns false for "no goal this frame" (the owner keeps its own behaviour).
+	// The class of a profile (2026-10-20, the user): a vehicle holds one profile of each class at once, so choosing where it goes never replaces
+	// how it fights or when it shoots. Navigation: escort, hold, return home, patrol, hauler, courier, scout, cruise. Combat: attack, defend (the
+	// ram is a one-shot order, vehicleflight::RequestRam). Weapons: free fire (default), opportunistic, hold fire, never (the player's seat).
+	enum class Class : std::uint8_t { Navigation = 0, Combat = 1, Weapons = 2 };
+	inline constexpr int kClasses = 3;
+
+	// A profile: a goal source. goal() returns false for "no goal this frame" (the owner keeps its own behaviour). Combat and Weapons
+	// profiles are selectors the owner reads with AssignedTo(id, cls); their goal may be null.
 	struct Profile
 	{
 		const char* name;
 		std::uint8_t users;              // bit mask of User
 		bool (*goal)(Context& ctx, Goal& out);
 		bool needsSeats;                 // boards / unloads someone (waits for SetSeatProvider)
+		Class cls = Class::Navigation;
 	};
 
 	// ---- registry ----
@@ -78,13 +86,16 @@ namespace vcontract
 	const Profile* ProfileAt(int i);
 	const Profile* Find(const char* name);
 
-	// ---- assignment (by vehicle form id) ----
+	// ---- assignment (by vehicle form id), one per class ----
+	// Assign fills p's own class and leaves the vehicle's other classes alone; a null p clears the Navigation class only.
 	void Assign(std::uint32_t vehicleId, const Profile* p, double homeX, double homeY);
-	void Unassign(std::uint32_t vehicleId);
-	const Profile* AssignedTo(std::uint32_t vehicleId);  // nullptr: the owner's default behaviour
+	void Unassign(std::uint32_t vehicleId);              // every class (the job is over, the driver left)
+	void Unassign(std::uint32_t vehicleId, Class cls);
+	const Profile* AssignedTo(std::uint32_t vehicleId);  // the Navigation profile; nullptr: the owner's default behaviour
+	const Profile* AssignedTo(std::uint32_t vehicleId, Class cls);
 
 	// ---- the owners' hook: the assigned profile's goal for this frame (false: none applies, keep your own) ----
-	bool GoalFor(User user, int pilot, std::uintptr_t vehicle, std::uintptr_t player, Goal& out);
+	bool GoalFor(User user, int pilot, std::uintptr_t vehicle, std::uintptr_t player, Goal& out, Class cls = Class::Navigation);
 
 	// ---- seats (implemented by the seat owner) ----
 	// WaitingToLand: an exit is asked but the vehicle is still flying (NORMAL waits for the flight code's landing).

@@ -40,7 +40,15 @@ namespace vehicleflight
 	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out);
 	// The player's custom map marker as a point in `vehicle`'s world (false: none, not loaded, another worldspace, too far).
 	bool Ramming(std::uint32_t vehicleId);
-	bool RequestRam(std::uintptr_t actor); // explicit scanner highlight in combat
+	// Hold T (scantarget): the driven or own vehicle hovers in place and waits for a ram target; returns its form id, 0 when refused (logged).
+	// The player keeps driving and shooting a vehicle they drive. Ends on a ram order, a cleared route, a load or ramlogic::kReadyMs.
+	std::uint32_t ArmRam();
+	bool RamReady(std::uint32_t vehicleId);
+	void DisarmRam();
+	// Cover (U) is on for the player's own vehicle (empty, or a follower drives it): a T selection then sets its guard point instead of a trip.
+	bool CoverActive();
+	bool SetGuardPoint(double x, double y);  // the vehicle holds there and defends from it; false when Cover is off or the vehicle cannot fly
+	bool RequestRam(std::uintptr_t actor); // the actor highlighted after ArmRam; refusals are logged with their reason
 	void FreshScannerTarget(); // explicit selection can reuse the same marker coordinates
 	void EndTargetSession(std::uintptr_t vehicle);
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y, double* z = nullptr);

@@ -1,4 +1,6 @@
 #include "npcvehicles.h"
+#include "overrides.h"
+#include "profileclass.h"
 
 #include "addresses.h"
 #include "controlmap.h"
@@ -106,6 +108,9 @@ namespace npcvehicles
 			double tx = 0, ty = 0, tvx = 0, tvy = 0;  // the followed target's last position and smoothed velocity
 			ULONGLONG aggroAt = 0;             // last combat request (attack)
 			Profile profile = Profile::Escort;
+			bool autoCombat = false;           // the combat profile was chosen because a fight started (cleared when it is over)
+			ULONGLONG fightAt = 0;             // last frame with an enemy picked
+			bool fighting = false;             // an enemy is picked now (the follower row shows the combat profile)
 			bool gang = false;                 // started by the gang (mirrors the player), not by the force key
 			double originX = 0, originY = 0;   // where the NPC stood when the job began (the leash is measured from here)
 			bool haveOrigin = false;
@@ -627,8 +632,10 @@ namespace npcvehicles
 			if (p != Phase::Following) { j.foe = 0; j.foeTier = -1; j.foeAt = 0; j.rescueParked = j.scoutReported = j.waiting = j.retreating = false; j.pMode = -1; }
 			if (p == Phase::Idle) { j.exitWaitSince=0; j.order = 0; j.task = 0; j.haveHome = false; }
 			if (p == Phase::Idle && j.vehicle && !j.passenger) {  // the job is over: an escort / pursuit assignment ends with it (other profiles are left alone)
+				vcontract::Unassign(j.vehicle, vcontract::Class::Combat);
+				vcontract::Unassign(j.vehicle, vcontract::Class::Weapons);
 				const vcontract::Profile* ap = vcontract::AssignedTo(j.vehicle);
-				if (ap && (std::strcmp(ap->name, "escort") == 0 || std::strcmp(ap->name, "pursuit") == 0)) vcontract::Unassign(j.vehicle);
+				if (ap && std::strcmp(ap->name, "escort") == 0) vcontract::Unassign(j.vehicle, vcontract::Class::Navigation);
 			}
 			if (p == Phase::Boarding) {
 				j.exitWaitSince=0;
@@ -719,13 +726,6 @@ namespace npcvehicles
 		void Leave(Job& j, uptr npc, const char* why);
 		bool ApplyProfile(Job& j, Profile to, uptr player);
 		// escort / pursuit are profiles of the shared table (profiles.cpp); an assignment of one of them decides the job's behaviour.
-		void SyncProfile(Job& j, uptr player)
-		{
-			const vcontract::Profile* ap = vcontract::AssignedTo(j.vehicle);
-			if (!ap) return;
-			const Profile want = std::strcmp(ap->name, "pursuit") == 0 ? Profile::Pursuit : std::strcmp(ap->name, "escort") == 0 ? Profile::Escort : j.profile;
-			if (want != j.profile) ApplyProfile(j, want, player);
-		}
 
 		bool HasSeatInteraction(uptr npc)
 		{
@@ -863,6 +863,17 @@ namespace npcvehicles
 
 		bool SubmitFire(int slot, std::uint32_t vehicleId, bool fire)
 		{
+			// The one Weapons gate for the player's seat (profileclass "never"): every automatic shot comes through here, and a vehicle the player
+			// drives never fires by itself; the player shoots from it.
+			if (fire) {
+				const uptr player = Ptr(addr::kPlayerCharacterPtr);
+				const uptr driven = player ? EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(player) : 0;
+				if (!profileclass::MayFire(profileclass::Weapons::Free, driven && At<std::uint32_t>(driven, off::kFormId) == vehicleId)) {
+					static ULONGLONG said = 0;
+					if (GetTickCount64() - said > 10000) { said = GetTickCount64(); logger::Write("NPC vehicles: vehicle %08X weapon refused (the player drives it)", vehicleId); }
+					fire = false;
+				}
+			}
 			auto* h = g_fireHandler[slot];
 			std::memset(h + 0x80, 0, 0x20);
 			// The input block (handler + 0x80; FUN_141324650): +0x10 steer, +0x14 accelerate, +0x18 brake, +0x1C forward
@@ -970,6 +981,24 @@ namespace npcvehicles
 			const auto actor=RefById(it->second.attacker);return actor&&!Dead(actor)?actor:0;
 		}
 		ULONGLONG g_recallUntil = 0;             // escorts recalled into formation until then
+		constexpr ULONGLONG kFightOverMs = 20000;  // an automatically chosen combat profile ends this long after the last enemy
+		constexpr double kRecallBoard = 10.0;   // m: a recalled vehicle this close to the player parks and its crew driver gets out
+		overrides::Mode ModeOf(int order)
+		{
+			return order == int(CrewOrder::Recall) ? overrides::Mode::Recall : order == int(CrewOrder::Cover) ? overrides::Mode::Cover :
+				order == int(CrewOrder::Guard) ? overrides::Mode::Guard : overrides::Mode::None;
+		}
+		const char* OrderText(CrewOrder order)
+		{
+			switch (order) {
+			case CrewOrder::Marker: return "to your marker";
+			case CrewOrder::Hold: return "hold position";
+			case CrewOrder::Recall: return "recall to you";
+			case CrewOrder::Cover: return "cover you";
+			case CrewOrder::Guard: return "guard the point";
+			default: return "follow you";
+			}
+		}
 		constexpr double kFoeRange = 150.0;      // m from the vehicle
 		constexpr double kDefendLeash = 250.0;   // m: a defender's target stays this close to the player
 		constexpr ULONGLONG kFoePickMs = 500;
@@ -1118,7 +1147,8 @@ namespace npcvehicles
 			uptr firstVeh = 0;
 			double best = 1e9;
 			for (auto& j : g_jobs) {
-				if (j.phase != Phase::Following || j.profile != Profile::Escort || j.order == int(CrewOrder::Marker) || !targetsession::CanFollow(j.vehicle,vehicleflight::OwnRoverId())) continue;
+				if (j.phase != Phase::Following || j.profile != Profile::Escort || j.order == int(CrewOrder::Marker) || j.order == int(CrewOrder::Recall) ||
+					j.order == int(CrewOrder::Guard) || !targetsession::CanFollow(j.vehicle,vehicleflight::OwnRoverId())) continue;
 				const uptr v = RefById(j.vehicle);
 				if (!v) continue;
 				const double d = Dist(v, player);
@@ -1992,7 +2022,14 @@ namespace npcvehicles
 					TaskTick(j, npc, vehicle, player, aboard, now);
 					break;
 				}
-				SyncProfile(j, player);
+				if (j.profile == Profile::Escort && !vcontract::AssignedTo(j.vehicle)) {
+					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+					vcontract::Assign(j.vehicle, vcontract::Find("escort"), vp.x, vp.y);  // a follower's navigation default
+				}
+				// The player's override (N recall / U cover / T guard) limits what the fight below may do.
+				const auto mode = ModeOf(j.order);
+				const auto rules = overrides::For(mode);
+				if (!rules.fire && j.firing) { SubmitFire(j.pilot - 1, j.vehicle, false); j.firing = false; }
 				// Following, as the player's rover follow (U): trail behind the player, park when the player stands still,
 				// lift off again when the player moves away; the NPC stays aboard throughout.
 				const auto pp = At<game::Vec3>(player, off::kRefPosition);
@@ -2002,31 +2039,57 @@ namespace npcvehicles
 					j.stillSince = now;
 				}
 				const bool playerStill = now - j.stillSince >= kFollowStillMs;
-				// The goal comes from the vehicle's assigned profile (escort and pursuit by default); the actions (park, relaunch, attack run, weapon) are this owner's.
+				// Three classes (vcontract::Class): Navigation says where the vehicle goes (escort by default), Combat how it fights (attack / defend,
+				// chosen from Navigation when a fight starts), Weapons when it shoots. A hostile pursuer has only its attack profile, which also gives its goal.
 				vcontract::Goal pg;
-				const bool have = vcontract::GoalFor(vcontract::User::Npc, j.pilot, vehicle, player, pg);
+				bool have = vcontract::GoalFor(vcontract::User::Npc, j.pilot, vehicle, player, pg);
+				if (!have) have = vcontract::GoalFor(vcontract::User::Npc, j.pilot, vehicle, player, pg, vcontract::Class::Combat);
 				const vcontract::Profile* ap = vcontract::AssignedTo(j.vehicle);
-				const bool owned = ap && (std::strcmp(ap->name, "escort") == 0 || std::strcmp(ap->name, "pursuit") == 0);
-				// The combat target: escorts defend the player (vehicles in the fight first), pursuers attack the player's side; nothing picked: a pursuer attacks the player.
+				const char* navName = ap ? ap->name : nullptr;
+				const bool escortNav = profileclass::Is(navName, "escort");
+				const vcontract::Profile* cp = vcontract::AssignedTo(j.vehicle, vcontract::Class::Combat);
+				const vcontract::Profile* wp = vcontract::AssignedTo(j.vehicle, vcontract::Class::Weapons);
+				const auto weapons = profileclass::Effective(profileclass::WeaponsFor(wp ? wp->name : nullptr),
+					mode == overrides::Mode::Recall, mode == overrides::Mode::Cover);
+				// The combat target: defenders protect the player (vehicles in the fight first), attackers go for the player's enemies; nothing picked: a
+				// hostile pursuer attacks the player.
 				uptr foe = 0;
-				if (aboard && have && owned && Outdoors(player)) foe = PickFoe(j, npc, vehicle, player, now);
+				if (aboard && have && Outdoors(player) && rules.pickFoe) foe = PickFoe(j, npc, vehicle, player, now);
+				if (foe) j.fightAt = now;
+				if (foe && !cp) {
+					// A fight starts: the combat profile follows from the navigation profile; navigation itself stays assigned.
+					if ((cp = vcontract::Find(profileclass::DefaultCombat(navName)))) {
+						const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+						vcontract::Assign(j.vehicle, cp, vp.x, vp.y);
+						j.autoCombat = true;
+					}
+				}
+				else if (!foe && cp && j.autoCombat && now - j.fightAt > kFightOverMs) {
+					vcontract::Unassign(j.vehicle, vcontract::Class::Combat);
+					cp = nullptr;
+					j.autoCombat = false;
+				}
+				j.fighting = foe != 0;
+				// Cover and a guard point lock the combat profile to defend.
+				const bool attacking = cp && profileclass::Is(cp->name, "attack") && mode == overrides::Mode::None;
 				const bool retaliating=foe && foe==Aggressor(j.vehicle,now);
-				const bool defending = foe && j.profile == Profile::Escort && !retaliating;
+				const bool defending = foe && !attacking && !retaliating;
 				if (!defending) j.defMode = -1;
-				if (!foe && j.profile == Profile::Pursuit) foe = player;
+				if (!foe && j.profile == Profile::Pursuit && mode == overrides::Mode::None) foe = player;
 				const uptr foeVeh = foe ? InVehicle(foe) : 0;
 				const uptr aimRef = foeVeh ? foeVeh : foe;
 				const double toFoe = aimRef ? Dist(vehicle, aimRef) : 1e9;
 				int defMode = 0, pMode = -1;
-				if (foe && have && owned && j.profile == Profile::Pursuit) pMode = PursueGoal(j, aimRef, foeVeh != 0, vehicle, now, pg);
-				else if (foe && (foe != player || retaliating) && have) {
+				if (foe && have && attacking && rules.chase) pMode = PursueGoal(j, aimRef, foeVeh != 0, vehicle, now, pg);
+				else if (foe && (foe != player || retaliating) && have && rules.chase) {
 					if (defending) defMode = DefendGoal(j, aimRef, foeVeh != 0, player, vehicle, now, pg);
 					else OrbitGoal(j, aimRef, vehicle, pg);
 				}
 				// Orders and context for escorts: rescue wins over everything, a fight over the rest; then a crew marker order, then scouting.
-				const bool escortJob = j.profile == Profile::Escort && have && owned && targetsession::CanFollow(j.vehicle,vehicleflight::OwnRoverId());
+				const bool escortJob = j.profile == Profile::Escort && have && escortNav && targetsession::CanFollow(j.vehicle,vehicleflight::OwnRoverId());
 				const bool rescuer = escortJob && g_ec.mode == EscMode::Rescue && g_ec.rescuer == j.pilot;
-				const bool scouting = escortJob && !defending && !rescuer && g_ec.mode == EscMode::Scout && g_ec.scout == j.pilot && j.order != int(CrewOrder::Marker);
+				const bool scouting = escortJob && !defending && !rescuer && g_ec.mode == EscMode::Scout && g_ec.scout == j.pilot && j.order != int(CrewOrder::Marker) &&
+					mode == overrides::Mode::None;
 				bool toMarker = false;
 				if (!rescuer) j.rescueParked = false;
 				if (rescuer) {
@@ -2035,6 +2098,14 @@ namespace npcvehicles
 					pg.z = std::numeric_limits<double>::quiet_NaN();
 					pg.stop = 4.0;
 					pg.hold = false;
+				}
+				else if (mode == overrides::Mode::Recall) {
+					pg.x = pp.x; pg.y = pp.y; pg.z = std::numeric_limits<double>::quiet_NaN(); pg.stop = kRecallBoard * 0.6; pg.hold = false;
+					toMarker = true;  // N: straight to the player, whatever the fight
+				}
+				else if (mode == overrides::Mode::Guard) {
+					pg.x=j.orderX; pg.y=j.orderY; pg.z=j.orderZ; pg.stop=1.5; pg.hold=true;
+					toMarker=true; // the guard point beats a fight; the escort defends from it
 				}
 				else if (escortJob && !defending && j.order == int(CrewOrder::Hold)) {
 					pg.x=j.orderX; pg.y=j.orderY; pg.z=j.orderZ; pg.stop=1.5; pg.hold=true;
@@ -2060,13 +2131,14 @@ namespace npcvehicles
 						logger::Write("NPC vehicles: [%d] scouted the marker: %d enemies within 80 m", j.pilot, n);
 					}
 				}
-                if(foe && !rescuer && !toMarker && !scouting) {
+                if(foe && !rescuer && !toMarker && !scouting && rules.chase) {
                     const auto enemy=At<game::Vec3>(aimRef,off::kRefPosition);
                     const float threat[]={enemy.x,enemy.y,enemy.z+1.2f};
                     environment::CombatPosition(j.vehicle,threat,pg.x,pg.y,pg.z,defending||j.retreating);
                 }
 				const bool busyGoal = rescuer || toMarker || scouting;
-				const bool attackRun = defMode == 0 && (pMode < 0 || pMode == 10) && toFoe < kAttackRun && !rescuer;
+				const bool attackRun = defMode == 0 && (pMode < 0 || pMode == 10) && toFoe < kAttackRun && !rescuer && rules.chase &&
+					profileclass::MayAim(weapons, false);
 				if (!aboard) {
 					if(j.vehicle==vehicleflight::OwnRoverId() && j.order)vehicleflight::EndTargetSession(vehicle);
 					logger::Write("NPC vehicles: [%d] NPC %08X left the vehicle", j.pilot, j.npc);
@@ -2085,17 +2157,24 @@ namespace npcvehicles
 						logger::Write("NPC vehicles: [%d] you went indoors; NPC %08X waits at the door", j.pilot, j.npc);
 					}
 				}
+				else if (mode == overrides::Mode::Recall && toPlayer < kRecallBoard) {
+					vehicleflight::PilotStop(j.pilot, "recall: beside the player");
+					j.parked = true;
+					FollowerNotice(j.npc, "Your vehicle is here | your follower gets out");
+					logger::Write("NPC vehicles: [%d] recall: %.0f m from you; NPC %08X gets out for you", j.pilot, toPlayer, j.npc);
+					Set(j, Phase::Settling);
+				}
 				else if (!j.order && (j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) > kLeash : toPlayer > kGiveUp)) {
 					logger::Write("NPC vehicles: [%d] stopped following (%s, %.0f m from you, %.0f m from where it started)", j.pilot, Outdoors(player) ? "too far from its origin" : "you went indoors", toPlayer,
 						j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) : 0.0);
 					vehicleflight::PilotStop(j.pilot, "gave up");
 					Set(j, Phase::Settling);
 				}
-				else if (have && !owned) {
-					// HOOK 1 of the vehicle contract: another assigned profile (patrol, hauler, ...) drives.
+				else if (have && !escortNav && !foe && ap) {
+					// HOOK 1 of the vehicle contract: another navigation profile (patrol, hauler, ...) drives; a fight goes to the combat code below.
 					vehicleflight::PilotFly(j.pilot, vehicle, pg);
 				}
-				else if (pMode == 14 && toFoe > kRetreatDist - 20.0) {
+				else if (pMode == 14 && toFoe > kRetreatDist - 20.0 && j.profile == Profile::Pursuit) {
 					// Retreated far enough: land, the driver gets out and fights on foot; the vehicle's autopilot stays off a minute.
 					vehicleflight::PilotStop(j.pilot, "retreated");
 					vehicleflight::DisableAutopilot(j.vehicle, 60000, "retreated (hit limit near)");
@@ -2113,7 +2192,7 @@ namespace npcvehicles
 					}
 				}
 				else if (have && vehicleflight::PilotActive(j.pilot) && foe) {
-					if ((kProfiles[int(j.profile)].hostile || defending || retaliating) && !InCombat(npc) && now - j.aggroAt >= kReaggroMs) {
+					if ((kProfiles[int(j.profile)].hostile || defending || retaliating || attacking) && !InCombat(npc) && now - j.aggroAt >= kReaggroMs) {
 						j.aggroAt = now;
 						const bool ok = Aggro(npc, foe);
 						logger::Write("NPC vehicles: [%d] NPC %08X attack: combat with %08X -> %s", j.pilot, j.npc, At<std::uint32_t>(foe, off::kFormId), ok ? "asked" : "failed");
@@ -2130,7 +2209,7 @@ namespace npcvehicles
 					}
 					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 					const auto vr = At<game::Vec3>(vehicle, off::kRefRotation);
-					if ((defMode == 3 || pMode == 13) && std::hypot(pg.x - vp.x, pg.y - vp.y) < 12.0) {
+					if ((defMode == 3 || pMode == 13 || mode == overrides::Mode::Guard) && profileclass::MayAim(weapons, false) && std::hypot(pg.x - vp.x, pg.y - vp.y) < 12.0) {
 						// Overwatch: in place, the nose on the enemy (yaw and pitch), the autopilot holds the spot.
 						vehicleflight::Command c;
 						c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kPitch;
@@ -2145,7 +2224,8 @@ namespace npcvehicles
 					const double pitchWant = std::atan2(azp - vp.z, std::max(1.0, std::hypot(axp - vp.x, ayp - vp.y)));
 					const double pitchErr = std::fabs(pitchWant + vr.x);
 					const bool onTarget = aimErr < kFireCone && pitchErr < kFireCone * 1.5;
-					const bool inRange = (kProfiles[int(j.profile)].fire || defending || retaliating) && Dist3(vehicle, aimRef) < kFireRange;
+					const bool inRange = rules.fire && profileclass::MayFire(weapons, false) && (kProfiles[int(j.profile)].fire || defending || retaliating || attacking) &&
+						Dist3(vehicle, aimRef) < kFireRange;
 					const float muzzle[]={vp.x+float(std::sin(vr.z)*4),vp.y+float(std::cos(vr.z)*4),vp.z+1.5f};
                     const float shot[]={float(axp),float(ayp),float(azp)};
                     const bool clearShot=environment::ClearShot(j.vehicle,At<std::uint32_t>(aimRef,off::kFormId),
@@ -2191,7 +2271,7 @@ namespace npcvehicles
 						j.relaunchAt = now + kRelaunchWaitMs;
 					}
 					const bool waitOver = j.parked || now >= j.relaunchAt;
-					const bool orbit = kProfiles[int(j.profile)].orbit || defending || toMarker || scouting || (rescuer && !j.rescueParked);
+					const bool orbit = kProfiles[int(j.profile)].orbit || defending || attacking || toMarker || scouting || (rescuer && !j.rescueParked);
 					if (j.waiting) {
 						j.waiting = false;
 						logger::Write("NPC vehicles: [%d] you are outside again; following", j.pilot);
@@ -2950,6 +3030,21 @@ namespace npcvehicles
 			const uptr npc = RefById(j.npc);
 			if (!npc) return false;
 			j.profile = to;
+			if (const uptr veh = RefById(j.vehicle)) {
+				const auto vp = At<game::Vec3>(veh, off::kRefPosition);
+				if (to == Profile::Pursuit) {
+					// Hostile: the attack profile drives and fights; a follower's escort navigation would pull it back to the player.
+					const auto* nav = vcontract::AssignedTo(j.vehicle);
+					if (nav && std::strcmp(nav->name, "escort") == 0) vcontract::Unassign(j.vehicle, vcontract::Class::Navigation);
+					vcontract::Assign(j.vehicle, vcontract::Find("attack"), vp.x, vp.y);
+					j.autoCombat = false;
+				}
+				else {
+					const auto* cmb = vcontract::AssignedTo(j.vehicle, vcontract::Class::Combat);
+					if (cmb && std::strcmp(cmb->name, "attack") == 0 && !j.autoCombat) vcontract::Unassign(j.vehicle, vcontract::Class::Combat);
+					if (!vcontract::AssignedTo(j.vehicle)) vcontract::Assign(j.vehicle, vcontract::Find("escort"), vp.x, vp.y);
+				}
+			}
 			if (kProfiles[int(to)].hostile) {
 				j.aggroAt = GetTickCount64();
 				Aggro(npc, player);
@@ -3013,8 +3108,6 @@ namespace npcvehicles
 				if (j.phase != Phase::Following) continue;
 				const uptr veh = RefById(j.vehicle);
 				if (!veh) continue;
-				const auto vp = At<game::Vec3>(veh, off::kRefPosition);
-				vcontract::Assign(j.vehicle, vcontract::Find(to == Profile::Pursuit ? "pursuit" : "escort"), vp.x, vp.y);
 				if (ApplyProfile(j, to, player)) ++n;
 			}
 			logger::Write(to == Profile::Pursuit ? "Vehicles: pursuit" : "Vehicles: escort");
@@ -3025,52 +3118,6 @@ namespace npcvehicles
 			g_jobs[i].pilot = i + 1;
 			if (g_jobs[i].phase != Phase::Idle) Update(g_jobs[i], player);
 			if (g_jobs[i].phase == Phase::Following && !g_jobs[i].firing) PushDrive(g_jobs[i]);
-		}
-		// The HUD's gang line: what the NPC vehicles are doing, e.g. "2  1 pursuit, 1 escort, 1 boarding" (the test profile key shows only with debug keys).
-		int following[2] = {}, boarding = 0, leaving = 0, total = 0;
-		for (const auto& j : g_jobs) {
-			if (j.phase == Phase::Idle || !IsFollower(player,RefById(j.npc))) continue;
-			++total;
-			if (j.phase == Phase::Following) ++following[int(j.profile)];
-			else if (j.phase == Phase::Boarding) ++boarding;
-			else ++leaving;  // Settling / Leaving
-		}
-		char what[96] = "";
-		auto add = [&](int n, const char* label) {
-			if (n <= 0) return;
-			char part[32];
-			std::snprintf(part, sizeof(part), "%s%d %s", what[0] ? ", " : "", n, label);
-			std::strncat(what, part, sizeof(what) - std::strlen(what) - 1);
-		};
-		add(following[int(Profile::Pursuit)], "pursuit");
-		add(following[int(Profile::Escort)], "escort");
-		add(boarding, "boarding");
-		add(leaving, "getting out");
-		int followerRiders=0;for(const auto&r:g_riders)if(IsFollower(player,RefById(r.npc)))++followerRiders;
-		add(followerRiders,"riding");total+=followerRiders;
-		{
-			// The NPCs' names (2026-10-20, the user: names instead of "Gang n"): up to three, then "+n".
-			char names[96] = "";
-			int shown = 0, more = 0;
-			auto addName = [&](std::uint32_t npcId) {
-				if(!IsFollower(player,RefById(npcId)))return;
-				if (shown >= 3) { ++more; return; }
-				char nm[40];
-				ActorName(RefById(npcId), npcId, nm, sizeof(nm));
-				std::strncat(names, shown ? ", " : "", sizeof(names) - std::strlen(names) - 1);
-				std::strncat(names, nm, sizeof(names) - std::strlen(names) - 1);
-				++shown;
-			};
-			for (const auto& j : g_jobs) {
-				if (j.phase != Phase::Idle) addName(j.npc);
-			}
-			for (const auto& r : g_riders) addName(r.npc);
-			if (more) {
-				char tail[16];
-				std::snprintf(tail, sizeof(tail), " +%d", more);
-				std::strncat(names, tail, sizeof(names) - std::strlen(names) - 1);
-			}
-			hoverui::SetGang(total, names, g_aggroKey ? controlmap::KeyName(g_aggroKey).c_str() : "");
 		}
 		{
 			// One line per NPC vehicle / rider: "pursuit  REV8  120 m".
@@ -3083,9 +3130,25 @@ namespace npcvehicles
 				const uptr v = RefById(j.vehicle);
 				char name[40] = "";
 				ActorName(RefById(j.npc), j.npc, name, sizeof(name));  // who, not which vehicle
-				const char* state = j.phase == Phase::Following ? (j.task ? "driving" : kProfiles[int(j.profile)].name) : j.passenger ? "boarding as passenger" : j.phase == Phase::Boarding ? "boarding" : "getting out";
 				const double d = v ? Dist(v, player) : 0.0;
-				std::snprintf(line[nr], sizeof(line[nr]), "%s  %s  %.0f m", name, state, d);
+				if (j.phase == Phase::Following && !j.task) {
+					// The approved row: an active override alone, else NAV (· COMBAT in a fight) (· HOLD FIRE).
+					const auto mode = ModeOf(j.order);
+					const char* over = vehicleflight::Ramming(j.vehicle) ? "RAMMING" : vehicleflight::RamReady(j.vehicle) ? "RAM READY" :
+						mode == overrides::Mode::Recall ? "RECALL" : mode == overrides::Mode::Cover ? "COVER" : mode == overrides::Mode::Guard ? "GUARD POINT" :
+						j.order == int(CrewOrder::Hold) ? "HOLDING" : nullptr;
+					const auto* nav = vcontract::AssignedTo(j.vehicle);
+					const auto* cmb = vcontract::AssignedTo(j.vehicle, vcontract::Class::Combat);
+					const auto* wpn = vcontract::AssignedTo(j.vehicle, vcontract::Class::Weapons);
+					const std::string state = profileclass::State(over, nav ? nav->name : nullptr, cmb ? cmb->name : nullptr, j.fighting,
+						profileclass::WeaponsFor(wpn ? wpn->name : nullptr));
+					if (profileclass::ShowsDistance(over)) std::snprintf(line[nr], sizeof(line[nr]), "%s  %s  %.0f m", name, state.c_str(), d);
+					else std::snprintf(line[nr], sizeof(line[nr]), "%s  %s", name, state.c_str());
+				}
+				else {
+					const char* state = j.phase == Phase::Following ? "driving" : j.passenger ? "boarding as passenger" : j.phase == Phase::Boarding ? "boarding" : "getting out";
+					std::snprintf(line[nr], sizeof(line[nr]), "%s  %s  %.0f m", name, state, d);
+				}
 				ptrs[nr] = line[nr];
 				++nr;
 			}
@@ -3517,7 +3580,7 @@ namespace npcvehicles
 				if (!v || !npc || InVehicle(npc) != v) continue;
 				uptr gang[32];
 				const int n = Followers(player, gang, 32);
-				if (j.order == int(CrewOrder::Follow)) {
+				if (j.order == int(CrewOrder::Follow) || j.order == int(CrewOrder::Cover)) {
 					for (int i = 0; i < n; ++i) {
 						const uptr f = gang[i];
 						if (!f || f == npc || Dead(f) || InVehicle(f) || Dist(f, v) > 40.0) continue;
@@ -3778,8 +3841,6 @@ namespace npcvehicles
 			if (!vehicleId || !player || j.phase != Phase::Following || j.vehicle != vehicleId) continue;
 			const uptr veh = RefById(j.vehicle);
 			if (!veh) return false;
-			const auto vp = At<game::Vec3>(veh, off::kRefPosition);
-			vcontract::Assign(vehicleId, vcontract::Find(pursuit ? "pursuit" : "escort"), vp.x, vp.y);
 			return ApplyProfile(j, pursuit ? Profile::Pursuit : Profile::Escort, player);
 		}
 		return false;
@@ -3879,9 +3940,9 @@ namespace npcvehicles
 			j.pilot = int(&j - g_jobs) + 1;
 			if (!StartWalkBoard(&j, actor, vehicle)) return false;
 			j.order = int(order);
-			logger::Write("NPC vehicles: [%d] crew: follower %08X drives your vehicle %08X (%s)", j.pilot, At<std::uint32_t>(actor, off::kFormId), vehId,
-				order == CrewOrder::Marker ? "to your marker" : "following you");
-			FollowerNotice(At<std::uint32_t>(actor,off::kFormId),order == CrewOrder::Marker ? "A follower takes your vehicle to the marker" : "A follower drives your vehicle");
+			logger::Write("NPC vehicles: [%d] crew: follower %08X drives your vehicle %08X (%s)", j.pilot, At<std::uint32_t>(actor, off::kFormId), vehId, OrderText(order));
+			FollowerNotice(At<std::uint32_t>(actor,off::kFormId),order == CrewOrder::Marker ? "A follower takes your vehicle to the marker" :
+				order == CrewOrder::Cover ? "A follower drives your vehicle to cover you" : "A follower drives your vehicle");
 			return true;
 		}
 		return false;
@@ -3897,7 +3958,7 @@ namespace npcvehicles
 
 	void SetCrewOrder(std::uint32_t vehicleId, CrewOrder order)
 	{
-		if(order==CrewOrder::Follow && !targetsession::CanFollow(vehicleId,vehicleflight::OwnRoverId()))return;
+		if((order==CrewOrder::Follow||order==CrewOrder::Cover||order==CrewOrder::Recall) && !targetsession::CanFollow(vehicleId,vehicleflight::OwnRoverId()))return;
 		for (auto& j : g_jobs) {
 			if (!vehicleId || j.phase == Phase::Idle || j.vehicle != vehicleId || !j.order || (j.order == int(order) && order!=CrewOrder::Hold)) continue;
 			j.order = int(order);
@@ -3907,9 +3968,25 @@ namespace npcvehicles
 						j.orderX=pos.x; j.orderY=pos.y; j.orderZ=pos.z;
 					}
 				}
-			logger::Write("NPC vehicles: [%d] crew order: %s", j.pilot, order == CrewOrder::Marker ? "to your marker" : order == CrewOrder::Hold ? "hold position" : "follow you");
-			FollowerNotice(j.npc,order == CrewOrder::Marker ? "Your follower drives to the marker" : order == CrewOrder::Hold ? "Your follower holds position" : "Your follower follows you");
+			logger::Write("NPC vehicles: [%d] crew order: %s", j.pilot, OrderText(order));
+			FollowerNotice(j.npc,order == CrewOrder::Marker ? "Your follower drives to the marker" : order == CrewOrder::Hold ? "Your follower holds position" :
+				order == CrewOrder::Recall ? "Your follower brings your vehicle" : order == CrewOrder::Cover ? "Your follower covers you" : "Your follower follows you");
 		}
+	}
+
+	bool SetCrewGuard(std::uint32_t vehicleId, double x, double y, double z)
+	{
+		bool set = false;
+		for (auto& j : g_jobs) {
+			if (!vehicleId || j.phase != Phase::Following || j.vehicle != vehicleId || !j.order) continue;
+			j.order = int(CrewOrder::Guard);
+			j.orderX = x; j.orderY = y; j.orderZ = z;
+			j.parked = false; j.relaunchAt = 0;
+			logger::Write("NPC vehicles: [%d] crew order: guard the point (%.0f, %.0f, %.0f)", j.pilot, x, y, z);
+			FollowerNotice(j.npc, "Your follower guards the point");
+			set = true;
+		}
+		return set;
 	}
 
 	void ReleaseCrew(std::uint32_t vehicleId)

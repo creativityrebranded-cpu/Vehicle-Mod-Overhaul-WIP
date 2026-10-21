@@ -105,6 +105,11 @@ namespace hoverui
 			reinterpret_cast<void (*)(uptr, Value*, const char*, const Value*, std::uint32_t)>(vt[46])(root, out, cls, args, n);
 			return IsObject(*out);
 		}
+		bool GetVariable(uptr movie, Value* out, const char* path)
+		{
+			const uptr root = *reinterpret_cast<uptr*>(movie + 0x18);
+			return root && reinterpret_cast<bool (*)(uptr, Value*, const char*)>((*reinterpret_cast<void***>(root))[0x32])(root, out, path);
+		}
 		// A borrowed view of a managed value for passing as an argument (the owner keeps it alive).
 		Value Arg(const Value& v)
 		{
@@ -127,13 +132,14 @@ namespace hoverui
 		//  - Gear box: a key box with the gear number only, by its centre (gx, gy).
 		// Saved to Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\hoverui.ini.
 		enum { kW, kA, kS, kD, kGearDown, kGearUp, kHover, kGear, kButtons };
-		// Editor selections: each element (W, A, S, D, Descend, Gear, Hover, Gear box, Auto, Auto line, Gang), each of the
+		// Editor selections: each element (W, A, S, D, Descend, Gear, Hover, Gear box, Trip status, Target), each of the
 		// rover widget's own clips (kSelNative + i, e.g. the Exit button), then the groups.
-		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelRoute = 90, kSelNative = 100 };
-		constexpr int kFootEls = 8, kCarEls = 4;
+		enum { kSelLine = kButtons, kSelTarget, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelRoute = 90, kSelNative = 100 };
+		constexpr int kFootEls = 8, kCarEls = 3;
 		constexpr double kOverlayScale = 0.75;
+		// Legacy gang layout keys retain the exact saved position now used by Target.
 		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject", "vehicles" };
-		const char* const kCarNames[kCarEls] = { "auto", "autoline", "ganginveh", "vehiclesinveh" };
+		const char* const kCarNames[kCarEls] = { "autoline", "ganginveh", "vehiclesinveh" };
 		constexpr double kDefOff[kButtons][2] = { { 0.0, -31.0 }, { -23.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 0.0 }, { -2.0, 0.0 } };
 		struct Layout_t
 		{
@@ -148,7 +154,7 @@ namespace hoverui
 			double tx = 361.0, ty = 958.0;  // the scanner status box's centre
 			double routeX=42.0,routeY=230.0; // route group in HUD/scanner root coordinates
 			int msel = 3;                    // scanner editor: 0 Summon, 1 Follow, 2 status, 3 all
-			// The contextual HUD (2026-10-17): the on-foot panel (Summon, Follow, Get in, status, gang) in RightMeters_mc's
+			// The contextual HUD (2026-10-17): the on-foot panel (Summon, Follow, Get in, status, target) in RightMeters_mc's
 			// coordinates (Summon's key centre; measured from the rover widget once), and the in-vehicle extras' offset.
 			double fpx = -268.4, fpy = -160.4;
 			bool haveFoot = true;
@@ -158,8 +164,8 @@ namespace hoverui
 			bool oldRows = false;      // only the earlier per-row positions are known: derive the column from them
 			double oldX[3] = {}, oldY[3] = {};  // Gear+, Gear-, Hover (the earlier order)
 			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] }, { kDefOff[4][0], kDefOff[4][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
-			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, gang, Passenger, Eject, vehicles, Auto mode)
-			double carOff[kCarEls][2] = { { 342.0, 172.0 }, { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 } };    // per element nudges of the in-vehicle extras (Auto, Auto line, gang, vehicles, Auto mode)
+			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, target, Passenger, Eject, vehicles, Auto mode)
+			double carOff[kCarEls][2] = { { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 } };    // per element nudges of the in-vehicle extras (Trip status, target, vehicles, Auto mode)
 			// The rover widget's own clips (found by name when the widget is first seen) and their nudges.
 			std::vector<std::string> natNames;
 			std::map<std::string, std::pair<double, double>> natOff;
@@ -210,7 +216,7 @@ namespace hoverui
 				std::snprintf(line, sizeof(line), "foot = %.1f %.1f   ; on-foot panel: Summon's key centre x y\n", g_lay.fpx, g_lay.fpy);
 				out << line;
 			}
-			std::snprintf(line, sizeof(line), "extras = %.1f %.1f   ; in-vehicle Auto / status / gang offset x y\n", g_lay.eox, g_lay.eoy);
+			std::snprintf(line, sizeof(line), "extras = %.1f %.1f   ; in-vehicle Auto / status / target offset x y\n", g_lay.eox, g_lay.eoy);
 			out << line;
 			for (int i = 0; i < kFootEls; ++i) {
 				std::snprintf(line, sizeof(line), "foot_%s = %.1f %.1f\n", kFootNames[i], g_lay.footOff[i][0], g_lay.footOff[i][1]);
@@ -306,8 +312,7 @@ namespace hoverui
 			std::mutex lock;
 			bool own = false, nearOwn = false, autoOn = false, occupied = false;
 			std::string occKey;
-			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey;
-						int gang = 0;
+			std::string summonKey, followKey, useKey, status, autoLine, summonLabel, coverLabel;
 			std::string rows[kMaxRows];
 			int rowCount = 0;
 		} g_ctx;
@@ -856,6 +861,22 @@ namespace hoverui
 		std::string g_routeText;
 		std::string g_routeSkipKey,g_routeClearKey,g_routeRetryKey;
 		std::string g_scanText;  // the scanner screen status box text
+		double g_targetX = 0, g_targetY = 0;
+		bool g_targetPlaced = false;
+
+		bool TransformPoint(uptr movie, const Value& space, const char* method, double& x, double& y)
+		{
+			Value point, result;
+			const Value coords[] = { Num(x), Num(y) };
+			bool ok = false;
+			if (IsObject(space) && CreateObject(movie, &point, "flash.geom.Point", coords, 2)) {
+				const Value args[] = { Arg(point) };
+				ok = InvokeR(space, method, args, 1, &result) && IsObject(result) &&
+					GetNumber(result, "x", x) && GetNumber(result, "y", y) && std::isfinite(x) && std::isfinite(y);
+			}
+			Release(result); Release(point);
+			return ok;
+		}
 		struct MonoEl;
 		std::uint64_t MonoMessageDetour(uptr menu, void* msg)
 		{
@@ -985,7 +1006,7 @@ namespace hoverui
 			const bool visible=!text.empty();
 			MonoEl*actions[]={&view.retry,&view.skip,&view.clear};
 			const std::string keys[]={visible?retryKey:"",visible?skipKey:"",visible?clearKey:""};
-			const char*labels[]={"Retry trip","Skip stop","Clear route"};int shown=0;
+			const char*labels[]={"Retry trip","Skip stop","T T: clear route"};int shown=0;
 			for(int i=0;i<3;++i)if(show(*actions[i],keys[i],labels[i]))PlaceButtonKey(actions[i]->button,x+44+140*shown++,y+24,false,kOverlayScale);
 		}
 
@@ -994,13 +1015,13 @@ namespace hoverui
 		{
 			uptr movie = 0;
 			Value meters, widget;          // RightMeters_mc (on foot) and HUDVehicle_mc (in the vehicle)
-			MonoEl fSummon, fFollow, fGetIn, fStatus, fGang, fPass, fEject, fRows;
-			MonoEl vAuto, vLine, vGang, vRows;  // fRows / vRows: the per-vehicle line (one box, movable in the F7 editor)
+			MonoEl fSummon, fFollow, fGetIn, fStatus, fTarget, fPass, fEject, fRows;
+			MonoEl vLine, vTarget, vRows;  // fRows / vRows: the per-vehicle line (one box, movable in the F7 editor)
 			bool built = false, failed = false;
 		} g_ex;
 
-		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fGang, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows };
-		MonoEl* CarEls[kCarEls] = { &g_ex.vAuto, &g_ex.vLine, &g_ex.vGang, &g_ex.vRows };
+		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fTarget, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows };
+		MonoEl* CarEls[kCarEls] = { &g_ex.vLine, &g_ex.vTarget, &g_ex.vRows };
 
 		bool IsOurExtra(void* object)
 		{
@@ -1036,7 +1057,7 @@ namespace hoverui
 				SetMember(e->button, "visible", Bool(false));
 			}
 			g_ex.built = true;
-			logger::Write("Hover UI: contextual HUD added (on foot: Summon, Follow, Get in, status, gang; in the vehicle: Auto, status, gang)");
+			logger::Write("Hover UI: contextual HUD added (on foot: Summon, Follow, Get in, status, target; in the vehicle: Auto, status, target)");
 			return true;
 		}
 
@@ -1052,19 +1073,21 @@ namespace hoverui
 		void RefreshExtras()
 		{
 			bool own, nearOwn, autoOn, occupied;
-			int gang, rowCount = 0;
+			int rowCount = 0;
 			std::string rows[kMaxRows];
-			std::string summonKey, followKey, useKey, status, autoKey, autoLine, gangText, gangKey, occKey;
+			std::string summonKey, followKey, useKey, status, autoLine, occKey, target, summonLabel, coverLabel;
 			{
 				std::lock_guard lk(g_ctx.lock);
-				own = g_ctx.own; nearOwn = g_ctx.nearOwn; autoOn = g_ctx.autoOn; gang = g_ctx.gang;
+				own = g_ctx.own; nearOwn = g_ctx.nearOwn; autoOn = g_ctx.autoOn;
 				occupied = g_ctx.occupied; occKey = g_ctx.occKey;
 				summonKey = g_ctx.summonKey; followKey = g_ctx.followKey; useKey = g_ctx.useKey; status = g_ctx.status;
-				autoKey = g_ctx.autoKey; autoLine = g_ctx.autoLine; gangText = g_ctx.gangText; gangKey = g_ctx.gangKey;
+				summonLabel = g_ctx.summonLabel; coverLabel = g_ctx.coverLabel;
+				autoLine = g_ctx.autoLine;
 				rowCount = g_ctx.rowCount;
 				for (int i = 0; i < kMaxRows; ++i) rows[i] = g_ctx.rows[i];
 			}
 			const bool inVehicle = g_inVehicle.load();
+			{ std::lock_guard lk(g_scanLock); target = g_scanText; }
 			const bool foot = !inVehicle && own;
 			g_footShown = foot;
 			bool ed;
@@ -1074,40 +1097,37 @@ namespace hoverui
 			}
 			// While editing, every element shows (a sample text where it is empty), so each one can be placed.
 			if (ed) {
-				if (status.empty()) status = "FOLLOWING 42 m";
+				if (status.empty()) status = "COVER 42 m";
 				if (autoLine.empty()) autoLine = "AUTO 120 m";
-				if (gangText.empty() || gang <= 0) { gangText = "Gang 2"; gangKey = "."; }
-				if (autoKey.empty()) autoKey = " ";
+				if (target.empty()) target = "TARGET  1240 m";
 			}
-			ElSet(g_ex.fSummon, foot && !summonKey.empty(), "Summon", summonKey);
-			ElSet(g_ex.fFollow, foot && !followKey.empty(), g_followOn.load() ? "Stop follow" : "Follow", followKey);
+			ElSet(g_ex.fSummon, foot && !summonKey.empty(), summonLabel.empty() ? "Summon" : summonLabel.c_str(), summonKey);
+			ElSet(g_ex.fFollow, foot && !followKey.empty(), coverLabel.empty() ? "Cover" : coverLabel.c_str(), followKey);
 			ElSet(g_ex.fGetIn, foot && (nearOwn || ed), "Get in", useKey);
 			ElSet(g_ex.fStatus, foot && !status.empty(), " ", status);
 			MonoTint(g_ex.movie, g_ex.fStatus, !status.empty());
 			// Text inside one rounded box (label blank), like the FOLLOWING status box.
-			const std::string gangBox = gangText + (gangKey.empty() ? std::string() : "  [" + gangKey + "]");
 			std::string rowsBox;
 			for (int i = 0; i < kMaxRows && i < rowCount; ++i) {
 				if (rows[i].empty()) continue;
 				rowsBox += (rowsBox.empty() ? "" : "  |  ") + rows[i];
 			}
 			if (ed && rowsBox.empty()) rowsBox = "pursuit REV8 83 m";
-			ElSet(g_ex.fGang, !inVehicle && (gang > 0 || (ed && foot)), " ", gangBox);
-			ElSet(g_ex.fRows, !inVehicle && (gang > 0 || (ed && foot)) && !rowsBox.empty(), " ", rowsBox);
+			ElSet(g_ex.fTarget, !inVehicle && !ScannerOpen() && !target.empty(), " ", target);
+			MonoTint(g_ex.movie, g_ex.fTarget, true);
+			ElSet(g_ex.fRows, !inVehicle && !rowsBox.empty(), " ", rowsBox);
 			// Facing an occupied vehicle on foot: tap = the passenger seat, hold = eject the driver (half-size prompts).
 			g_ex.fPass.scale = g_ex.fEject.scale = kOverlayScale;
 			const bool occShow = !inVehicle && (occupied || (ed && foot));
 			ElSet(g_ex.fPass, occShow, "Passenger", occKey);
 			ElSet(g_ex.fEject, occShow, "Double tap: eject", occKey);
-			ElSet(g_ex.vAuto, inVehicle && !autoKey.empty(), autoOn ? "Auto on" : "Auto", autoKey);
-			MonoTint(g_ex.movie, g_ex.vAuto, autoOn);
 			ElSet(g_ex.vLine, inVehicle && (autoOn || ed) && !autoLine.empty(), " ", autoLine);
 			MonoTint(g_ex.movie, g_ex.vLine, true);
-			ElSet(g_ex.vGang, inVehicle && (gang > 0 || ed), " ", gangBox);
-			ElSet(g_ex.vRows, inVehicle && (gang > 0 || ed) && !rowsBox.empty(), " ", rowsBox);
-			if (ed) gang = std::max(gang, 1);
+			ElSet(g_ex.vTarget, inVehicle && !ScannerOpen() && !target.empty(), " ", target);
+			MonoTint(g_ex.movie, g_ex.vTarget, true);
+			ElSet(g_ex.vRows, inVehicle && !rowsBox.empty(), " ", rowsBox);
 			// Places: the on-foot panel in RightMeters_mc's coordinates; the extras in the rover widget's, beside the
-			// column (Auto) and under the WASD cluster (status, gang).
+			// column (Auto) and under the WASD cluster (status, target).
 			double fx, fy, ex, ey, cx, cy, d, colRight, colTop, colStep, fo[kFootEls][2], co[kCarEls][2];
 			bool edit;
 			int sel, fsel;
@@ -1132,7 +1152,12 @@ namespace hoverui
 				fsel = g_lay.fsel;
 			}
 			const bool blinkOff = edit && (GetTickCount64() / 300) % 2 == 0;
-			if (foot || gang > 0 || occupied) {
+			// The scanner has a separate movie. Transfer only screen coordinates, never its HUD objects.
+			double targetX = inVehicle ? cx + ex + co[1][0] : fx + 80.0 + fo[4][0];
+			double targetY = inVehicle ? cy + 1.7 * d + ey + co[1][1] : fy + 98.0 + fo[4][1];
+			const bool targetPlaced = TransformPoint(g_ex.movie, inVehicle ? g_ex.widget : g_ex.meters, "localToGlobal", targetX, targetY);
+			{ std::lock_guard lk(g_scanLock); g_targetPlaced = targetPlaced; g_targetX = targetX; g_targetY = targetY; }
+			if (foot || rowCount > 0 || occupied || !target.empty()) {
 				const double at[kFootEls][2] = { { fx, fy }, { fx + 120.0, fy }, { fx + 240.0, fy }, { fx + 80.0, fy + 52.0 }, { fx + 80.0, fy + 98.0 }, { fx + 240.0, fy + 52.0 }, { fx + 240.0, fy + 98.0 }, { fx + 80.0, fy + 98.0 } };
 				for (int i = 0; i < kFootEls; ++i) {
 					if (!FootEls[i]->shown) continue;
@@ -1146,13 +1171,13 @@ namespace hoverui
 				}
 			}
 			if (inVehicle) {
-				const double at[kCarEls][2] = { { colRight + 70.0 + ex, colTop + 2.0 * colStep + ey }, { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { cx + ex, cy + 1.7 * d + ey } };
+				const double at[kCarEls][2] = { { cx + ex, cy + 0.9 * d + ey }, { cx + ex, cy + 1.7 * d + ey }, { cx + ex, cy + 1.7 * d + ey } };
 				for (int i = 0; i < kCarEls; ++i) {
 					if (!CarEls[i]->shown) continue;
 					SetMember(CarEls[i]->button, "scaleX", Num(kOverlayScale));
 					SetMember(CarEls[i]->button, "scaleY", Num(kOverlayScale));
 					PlaceButtonKey(CarEls[i]->button, at[i][0] + co[i][0], at[i][1] + co[i][1], false, kOverlayScale);
-					const bool picked = sel == kSelExtras || sel == kSelAll || sel == kSelAuto + i;
+					const bool picked = sel == kSelExtras || sel == kSelAll || sel == kSelLine + i;
 					SetMember(CarEls[i]->button, "alpha", Num(blinkOff && picked ? 0.35 : 1.0));
 				}
 			}
@@ -1172,11 +1197,23 @@ namespace hoverui
 
 		// monoclemenu.swf: SetRightInfoDisplayState selects "MapMarker" only for an aimed POI.
 		// NearbyPOIDisplay is area context and must never select a destination on its own.
-		void CaptureScannerDestination(const Value& root)
+		void CaptureScannerDestination(uptr movie, const Value& root)
 		{
 			std::string name;
 			double pickForm=0,pickHandle=0;
-			GetNumber(root,"CurrentFormID",pickForm);GetNumber(root,"CurrentPickRefHandle",pickHandle);
+			// These MonocleMenu fields are private. Use its public data provider instead.
+			Value manager, provider, data;
+			const Value providerArgs[] = { Str("MonoclePickRefData"), Bool(false), Bool(false) };
+			const bool havePick = GetVariable(movie, &manager, "Shared.AS3.Data.BSUIDataManager") && IsObject(manager) &&
+				InvokeR(manager, "GetDataFromClient", providerArgs, 3, &provider) && IsObject(provider) &&
+				GetMember(provider, "data", &data) && IsObject(data);
+			if (havePick) { GetNumber(data, "uFormID", pickForm); GetNumber(data, "uHandle", pickHandle); }
+			static int pickSource = -1;
+			if (pickSource != int(havePick)) {
+				pickSource = int(havePick);
+				logger::Write("Scanner native pick provider: %s", havePick ? "ready" : "unavailable");
+			}
+			Release(data); Release(provider); Release(manager);
 			Value panel, marker, description, text, range, rangeText;
 			double distance = 0;
 			if (GetMember(root, "RightInfoDisplay_mc", &panel) && IsObject(panel) &&
@@ -1217,7 +1254,7 @@ namespace hoverui
 			}
 			if (movie) {
 				const auto& root = *reinterpret_cast<const Value*>(menu + 0x58);
-				if (IsObject(root)) CaptureScannerDestination(root);
+				if (IsObject(root)) CaptureScannerDestination(movie, root);
 				RenderRoute(menu, movie, true);
 			}
 			if (!movie || g_mono.failed) return;
@@ -1239,24 +1276,25 @@ namespace hoverui
 			}
 			// Only the status box is used now: it carries the scanner marker text (the distance to what you look at).
 			std::string scan;
+			bool placed;
+			double x, y;
 			{
 				std::lock_guard lk(g_scanLock);
 				scan = g_scanText;
+				placed = g_targetPlaced; x = g_targetX; y = g_targetY;
 			}
 			bool edit;
-			int sel;
-			double x, y;
+			bool picked;
 			{
 				std::lock_guard lk(g_lay.lock);
-				x = g_lay.tx;
-				y = g_lay.ty;
 				edit = g_lay.edit;
-				sel = g_lay.msel;
+				picked = g_inVehicle.load() ? g_lay.sel == kSelTarget || g_lay.sel == kSelExtras || g_lay.sel == kSelAll : g_lay.fsel == 4 || g_lay.fsel == kFootEls;
 			}
 			MonoShow(g_mono.summon, false);
 			MonoShow(g_mono.follow, false);
 			if (scan.empty() && edit) scan = "TARGET  1240 m";  // shown with a sample while editing, so it can be placed
-			const bool show = !scan.empty();
+			const auto& root = *reinterpret_cast<const Value*>(menu + 0x58);
+			const bool show = !scan.empty() && placed && TransformPoint(movie, root, "globalToLocal", x, y);
 			MonoShow(g_mono.status, show);
 			if (!show) return;
 			MonoSetData(movie, g_mono.status, " ");
@@ -1266,7 +1304,7 @@ namespace hoverui
 			SetMember(g_mono.status.button, "scaleX", Num(kOverlayScale));
 			SetMember(g_mono.status.button, "scaleY", Num(kOverlayScale));
 			PlaceButtonKey(g_mono.status.button, x, y, false, kOverlayScale);
-			SetMember(g_mono.status.button, "alpha", Num(blinkOff && (sel == 3 || sel == 2) ? 0.35 : 1.0));
+			SetMember(g_mono.status.button, "alpha", Num(blinkOff && picked ? 0.35 : 1.0));
 		}
 
 		void MonoWork(uptr menu)
@@ -1436,9 +1474,12 @@ namespace hoverui
 		if (g_followKey != key) g_followKey = key;
 	}
 
-	void SetFoot(bool own, bool nearOwn, const char* summonKey, const char* followKey, const char* useKey, const char* status)
+	void SetFoot(bool own, bool nearOwn, const char* summonKey, const char* followKey, const char* useKey, const char* status,
+		const char* summonLabel, const char* coverLabel)
 	{
 		std::lock_guard lk(g_ctx.lock);
+		if (g_ctx.summonLabel != summonLabel) g_ctx.summonLabel = summonLabel;
+		if (g_ctx.coverLabel != coverLabel) g_ctx.coverLabel = coverLabel;
 		g_ctx.own = own;
 		g_ctx.nearOwn = nearOwn;
 		if (g_ctx.summonKey != summonKey) g_ctx.summonKey = summonKey;
@@ -1454,24 +1495,11 @@ namespace hoverui
 		if (g_ctx.occKey != key) g_ctx.occKey = key;
 	}
 
-	void SetAuto(const char* key, bool on, const char* line)
+	void SetTripStatus(bool on, const char* line)
 	{
 		std::lock_guard lk(g_ctx.lock);
 		g_ctx.autoOn = on;
-		if (g_ctx.autoKey != key) g_ctx.autoKey = key;
 		if (g_ctx.autoLine != line) g_ctx.autoLine = line;
-	}
-
-	void SetGang(int count, const char* profile, const char* key)
-	{
-		// (2026-10-20, the user: the NPCs' names instead of "Gang n"): the caller's text is the names; no text = the count as before.
-		char t[96];
-		if (profile && profile[0]) std::snprintf(t, sizeof(t), "%s", profile);
-		else std::snprintf(t, sizeof(t), "Gang %d", count);
-		std::lock_guard lk(g_ctx.lock);
-		g_ctx.gang = count;
-		if (g_ctx.gangText != t) g_ctx.gangText = t;
-		if (g_ctx.gangKey != key) g_ctx.gangKey = key;
 	}
 
 	void SetRows(int count, const char* const* lines)
@@ -1488,6 +1516,7 @@ namespace hoverui
 		g_reset = true;
 		std::lock_guard lk(g_scanLock);
 		g_placeName.clear(); g_placeAt = 0;
+		g_scanText.clear(); g_targetPlaced = false;
 		g_routeText.clear();
 		g_routeSkipKey.clear();g_routeClearKey.clear();g_routeRetryKey.clear();
 	}
@@ -1509,12 +1538,12 @@ namespace hoverui
 		std::string SelName(bool inVehicle)
 		{
 			if (!inVehicle) {
-				const char* foot[kFootEls + 2] = { "Summon", "Follow", "Get in", "Status", "Gang", "Passenger", "Eject", "Vehicles", "Panel", "Route" };
+				const char* foot[kFootEls + 2] = { "Summon", "Follow", "Get in", "Status", "Target", "Passenger", "Eject", "Vehicles", "Panel", "Route" };
 				return foot[std::clamp(g_lay.fsel, 0, kFootEls+1)];
 			}
 			const int s = g_lay.sel;
 			if(s==kSelRoute)return "Route";
-			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Descend", "Gear", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "WASD", "Column", "Extras",
+			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Descend", "Gear", "Hover", "Gear box", "Trip status", "Target", "Vehicles", "WASD", "Column", "Extras",
 				"All" };
 			if (s >= 0 && s <= kSelAll) return names[s];
 			if (s >= kSelNative && s - kSelNative < int(g_lay.natNames.size())) return g_lay.natNames[s - kSelNative];
@@ -1556,7 +1585,7 @@ namespace hoverui
 		const double dy = (press[6] ? step : 0.0) - (press[5] ? step : 0.0);
 		const double dd = (press[8] ? step : 0.0) - (press[7] ? step : 0.0);
 		if (!g_inVehicle.load()) {
-			// On foot: Page Up / Page Down pick Summon, Follow, Get in, status, gang or the whole panel; the arrows move it.
+			// On foot: Page Up / Page Down pick Summon, Follow, Get in, status, target or the whole panel; the arrows move it.
 			if (press[1] || press[2]) {
 				g_lay.fsel = (g_lay.fsel + (press[1] ? kFootEls+1 : 1)) % (kFootEls + 2);
 				notify::Show("UI edit: %s", SelName(false).c_str());
@@ -1585,21 +1614,6 @@ namespace hoverui
 			if(dx!=0||dy!=0){g_lay.routeX+=dx;g_lay.routeY+=dy;SaveLayout();}
 			if(press[9]){g_lay.routeX=42;g_lay.routeY=230;SaveLayout();}return;
 		}
-		if (ScannerOpen()) {
-			// In the scanner: Page Up / Page Down pick Summon, Follow, the status box or all; the arrows move them.
-			if (press[1]) g_lay.msel = (g_lay.msel + 3) % 4;
-			if (press[2]) g_lay.msel = (g_lay.msel + 1) % 4;
-			const double sstep = focused && (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? 10.0 : 1.0;
-			const double sdx = (press[4] ? sstep : 0.0) - (press[3] ? sstep : 0.0), sdy = (press[6] ? sstep : 0.0) - (press[5] ? sstep : 0.0);
-			if (sdx != 0.0 || sdy != 0.0) {
-				const int m = g_lay.msel;
-				if (m == 0 || m == 3) { g_lay.sx += sdx; g_lay.sy += sdy; }
-				if (m == 1 || m == 3) { g_lay.fx += sdx; g_lay.fy += sdy; }
-				if (m == 2 || m == 3) { g_lay.tx += sdx; g_lay.ty += sdy; }
-				SaveLayout();
-			}
-			return;
-		}
 		const int sel = g_lay.sel;
 		const bool all = sel == kSelAll;
 		bool changed = false;
@@ -1610,7 +1624,7 @@ namespace hoverui
 			if (all || sel == kSelExtras) { g_lay.eox += dx; g_lay.eoy += dy; }
 			if(all){g_lay.routeX+=dx;g_lay.routeY+=dy;}
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] += dx; g_lay.off[sel][1] += dy; }
-			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] += dx; g_lay.carOff[sel - kSelAuto][1] += dy; }
+			if (sel >= kSelLine && sel <= kSelRows) { g_lay.carOff[sel - kSelLine][0] += dx; g_lay.carOff[sel - kSelLine][1] += dy; }
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) {
 				if (all || sel == kSelNative + i) {
 					auto& o = g_lay.natOff[g_lay.natNames[i]];
@@ -1623,7 +1637,7 @@ namespace hoverui
 		if (press[9]) {
 			// Delete: the picked element back to its default place.
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] = kDefOff[sel][0]; g_lay.off[sel][1] = kDefOff[sel][1]; changed = true; }
-			if (sel >= kSelAuto && sel <= kSelRows) { g_lay.carOff[sel - kSelAuto][0] = g_lay.carOff[sel - kSelAuto][1] = 0.0; changed = true; }
+			if (sel >= kSelLine && sel <= kSelRows) { g_lay.carOff[sel - kSelLine][0] = g_lay.carOff[sel - kSelLine][1] = 0.0; changed = true; }
 			if (sel >= kSelNative && sel - kSelNative < int(g_lay.natNames.size())) { g_lay.natOff.erase(g_lay.natNames[sel - kSelNative]); changed = true; }
 		}
 		if (dd != 0.0) {

@@ -57,13 +57,16 @@ namespace npcvehicles
 	// Crew orders (2026-10-20, the user: with followers, the vehicle buttons send a follower to drive the player's own vehicle and do what was asked).
 	// Follow: the follower drives it after the player (an escort: it defends, rescues, scouts); Marker: it flies to the player's map marker and
 	// does the Auto behaviour there (vehicleflight::GetAutoMode: stop / orbit / patrol).
-	enum class CrewOrder : int { None = 0, Follow = 1, Marker = 2, Hold = 3 };
+	// Recall (N), Cover (U) and Guard (T while covering) are the player's overrides (overrides.h): Recall drives to the player and the driver gets out
+	// for the player; Cover follows and defends the player without chasing; Guard holds the point set by SetCrewGuard and defends from there.
+	enum class CrewOrder : int { None = 0, Follow = 1, Marker = 2, Hold = 3, Recall = 4, Cover = 5, Guard = 6 };
 	// A follower free to drive (on foot, not busy, alive) within `range` metres of (x, y); 0 when none.
 	std::uintptr_t FreeFollower(std::uintptr_t player, double x, double y, double range);
 	// That follower walks to `vehicle` (the player's own one allowed) and drives it with `order`; false when nobody could be sent.
 	bool CrewBoard(std::uintptr_t player, std::uintptr_t vehicle, CrewOrder order);
 	CrewOrder CrewOrderOf(std::uint32_t vehicleId);       // None: no crew job on that vehicle
 	void SetCrewOrder(std::uint32_t vehicleId, CrewOrder order);
+	bool SetCrewGuard(std::uint32_t vehicleId, double x, double y, double z);  // Guard at (x, y, z); false: no crew job on that vehicle
 	void ReleaseCrew(std::uint32_t vehicleId);             // the crew driver gets out
 	// Civil tasks (2026-10-20, the user: everyday traffic). The NPC walks to the vehicle, drives it and finally parks it in a clear spot and gets out:
 	//  transit: to (x, y), then it walks the rest of its way; patrol: two laps round the vehicle's parking place, then home; a fight ends any task.

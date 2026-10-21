@@ -6,8 +6,11 @@
 #include "hulllogic.h"
 #include "boostlogic.h"
 #include "altcontrol.h"
+#include "targetinput.h"
 #include "ramlogic.h"
+#include "overrides.h"
 #include <cstdio>
+#include <string>
 #include <cmath>
 #include <limits>
 int main(){
@@ -71,13 +74,16 @@ int main(){
  check(boostlogic::kMultiplier>1,"paid boost multiplies every selected gear");
  check(ramlogic::Owns(8,8,1000),"explicit ram retains its driver over ordinary parking/follow orders");
  check(!ramlogic::Owns(8,9,1000)&&!ramlogic::Owns(8,8,15000),"ram ownership excludes unrelated vehicles and expired orders");
- check(ramlogic::CanSelect(true,true,true,false),"highlighted living actor in combat can be rammed");
- check(!ramlogic::CanSelect(false,true,true,false),"ordinary destination selection outside combat remains navigation");
+ check(ramlogic::CanSelect(true,true,true,false),"armed vehicle can ram the highlighted living actor");
+ check(!ramlogic::CanSelect(false,true,true,false),"an actor selection without a T hold remains navigation");
  check(!ramlogic::CanSelect(true,false,true,false)&&!ramlogic::CanSelect(true,true,true,true),"ram selection excludes places and own occupants");
- check(ramlogic::Finished(true,true,15000,false,100,4),"ram order has a finite timeout");
- check(ramlogic::Finished(true,true,1000,true,3,4),"ram ends after nearby impact");
- check(!ramlogic::Finished(true,true,1000,true,50,4),"distant contact cannot falsely complete ram");
- check(ramlogic::Finished(false,true,100,false,50,4),"lost ram target cancels order");
+ check(ramlogic::Reject(true,true,false,false)!=nullptr&&ramlogic::Reject(false,true,true,false)!=nullptr,"refused rams carry a logged reason");
+ check(ramlogic::Armed(8,8,1000)&&!ramlogic::Armed(8,9,1000)&&!ramlogic::Armed(8,8,ramlogic::kReadyMs),"ram-ready belongs to one vehicle and expires");
+ check(ramlogic::Finished(true,15000,false,100,4),"ram order has a finite timeout");
+ check(ramlogic::Finished(true,1000,true,3,4),"ram ends after nearby impact");
+ check(!ramlogic::Finished(true,1000,true,50,4),"distant contact cannot falsely complete ram");
+ check(ramlogic::Finished(false,100,false,50,4),"lost ram target cancels order");
+ check(!ramlogic::Finished(true,1000,false,50,4),"an explicit ram is not cut short by the player's combat flag");
  altcontrol::Input alt;
  alt.Update(false,true,0);
  auto action=alt.Update(true,true,10);
@@ -103,5 +109,49 @@ int main(){
  alt.Update(false,true,2010);alt.Update(true,true,2020);
  check(alt.Update(false,true,2100).cycle,"fresh Alt press works after boarding or focus returns");
  check(altcontrol::NextGear(1)==2&&altcontrol::NextGear(2)==3&&altcontrol::NextGear(3)==4&&altcontrol::NextGear(4)==1,"Alt cycles all four gears and wraps to first");
+ targetinput::Input targeting; targeting.Update(false,true,0);
+ auto targetAction=targeting.Update(true,true,10);
+ check(targetAction.capture&&!targetAction.tap&&!targetAction.hold,"T press captures the aimed selection without acting");
+ targetAction=targeting.Update(false,true,110);
+ check(!targetAction.tap&&!targetAction.doubleTap,"single tap waits out the double-tap window before selecting");
+ check(!targeting.Update(false,true,300).tap,"tap is not reported inside the double-tap window");
+ targetAction=targeting.Update(false,true,410);
+ check(targetAction.tap&&!targetAction.doubleTap&&!targetAction.hold,"single tap selects once the window has passed");
+ check(!targeting.Update(false,true,500).tap,"released T cannot repeatedly select targets");
+ targeting.Update(true,true,1000);targeting.Update(false,true,1080);
+ targetAction=targeting.Update(true,true,1200);
+ check(targetAction.doubleTap&&!targetAction.tap&&!targetAction.capture,"second press inside the window clears the route and keeps the first capture");
+ targetAction=targeting.Update(false,true,1260);
+ check(!targetAction.tap&&!targeting.Update(false,true,2000).tap,"a double tap never also selects a destination or ram");
+ targeting.Update(true,true,3000);targetAction=targeting.Update(true,true,3900);
+ check(!targetAction.hold,"T hold waits a full second");
+ targetAction=targeting.Update(true,true,4010);
+ check(targetAction.hold&&!targetAction.tap,"holding T arms the ram instead of selecting");
+ check(!targeting.Update(true,true,4300).hold,"T hold fires once per press");
+ targetAction=targeting.Update(false,true,4310);
+ check(!targetAction.tap&&!targetAction.hold&&!targeting.Update(false,true,4800).tap,"releasing a hold cannot select or ram");
+ targeting.Update(true,true,5000);targetAction=targeting.Update(false,true,6100);
+ check(targetAction.hold&&!targetAction.tap&&!targeting.Update(false,true,6600).tap,"missed hold frames still count as a hold, never a selection");
+ targetinput::Input almost; almost.Update(false,true,0); almost.Update(true,true,10);
+ check(!almost.Update(false,true,960).hold&&almost.Update(false,true,1300).tap,"a 950 ms press is still a tap, not a hold");
+ targeting.Update(true,true,7000);targeting.Update(false,true,7050);targeting.Update(false,false,7100);
+ check(!targeting.Update(false,true,7500).tap,"loss of input context cancels a pending tap");
+ targeting.Update(true,true,8000);targeting.Update(false,true,8050);targeting.Cancel(false);
+ check(!targeting.Update(false,true,8500).tap,"scanner or session change cancels a pending tap");
+ targeting.Update(true,false,9000);
+ check(!targeting.Update(true,true,9100).capture&&!targeting.Update(true,true,9700).hold,"T already held when input becomes usable needs a fresh press");
+ targeting.Update(false,true,9800);targeting.Update(true,true,9900);targeting.Update(false,true,9950);
+ targetAction=targeting.Update(true,true,10400);
+ check(targetAction.tap&&targetAction.capture&&!targetAction.doubleTap,"a late second press after a frame gap delivers the first tap and starts a new one");
+ using overrides::Mode;
+ check(overrides::OnSummon(Mode::Cover)==Mode::Recall&&overrides::OnSummon(Mode::Guard)==Mode::Recall&&overrides::OnSummon(Mode::Recall)==Mode::Recall,"N always recalls and never toggles off");
+ {const auto r=overrides::For(Mode::Recall);check(!r.pickFoe&&!r.fire&&!r.chase&&r.followPlayer,"recall drops the fight and holds fire");}
+ {const auto r=overrides::For(Mode::Cover);check(r.pickFoe&&r.fire&&!r.chase&&r.followPlayer,"cover defends the player without chasing");}
+ {const auto r=overrides::For(Mode::Guard);check(r.holdPoint&&!r.chase&&r.fire,"guard holds its point and defends from it");}
+ {const auto r=overrides::For(Mode::None);check(r.pickFoe&&r.chase&&r.fire,"without an override the vehicle's own combat behaviour runs");}
+ check(overrides::OnCover(Mode::None)==Mode::Cover&&overrides::OnCover(Mode::Cover)==Mode::None&&overrides::OnCover(Mode::Guard)==Mode::Cover,"U toggles cover and resumes it from a guard point");
+ check(overrides::OnTarget(Mode::Cover)==Mode::Guard&&overrides::OnTarget(Mode::None)==Mode::None&&overrides::OnTarget(Mode::Recall)==Mode::Recall,"T sets a guard point only while covering");
+ check(std::string(overrides::SummonLabel(true))=="Recall"&&std::string(overrides::SummonLabel(false))=="Summon","N's name follows the vehicle's context");
+ check(std::string(overrides::CoverLabel(Mode::Cover))=="Stop cover"&&std::string(overrides::CoverLabel(Mode::Guard))=="Cover","U's name follows the cover state");
  return failures?1:0;
 }

@@ -63,3 +63,5 @@ sp_options(routeplan_test)
 
 add_executable(vehiclelogic_test tests/vehiclelogic_test.cpp)
 sp_options(vehiclelogic_test)
+add_executable(profileclass_test tests/profileclass_test.cpp src/vcontract.cpp)
+sp_options(profileclass_test)

@@ -5,6 +5,16 @@ The log timestamps every line; a crash prints `CRASH?` with the stack and the pl
 
 ## Status as of this version (2026-10-18)
 
+### Controls, overrides and profile classes (2026-10-20, later)
+
+The Release DLL builds with the T tap / double tap / hold controls, the armed ram, N recall / U cover / guard points, the Navigation / Combat / Weapons classes, and the empty own vehicle's cover combat. Eight offline executables pass **205 assertions**: navfield 15, scannercontext 12, triplogic 17, environment 14, recovery 12, routeplan 7, vehiclelogic 93 (Alt and T gestures, ram arming / ending, override rules, labels) and the new `profileclass_test` 35 (class isolation against the real `vcontract.cpp`, combat defaults, the weapons gate, row texts, cover-combat rules). None of it has been tested in game.
+
+Things to watch in a normal session (no test keys are added):
+- `Scanner native pick provider: ready` (the actor pick), then `Ram ready: ...` after a T hold and `Ram order: ... -> highlighted actor ...` after a tap on someone. A refusal or end line gives the reason.
+- `Rover recall: N pressed` and `Rover cover: on/off`, plus `Rover guard: ... guards (x, y)` after T while covering.
+- `Rover cover: enemy ...`, `lifting off to defend` and `weapon burst ...` when enemies come near while your empty vehicle covers you. `weapon refused (the player drives it)` must only appear if something tried to fire your driven vehicle.
+- `Profiles: vehicle ... combat -> defend/attack` when a follower's fight starts, then `combat -> default` about 20 s after it ends.
+
 ### Shared-system update (2026-10-20)
 
 The current Release DLL (0.61.0) builds successfully. Seven offline executables cover navigation, environmental traffic/fire, route lifecycle and the current bug fixes: `navfield_test`, `environment_test`, `recovery_test`, `triplogic_test`, `scannercontext_test`, `routeplan_test`, and `vehiclelogic_test`. 130 assertions pass in the latest run; assertions include exact full body ownership/generation, chassis discovery beyond the first scene body, roll beyond 90 degrees, attached-camera pitch, marker consumption, outdoor-path eligibility, hull-dependent limits, precise projectile hull intersections, native boost timing, and explicit ram selection/termination.

@@ -6,6 +6,7 @@
 #include "mappoints.h"
 #include "scannercontext.h"
 #include "ramlogic.h"
+#include "targetinput.h"
 #include "npcvehicles.h"
 #include "hoverui.h"
 #include "log.h"
@@ -52,7 +53,12 @@ namespace scantarget
 		};
 
 		int g_key = 'T';
-		bool g_keyRead = false, g_keyDown = false;
+		bool g_keyRead = false;
+		targetinput::Input g_input;
+		Target g_pressedTarget;
+		std::uint32_t g_pressedActor = 0;
+		bool g_pressedInScanner = false, g_lastScanner = false;
+		std::uint32_t g_armed = 0;       // the vehicle a T hold armed for a ram (vehicleflight::ArmRam)
 		ULONGLONG g_lastAsk = 0, g_setAt = 0;
 		float g_setDist = 0;
 		bool g_setEstimated = false;
@@ -60,20 +66,17 @@ namespace scantarget
 
 		// Marker chain (2026-10-20, the user): a press while a trip to the current marker is on queues the point; when the player's vehicle is
 		// kSwapEtaS from the current marker (time to arrival from its speed) or kSwapNear metres, the game's marker moves to the next point and Auto,
-		// which follows the marker, flies on without stopping. Holding the key kReplaceMs replaces the whole chain with the new point.
+		// which follows the marker, flies on without stopping. A double tap of T clears the entire route instead of selecting a new point.
 		constexpr double kSwapEtaS = 4.0, kSwapNear = 15.0, kArrivedNear = 20.0;
-		constexpr ULONGLONG kReplaceMs = 800;
 		struct Point { float x, y, z; std::string name; };
 		std::vector<Point> g_chain;      // queued points, next first
-		ULONGLONG g_downAt = 0;
-		bool g_held = false;             // this press already acted as a hold
 		double g_vx = 0, g_vy = 0, g_lastX = 0, g_lastY = 0;  // the vehicle's smoothed speed
 		ULONGLONG g_lastAt = 0;
 		std::uint32_t g_lastVeh = 0;
 		Point g_current{};               // the point the game's marker was last moved to by us
 		bool g_haveCurrent = false;
-		int g_skipKey=-1, g_clearKey=-1, g_retryKey=-1;
-		bool g_retryDown=false, g_skipDown=false, g_clearDown=false, g_routeCleared=false;
+		int g_skipKey=-1, g_retryKey=-1;
+		bool g_retryDown=false, g_skipDown=false, g_routeCleared=false;
 		ULONGLONG g_clearedAt=0;
 		ULONGLONG g_lostSince=0;
 
@@ -340,15 +343,28 @@ namespace scantarget
 			return true;
 		}
 
-		void ClearRoute()
+		// Drops the queued route; the game's marker stays where it is and no longer drives the vehicle (until a new selection).
+		void DropRoute()
 		{
 			const auto vehicle=RefById(vehicleflight::OwnRoverId());
 			double mx=0,my=0;
 			if(vehicle && vehicleflight::MarkerPoint(vehicle,mx,my)) {g_current.x=float(mx); g_current.y=float(my);}
 			g_chain.clear(); g_haveCurrent=false; g_setAt=0;
 			g_routeCleared=true; g_clearedAt=GetTickCount64();
-			vehicleflight::CancelScannerTrip();
+		}
+
+		void ClearRoute()
+		{
+			DropRoute();
+			g_armed=0;
+			vehicleflight::CancelScannerTrip();  // also disarms a ram-ready vehicle
 			notify::Show("Route cleared | holding position");
+		}
+
+		std::uint32_t Armed()
+		{
+			if(g_armed && !vehicleflight::RamReady(g_armed)) { logger::Write("Ram ready: vehicle %08X no longer armed", g_armed); g_armed=0; }
+			return g_armed;
 		}
 
 		std::string RouteName(const std::string& name, const char* fallback)
@@ -371,18 +387,20 @@ namespace scantarget
 			}
 			if(g_retryKey<0) g_retryKey=controlmap::ClaimFirst("route","Retry trip",{VK_OEM_1,VK_F8,VK_F12});
             if(g_skipKey<0) g_skipKey=controlmap::ClaimFirst("route","Skip stop",{VK_OEM_4,VK_F9,VK_F10,'K'});
-			if(g_clearKey<0) g_clearKey=controlmap::ClaimFirst("route","Clear route",{VK_OEM_5,VK_F10,VK_F11,'N'});
 			const bool skip=Focused() && g_skipKey && (GetAsyncKeyState(g_skipKey)&0x8000)!=0;
-			const bool clear=Focused() && g_clearKey && (GetAsyncKeyState(g_clearKey)&0x8000)!=0;
 			const bool retry=Focused() && g_retryKey && (GetAsyncKeyState(g_retryKey)&0x8000)!=0;
             const bool available=(marker || !g_chain.empty()) && !g_routeCleared;
 			if(retry && !g_retryDown && available) vehicleflight::RetryScannerTrip();
-            else if(clear && !g_clearDown && available) ClearRoute();
 			else if(skip && !g_skipDown && available) {
 				if(g_chain.empty()) ClearRoute();
 				else if(AdvanceStop(true)) vehicleflight::RequestScannerTrip();
 			}
-			g_skipDown=skip; g_clearDown=clear; g_retryDown=retry;
+			g_skipDown=skip; g_retryDown=retry;
+			if(Armed()) {
+				const std::string key=controlmap::KeyName(g_key);
+				hoverui::SetRoute(("RAM READY \xC2\xB7 SELECT TARGET\n"+key+" "+key+": cancel").c_str());
+				return;
+			}
 			if(g_routeCleared) {
 				hoverui::SetRoute(now-g_clearedAt<3000 ? "ROUTE CLEARED\nHolding position" : "");
 				return;
@@ -412,7 +430,7 @@ namespace scantarget
 			}
 			if(g_chain.size()>3) panel+="\n+"+std::to_string(g_chain.size()-3)+" more stops";
 			const std::string retryKey=progress.phase==triplogic::Phase::Unreachable?(g_retryKey?controlmap::KeyName(g_retryKey):"unbound"):"";
-			const std::string skipKey=g_skipKey?controlmap::KeyName(g_skipKey):"unbound",clearKey=g_clearKey?controlmap::KeyName(g_clearKey):"unbound";
+			const std::string skipKey=g_skipKey?controlmap::KeyName(g_skipKey):"unbound",clearKey=controlmap::KeyName(g_key);
 			hoverui::SetRoute(panel.c_str(),skipKey.c_str(),clearKey.c_str(),retryKey.c_str());
 		}
 
@@ -433,78 +451,77 @@ namespace scantarget
 
 	}
 
+	namespace
+	{
+		// A single T tap (after the double-tap window): ram the highlighted actor when armed, otherwise the aimed place becomes the destination.
+		void Select(uptr player, ULONGLONG now)
+		{
+			const auto actor = RefById(g_pressedActor);
+			const auto pick = hoverui::ScannerPickContext();
+			const std::uint32_t armed = Armed();
+			logger::Write("Target selection: native form %08X handle %08X actor %08X ram-ready %08X combat %d", pick.form, pick.handle, g_pressedActor, armed,
+				npcvehicles::IsInCombat(player) ? 1 : 0);
+			if (armed) {
+				// Waiting for a ram target: only the exact highlighted actor counts; a place never sends the vehicle away.
+				if (!actor) notify::Show("No target highlighted | ram still ready");
+				else if (vehicleflight::RequestRam(actor)) { g_armed = 0; notify::Show("Ram order set"); }
+				else notify::Show("Ram order unavailable");
+				return;
+			}
+			const auto& selected = g_pressedTarget;
+			if (!selected.valid) { notify::Show("Scanner marker: nothing to mark"); return; }
+			if (vehicleflight::CoverActive()) {
+				// Covering: the aimed place becomes the vehicle's guard point, not a trip or an implicit ram.
+				if (vehicleflight::SetGuardPoint(selected.x, selected.y)) notify::Show("Guard point set");
+				else notify::Show("Guard point unavailable");
+				return;
+			}
+			const Point q{selected.x, selected.y, selected.z, selected.name};
+			double left = 0, eta = 0;
+			if (g_haveCurrent && vehicleflight::ProgressFor(vehicleflight::OwnRoverId()).active && TripState(now, left, eta) && left > kArrivedNear && !g_routeCleared) {
+				g_chain.push_back(q);
+				logger::Write("Scanner marker: queued stop %zu at (%.0f, %.0f, %.0f)", g_chain.size()+1, q.x, q.y, q.z);
+				notify::Show("Marker queued (%zu stops)", g_chain.size()+1);
+			} else if (PlaceMarker(q, "set at")) {
+				vehicleflight::RequestScannerTrip();
+				notify::Show(selected.name.empty() ? "Target selected | navigation started" : "Target: %s | navigation started", selected.name.c_str());
+			} else { notify::Show("Target could not be set"); return; }
+			g_setAt = now; g_setDist = selected.dist; g_setEstimated = selected.estimated; g_setName = selected.name;
+		}
+	}
+
 	void Tick()
 	{
 		const uptr player = *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr);
 		if (!player) return;
 		const ULONGLONG now = GetTickCount64();
+		ReadKey();
 		RouteTick(now);
 		ChainTick(now);
-		if (!hoverui::IsScannerOpen()) {
-			hoverui::SetScan("");
-			g_keyDown = false;
-			return;
+		const bool scanner = hoverui::IsScannerOpen();
+		const Target t = scanner ? Look(player, now) : Target{};
+		const bool held = (GetAsyncKeyState(g_key) & 0x8000) != 0;
+		const bool driving = reinterpret_cast<uptr (*)(uptr)>(game::Base() + addr::kPlayerVehicle)(player) != 0;
+		const bool enabled = Focused() && (scanner || driving || g_haveCurrent || !g_chain.empty() || Armed() ||
+			vehicleflight::Ramming(vehicleflight::OwnRoverId()));
+		// A tap captured in the scanner must not land after it closed (or a tap outside it inside the scanner).
+		if (scanner != g_lastScanner) { g_input.Cancel(held); g_lastScanner = scanner; }
+		const auto action = g_input.Update(held, enabled, now);
+		if (action.tap && g_pressedInScanner) Select(player, now);
+		if (action.capture) {
+			g_pressedTarget = t;
+			g_pressedInScanner = scanner;
+			const auto actor = scanner ? HighlightedActor() : 0;
+			g_pressedActor = actor ? At<std::uint32_t>(actor, off::kFormId) : 0;
 		}
-		ReadKey();
-		const Target t = Look(player, now);
-		const bool down = Focused() && (GetAsyncKeyState(g_key) & 0x8000) != 0;
-		const bool press = down && !g_keyDown;
-		const bool release = !down && g_keyDown;
-		g_keyDown = down;
-		if (press) {
-			if(const auto actor=HighlightedActor();actor&&npcvehicles::IsInCombat(player)) {
-				g_held=true;g_downAt=0;
-				if(vehicleflight::RequestRam(actor))notify::Show("Ram order set");
-				else notify::Show("Ram order unavailable");
-				return;
-			}
-			g_downAt = now;
-			g_held = false;
+		if (action.doubleTap) { logger::Write("Scanner key: double tap clears the route"); ClearRoute(); }
+		if (action.hold) {
+			DropRoute();
+			g_armed = vehicleflight::ArmRam();
+			if (g_armed) notify::Show("Ram ready | tap %s on a target", controlmap::KeyName(g_key).c_str());
+			else { g_routeCleared = false; notify::Show("Ram ready unavailable"); }
 		}
-		// Tap (acts on release): set, or queue while a trip is on. Hold: replace the chain with this point.
-		const bool hold = down && !g_held && g_downAt && now - g_downAt >= kReplaceMs;
-		if (hold) g_held = true;
-		if (hold || (release && !g_held)) {
-			if (!t.valid) {
-				notify::Show("Scanner marker: nothing to mark");
-				logger::Write("Scanner marker: pressed, but the view hits nothing");
-			}
-			else {
-				const Point q{ t.x, t.y, t.z, t.name };
-				double left = 0, eta = 0;
-				const bool trip = TripState(now, left, eta);
-				if (!hold && trip && left > kArrivedNear && !g_routeCleared) {
-					g_chain.push_back(q);
-					g_setAt = now;
-					g_setDist = t.dist;
-					g_setEstimated = t.estimated;
-					g_setName = t.name;
-					logger::Write("Scanner marker: queued (%.0f, %.0f, %.0f) as stop %zu (current marker %.0f m from your vehicle)", t.x, t.y, t.z, g_chain.size() + 1, left);
-					char msg[48];
-					std::snprintf(msg, sizeof(msg), "Marker queued (%zu in the chain)", g_chain.size() + 1);
-					notify::Show(msg);
-				}
-				else {
-					if (!g_chain.empty()) logger::Write("Scanner marker: chain of %zu replaced", g_chain.size());
-					g_chain.clear();
-					const bool ok = PlaceMarker(q, hold ? "set (hold: chain replaced) at" : "set at");
-					logger::Write("Scanner marker: %.0f m away%s%s (hit form %08X)", t.dist, t.estimated ? " (estimated)" : "", t.snapped ? ", pulled to the structure" : "", t.formId);
-					if (ok) {
-						g_setAt = now;
-						g_setDist = t.dist;
-						g_setEstimated = t.estimated;
-						g_setName = t.name;
-						if (t.name.empty()) notify::Show("Marker set | your vehicle is coming");
-						else {
-							char named[256];
-							std::snprintf(named, sizeof(named), "Destination: %s | your vehicle is coming", t.name.c_str());
-							notify::Show(named);
-						}
-						vehicleflight::RequestScannerTrip();
-					}
-				}
-			}
-		}
+		if (!scanner) { hoverui::SetScan(""); return; }
 		char buf[256];
 		if (g_setAt && now - g_setAt < 3000) {
 			Target shown = t;
@@ -533,20 +550,20 @@ namespace scantarget
 	void EndRide()
 	{
 		g_chain.clear(); g_haveCurrent=false; g_setAt=0; g_setName.clear();
+		g_input.Cancel(true); g_armed=0; g_pressedActor=0; g_pressedInScanner=false;
 		g_routeCleared=false; g_lastAt=0; g_lastVeh=0; g_lostSince=0;
 		hoverui::SetRoute(""); hoverui::SetScan("");
 	}
 
 	void Reset()
 	{
-		g_keyDown = false;
+		g_input = {}; g_pressedActor = 0; g_pressedInScanner = false; g_lastScanner = false; g_armed = 0;
 		g_setAt = 0;
 		g_setName.clear();
 		g_chain.clear();
 		g_lastAt = 0;
-		g_downAt = 0;
 		g_haveCurrent = false;
-		g_retryDown=false; g_skipDown=false; g_clearDown=false; g_routeCleared=false; g_lostSince=0;
+		g_retryDown=false; g_skipDown=false; g_routeCleared=false; g_lostSince=0;
 		hoverui::SetRoute("");
 		g_pois.clear();
 		g_poiHave = false;
