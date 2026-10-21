@@ -119,7 +119,23 @@ namespace vehicleaim
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				handle = 0;
 			}
-			if (handle) vehiclehits::NoteLaunch(handle, shooter);
+			// The launch line (origin, and the direction from the pitch / heading angles), for shots gone before their first frame.
+			float origin[3] = {}, dir[3] = {};
+			bool line = false;
+			if (data) {
+				__try {
+					const float* org = reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(data) + kOrigin);
+					const float pitch = *reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(data) + kAngleX);
+					const float heading = *reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(data) + kAngleZ);
+					origin[0] = org[0]; origin[1] = org[1]; origin[2] = org[2];
+					dir[0] = std::sin(heading) * std::cos(pitch); dir[1] = std::cos(heading) * std::cos(pitch); dir[2] = -std::sin(pitch);  // pitch + is nose down
+					line = std::isfinite(origin[0]) && std::isfinite(dir[0]);
+				}
+				__except (EXCEPTION_EXECUTE_HANDLER) {
+					line = false;
+				}
+			}
+			if (handle) vehiclehits::NoteLaunch(handle, shooter, line ? origin : nullptr, line ? dir : nullptr);
 			return r;
 		}
 	}

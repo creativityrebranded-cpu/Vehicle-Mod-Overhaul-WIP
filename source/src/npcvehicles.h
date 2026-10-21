@@ -28,7 +28,7 @@ namespace npcvehicles
 	// ---- Exit service (spec: vcontract.h ExitRequest / SeatState; polled). An actor aboard any vehicle gets out; a job's driver also ends its job and the
 	// vehicle is Unassigned from its profile. Modes: Auto = wait landed, the game's animated dismount, then the instant exit; Normal = the first two (Refused
 	// if they fail); Quick = the dismount with a short watch; Instant = the game's instant exit at once. After it the actor stands at the request's point or
-	// beside the vehicle away from the player.
+	// beside the vehicle away from the player. Eject bypasses landing and exits outside the hull at its current altitude (NPCs only).
 	bool RequestExit(std::uintptr_t actor, const vcontract::ExitRequest& req);
 	int UnloadVehicle(std::uintptr_t vehicle, const vcontract::ExitRequest& req, bool includeDriver);  // how many were asked
 	vcontract::SeatState ExitStateOf(std::uintptr_t actor);
@@ -82,7 +82,7 @@ namespace npcvehicles
 	// standing in its own camp (the place's owner is its faction). Parked town vehicles stay put. Never the player's.
 	bool FighterMayTake(std::uintptr_t actor, std::uintptr_t vehicle);
 	// Main thread: the game's own exit for the player (FUN_141952530, with its obstruction checks); true when it let them out.
-	bool ExitPlayer();
+	bool ExitPlayer(bool force = false);  // force: when the game's exit refuses, end the seat interaction (a wreck)
 	// The NPC flying pilot `pilot` (1..) is in a fight / its combat AI chose to retreat or flee (travelmode: both hover).
 	bool PilotFighting(int pilot);
 	bool PilotFleeing(int pilot);
@@ -98,7 +98,8 @@ namespace npcvehicles
 	Stance CurrentStance();
 	// Witness reactions (2026-10-20, notes/VEHICLE_BEHAVIOUR_RESEARCH_20261020.md): a crash at (x, y, z) -> calm bystanders within 10 m flee
 	// (ActionFleeStart), within 25 m cower (ActionCower). Never followers, quest NPCs, anyone fighting or in a vehicle. Seamless.ini [witness] enabled=0 off.
-	// Native friendship gate for shot hits: neutral drivers remain damageable; player and companion pairs are protected. Main thread only.
+	// Friendship gate for every vehicle damage source: allied drivers/owners are protected, including the player's allies. Neutrals remain damageable.
+	// Main thread only.
 	bool VehicleFriendlyToShooter(std::uintptr_t vehicle, std::uint32_t shooterFormId);
 	// Actual seated driver (player included), 0 when empty or unreadable. Main thread only.
 	std::uint32_t VehicleDriverId(std::uint32_t vehicleId);
@@ -110,6 +111,8 @@ namespace npcvehicles
 	std::uint32_t NativeEnemyId(std::uintptr_t actor); // native combat target, validated hostility
 	bool AreHostile(std::uintptr_t a, std::uintptr_t b);
 	bool AreAllies(std::uintptr_t a, std::uintptr_t b);
+	// Native damage callbacks: uncached engine relations, with atomically published crew membership.
+	bool FriendlyActorDamage(std::uintptr_t victim, std::uintptr_t attacker);
 	// Enemy patrol convoy: the second vehicle follows `leadVehicleId`'s patrol at 12 m and parks when the lead's job ends.
 	bool StartConvoy(std::uintptr_t actor, std::uintptr_t vehicle, std::uint32_t leadVehicleId);
 }

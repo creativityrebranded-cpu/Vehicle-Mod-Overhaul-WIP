@@ -221,7 +221,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	g_messaging = static_cast<SFSEMessagingInterface*>(sfse->QueryInterface(kInterface_Messaging));
 	g_tasks = static_cast<SFSETaskInterface*>(sfse->QueryInterface(kInterface_Task));
 	if (!g_messaging || !g_messaging->RegisterListener(g_handle, "SFSE", SfseMessage)) return false;
-	logger::Write("SeamlessVehicle 0.63.0 loaded; core optional");
+	logger::Write("SeamlessVehicle 0.63.1 loaded; core optional");
 	return true;
 }
 }

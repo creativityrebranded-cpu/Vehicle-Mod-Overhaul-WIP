@@ -1,4 +1,5 @@
 #include "integrationlogic.h"
+#include "interactionlogic.h"
 #include "combat_ai.h"
 #include "coverfight.h"
 #include <cstdio>
@@ -95,5 +96,25 @@ int main() {
     st.ms.phase=3;s.foe.id=3;s.now+=100;combatai::Tick(st,s,w,sw,out);check(st.ms.phase==0&&st.ms.since==s.now,"new native enemy resets manoeuvre even if chosen action is unchanged");
     tactics::TState ts;tactics::Unit me,it;tactics::Facts facts;tactics::Enter(ts,tactics::T::BoxIn,me,it,facts,1000,0);tactics::Enter(ts,tactics::T::BoxIn,me,it,facts,1100,2);
     check(ts.slot==2,"live box-slot reassignment reaches tactic steering");
+    Box ejectHull; ejectHull.p[2]=150; ejectHull.half[0]=8; ejectHull.half[1]=3; ejectHull.half[2]=2;
+    double exitRight[3]{},exitLeft[3]{};
+    check(EjectPosition(ejectHull,0,1,exitRight)&&EjectPosition(ejectHull,0,-1,exitLeft),"air ejection has both hull-relative escape sides");
+    check(exitRight[0]==9.5&&exitLeft[0]==-9.5&&exitRight[2]==150&&exitLeft[2]==150,"wide vehicle clears its actual hull without teleporting NPC to ground");
+    Box actorBox; actorBox.p[0]=exitRight[0];actorBox.p[2]=exitRight[2]+1;actorBox.half[0]=actorBox.half[1]=.5;
+    check(!Touching(ejectHull,actorBox),"ejected upright actor has room outside the hull");
+    ejectHull.axis[0][0]=0;ejectHull.axis[0][2]=1;ejectHull.axis[2][0]=-1;ejectHull.axis[2][2]=0;
+    check(EjectPosition(ejectHull,0,1,exitRight)&&exitRight[0]==3.5&&exitRight[2]==150,"rolled vehicle uses projected hull extent at flight altitude");
+    ejectHull=Box{};ejectHull.p[0]=100;ejectHull.p[1]=200;ejectHull.p[2]=80;
+    check(EjectPosition(ejectHull,1.5707963267948966,1,exitRight)&&std::fabs(exitRight[0]-100)<1e-6&&std::fabs(exitRight[1]-197.5)<1e-6,"escape follows vehicle heading in world coordinates");
+    ejectHull.half[0]=NAN;check(!EjectPosition(ejectHull,0,1,exitRight),"unreadable hull cannot manufacture an ejection point");
+    check(!EjectPosition(Box{},NAN,1,exitRight),"unreadable heading refuses ejection");
+    const float chassisCenter[]{0,50,5},chassisRotation[]{1,0,0,0,1,0,0,0,1},chassisHalf[]{1.2f,2.3f,1};
+    const float launch[]{0,0,5},firstSample[]{0,100,5};double fraction=0;
+    check(interactionlogic::HullHit(chassisCenter,chassisRotation,chassisHalf,launch,firstSample,fraction)&&fraction>0.47&&fraction<0.49,"fast shot crosses vehicle in launch-to-first-sample segment");
+    const float impact[]{0,48,5};
+    check(interactionlogic::HullHit(chassisCenter,chassisRotation,chassisHalf,impact,impact,fraction),"native contact inside chassis counts even without surviving projectile frames");
+    const float miss[]{2,48,5},invalid[]{NAN,48,5};
+    check(!interactionlogic::HullHit(chassisCenter,chassisRotation,chassisHalf,miss,miss,fraction),"native impact beside chassis does not manufacture vehicle damage");
+    check(!interactionlogic::HullHit(chassisCenter,chassisRotation,chassisHalf,invalid,invalid,fraction),"invalid contact cannot damage every vehicle");
     std::printf("%d checks, %d failures\n",checks,failures);return failures?1:0;
 }

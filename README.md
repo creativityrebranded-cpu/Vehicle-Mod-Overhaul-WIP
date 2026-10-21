@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current version: **0.63.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current version: **0.63.1** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -33,12 +33,14 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Rescue, scout, wait** | A follower vehicle picks you up when you are hurt, scouts your marker, waits at the door | Untested |
 | **Smarter enemies** | Enemy vehicles flank, intercept, block, hover overhead, retreat when damaged and call for help | Untested |
 | **Vehicle health** | Vehicles take damage from shots and rams, share some with the driver, and wreck at 0 health | Untested |
+| **Friendly-fire protection** | Allied vehicle shots/rams and attributed native actor damage are blocked | Offline checks pass; needs live verification |
+| **NPC air ejection** | Wrecked NPC occupants and the airborne exit command release the seat without waiting for a landing | Offline checks pass; needs live verification |
 | **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
 | **Vehicles respect each other** | No more vehicles "magnetised" together; right of way decides who gives way | Untested |
 | **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
 | **Shared 3D navigation** | Altitude cost fields guide local trajectory plans; bounded recovery holds failed trips with Retry / Skip and T T (clear) | Untested in game; offline checks pass |
 | **Environment-aware traffic and combat** | Traffic detours check the world map; combat positions consider cover and automated fire requires a clear-shot probe | Untested in game; offline checks pass |
-| **Checked boarding and drop-off** | Vehicle footprint, slope, water, headroom, standing space, and stopped arrival are checked before boarding or exit | Untested in game; offline checks pass |
+| **Checked boarding and drop-off** | Vehicle footprint, slope, water, headroom, standing space, and stopped arrival are checked before boarding or ordinary exit; emergency ejection works in flight | Untested in game; offline checks pass |
 | **Flies under things** | Overhangs and bridges are flown under; ceilings cap the height | Untested |
 | **Knows the area up front** | The game's own collision objects are read into the vehicles' map, so planning starts with the walls already known | Untested |
 | **Night and weather** | Autopilots slow down and fly a little higher at night and in rain, snow or dust | Untested |
@@ -173,13 +175,41 @@ The HUD shows what you can do now and one status card (0.62.0). Everything uses 
 
 ---
 
+## What's new in 0.63.1
+
+The offline checks pass. The enemy bar has been seen in game. The new native-impact and first-segment damage checks,
+boarding aggression restoration, friendly-fire protection and NPC air ejection need live verification.
+
+- **Driving is the preferred mode.** With no reason to fly, a vehicle drives on the ground, long trips included. It hovers
+  for water, rough ground, an obstacle taller than a jump, a fight, catching you, or a goal 75 m or more above. Only hover
+  profiles (courier, scout) fly by default.
+- **Launch-line hit checks.** A projectile that is gone before the mod's first look at it is checked along its launch
+  line. The launch-to-first-sample segment is now checked too, and native projectile impact events provide a second hit path.
+  These fixes address missed damage reported in the previous live test and need retesting. One registered shot takes at most 20% of a vehicle's health
+  (`[hits] shotCap=20`), so a vehicle gun no longer wrecks a vehicle in one hit.
+- **A wreck throws you out.** Your wrecked vehicle ejects you at once, and a wrecked vehicle cannot be boarded until it
+  repairs itself past 25%.
+- **Friendly vehicle damage is off.** Mod-applied shots, rams and driver health damage cannot hurt allies, including the player's faction allies.
+  The native actor damage path also rejects attributed damage between allies, covering direct hits and explosions that use that path.
+- **NPC air ejection.** Wrecks eject NPC occupants without waiting for a landing. The NPC exit key also ejects while airborne;
+  the NPC is placed outside the actual hull at its current altitude and then falls under the game's physics.
+- **Wider fire gate.** NPC vehicles fire when the nose is within 25 deg of the target (up to 40 deg up close), since their
+  shots are aimed at launch; they spend far less time lining up.
+- **Names.** Health lines show the vehicle's own name (for example REV-8), cut at 14 characters to fit the field; the text
+  bar is gone (the bar under the enemy's health bar is the graphic one).
+- **Never calm in a seat.** Switching a driver to escort no longer calms them; an NPC calmed to walk to a vehicle in a fight
+  gets its own recorded enemy back once seated, with a bounded restoration period independent of other NPCs fighting.
+- **Attacking vehicles provokes a contextual response.** Shots and damaging rams provoke the pilot/occupants and nearby owners/faction allies.
+  Assault alarms use the game's crime system, and neutral bystanders can flee or cower. Damage settings do not suppress shot provocation.
+- **New default HUD layout** (positions and sizes); F7's Delete returns to it.
+
 ## What's new in 0.63.0
 
 None of this has been tested in game yet; the offline checks pass.
 
 - **Hover or drive.** NPC vehicles, and your own on autopilot (summon, follow, cover, guard, Auto), now choose per moment to fly
   or to drive on the ground. They hover over water, rough ground and obstacles taller than a jump (rays up to 250 m ahead), when
-  catching you, in fights, when the goal is 75 m or more above, and on trips over 500 m. They drive inside settlements, on trips
+  catching you, in fights, when the goal is 75 m or more above, and (until 0.63.1) on trips over 500 m. They drive inside settlements, on trips
   under 300 m, and when the hover is failing (under 30% health). Each navigation profile has its own default (Escort copies
   you). A reason must hold 2 s and a mode lasts at least 10 s; a blocking reason switches at once and is then held 30 s.
   "Drive" is the hover held just over the ground; the game's own driving is used only with you aboard, in a tight spot, or
@@ -419,6 +449,7 @@ All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 | `seamless.ini` | `[hits]` | `weaponScale` | `1` | Multiplies the weapons' damage to vehicles |
 | `seamless.ini` | `[hits]` | `damage` | `20` | Damage per shot, only when the weapon's own damage cannot be read |
 | `seamless.ini` | `[hits]` | `ramCap` | `35` | Percent of a vehicle's health one ram may take |
+| `seamless.ini` | `[hits]` | `shotCap` | `20` | Percent of a vehicle's health one shot may take |
 | `seamless.ini` | `[witness]` | `enabled` | `1` | `0` = bystanders do not react to crashes |
 | `seamless.ini` | `[combat]` | `ai`, `ram` | `1`, `1` | `0` = simpler attack runs / no rams |
 | `seamless.ini` | `[nav]` | `travel` | `1` | `0` = vehicles hover, and drive only to get out of tight spots |

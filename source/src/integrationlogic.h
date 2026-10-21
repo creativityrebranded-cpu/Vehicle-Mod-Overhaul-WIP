@@ -31,6 +31,19 @@ inline bool Valid(const Box& b) {
     for(int i=0;i<3;++i)for(int j=i+1;j<3;++j){double d=0;for(int k=0;k<3;++k)d+=b.axis[i][k]*b.axis[j][k];if(std::fabs(d)>0.02)return false;}
     return true;
 }
+// A horizontal escape outside the hull, including rolled/pitched and unusually wide vehicles.
+// Keep the current altitude: the engine handles falling after the seat is released.
+inline bool EjectPosition(const Box& hull, double heading, int side, double out[3]) {
+    if (!Valid(hull) || !std::isfinite(heading)) return false;
+    const double dx = std::cos(heading) * (side < 0 ? -1 : 1);
+    const double dy = -std::sin(heading) * (side < 0 ? -1 : 1);
+    double radius = 0;
+    for (int i = 0; i < 3; ++i) radius += std::fabs(dx * hull.axis[i][0] + dy * hull.axis[i][1]) * hull.half[i];
+    out[0] = hull.p[0] + dx * (radius + 1.5);
+    out[1] = hull.p[1] + dy * (radius + 1.5);
+    out[2] = hull.p[2];
+    return true;
+}
 // Full oriented-box separating-axis test, including pitch/roll. The tolerance is
 // centimetres of solver separation, not a radius around the chassis.
 inline bool Touching(const Box& a, const Box& b, double tolerance=0.08) {

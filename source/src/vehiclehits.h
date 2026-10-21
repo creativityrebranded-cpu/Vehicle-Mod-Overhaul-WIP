@@ -13,7 +13,9 @@
 namespace vehiclehits
 {
 	// Any thread (the launch hook): a projectile was launched by `shooterFormId` (0 unknown); `handle` is its reference handle.
-	void NoteLaunch(std::uint32_t handle, std::uint32_t shooterFormId);
+	// origin / dir: the launch point and unit direction (vehicleaim reads them from the launch data), so a shot gone before its
+	// first frame here is still checked along that line.
+	void NoteLaunch(std::uint32_t handle, std::uint32_t shooterFormId, const float* origin = nullptr, const float* dir = nullptr);
 	void Tick();   // main thread, every frame, after world::Publish
 	void Reset();  // a save load
     struct Ballistics { double speed=0, range=100; bool nativeRange=false, observedSpeed=false; };

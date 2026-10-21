@@ -10,6 +10,8 @@
 #include "vehicleworld.h"
 #include "interactionlogic.h"
 #include "weapondamage.h"
+#include "combat_relations.h"
+#include "environment.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -57,19 +59,27 @@ namespace vehiclehits
 
 		struct Proj
 		{
-			std::uint32_t handle = 0, shooter = 0, shooterVeh = 0;
+			std::uint32_t handle = 0, shooter = 0, shooterVeh = 0, projectileId = 0;
 			float weaponRange=0,falloff=1;
             float weaponDamage = NAN;                       // native total at launch; no borrowed weapon/projectile pointers
 			std::uint32_t weaponId = 0, attackerId = 0;      // actual driver when the launch shooter is a vehicle
 			bool resolved = false;                          // shooterVeh and the side looked up
 			int side = 0;                                   // 1 the player's side (the player, a follower, their vehicles), -1 a pursuer, 0 anyone else
 			bool seen = false;                              // a position was read
+			bool haveLine = false;                          // the launch point and direction are known
+			float o[3] = {}, d[3] = {};
 			float p[3] = {}, v[3] = {};
+			float closest = 1e9f;                           // the nearest any reading came to a vehicle's centre (the miss log)
+			std::uint32_t closestId = 0;
+			unsigned frames = 0;                            // positions read
 			ULONGLONG at = 0, seenAt = 0;
 		};
 		std::mutex g_lock;
 		Proj g_new[kMax];                                   // from the hook (any thread)
 		int g_newCount = 0;
+		struct NativeImpact { std::uint32_t projectile=0,shooterHandle=0,weapon=0; float damage=NAN,point[3]{}; ULONGLONG at=0; };
+		NativeImpact g_newImpacts[256]; int g_newImpactCount=0;
+		combatrelations::PairCooldown<512> g_projectileHits;
 		struct WeaponFlight { Ballistics data; std::uint32_t weapon=0; ULONGLONG at=0; };
         std::unordered_map<std::uint32_t,WeaponFlight> g_ballistics;
         Proj g_live[kMax];                                  // main thread
@@ -80,7 +90,7 @@ namespace vehiclehits
 		Damage g_dmg[64];
 
 		bool g_iniRead = false;
-		float g_hitDamage = 20.0f, g_weaponScale = 1.0f, g_limitIni = 0.0f, g_playerHealth = 0.0f, g_vehicleHealth = 300.0f, g_driverShare = 0.25f, g_ramCap = 0.35f;
+		float g_hitDamage = 20.0f, g_weaponScale = 1.0f, g_limitIni = 0.0f, g_playerHealth = 0.0f, g_vehicleHealth = 300.0f, g_driverShare = 0.25f, g_ramCap = 0.35f, g_shotCap = 0.20f;
 		unsigned g_weaponChecks = 0;
 		unsigned g_probes = 0, g_driverChecks = 0;
 		unsigned g_cooldownS = 30;
@@ -104,6 +114,7 @@ namespace vehiclehits
 				g_vehicleHealth = float(GetPrivateProfileIntW(L"hits", L"health", 300, ini.c_str()));
 				g_driverShare = float(GetPrivateProfileIntW(L"hits", L"driverShare", 25, ini.c_str())) / 100.0f;
 				g_ramCap = float(GetPrivateProfileIntW(L"hits", L"ramCap", 35, ini.c_str())) / 100.0f;
+				g_shotCap = float(GetPrivateProfileIntW(L"hits", L"shotCap", 20, ini.c_str())) / 100.0f;
 				g_limitIni = float(GetPrivateProfileIntW(L"hits", L"limit", 0, ini.c_str()));
 				g_cooldownS = GetPrivateProfileIntW(L"hits", L"cooldown", 30, ini.c_str());
 			}
@@ -112,9 +123,10 @@ namespace vehiclehits
 			g_vehicleHealth = std::clamp(g_vehicleHealth, 10.0f, 100000.0f);
 			g_driverShare = std::clamp(g_driverShare, 0.0f, 1.0f);
 			g_ramCap = std::clamp(g_ramCap, 0.0f, 1.0f);
+			g_shotCap = std::clamp(g_shotCap, 0.01f, 1.0f);
 			logger::Write("Vehicle hits: %.0f damage per hit, vehicle health %.0f%s; a full bar costs the driver %.0f%% of their health; wrecked at 0 (repaired over %.0f%%)",
 				g_hitDamage, g_limitIni > 0 ? g_limitIni : g_vehicleHealth, g_limitIni > 0 ? " (ini limit=)" : "", g_driverShare * 100.0f, kRepairedShare * 100.0f);
-			logger::Write("Vehicle hits: one ram deals at most %.0f%% of a vehicle's health (ramCap)", g_ramCap * 100.0f);
+			logger::Write("Vehicle hits: one ram deals at most %.0f%% of a vehicle's health (ramCap), one shot at most %.0f%% (shotCap)", g_ramCap * 100.0f, g_shotCap * 100.0f);
 			logger::Write("Vehicle hits: native projectile weapon damage, weaponScale=%.3f; damage=%.0f only when native data is unavailable", g_weaponScale, g_hitDamage);
 		}
 
@@ -195,6 +207,49 @@ namespace vehiclehits
             __except(EXCEPTION_EXECUTE_HANDLER){return false;}
         }
 
+		constexpr std::uint32_t kNativeImpact=0x01B47540;
+		// Complete 15-byte prologue: mov r11,rsp; three register-to-stack moves; no RIP-relative instructions.
+		constexpr std::uint8_t kImpactPrologue[]{0x4C,0x8B,0xDC,0x45,0x88,0x4B,0x20,0x49,0x89,0x53,0x10,0x49,0x89,0x4B,0x08};
+		using Impact_t=void(*)(uptr,uptr,uptr,unsigned char,uptr,unsigned char);
+		Impact_t g_impactOriginal=nullptr;
+		bool ReadNativeImpact(uptr projectile,uptr result,NativeImpact& event) {
+			// 141b47540: contact position at result+18h, origin index at +24h.
+			// 141b3a990: projectile+170h holds the shooter reference handle.
+			__try {
+				if(!projectile||!result||!At<uptr>(result,0))return false;
+				event.projectile=At<std::uint32_t>(projectile,off::kFormId);
+				event.shooterHandle=At<std::uint32_t>(projectile,0x170);
+				const auto p=At<game::Vec3>(result,0x18);
+				event.point[0]=p.x;event.point[1]=p.y;event.point[2]=p.z;
+				const auto origin=At<std::uint32_t>(result,0x24),count=At<std::uint32_t>(game::Base(),0x061FAE80);
+				if(origin<count) {
+					const auto table=Ptr(0x061FAE88);
+					if(!table||count>1000000)return false;
+					for(int axis=0;axis<3;++axis)event.point[axis]+=At<float>(table,origin*12+axis*4);
+				}
+				for(float coordinate:event.point)if(!std::isfinite(coordinate))return false;
+				const auto weapon=At<uptr>(projectile,0x1E0);
+				if(weapon) {
+					event.weapon=At<std::uint32_t>(weapon,off::kFormId);
+					constexpr unsigned char sig[]{0x40,0x53,0x48,0x83,0xEC,0x30,0x8B,0x81,0xF8,0x01,0x00,0x00,0x48,0x8B,0xD9,0x48};
+					if(!std::memcmp(reinterpret_cast<void*>(game::Base()+0x01B52190),sig,sizeof(sig)))event.damage=EngineFn<float(*)(uptr)>(0x01B52190)(projectile);
+				}
+				event.at=GetTickCount64();return event.projectile&&event.shooterHandle;
+			}__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+		}
+		void ImpactDetour(uptr projectile,uptr result,uptr a3,unsigned char a4,uptr a5,unsigned char a6) {
+			NativeImpact event;
+			if(ReadNativeImpact(projectile,result,event)) {
+				std::lock_guard lock(g_lock);
+				if(g_newImpactCount<256)g_newImpacts[g_newImpactCount++]=event;
+			}
+			g_impactOriginal(projectile,result,a3,a4,a5,a6);
+		}
+		std::uint32_t ProjectileId(std::uint32_t handle) {
+			__try {const auto ref=HandleRef(handle);return ref?At<std::uint32_t>(ref,off::kFormId):0;}
+			__except(EXCEPTION_EXECUTE_HANDLER){return 0;}
+		}
+
 		// This is the game's read-only amount calculation, not ApplyDamage:
 		// local perk entrypoint FC, then 140d83210's difficulty multiplier. The
 		// native damage caller 141905d30 uses it only with the player involved.
@@ -246,6 +301,13 @@ namespace vehiclehits
 				return 0;
 			}
 		}
+		std::uint32_t ShooterActorId(std::uint32_t shooter) {
+			if(const auto driver=npcvehicles::VehicleDriverId(shooter))return driver;
+			if(shooter==vehicleflight::OwnRoverId()) {
+				const auto player=Ptr(addr::kPlayerCharacterPtr);if(player)return At<std::uint32_t>(player,off::kFormId);
+			}
+			return shooter;
+		}
 
 		float g_playerHealthNow = NAN;
 
@@ -279,13 +341,37 @@ namespace vehiclehits
 			return std::isfinite(now) && std::isfinite(max) && max > 0.0f && max < 1.0e6f;
 		}
 
+		constexpr std::uint32_t kActorDamage = 0x01905D30;
+		// push rbp; push rsi; push r14; sub rsp,80h; mov rax,[rcx] (15 bytes including the initial REX prefix).
+		constexpr std::uint8_t kActorDamagePrologue[]{0x40,0x55,0x56,0x41,0x56,0x48,0x81,0xEC,0x80,0x00,0x00,0x00,0x48,0x8B,0x01};
+		using ActorDamage_t = std::uint64_t (*)(uptr, float, uptr, unsigned char);
+		ActorDamage_t g_actorDamageOriginal = nullptr;
+		std::atomic<unsigned> g_friendlyDamageBlocked{0};
+		std::uint64_t ActorDamageDetour(uptr victim, float amount, uptr attacker, unsigned char reason)
+		{
+			bool block = false;
+			std::uint32_t victimId = 0, attackerId = 0;
+			__try {
+				if (attacker && combatrelations::BlockFriendlyDamage(amount, victim == attacker, combatrelations::Relation::Ally)) {
+					block = npcvehicles::FriendlyActorDamage(victim, attacker);
+					if (block) { victimId = At<std::uint32_t>(victim, off::kFormId); attackerId = At<std::uint32_t>(attacker, off::kFormId); }
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { block = false; }
+			if (block) {
+				if (g_friendlyDamageBlocked.fetch_add(1, std::memory_order_relaxed) < 12)
+					logger::Write("Friendly fire: native actor damage blocked (%08X -> %08X, %.1f damage, reason %u)", attackerId, victimId, amount, unsigned(reason));
+				return 0; // Native invulnerability returns the same false result (actor-damage.c).
+			}
+			return g_actorDamageOriginal(victim, amount, attacker, reason);
+		}
 		// Native actor damage core retains invulnerability/protection and attacker attribution.
         bool DamageHealth(uptr actor,float amount,uptr attacker)
         {
             __try {
                 constexpr unsigned char sig[]{0x40,0x55,0x56,0x41,0x56,0x48,0x81,0xEC,0x80,0x00,0x00,0x00,0x48,0x8B,0x01,0x45};
                 // Pinned executable signature; float amount uses XMM1, actor R8, reason R9B.
-                if(std::memcmp(reinterpret_cast<void*>(game::Base()+0x01905D30),sig,sizeof(sig)))return false;
+                if(!g_actorDamageOriginal && std::memcmp(reinterpret_cast<void*>(game::Base()+kActorDamage),sig,sizeof(sig)))return false;
                 // Native damage reason 6 is the path that receives an already
                 // scaled amount (141905d30 explicitly skips its difficulty pass).
                 EngineFn<std::uint64_t(*)(uptr,float,uptr,unsigned char)>(0x01905D30)(actor,amount,attacker,6);
@@ -379,6 +465,8 @@ namespace vehiclehits
 		void AddDamage(const world::VehicleInfo& v, float amount, std::uint32_t by, int side, ULONGLONG now, const char* what,std::uint32_t attacker=0)
 		{
 			if (!features::On(features::Id::VehicleDamage)) return;  // [hits] enabled, also the settings menu
+			// Every damage source (shots, rams and driver health share) uses the same friendship gate.
+			if (npcvehicles::VehicleFriendlyToShooter(v.ref, by ? by : attacker)) return;
 			Damage* d = DamageFor(v.formId, true);
 			const float limit = Limit();
 			const float dealt = std::min(amount, std::max(0.0f, limit - d->damage));
@@ -398,12 +486,16 @@ namespace vehiclehits
 			d->wreckRenew = now;
 			logger::Write("Vehicle hits: %08X WRECKED (%u hits): autopilot, hover and weapon off until repaired over %.0f%%", v.formId, d->hits, kRepairedShare * 100.0f);
 			vehicleflight::DisableAutopilot(v.formId, unsigned(kWreckRenewMs + 5000), "wrecked");
+			vcontract::ExitRequest eject;
+			eject.mode = vcontract::ExitMode::Eject; eject.waitLanded = false;
+			npcvehicles::UnloadVehicle(v.ref, eject, true);
 			npcvehicles::WitnessCrash(v.pos[0], v.pos[1], v.pos[2], "a vehicle wrecked");
 			if (own) notify::Show("Your vehicle is wrecked: it repairs itself slowly");
 		}
 
 		void Hit(const world::VehicleInfo& v, const Proj& pr, ULONGLONG now)
 		{
+			if(pr.projectileId && !g_projectileHits.Claim(pr.projectileId,v.formId,now,8000))return;
 			Probe(v);
 			float native = pr.weaponDamage;
 			bool available = weapondamage::Valid(native);
@@ -420,7 +512,8 @@ namespace vehiclehits
 				const uptr target = playerTarget ? player : targetId ? RefById(targetId) : 0;
 				available = ScaleForDifficulty(target, native, native);
 			}
-			const auto hit = weapondamage::Resolve(available, native, g_weaponScale, g_hitDamage);
+			auto hit = weapondamage::Resolve(available, native, g_weaponScale, g_hitDamage);
+			hit.damage = std::min(hit.damage, Limit() * g_shotCap);  // [hits] shotCap: one vehicle-gun hit never wrecks a vehicle
 			if (g_weaponChecks < 12 || logger::Verbose()) {
 				++g_weaponChecks;
 				logger::Write("Vehicle hits: weapon %08X, shooter %08X (driver %08X), target driver %08X: launch %.3f, native scaled %.3f, weaponScale %.3f -> %.3f (%s; player difficulty %s)",
@@ -435,7 +528,7 @@ namespace vehiclehits
 		Shot g_shots[32];
 	}
 
-	void NoteLaunch(std::uint32_t handle, std::uint32_t shooterFormId)
+	void NoteLaunch(std::uint32_t handle, std::uint32_t shooterFormId, const float* origin, const float* dir)
 	{
 		if (!handle) return;
 		// Capture immediately after native Launch completes, while the projectile
@@ -453,10 +546,15 @@ namespace vehiclehits
 		Proj& p = g_new[g_newCount++];
 		p = Proj{};
 		p.handle = handle;
+		p.projectileId=ProjectileId(handle);
 		p.shooter = shooterFormId;
 		p.weaponDamage = nativeDamage;
 		p.weaponId = weapon; p.weaponRange=range;
 		p.at = GetTickCount64();
+		if (origin && dir && std::isfinite(origin[0]) && std::isfinite(dir[0])) {
+			p.haveLine = true;
+			for (int k = 0; k < 3; ++k) { p.o[k] = origin[k]; p.d[k] = dir[k]; }
+		}
 	}
 
 	namespace { void EnemyBarTick(const world::Snapshot& snap, bool haveVehicles); }  // below, with the enemy bar hook
@@ -465,25 +563,52 @@ namespace vehiclehits
 	{
 		ReadIni();
 		const ULONGLONG now = GetTickCount64();
+		NativeImpact impacts[256];int impactCount=0;
         if(g_ballistics.size()>256){std::erase_if(g_ballistics,[&](const auto& p){return now-p.second.at>60000;});while(g_ballistics.size()>256){auto oldest=std::min_element(g_ballistics.begin(),g_ballistics.end(),[](const auto&a,const auto&b){return a.second.at<b.second.at;});g_ballistics.erase(oldest);}}
 		{
 			std::lock_guard lk(g_lock);
 			for (int i = 0; i < g_newCount; ++i) {
+				// Native projectile references may be reused for a later shot.
+				if(g_new[i].projectileId)g_projectileHits.Forget(g_new[i].projectileId);
 				if (g_liveCount < kMax) g_live[g_liveCount++] = g_new[i];
 				++g_launches;
 			}
 			g_newCount = 0;
+			impactCount=g_newImpactCount;std::copy(g_newImpacts,g_newImpacts+impactCount,impacts);g_newImpactCount=0;
 		}
 		static world::Snapshot snap;
 		const bool haveVehicles = world::Vehicles(snap);
 		EnemyBarTick(snap, haveVehicles);
+		for(int i=0;haveVehicles&&i<impactCount;++i) {
+			const auto& impact=impacts[i];const auto shooter=HandleRef(impact.shooterHandle);
+			if(!shooter)continue;
+			Proj shot;shot.projectileId=impact.projectile;shot.shooter=At<std::uint32_t>(shooter,off::kFormId);
+			shot.shooterVeh=VehicleOf(shot.shooter);shot.attackerId=ShooterActorId(shot.shooter);shot.side=ShooterSide(shot);
+			shot.weaponId=impact.weapon;shot.weaponDamage=impact.damage;
+			const world::VehicleInfo* struck=nullptr;double nearest=1e30;
+			for(unsigned k=0;k<snap.count&&k<64;++k) {
+				const auto& v=snap.v[k];if(!interactionlogic::OtherVehicle(v.formId,shot.shooter,shot.shooterVeh))continue;
+				float center[3];const double age=now>=impact.at?std::min(double(now-impact.at)/1000.0,0.1):0;
+				for(int axis=0;axis<3;++axis)center[axis]=v.center[axis]-float(v.vel[axis]*age);
+				double t=0;if(!interactionlogic::HullHit(center,v.rot,v.half,impact.point,impact.point,t))continue;
+				const double distance=std::hypot(std::hypot(impact.point[0]-center[0],impact.point[1]-center[1]),impact.point[2]-center[2]);
+				if(distance<nearest){nearest=distance;struck=&v;}
+			}
+			static unsigned logs=0;
+			if((struck&&logs<20)||logger::Verbose()) {
+				++logs;logger::Write("Vehicle hits: native impact %08X from %08X at (%.1f, %.1f, %.1f): vehicle %08X",impact.projectile,shot.shooter,impact.point[0],impact.point[1],impact.point[2],struck?struck->formId:0);
+			}
+			if(struck&&!npcvehicles::VehicleFriendlyToShooter(struck->ref,shot.shooter)) {
+				// Provocation is independent of health settings and whether a numerical damage amount is available.
+				npcvehicles::VehicleAggression(struck->ref,shot.attackerId);Hit(*struck,shot,now);
+			}
+		}
 		for (int i = 0; i < g_liveCount;) {
 			Proj& pr = g_live[i];
 			if (!pr.resolved) {
 				pr.resolved = true;
 				pr.shooterVeh = VehicleOf(pr.shooter);
-				pr.attackerId = npcvehicles::VehicleDriverId(pr.shooter);
-				if (!pr.attackerId) pr.attackerId = pr.shooter;
+				pr.attackerId = ShooterActorId(pr.shooter);
 				pr.side = ShooterSide(pr);
 				if (!weapondamage::Valid(pr.weaponDamage) && !CaptureWeaponDamage(pr.handle, pr.weaponDamage, pr.weaponId,pr.weaponRange)) pr.weaponDamage = NAN;
 			}
@@ -495,7 +620,30 @@ namespace vehiclehits
             float cur[3];
             const bool alive = now - pr.at < kProjMaxMs && ProjPos(pr.handle, cur);
 			bool done = !alive;
-			if (pr.seen && haveVehicles) {
+			if (!alive && !pr.seen && pr.haveLine && haveVehicles) {
+				const double reach = std::clamp(double(pr.weaponRange > 1 ? pr.weaponRange : 300.0f), 20.0, 600.0);
+				float b[3];
+				for (int k = 0; k < 3; ++k) b[k] = float(pr.o[k] + pr.d[k] * reach);
+				const world::VehicleInfo* struck = nullptr;
+				double nearest = 2;
+				for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+					const auto& v = snap.v[k];
+					if (!interactionlogic::OtherVehicle(v.formId, pr.shooter, pr.shooterVeh)) continue;
+					double t = 0;
+					if (interactionlogic::HullHit(v.center, v.rot, v.half, pr.o, b, t) && t < nearest) { nearest = t; struck = &v; }
+				}
+				static unsigned lineLogs = 0;
+				if (lineLogs < 8 || logger::Verbose()) {
+					++lineLogs;
+					logger::Write("Vehicle hits: a shot from %08X was gone before its first frame; its launch line (%.0f m) %s%s", pr.shooter, reach,
+						struck ? "passes through " : "misses every vehicle", struck ? "a vehicle" : "");
+				}
+				if (struck && !npcvehicles::VehicleFriendlyToShooter(struck->ref, pr.shooter)) {
+					npcvehicles::VehicleAggression(struck->ref, pr.attackerId);
+					Hit(*struck, pr, now);
+				}
+			}
+			if ((pr.seen || (alive && pr.haveLine)) && haveVehicles) {
 				float b[3];
 				if (alive) {
 					b[0] = cur[0]; b[1] = cur[1]; b[2] = cur[2];
@@ -508,12 +656,19 @@ namespace vehiclehits
 				const world::VehicleInfo* struck=nullptr;double nearest=2;
 				for(std::uint32_t k=0;k<snap.count&&k<64;++k){const auto&v=snap.v[k];
 					if(!interactionlogic::OtherVehicle(v.formId,pr.shooter,pr.shooterVeh))continue;
-					double t=0;if(interactionlogic::HullHit(v.center,v.rot,v.half,pr.p,b,t)&&t<nearest){nearest=t;struck=&v;}
+					double t=0;if(interactionlogic::HullHit(v.center,v.rot,v.half,pr.seen?pr.p:pr.o,b,t)&&t<nearest){nearest=t;struck=&v;}
 				}
 				if(struck){
 					if(!npcvehicles::VehicleFriendlyToShooter(struck->ref,pr.shooter)) {
 						npcvehicles::VehicleAggression(struck->ref,pr.attackerId);
 						Hit(*struck,pr,now);
+					}
+					else {
+						static unsigned friendlyLogs = 0;  // 2026-10-21: shots at an enemy vehicle never counted; is this why?
+						if (friendlyLogs < 10 || logger::Verbose()) {
+							++friendlyLogs;
+							logger::Write("Vehicle hits: a shot from %08X (driver %08X) passed through %08X but counts as friendly fire: no damage", pr.shooter, pr.attackerId, struck->formId);
+						}
 					}
 					done=true;
 				}
@@ -530,8 +685,25 @@ namespace vehiclehits
 				pr.p[0] = cur[0]; pr.p[1] = cur[1]; pr.p[2] = cur[2];
 				pr.seen = true;
 				pr.seenAt = now;
+				++pr.frames;
+				if (haveVehicles) for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+					const auto& v = snap.v[k];
+					if (!interactionlogic::OtherVehicle(v.formId, pr.shooter, pr.shooterVeh)) continue;
+					const float dd = std::sqrt((cur[0] - v.center[0]) * (cur[0] - v.center[0]) + (cur[1] - v.center[1]) * (cur[1] - v.center[1]) + (cur[2] - v.center[2]) * (cur[2] - v.center[2]));
+					if (dd < pr.closest) { pr.closest = dd; pr.closestId = v.formId; }
+				}
 			}
 			if (done) {
+				// A shot by the player's side that hit no vehicle: how close it came (2026-10-21: shots at an enemy never counted).
+				static unsigned missLogs = 0;
+				if (pr.side == 1 && pr.closestId && pr.closest < 40.0f && (missLogs < 15 || logger::Verbose())) {
+					++missLogs;
+					const world::VehicleInfo* nearVeh = nullptr;
+					for (std::uint32_t k = 0; haveVehicles && k < snap.count && k < 64; ++k) if (snap.v[k].formId == pr.closestId) nearVeh = &snap.v[k];
+					logger::Write("Vehicle hits: a shot from %08X ended (%u positions read%s): nearest vehicle %08X, %.1f m from its centre (its half size %.1f x %.1f x %.1f)%s",
+						pr.shooter, pr.frames, pr.seen ? "" : ", none", pr.closestId, pr.closest, nearVeh ? nearVeh->half[0] : 0.0f, nearVeh ? nearVeh->half[1] : 0.0f,
+						nearVeh ? nearVeh->half[2] : 0.0f, alive ? "" : " (the projectile is gone)");
+				}
 				g_live[i] = g_live[--g_liveCount];
 				continue;
 			}
@@ -569,8 +741,9 @@ namespace vehiclehits
 		{
 			std::lock_guard lk(g_lock);
 			g_newCount = 0;
+			g_newImpactCount=0;
 		}
-		g_liveCount=0;g_ballistics.clear();g_playerHealth=0;g_playerHealthNow=NAN;
+		g_liveCount=0;g_ballistics.clear();g_projectileHits={};g_playerHealth=0;g_playerHealthNow=NAN;
 		for (auto& d : g_dmg) d = Damage{};
 	}
 
@@ -757,6 +930,18 @@ namespace vehiclehits
 
 	void InstallEnemyBar()
 	{
+		void* impactOriginal=nullptr;
+		if(hook::Install(game::Base()+kNativeImpact,kImpactPrologue,sizeof(kImpactPrologue),reinterpret_cast<void*>(&ImpactDetour),&impactOriginal)) {
+			g_impactOriginal=reinterpret_cast<Impact_t>(impactOriginal);
+			logger::Write("Vehicle hits: native projectile impact hook installed (141B47540); first flight segment tracked");
+		}else logger::Write("Vehicle hits: native projectile impact hook FAILED; sampled flight segments remain active");
+		void* damageOriginal = nullptr;
+		if (hook::Install(game::Base() + kActorDamage, kActorDamagePrologue, sizeof(kActorDamagePrologue), reinterpret_cast<void*>(&ActorDamageDetour), &damageOriginal)) {
+			g_actorDamageOriginal = reinterpret_cast<ActorDamage_t>(damageOriginal);
+			logger::Write("Friendly fire: native actor damage protection installed; allied direct hits and attributed explosion damage blocked");
+		} else {
+			logger::Write("Friendly fire: native damage hook FAILED; only mod-applied vehicle damage protected");
+		}
 		// mov r11, rsp; mov [r11+18h], rbx; push rbp; push rsi; push rdi; push r12; push r13; push r14 (16 bytes, no RIP-relative).
 		static const std::uint8_t kPrologue[16] = { 0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56 };
 		void* original = nullptr;

@@ -43,6 +43,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <unordered_map>
 #include <utility>
@@ -142,6 +143,7 @@ namespace npcvehicles
 			ULONGLONG aimAt = 0;
 			ULONGLONG tAt = 0;
 			std::uint32_t resumeFoe=0, lastEnemyActor=0, squadFocus=0;
+			combatrelations::BoardingFight boardingFight;
 			integrationlogic::Controller controller=integrationlogic::Controller::Navigation;
 			std::uint32_t foe = 0;             // the combat target (an actor; its vehicle is aimed at when it sits in one), 0 = none
 			int foeTier = -1;                  // 0 = in a vehicle, 1 = on foot
@@ -227,7 +229,12 @@ namespace npcvehicles
 		// 2026-10-21: longer bursts, shorter gaps (1.2 s / 1.5 s fired 44 % of the time, about 2 shots a burst). The cone stays 8 deg (the approved
 		// proposal); the nose is now held on the aim point while moving (manoeuvres), and the shots are also turned onto it at launch (vehicleaim).
 		constexpr ULONGLONG kBurstMs = 2000, kBurstGapMs = 600;
-		constexpr double kFireCone = 0.14;         // rad (8 deg) yaw; pitch 1.5x
+		// The fire gate (2026-10-21, the user: "vehicles spend too much time nose pointing to shoot"): shots are re-aimed at the
+		// target at launch (vehicleaim), so the nose only needs to be roughly on it: 25 deg, widening up to 40 deg up close (a
+		// near target fills more of the view); pitch 1.5x. Never wider, so a gun never fires sideways or backwards.
+		constexpr double kFireCone = 0.44;         // rad (25 deg) yaw; pitch 1.5x
+		constexpr double kFireConeNear = 0.70;     // rad (40 deg) at close range
+		double FireCone(double dist) { return std::clamp(std::atan2(8.0, std::max(1.0, dist)), kFireCone, kFireConeNear); }
 		// Aim: the weapon fires along the vehicle's nose, so the whole vehicle aims. The aim point leads the player by
 		// the shot's flight time (kShotSpeed) and sits at chest height.
 		// Lead speed comes from the native projectile flight, through vehiclehits::ShotTime.
@@ -661,9 +668,26 @@ namespace npcvehicles
 		bool Aggro(uptr actor, uptr target);
         bool HostileTo(uptr actor, uptr target);
         uptr HandleRef(std::uint32_t handle);
+        bool PlayerTeam(uptr actor);
+        bool InCombat(uptr actor);
+        std::uint32_t BoardingEnemy(uptr npc) {
+            if(const auto enemy=NativeEnemyId(npc))return enemy;
+            const auto target=HandleRef(At<std::uint32_t>(npc,0x298));
+            if(target&&IsActorRef(target)&&!Dead(target)&&target!=npc&&!(PlayerTeam(npc)&&PlayerTeam(target))&&
+                (InCombat(npc)||HostileTo(npc,target)||HostileTo(target,npc)))return At<std::uint32_t>(target,off::kFormId);
+            const auto player=Ptr(addr::kPlayerCharacterPtr);
+            return player&&InCombat(npc)&&!(PlayerTeam(npc)&&PlayerTeam(player))&&(HostileTo(npc,player)||HostileTo(player,npc))?At<std::uint32_t>(player,off::kFormId):0;
+        }
         void ResumeCombat(Job& j) {
             const auto npc=RefById(j.npc), enemy=RefById(j.resumeFoe);
-            if(npc&&enemy&&!Dead(enemy)&&(HostileTo(npc,enemy)||HostileTo(enemy,npc))) Aggro(npc,enemy);
+            // StopCombat can erase the hostility it is meant to pause. The captured native enemy is the evidence;
+            // do not demand a still-active fight, or another NPC fighting the player, after boarding.
+            if(npc&&enemy&&!Dead(enemy)&&!(PlayerTeam(npc)&&PlayerTeam(enemy))) {
+                const auto now=GetTickCount64();
+                j.boardingFight.Remember(j.resumeFoe,now);j.aggroAt=now;
+                const bool restored=Aggro(npc,enemy);
+                logger::Write("NPC vehicles: [%d] boarding fight restored: %08X -> %08X (%s); target retained independently of other fighters",j.pilot,j.npc,j.resumeFoe,restored?"requested":"retry needed");
+            }
             j.resumeFoe=0;
         }
         void Set(Job& j, Phase p)
@@ -675,7 +699,7 @@ namespace npcvehicles
             j.since = GetTickCount64();
 			if (p != Phase::Following) { j.foe = 0; j.foeTier = -1; j.foeAt = 0; j.rescueParked = j.scoutReported = j.waiting = j.retreating = false; j.pMode = -1;
 				j.manOn = false; j.man = manoeuvre::Mind{}; j.manAt = 0; j.aiOn = false; j.ai = combatai::State{}; j.role = brain::Role::Engager; }
-			if (p == Phase::Idle) { j.resumeFoe=j.lastEnemyActor=j.squadFocus=0; j.exitWaitSince=0; j.order = 0; j.task = 0; j.haveHome = false; }
+			if (p == Phase::Idle) { j.resumeFoe=j.lastEnemyActor=j.squadFocus=0; j.boardingFight={}; j.exitWaitSince=0; j.order = 0; j.task = 0; j.haveHome = false; }
 			if (p == Phase::Idle && j.vehicle && !j.passenger) {  // the job is over: an escort / pursuit assignment ends with it (other profiles are left alone)
 				vcontract::Unassign(j.vehicle, vcontract::Class::Combat);
 				vcontract::Unassign(j.vehicle, vcontract::Class::Weapons);
@@ -684,6 +708,7 @@ namespace npcvehicles
 			}
 			if (p == Phase::Boarding) {
 				j.exitWaitSince=0;
+				j.boardingFight={};
 				j.cmdTries = 0;
 				j.cmdTryAt = 0;
 				j.cmdInstant = false;
@@ -1032,6 +1057,7 @@ namespace npcvehicles
 			__except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
 		}
 		using CombatRelation = combatrelations::Relation;
+		std::atomic<std::uint32_t> g_damageCrew[kJobs]{};
 		struct RelationCache { CombatRelation relation = CombatRelation::Neutral; ULONGLONG until = 0; };
 		std::unordered_map<std::uint64_t, RelationCache> g_relations;
 		CombatRelation CombatRelationOf(uptr a, uptr b)
@@ -1174,6 +1200,12 @@ namespace npcvehicles
 			if (defend && now < g_recallUntil) {
 				if (j.foe) { logger::Write("NPC vehicles: [%d] recalled: target %08X dropped", j.pilot, j.foe); j.foe = 0; }
 				return 0;
+			}
+			const auto boardingEnemy=RefById(j.boardingFight.target);
+			if(j.boardingFight.Active(now,boardingEnemy&&!Dead(boardingEnemy),boardingEnemy&&PlayerTeam(npc)&&PlayerTeam(boardingEnemy)) &&
+				InVehicle(boardingEnemy)!=vehicle && Dist3(vehicle,boardingEnemy)<kFoeRange*1.2) {
+				if(!InCombat(npc)&&now-j.aggroAt>=2000){j.aggroAt=now;Aggro(npc,boardingEnemy);g_relations.clear();}
+				j.foe=j.boardingFight.target;j.foeAt=now;return boardingEnemy;
 			}
 			if(const auto focus=RefById(j.squadFocus);focus&&IsFoe(j,npc,player,focus)&&InVehicle(focus)!=vehicle&&
                 Dist3(vehicle,focus)<kFoeRange*1.2&&(!defend||Dist(focus,player)<kDefendLeash)) {
@@ -1951,6 +1983,8 @@ namespace npcvehicles
 					const bool capped = tactics::CapRam(res, maxHealth, maxHealth, vehiclehits::RamCap(), &rawIt, &rawMe);
 					const uptr rammerVehicle = RefById(R.formId), victimVehicle = RefById(V.formId);
 					const uptr rammer = CombatDriver(rammerVehicle), victim = CombatDriver(victimVehicle), player = Ptr(addr::kPlayerCharacterPtr);
+					// Allied collisions cause no damage, driver injury, aggression, crime or stun.
+					if (VehicleFriendlyToShooter(victimVehicle, R.formId) || VehicleFriendlyToShooter(rammerVehicle, V.formId)) continue;
 					// Neutrality must be sampled before StartCombat changes it; a ram raises assault, never a theft alarm.
 					const bool protectedVictim = victim && PlayerTeam(victim);
 					const bool hostileBefore = victim && player && (HostileTo(victim, player) || HostileTo(player, victim) || FactionReaction(victim, player) == 1);
@@ -2289,7 +2323,7 @@ namespace npcvehicles
 			vcontract::Goal g;
 			g.nav.speedLimit = 22.0f;
 			g.nav.priority = 10;
-			g.nav.travel = travelmode::Default::Drive;  // civil trips drive; terrain, water or a long way make them hover
+			g.nav.travel = travelmode::Default::Drive;  // civil trips drive; terrain, water or a tall obstacle make them hover
 			if (j.task == 8) {  // convoy: behind the lead vehicle; the lead's job over -> park
 				const uptr lead = RefById(j.lead);
 				if (!lead || !Busy(j.lead)) { BeginPark(j, player, vp.x, vp.y, "convoy: the lead is done"); return; }
@@ -2470,10 +2504,10 @@ namespace npcvehicles
 		// back to the instant exit; afterwards make sure the NPC does not stand inside the vehicle.
 		constexpr ULONGLONG kExitWatchMs = 6000;  // the animated exit gets this long before the instant exit is used
 
-		bool InstantExit(uptr npc)
+		bool InstantExit(uptr npc, bool eject = false)
 		{
             const auto vehicle=InVehicle(npc);
-            if(vehicle&&environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe)return false;
+            if(!eject&&vehicle&&environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe)return false;
 			g_allowDismount = true;
 			__try {
 				EngineFn<void (*)(uptr)>(0x01A9C530)(npc);
@@ -2635,6 +2669,36 @@ namespace npcvehicles
 					FinishExit(t, npc, vehicle, true);
 					continue;
 				}
+				if (t.req.mode == vcontract::ExitMode::Eject) {
+					world::Snapshot ejectWorld;
+					const world::VehicleInfo* hull = nullptr;
+					if (world::Vehicles(ejectWorld)) for (unsigned k = 0; k < ejectWorld.count && k < 64; ++k)
+						if (ejectWorld.v[k].formId == t.veh) { hull = &ejectWorld.v[k]; break; }
+					double point[3]{};
+					bool ready = false;
+					if (hull) {
+						const auto player = Ptr(addr::kPlayerCharacterPtr);
+						const auto pp = player ? At<game::Vec3>(player, off::kRefPosition) : game::Vec3{};
+						const double towardPlayer = (pp.x - hull->center[0]) * std::cos(hull->heading) - (pp.y - hull->center[1]) * std::sin(hull->heading);
+						const int preferred = player && towardPlayer > 0 ? -1 : 1;
+						for (int side : {preferred, -preferred}) {
+							if (!integrationlogic::EjectPosition(HullBox(*hull), hull->heading, side, point)) break;
+							const float from[] = {hull->center[0], hull->center[1], hull->center[2] + 1.0f};
+							const float to[] = {float(point[0]), float(point[1]), float(point[2]) + 1.0f};
+							if (!environment::LineBlocked(from, to)) { ready = true; break; }
+						}
+					}
+					if (!ready) {
+						if (now - t.t0 > t.req.timeoutMs) FinishExit(t, npc, vehicle, false);
+						continue;
+					}
+					const bool called = InstantExit(npc, true);
+					const bool out = !InVehicle(npc);
+					t.req.x = float(point[0]); t.req.y = float(point[1]); t.req.z = float(point[2]);
+					logger::Write("NPC vehicles: air eject NPC %08X from %08X at altitude %.1f: native %s, %s", t.npc, t.veh, point[2], called ? "called" : "failed", out ? "OUT" : "still aboard");
+					if (out || now - t.t0 > t.req.timeoutMs) FinishExit(t, npc, vehicle, out);
+					continue;
+				}
                 const auto site=environment::BoardingSite(vehicle);
                 if(site.verdict!=environment::Verdict::Safe) {
                     if(now-t.t0>t.req.timeoutMs){logger::Write("Exit refused: %s",site.reason);FinishExit(t,npc,vehicle,false);}
@@ -2716,7 +2780,7 @@ namespace npcvehicles
 			t->t0 = t->tStage = GetTickCount64();
 			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 			t->lx = vp.x; t->ly = vp.y; t->lz = vp.z;
-			t->stage = req.mode == vcontract::ExitMode::Instant ? 4 : req.mode == vcontract::ExitMode::Quick ? 3 : (req.waitLanded ? 1 : 2);
+			t->stage = req.mode == vcontract::ExitMode::Instant || req.mode == vcontract::ExitMode::Eject ? 4 : req.mode == vcontract::ExitMode::Quick ? 3 : (req.waitLanded ? 1 : 2);
 			// A job's driver: the autopilot stops (the flight code lands the vehicle); the job is ended when the exit finishes.
 			for (auto& j : g_jobs) {
 				if (j.phase != Phase::Idle && j.npc == id && j.phase == Phase::Following) vehicleflight::PilotStop(j.pilot, "exit requested");
@@ -2733,7 +2797,13 @@ namespace npcvehicles
 			for (auto& jj : g_jobs) {
 				if (jj.phase == Phase::Idle) continue;
 				const uptr nn = RefById(jj.npc);
-				if (nn && InVehicle(nn)) n += StartExit(nn, vcontract::ExitRequest{}) ? 1 : 0;
+				if (nn && InVehicle(nn)) {
+					vcontract::ExitRequest req;
+					if (environment::BoardingSite(InVehicle(nn)).verdict != environment::Verdict::Safe) {
+						req.mode = vcontract::ExitMode::Eject; req.waitLanded = false;
+					}
+					n += StartExit(nn, req) ? 1 : 0;
+				}
 				else if (nn) Set(jj, Phase::Idle);
 			}
 			logger::Write(n ? "Exit requested for %d NPC(s)" : "No NPC aboard a job vehicle", n);
@@ -2851,7 +2921,10 @@ namespace npcvehicles
 					// get-in waits behind the combat AI and the NPC never walks. Not the get-in now: calm, ask once more.
 					if (type != 0x29 && !j.reasked) {
 						j.reasked = true;
-						if (combat == 1) Calm(npc);
+						if (combat == 1) {
+							if (!j.resumeFoe) j.resumeFoe = BoardingEnemy(npc);
+							Calm(npc);
+						}
 						const int r = Mount(npc, vehicle);
 						logger::Write("NPC vehicles: [%d] NPC %08X get-in asked again (%s) -> %d", j.pilot, j.npc, combat == 1 ? "calmed first" : "package was replaced", r);
 						if (r >= 1) {
@@ -2916,7 +2989,9 @@ namespace npcvehicles
 					vehicleflight::PilotStop(j.pilot, "wrecked");
 					FollowerNotice(j.npc, "Your follower's vehicle is wrecked | they get out");
 					logger::Write("NPC vehicles: [%d] vehicle %08X wrecked; NPC %08X gets out", j.pilot, j.vehicle, j.npc);
-					Set(j, Phase::Settling);
+					vcontract::ExitRequest eject;
+					eject.mode = vcontract::ExitMode::Eject; eject.waitLanded = false;
+					StartExit(npc, eject);
 					break;
 				}
 				if(vehicleflight::Ramming(j.vehicle)) {
@@ -3173,7 +3248,8 @@ namespace npcvehicles
 					// both on the led aim point, in 3D range. Rotation x is nose down +.
 					const double pitchWant = std::atan2(azp - vp.z, std::max(1.0, std::hypot(axp - vp.x, ayp - vp.y)));
 					const double pitchErr = std::fabs(pitchWant + vr.x);
-					const bool onTarget = aimErr < kFireCone && pitchErr < kFireCone * 1.5;
+					const double cone = FireCone(Dist3(vehicle, aimRef));
+					const bool onTarget = aimErr < cone && pitchErr < std::min(cone * 1.5, 0.9);
 					const bool inRange = rules.fire && profileclass::MayFire(weapons, false) && (kProfiles[int(j.profile)].fire || defending || retaliating || attacking) &&
 						Dist3(vehicle, aimRef) < vehiclehits::BallisticsOf(j.vehicle).range;
 					if (j.aiOn) { axp=j.aiAimX; ayp=j.aiAimY; azp=j.aiAimZ; }
@@ -3280,10 +3356,30 @@ namespace npcvehicles
 			}
 		}
 
+		// The name of what a reference is: its own display name, else its base object's (vtable +0x268 on the base, which the
+		// game's own display name falls back to (FUN_140B252F0) but skips in some states: the HUD showed form ids 2026-10-21).
+		// "" when neither has one.
+		const char* BaseName(uptr ref)
+		{
+			const char* n = ref ? RawDisplayName(ref) : nullptr;
+			if (n && n[0]) return n;
+			const uptr base = ref ? At<uptr>(ref, 0x98) : 0;
+			n = base ? RawDisplayName(base) : nullptr;
+			if (n && n[0]) return n;
+			static int told = 0;  // why a name is missing (2026-10-21: the card showed "Vehicle")
+			if (ref && told < 6) {
+				++told;
+				logger::Write("NPC vehicles: no name for %08X (base %08X, form type %u; the reference's name \"%s\", the base's \"%s\")", At<std::uint32_t>(ref, off::kFormId),
+					base ? At<std::uint32_t>(base, off::kFormId) : 0, base ? unsigned(At<std::uint8_t>(base, 0x2E)) : 0u, RawDisplayName(ref) ? RawDisplayName(ref) : "(null)",
+					base && RawDisplayName(base) ? RawDisplayName(base) : "(null)");
+			}
+			return "";
+		}
+
 		void ActorName(uptr actor, std::uint32_t id, char* out, size_t cap)
 		{
-			const char* n = actor ? RawDisplayName(actor) : nullptr;
-			if (n && n[0]) std::snprintf(out, cap, "%s", n);
+			const char* n = BaseName(actor);
+			if (n[0]) std::snprintf(out, cap, "%s", n);
 			else std::snprintf(out, cap, "%08X", id);
 		}
 
@@ -3292,23 +3388,21 @@ namespace npcvehicles
 		{
 			const uptr veh = RefById(id);
 			if (!veh) return false;
-			char name[40] = "", driverName[40] = "";
-			ActorName(veh, id, name, sizeof(name));
+			// Short enough for the card's field (2026-10-21, the user: the line overflowed): names cut at 14 characters (the game's
+			// own enemy-name limit), no text bar (the bar under the enemy's health bar is the graphic one).
+			char name[15] = "", driverName[15] = "";
+			std::snprintf(name, sizeof(name), "%s", BaseName(veh)[0] ? BaseName(veh) : "Vehicle");
 			uptr driver = 0;
 			if (veh == driven) driver = player;
 			for (const auto& j : g_jobs) if (!driver && j.vehicle == id && j.phase == Phase::Following) driver = RefById(j.npc);
 			static world::Snapshot snap;
 			if (!driver && world::Vehicles(snap)) for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) if (snap.v[k].formId == id && snap.v[k].driverId) driver = RefById(snap.v[k].driverId);
-			if (driver && driver != player) ActorName(driver, At<std::uint32_t>(driver, off::kFormId), driverName, sizeof(driverName));
+			if (driver && driver != player) std::snprintf(driverName, sizeof(driverName), "%s", BaseName(driver));
 			const float share = vehiclehits::HealthShare(id);
-			char bar[11];
-			const int filled = int(std::lround(share * 10.0f));
-			for (int i = 0; i < 10; ++i) bar[i] = i < filled ? '#' : '-';
-			bar[10] = 0;
 			char drv[40] = "";
 			float hn = 0, hm = 0;
 			if (driver && !Dead(driver) && vehiclehits::ActorHealth(driver, hn, hm)) std::snprintf(drv, sizeof(drv), "  %s %.0f%%", driver == player ? "you" : "driver", hn / hm * 100.0f);
-			std::snprintf(out, size, "%s%s%s%s  [%s] %.0f%%%s%s", name, driverName[0] ? " (" : "", driverName, driverName[0] ? ")" : "", bar, share * 100.0f, drv,
+			std::snprintf(out, size, "%s%s%s%s  %.0f%%%s%s", name, driverName[0] ? " (" : "", driverName, driverName[0] ? ")" : "", share * 100.0f, drv,
 				vehiclehits::Wrecked(id) ? "  WRECKED" : "");
 			return true;
 		}
@@ -3541,14 +3635,14 @@ namespace npcvehicles
 		// the user could still get into an NPC's vehicle): a refused seat stands the player back up, unless the player is in
 		// another vehicle.
 		ULONGLONG g_activatePressAt = 0;  // the player's last Activate press (SeatTick): only a sit the player asked for is undone
-		void StandPlayerUp(uptr vehicle)
+		void StandPlayerUp(uptr vehicle, const char* why = "That vehicle is taken")
 		{
 			if (GetTickCount64() - g_activatePressAt > 4000) return;  // an NPC's own sit runs the same call
 			const uptr player = Ptr(addr::kPlayerCharacterPtr);
 			const uptr pin = player ? InVehicle(player) : 0;
 			if (!player || (pin && pin != vehicle) || Dist(player, vehicle) >= 12.0) return;
 			const bool out = EndInteraction(player);
-			notify::Show("That vehicle is taken");
+			notify::Show("%s", why);
 			logger::Write("NPC vehicles: the player stood back up from vehicle %08X -> %s", At<std::uint32_t>(vehicle, off::kFormId), out ? "out" : "FAILED");
 		}
 
@@ -3573,9 +3667,14 @@ namespace npcvehicles
 			const bool ours = id && OursVehicle(id);
 			const uptr other = id && pc && id != vehicleflight::OwnRoverId() ? DriverOf(vehicle, pc) : 0;
 			const bool driven = other && !IsFollower(pc, other);  // a follower riding along never keeps you out
-			const bool block = ours || driven;
+			const bool wreck = id && vehiclehits::Wrecked(id);  // a wreck cannot be driven (it repairs itself over 25%)
+			const bool block = ours || driven || wreck;
 			logger::Write("NPC vehicles: the game seats the player in vehicle %08X (caller 14%07llX) -> %s", id, static_cast<unsigned long long>(caller),
-				ours ? "BLOCKED (an NPC job's vehicle)" : driven ? "BLOCKED (someone else drives it)" : "allowed");
+				ours ? "BLOCKED (an NPC job's vehicle)" : driven ? "BLOCKED (someone else drives it)" : wreck ? "BLOCKED (wrecked)" : "allowed");
+			if (wreck && !ours && !driven) {
+				StandPlayerUp(vehicle, "That vehicle is wrecked");
+				return;
+			}
 			if (block) {
 				StandPlayerUp(vehicle);
 				const uptr npc = JobNpcFor(id);
@@ -3652,8 +3751,8 @@ namespace npcvehicles
 			}
 			const bool seat = CanMount(npc, vehicle);
 			// In combat the get-in package never runs (it waits behind the combat AI): calm first.
+			if(seat)slot.resumeFoe=BoardingEnemy(npc);
 			if (seat && InCombat(npc)) {
-                slot.resumeFoe=NativeEnemyId(npc);
 				Calm(npc);
 				logger::Write("NPC vehicles: [%d] NPC %08X was in combat; calmed for the get-in", slot.pilot, npcId);
 			}
@@ -3678,8 +3777,8 @@ namespace npcvehicles
 			// The Walk key: the game's own follower command. The job only watches (no instant seat); Enter and the seated check follow.
 			// Native, data-driven: SeamlessPilots.esm's quest package (any actor); else the follower command (followers only).
 			// Context: in combat the NPC is calmed (or the fight would outrank the package) and RUNS to the vehicle; otherwise it walks at the package's own pace.
+			slot->resumeFoe=BoardingEnemy(npc);
 			if (InCombat(npc)) {
-                slot->resumeFoe=NativeEnemyId(npc);
 				Calm(npc);
 				SetForceRun(npc, true);
 				slot->forcedRun = true;
@@ -4090,7 +4189,9 @@ namespace npcvehicles
 
 	namespace
 	{
-		// One job's profile (escort / pursuit): pursuit puts the driver in combat with the player, escort calms it and stops the weapon.
+		// One job's profile (escort / pursuit): pursuit puts the driver in combat with the player, escort stops the weapon. The mod
+		// never calms anyone in a seat (2026-10-21, the user: "mod should never turn anyone calm in the seat"); only an NPC walking
+		// to a vehicle in a fight is calmed (the get-in package waits behind combat), and its fight resumes once it sits.
 		bool ApplyProfile(Job& j, Profile to, uptr player, bool provokePlayer)
 		{
 			const uptr npc = RefById(j.npc);
@@ -4116,7 +4217,6 @@ namespace npcvehicles
 				Aggro(npc, player);
 			}
 			else if(provokePlayer) {
-				Calm(npc);
 				if (j.firing) SubmitFire(j.pilot - 1, j.vehicle, false);
 				j.firing = false;
 			}
@@ -4209,8 +4309,8 @@ namespace npcvehicles
 				// The bar under the game's enemy bar, while it shows a vehicle's driver (vehiclehits::EnemyBarVehicle).
 				const std::uint32_t barId = bars ? vehiclehits::EnemyBarVehicle() : 0;
 				const uptr barVeh = RefById(barId);
-				char barName[48] = "";
-				if (barVeh) ActorName(barVeh, barId, barName, sizeof(barName));
+				char barName[15] = "";  // the game's own enemy names stop at 14 characters
+				if (barVeh) std::snprintf(barName, sizeof(barName), "%s", BaseName(barVeh)[0] ? BaseName(barVeh) : "Vehicle");
 				hoverui::SetVehicleBar(barName, barVeh ? vehiclehits::HealthShare(barId) : 0.0f);
 			}
 			for (const auto& j : g_jobs) {
@@ -4568,6 +4668,7 @@ namespace npcvehicles
 		const std::uint32_t vid = At<std::uint32_t>(vehicle, off::kFormId);
 		for (const uptr r : modscene::LoadedRefs(8000)) {
 			if (!IsActorRef(r) || InVehicle(r) != vehicle) continue;
+			if (req.mode == vcontract::ExitMode::Eject && r == Ptr(addr::kPlayerCharacterPtr)) continue;
 			bool isDriver = false;
 			for (const auto& j : g_jobs) {
 				if (j.phase != Phase::Idle && j.vehicle == vid && j.npc == At<std::uint32_t>(r, off::kFormId)) isDriver = true;
@@ -4636,10 +4737,16 @@ namespace npcvehicles
 		return false;
 	}
 
-	bool ExitPlayer()
+	bool ExitPlayer(bool force)
 	{
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
-		return player && InVehicle(player) && Dismount(player) == 1;
+		if (!player || !InVehicle(player)) return false;
+		if (Dismount(player) == 1) return true;
+		if (!force) return false;
+		g_allowDismount = true;
+		const bool out = EndInteraction(player);
+		g_allowDismount = false;
+		return out;
 	}
 
 	bool FighterMayTake(std::uintptr_t actor, std::uintptr_t vehicle)
@@ -4999,6 +5106,7 @@ namespace npcvehicles
 
 	void Reset()
 	{
+		for (auto& member : g_damageCrew) member.store(0, std::memory_order_relaxed);
 		for (auto& j : g_jobs) j = Job{};
 		g_riders.clear();
 		g_seatLogged.clear();
@@ -5158,6 +5266,10 @@ namespace npcvehicles
 	}
 void BeginFrame()
     {
+		for (int i = 0; i < kJobs; ++i) {
+			const auto& job = g_jobs[i];
+			g_damageCrew[i].store(job.phase != Phase::Idle && (job.gang || job.order) ? job.npc : 0, std::memory_order_relaxed);
+		}
         g_driverIndex.clear();
         auto note=[](uptr actor) {
             if(!actor||!IsActorRef(actor)||Dead(actor))return;
@@ -5175,6 +5287,23 @@ void BeginFrame()
     }
     bool AreHostile(uptr a,uptr b){return CombatRelationOf(a,b)==CombatRelation::Enemy;}
     bool AreAllies(uptr a,uptr b){return CombatRelationOf(a,b)==CombatRelation::Ally;}
+	bool FriendlyActorDamage(uptr victim, uptr attacker)
+	{
+		if (!victim || !attacker || victim == attacker || !IsActorRef(victim) || !IsActorRef(attacker)) return false;
+		const auto player = Ptr(addr::kPlayerCharacterPtr);
+		bool victimTeam = victim == player || (player && IsFollower(player, victim));
+		bool attackerTeam = attacker == player || (player && IsFollower(player, attacker));
+		const auto victimId = At<std::uint32_t>(victim, off::kFormId), attackerId = At<std::uint32_t>(attacker, off::kFormId);
+		for (const auto& member : g_damageCrew) {
+			const auto id = member.load(std::memory_order_relaxed);
+			victimTeam = victimTeam || (id && id == victimId);
+			attackerTeam = attackerTeam || (id && id == attackerId);
+		}
+		// No main-thread relation map or mutable job storage is touched from the native callback.
+		if (victimTeam && attackerTeam) return true;
+		if (HostileTo(victim, attacker) || HostileTo(attacker, victim)) return false;
+		return combatrelations::Classify(false, false, FactionReaction(victim, attacker), FactionReaction(attacker, victim)) == CombatRelation::Ally;
+	}
     std::uint32_t NativeEnemyId(uptr actor)
     {
         __try {
@@ -5203,11 +5332,12 @@ void BeginFrame()
 		if (InVehicle(shooter) == vehicle) return true;
 		const uptr driver = CombatDriver(vehicle);
 		if (driver) {
-            const auto player=Ptr(addr::kPlayerCharacterPtr);
             if(PlayerTeam(shooter)&&PlayerTeam(driver))return true;
-            // The player may initiate an attack against a faction ally. Companions stay protected.
-            return shooter!=player && CombatRelationOf(shooter,driver)==CombatRelation::Ally;
+            return CombatRelationOf(shooter,driver)==CombatRelation::Ally;
         }
+		const auto directOwner = OwnerForm(vehicle);
+		const auto owner = directOwner ? directOwner : realvehicles::PlaceOwner(vehicle);
+		if (owner && (owner == At<uptr>(shooter, 0x98) || (At<std::uint8_t>(owner, 0x2E) == 0x0D && InFaction(shooter, owner)))) return true;
 		return At<std::uint32_t>(vehicle, off::kFormId) == vehicleflight::OwnRoverId() && PlayerTeam(shooter);
 	}
 
@@ -5215,6 +5345,7 @@ void BeginFrame()
 	{
 		const auto shooter=RefById(shooterId);
 		if(!vehicle||!shooter||!IsActorRef(shooter)||Dead(shooter)||InVehicle(shooter)==vehicle)return;
+		if (VehicleFriendlyToShooter(vehicle, shooterId)) return;
 		const auto id=At<std::uint32_t>(vehicle,off::kFormId);const auto now=GetTickCount64();
 		if(g_aggression.size()>256)std::erase_if(g_aggression,[&](const auto&p){return now>=p.second.until;});
 		g_relations.clear();
@@ -5222,19 +5353,37 @@ void BeginFrame()
         if(event.attacker!=shooterId||now>=event.until)event={};
         const bool refresh=event.attacker!=shooterId || now-event.nativeAt>=2000;
 		event.attacker=shooterId;event.until=now+60000;if(!refresh)return;event.nativeAt=now;
-		const auto player=Ptr(addr::kPlayerCharacterPtr);const auto owner=OwnerForm(vehicle);int reacted=0;
-		for(const auto actor:modscene::LoadedRefs(8000)) {
+		const auto player=Ptr(addr::kPlayerCharacterPtr);const auto directOwner=OwnerForm(vehicle);
+		const auto owner=directOwner?directOwner:realvehicles::PlaceOwner(vehicle);
+		const auto actors=modscene::LoadedRefs(8000);uptr principal=CombatDriver(vehicle);int reacted=0,assisted=0;
+		if(!principal&&id==vehicleflight::OwnRoverId())principal=player;
+		if(!principal&&owner)for(const auto actor:actors) {
+			if(actor&&IsActorRef(actor)&&!Dead(actor)&&Dist(actor,vehicle)<=80.0&&At<uptr>(actor,0x98)==owner){principal=actor;break;}
+		}
+		for(auto& job:g_jobs)if(job.phase!=Phase::Idle&&job.vehicle==id) {
+			const auto occupant=RefById(job.npc);if(!occupant||(PlayerTeam(occupant)&&PlayerTeam(shooter)))continue;
+			if(job.phase==Phase::Boarding)job.resumeFoe=shooterId;
+			else job.boardingFight.Remember(shooterId,now);
+		}
+		bool principalSeen=false;
+		for(const auto actor:actors) {
 			if(!actor||actor==player||actor==shooter||!IsActorRef(actor)||Dead(actor))continue;
 			const bool aboard=InVehicle(actor)==vehicle;
 			const bool owns=owner && (At<uptr>(actor,0x98)==owner || (At<std::uint8_t>(owner,0x2E)==0x0D && InFaction(actor,owner)));
-			if(!aboard && (!owns||Dist(actor,vehicle)>80.0))continue;
-			if(PlayerTeam(actor) && PlayerTeam(shooter))continue;
+			const bool ally=principal&&actor!=principal&&CombatRelationOf(actor,principal)==CombatRelation::Ally;
+			const auto role=combatrelations::AttackRole(aboard,owns,ally,Dist(actor,vehicle)<=80.0,PlayerTeam(actor)&&PlayerTeam(shooter));
+			if(role==combatrelations::VehicleAttackRole::None)continue;
+			if(actor==principal)principalSeen=true;
             if(reportCrime&&!event.crimeRaised&&shooter==player && !HostileTo(actor,shooter)&&!HostileTo(shooter,actor)&&FactionReaction(actor,shooter)!=1) {
                 CrimeAlarms(actor,vehicle,player,true,false);event.crimeRaised=true;
             }
-			if(Aggro(actor,shooter))++reacted;
+			if(Aggro(actor,shooter)){++reacted;if(role==combatrelations::VehicleAttackRole::Ally)++assisted;}
 		}
-		logger::Write("Vehicle aggression: %08X attacked vehicle %08X; %d occupants/owners reacted",shooterId,id,reacted);
+		if(principal&&!principalSeen&&principal!=shooter&&principal!=player&&!(PlayerTeam(principal)&&PlayerTeam(shooter)))if(Aggro(principal,shooter))++reacted;
+		if(reportCrime) {
+			const auto p=At<game::Vec3>(vehicle,off::kRefPosition);WitnessCrash(p.x,p.y,p.z,"an attack on a vehicle");
+		}
+		logger::Write("Vehicle aggression: %08X attacked vehicle %08X; %d occupants/owners/allies reacted (%d faction allies); assault %s",shooterId,id,reacted,assisted,event.crimeRaised?"reported":"not applicable");
 	}
 
 }

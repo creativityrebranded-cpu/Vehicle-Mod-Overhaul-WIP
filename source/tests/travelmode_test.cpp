@@ -10,7 +10,11 @@ int main()
     Inputs base; base.tripDist = 400; base.profile = Default::Drive;
     check(Decide(base).mode == Mode::Drive, "a drive profile drives a mid-length trip");
     Inputs in = base; in.tripDist = 800;
-    check(Decide(in).mode == Mode::Hover, "a long trip hovers");
+    check(Decide(in).mode == Mode::Drive, "driving is preferred: a long trip drives");
+    in.profile = Default::Auto;
+    check(Decide(in).mode == Mode::Drive, "with no profile and no reason to fly, it drives");
+    in.profile = Default::Hover;
+    check(Decide(in).mode == Mode::Hover, "a hover profile (courier, scout) still flies a long trip");
     in = base; in.tripDist = 120; in.profile = Default::Auto;
     check(Decide(in).mode == Mode::Drive, "a short trip drives");
     in = base; in.tripDist = 120; in.profile = Default::Hover;

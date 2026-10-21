@@ -6,6 +6,26 @@
 // A live combat hostility overrides a faction friendship. Neutral actors never become squad mates merely by sharing an enemy.
 namespace combatrelations {
 enum class Relation : std::uint8_t { Neutral, Ally, Enemy };
+// Only attributed damage between different allies is friendly fire. Self/environmental
+// damage and healing must still use the native path.
+inline bool BlockFriendlyDamage(float amount, bool sameActor, Relation relation) {
+    return std::isfinite(amount) && amount > 0 && !sameActor && relation == Relation::Ally;
+}
+struct BoardingFight {
+    std::uint32_t target = 0;
+    std::uint64_t until = 0;
+    void Remember(std::uint32_t enemy, std::uint64_t now) { target = enemy; until = enemy ? now + 60000 : 0; }
+    bool Active(std::uint64_t now, bool targetAlive, bool protectedPair) const {
+        return target && now < until && targetAlive && !protectedPair;
+    }
+};
+enum class VehicleAttackRole { None, Occupant, Owner, Ally };
+inline VehicleAttackRole AttackRole(bool aboard, bool owner, bool factionAlly, bool nearby, bool protectedPair) {
+    if(protectedPair)return VehicleAttackRole::None;
+    if(aboard)return VehicleAttackRole::Occupant;
+    if(!nearby)return VehicleAttackRole::None;
+    return owner?VehicleAttackRole::Owner:factionAlly?VehicleAttackRole::Ally:VehicleAttackRole::None;
+}
 inline Relation Classify(bool protectedPair, bool hostile, int ab, int ba)
 {
     if (protectedPair) return Relation::Ally;
@@ -35,6 +55,7 @@ inline RamPolicy RamConsequences(double closing, bool rammerKnown, bool victimKn
 }
 template<int N> struct PairCooldown {
     struct Pair { std::uint32_t a = 0, b = 0; std::uint64_t at = 0; bool used = false; } p[N];
+    void Forget(std::uint32_t id) { for(auto& pair:p)if(pair.a==id||pair.b==id)pair.used=false; }
     bool Claim(std::uint32_t a, std::uint32_t b, std::uint64_t now, std::uint64_t cooldown = 1500)
     {
         if (!a || !b || a == b) return false;

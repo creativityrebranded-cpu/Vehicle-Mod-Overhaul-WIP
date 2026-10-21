@@ -105,7 +105,8 @@ namespace vcontract
 	enum class SeatState : std::uint8_t { None, Walking, Seating, Driver, Passenger, Refused, WaitingToLand, Exiting };
 
 	// How to get out (agreed with the seat session 2026-10-18). Auto = Normal, falling back to Quick then Instant.
-	enum class ExitMode : std::uint8_t { Auto, Normal, Quick, Instant };
+	// Eject releases the seat in flight and places the actor outside the hull at its current altitude.
+	enum class ExitMode : std::uint8_t { Auto, Normal, Quick, Instant, Eject };
 	struct ExitRequest
 	{
 		ExitMode mode = ExitMode::Auto;

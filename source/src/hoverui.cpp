@@ -146,34 +146,41 @@ namespace hoverui
 		// Legacy gang layout keys retain the exact saved position now used by Target.
 		const char* const kFootNames[kFootEls] = { "summon", "follow", "getin", "status", "gang", "pass", "eject", "vehicles" };
 		const char* const kCarNames[kCarEls] = { "autoline", "ganginveh", "vehiclesinveh" };
-		constexpr double kDefOff[kButtons][2] = { { 0.0, -31.0 }, { -23.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 0.0 }, { -2.0, 0.0 } };
+		// The defaults are the user's own layout (hoverui.ini of 2026-10-21 17:5x, "use that as mod default"); F7's Delete returns to them.
+		constexpr double kDefOff[kButtons][2] = { { 0.0, -21.0 }, { -24.0, 0.0 }, { 0.0, 0.0 }, { 24.0, 1.0 }, { -2.0, 0.0 }, { 0.0, 0.0 }, { 3.0, 0.0 }, { 0.0, 0.0 } };
+		constexpr double kDefFoot[kFootEls][2] = { { -9.0, 45.0 }, { 165.0, 44.0 }, { -167.0, 42.0 }, { 64.0, -90.0 }, { 65.0, -175.0 }, { -29.0, -7.0 }, { -143.0, -53.0 }, { 66.0, -178.0 } };
+		constexpr double kDefCar[kCarEls][2] = { { 845.0, 8.0 }, { 1007.0, -324.0 }, { 1006.0, -261.0 } };
+		constexpr double kDefRouteX = 38.0, kDefRouteY = 160.0;
 		struct Layout_t
 		{
 			std::mutex lock;
-			// Minted from the player's hoverui.ini of 2026-10-17 20:4x (every element); F7 still edits, and hoverui.ini overrides.
-			double cx = 236.0, cy = -170.0, d = 60.0;  // d <= 0: measured once (W's key + label clear the S row)
+			// Minted from the player's hoverui.ini of 2026-10-21 17:5x (every element); F7 still edits, and hoverui.ini overrides.
+			double cx = 158.0, cy = -258.0, d = 60.0;  // d <= 0: measured once (W's key + label clear the S row)
 			bool labelsAbove = false;  // unused: Accelerate's label is above W, the others under their keys
-			double colRight = 650.0, colTop = -246.0, colStep = 54.5;
-			double gx = 477.4, gy = 50.2;
-			double sx = 399.0, sy = 1011.0;  // the scanner call button's key box centre, in the scanner root's coordinates
-			double fx = 325.0, fy = 1011.0;  // the scanner follow button's key box centre
-			double tx = 361.0, ty = 958.0;  // the scanner status box's centre
-			double routeX=42.0,routeY=230.0; // route group in HUD/scanner root coordinates
+			double colRight = 588.0, colTop = -348.0, colStep = 54.5;
+			double gx = 539.4, gy = -416.8;
+			double sx = 1739.0, sy = 961.0;  // the scanner call button's key box centre, in the scanner root's coordinates
+			double fx = 1665.0, fy = 961.0;  // the scanner follow button's key box centre
+			double tx = 1701.0, ty = 908.0;  // the scanner status box's centre
+			double routeX=kDefRouteX,routeY=kDefRouteY; // route group in HUD/scanner root coordinates
 			int msel = 3;                    // scanner editor: 0 Summon, 1 Follow, 2 status, 3 all
 			// The contextual HUD (2026-10-17): the on-foot panel (Summon, Follow, Get in, status, target) in RightMeters_mc's
 			// coordinates (Summon's key centre; measured from the rover widget once), and the in-vehicle extras' offset.
-			double fpx = -268.4, fpy = -160.4;
+			double fpx = -292.4, fpy = -237.4;
 			bool haveFoot = true;
-			double eox = -650.0, eoy = -205.0;
+			double eox = -843.0, eoy = -224.0;
 			bool scannerOld = false;          // read as the earlier top-left corner: converted once the button exists
 			bool haveCluster = true, haveColumn = true, haveGearBox = true;
 			bool oldRows = false;      // only the earlier per-row positions are known: derive the column from them
 			double oldX[3] = {}, oldY[3] = {};  // Gear+, Gear-, Hover (the earlier order)
-			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] }, { kDefOff[4][0], kDefOff[4][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
-			double footOff[kFootEls][2] = { { 0.0, -40.0 }, { 120.0, -39.0 }, { -120.0, -40.0 }, { 110.0, 90.0 }, { -56.0, 45.0 }, { -120.0, -64.0 }, { -120.0, -82.0 }, { -56.0, 89.0 } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, target, Passenger, Eject, vehicles, Auto mode)
-			double carOff[kCarEls][2] = { { 766.0, 376.0 }, { 342.0, 289.0 }, { 342.0, 333.0 } };    // per element nudges of the in-vehicle extras (Trip status, target, vehicles, Auto mode)
+			double off[kButtons][2] = { { kDefOff[0][0], kDefOff[0][1] }, { kDefOff[1][0], kDefOff[1][1] }, { kDefOff[2][0], kDefOff[2][1] }, { kDefOff[3][0], kDefOff[3][1] },
+				{ kDefOff[4][0], kDefOff[4][1] }, { kDefOff[5][0], kDefOff[5][1] }, { kDefOff[6][0], kDefOff[6][1] }, { kDefOff[7][0], kDefOff[7][1] } };  // per element nudges (W, A, S, D, Gear-, Gear+, Hover); the gear box uses gx, gy
+			double footOff[kFootEls][2] = { { kDefFoot[0][0], kDefFoot[0][1] }, { kDefFoot[1][0], kDefFoot[1][1] }, { kDefFoot[2][0], kDefFoot[2][1] }, { kDefFoot[3][0], kDefFoot[3][1] },
+				{ kDefFoot[4][0], kDefFoot[4][1] }, { kDefFoot[5][0], kDefFoot[5][1] }, { kDefFoot[6][0], kDefFoot[6][1] }, { kDefFoot[7][0], kDefFoot[7][1] } };  // per element nudges of the on-foot panel (Summon, Follow, Get in, status, target, Passenger, Eject, vehicles, Auto mode)
+			double carOff[kCarEls][2] = { { kDefCar[0][0], kDefCar[0][1] }, { kDefCar[1][0], kDefCar[1][1] }, { kDefCar[2][0], kDefCar[2][1] } };    // per element nudges of the in-vehicle extras (Trip status, target, vehicles, Auto mode)
 			// Per element sizes (multipliers of each element's default scale).
-			double btnSize[kButtons] = { 1, 1, 1, 1, 1, 1, 1, 1 }, footSize[kFootEls] = { 1, 1, 1, 1, 1, 1, 1, 1 }, carSize[kCarEls] = { 1, 1, 1 }, routeSize = 1;
+			double btnSize[kButtons] = { 1.35, 1.35, 1.35, 1.35, 1.35, 1.35, 1.35, 1.35 }, footSize[kFootEls] = { 1.15, 1.15, 1.15, 1.15, 1.15, 1.15, 1.15, 1.15 },
+				carSize[kCarEls] = { 1.35, 1.60, 1.85 }, routeSize = 1.35;
 			// The rover widget's own clips (found by name when the widget is first seen) and their nudges.
 			std::vector<std::string> natNames;
 			std::map<std::string, std::pair<double, double>> natOff;
@@ -1635,10 +1642,19 @@ namespace hoverui
 		{
 			const Value& root = *reinterpret_cast<const Value*>(menu + 0x58);
 			if (!IsObject(root)) return false;
-			Value base;
-			bool ok = GetMember(root, "EnemyHealthMeter_mc", &g_ex.vbMeter) && IsObject(g_ex.vbMeter) &&
-				GetMember(g_ex.vbMeter, "EnemyHealthAnimBase_mc", &base) && IsObject(base) &&
-				CreateObject(movie, &g_ex.vbBar, "HUDMenu_fla.EnemyHealthAnimBase_72", nullptr, 0);
+			Value base, holder;
+			// The meter is a root member in the script export; it may sit inside EnemyHealthHolder_mc instead (2026-10-21 run: not found).
+			bool meter = GetMember(root, "EnemyHealthMeter_mc", &g_ex.vbMeter) && IsObject(g_ex.vbMeter);
+			if (!meter) {
+				Release(g_ex.vbMeter);
+				meter = GetMember(root, "EnemyHealthHolder_mc", &holder) && IsObject(holder) && GetMember(holder, "EnemyHealthMeter_mc", &g_ex.vbMeter) && IsObject(g_ex.vbMeter);
+			}
+			Release(holder);
+			const bool haveBase = meter && GetMember(g_ex.vbMeter, "EnemyHealthAnimBase_mc", &base) && IsObject(base);
+			const bool made = haveBase && CreateObject(movie, &g_ex.vbBar, "HUDMenu_fla.EnemyHealthAnimBase_72", nullptr, 0);
+			bool ok = made;
+			if (!ok) logger::Write("Hover UI: vehicle bar: %s", !meter ? "no EnemyHealthMeter_mc (root or EnemyHealthHolder_mc)" : !haveBase ? "no EnemyHealthAnimBase_mc in the meter" :
+				"HUDMenu_fla.EnemyHealthAnimBase_72 could not be created");
 			if (ok) {
 				SetMember(g_ex.vbBar, "name", Str("sv_vehiclebar"));
 				const Value addArgs[1] = { Arg(g_ex.vbBar) };
@@ -1666,6 +1682,7 @@ namespace hoverui
 				logger::Write("Hover UI: vehicle bar %s (under the enemy bar at %.0f, %.0f, its height %.0f; bar width %.0f)", ok ? "added" : "incomplete", bx, by, bh, g_ex.vbWidth);
 			}
 			Release(base);
+			if (!ok) { Release(g_ex.vbName); Release(g_ex.vbBg); Release(g_ex.vbFill); Release(g_ex.vbBar); Release(g_ex.vbMeter); }  // the next try starts clean
 			return ok;
 		}
 
@@ -1697,10 +1714,13 @@ namespace hoverui
 
 		void WorkExtras(uptr menu, uptr movie)
 		{
-			if (!g_ex.vbBuilt && !g_ex.vbFailed) {
+			static int vbTries = 0;
+			static ULONGLONG vbTriedAt = 0;
+			if (!g_ex.vbBuilt && !g_ex.vbFailed && GetTickCount64() - vbTriedAt >= 2000) {
+				vbTriedAt = GetTickCount64();
 				g_ex.movie = movie;
 				if (BuildVehicleBar(menu, movie)) g_ex.vbBuilt = true;
-				else {
+				else if (++vbTries >= 5) {  // the HUD may still be assembling: a few tries, then the card line only
 					g_ex.vbFailed = true;
 					logger::Write("Hover UI: vehicle bar could not be built (EnemyHealthMeter_mc / EnemyHealthAnimBase_72); the status card line stays");
 				}
@@ -2204,14 +2224,14 @@ namespace hoverui
 			}
 			if(g_lay.fsel==kFootEls+1){
 				if(dx!=0||dy!=0){g_lay.routeX+=dx;g_lay.routeY+=dy;SaveLayout();}
-				if(press[9]){g_lay.routeX=42;g_lay.routeY=230;SaveLayout();}return;
+				if(press[9]){g_lay.routeX=kDefRouteX;g_lay.routeY=kDefRouteY;SaveLayout();}return;
 			}
 			if (dx != 0.0 || dy != 0.0) {
 				if (g_lay.fsel == kFootEls) { g_lay.fpx += dx; g_lay.fpy += dy; }
 				else { g_lay.footOff[g_lay.fsel][0] += dx; g_lay.footOff[g_lay.fsel][1] += dy; }
 				SaveLayout();
 			}
-			if (press[9] && g_lay.fsel < kFootEls) { g_lay.footOff[g_lay.fsel][0] = g_lay.footOff[g_lay.fsel][1] = 0.0; SaveLayout(); }
+			if (press[9] && g_lay.fsel < kFootEls) { g_lay.footOff[g_lay.fsel][0] = kDefFoot[g_lay.fsel][0]; g_lay.footOff[g_lay.fsel][1] = kDefFoot[g_lay.fsel][1]; SaveLayout(); }
 			return;
 		}
 		if (press[1] || press[2]) {
@@ -2224,7 +2244,7 @@ namespace hoverui
 		}
 		if(g_lay.sel==kSelRoute){
 			if(dx!=0||dy!=0){g_lay.routeX+=dx;g_lay.routeY+=dy;SaveLayout();}
-			if(press[9]){g_lay.routeX=42;g_lay.routeY=230;SaveLayout();}return;
+			if(press[9]){g_lay.routeX=kDefRouteX;g_lay.routeY=kDefRouteY;SaveLayout();}return;
 		}
 		const int sel = g_lay.sel;
 		const bool all = sel == kSelAll;
@@ -2249,7 +2269,7 @@ namespace hoverui
 		if (press[9]) {
 			// Delete: the picked element back to its default place.
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] = kDefOff[sel][0]; g_lay.off[sel][1] = kDefOff[sel][1]; changed = true; }
-			if (sel >= kSelLine && sel <= kSelRows) { g_lay.carOff[sel - kSelLine][0] = g_lay.carOff[sel - kSelLine][1] = 0.0; changed = true; }
+			if (sel >= kSelLine && sel <= kSelRows) { g_lay.carOff[sel - kSelLine][0] = kDefCar[sel - kSelLine][0]; g_lay.carOff[sel - kSelLine][1] = kDefCar[sel - kSelLine][1]; changed = true; }
 			if (sel >= kSelNative && sel - kSelNative < int(g_lay.natNames.size())) { g_lay.natOff.erase(g_lay.natNames[sel - kSelNative]); changed = true; }
 		}
 		if (dd != 0.0) {

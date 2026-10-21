@@ -3939,6 +3939,27 @@ namespace vehicleflight
 		{
 			static bool exitDown = false;
 			static ULONGLONG settleSince = 0;
+			// Wrecked under you (2026-10-21, the user: "when wrecked it should force eject player"): out at once, without setting
+			// down first; the game's exit is tried, then the seat interaction is ended. Retried every 500 ms until you are out.
+			{
+				static ULONGLONG ejectAt = 0;
+				static unsigned ejectTries = 0;
+				if (driven && vehiclehits::Wrecked(At<std::uint32_t>(driven, off::kFormId))) {
+					const ULONGLONG t = GetTickCount64();
+					if (t - ejectAt >= 500) {
+						ejectAt = t;
+						settleSince = 0;
+						if (g.active) {
+							g.playerAuto = false; g.autopilot = false; g.routeHold = false; g.holdId = 0;
+							Stop("wrecked: you are thrown out");
+						}
+						const bool out = npcvehicles::ExitPlayer(true);
+						if (ejectTries++ < 5) logger::Write("Rover: your vehicle %08X is wrecked -> ejecting you: %s", At<std::uint32_t>(driven, off::kFormId), out ? "out" : "not yet (retrying)");
+						if (out) notify::Show("Your vehicle is wrecked: you were thrown out");
+					}
+				}
+				else ejectTries = 0;
+			}
 			static std::uintptr_t settleVehicle = 0;
 			static int exitKey = 0;
 			if (!exitKey) exitKey = controlmap::KeyFor("Vehicle", "VehicleExit", 'E');
@@ -4838,6 +4859,7 @@ namespace vehicleflight
 		const auto id=At<std::uint32_t>(vehicle,off::kFormId),actorId=At<std::uint32_t>(actor,off::kFormId);
 		const char* why=ramlogic::Reject(npcvehicles::LooksLikeActor(actor),!npcvehicles::IsDead(actor),
 			EngineFn<std::uintptr_t(*)(std::uintptr_t)>(addr::kPlayerVehicle)(actor)==vehicle);
+		if (!why && npcvehicles::AreAllies(player, actor)) why = "friendly fire disabled";
 		if(!why&&(!Worldspace(vehicle)||Worldspace(actor)!=Worldspace(vehicle)))why="actor in another world";
 		if(!why&&IsDisabled(id))why="autopilot disabled after hits";
 		if(why){logger::Write("Ram order: vehicle %08X -> actor %08X refused (%s)",id,actorId,why);return false;}
@@ -4857,6 +4879,9 @@ namespace vehicleflight
 		if(pilot<1||pilot>=kPilots||!vehicle||!actor||g_ram.vehicle||!g_gs[pilot].active)return false;
 		const auto id=At<std::uint32_t>(vehicle,off::kFormId),actorId=At<std::uint32_t>(actor,off::kFormId);
 		if(IsDisabled(id)||npcvehicles::IsDead(actor)||Worldspace(actor)!=Worldspace(vehicle))return false;
+		const auto driverId = npcvehicles::VehicleDriverId(id);
+		const auto driver = driverId ? RefById(driverId) : 0;
+		if (driver && npcvehicles::AreAllies(driver, actor)) return false;
 		vcontract::Goal goal;const auto target=At<game::Vec3>(actor,off::kRefPosition);
 		goal.x=target.x;goal.y=target.y;goal.z=target.z+1;goal.cruise=true;goal.cruiseSpeed=26;goal.stop=0;
 		if(!PilotFly(pilot,vehicle,goal))return false;
