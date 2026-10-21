@@ -101,7 +101,12 @@ int main()
         const Decision held = Tick(b, d, true);
         check(held.Same(d) && std::strcmp(held.why, "held (hysteresis)") == 0, "a slightly better leaf does not replace the running one (hysteresis)");
         b.bfm[int(bfm::M::PurePursuit)] = 0.95;
-        check(Tick(b, d, true).m == bfm::M::PurePursuit, "a clearly better one does");
+        check(Tick(b, d, true).Same(d) && std::strcmp(Tick(b, d, true).why, "held (minimum time)") == 0, "within its minimum time even a clearly better leaf waits");
+        b.now = 10000 + kMinHoldMs;
+        check(Tick(b, d, true).m == bfm::M::PurePursuit, "after the minimum time a clearly better one does");
+        b.tac[int(tactics::T::CutOff)] = 0; b.now = 10100;
+        check(Tick(b, d, true).m == bfm::M::PurePursuit, "a leaf that became impossible is replaced at once");
+        b.tac[int(tactics::T::CutOff)] = 0.7; b.now = 10000;
         b.tacticsOn = false; b.tac[int(tactics::T::CutOff)] = 0.99;
         check(Tick(b, {}, false).action == Action::Bfm, "tactics switched off: no tactic leaves");
         b.tacticsOn = true;

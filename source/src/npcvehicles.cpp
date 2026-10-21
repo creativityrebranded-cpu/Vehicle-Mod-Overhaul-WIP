@@ -4349,8 +4349,8 @@ namespace npcvehicles
 		void FinderDetour(uptr a1, std::uint32_t a2, std::uint8_t a3, int a4, uptr a5, uptr a6, uptr a7, uptr a8, uptr a9)
 		{
 			g_finderOrig(a1, a2, a3, a4, a5, a6, a7, a8, a9);
-			static int budget = 40;  // the AI calls the finder too (a mount package running); log a limited number of those
-			if (g_traceSeat || budget > 0) {
+			static int budget = 40;  // with verbose logging the AI's own calls are logged too (a limited number)
+			if (g_traceSeat || (budget > 0 && logger::Verbose())) {
 				if (!g_traceSeat) --budget;
 				const std::uint32_t n = a9 ? At<std::uint32_t>(a9, 0) : 0u;
 				logger::Write("SEAT TRACE: entry-point finder FUN_14062FC20 (race/skeleton %p, flags %u) found %u entry point(s)%s", reinterpret_cast<void*>(a1), unsigned(a3), n, g_traceSeat ? "" : " [AI]");
@@ -4361,7 +4361,7 @@ namespace npcvehicles
 		{
 			const std::uint64_t r = g_poseOrig(f, a2, a3, a4, a5, a6, a7, a8, a9);
 			static int budget = 40;
-			if (g_traceSeat || budget > 0) {
+			if (g_traceSeat || (budget > 0 && logger::Verbose())) {
 				if (!g_traceSeat) --budget;
 				// a4 = the entry node position (scaled by f), a7 = a second vector (the approach / facing delta); both are floats x y z.
 				logger::Write("SEAT TRACE: entry-node pose FUN_140EFB310 -> %d  scale %.2f  pos (%.2f, %.2f, %.2f)  vec (%.2f, %.2f, %.2f)%s", int(r & 0xFF), f, a4 ? a4[0] : 0.f, a4 ? a4[1] : 0.f, a4 ? a4[2] : 0.f,

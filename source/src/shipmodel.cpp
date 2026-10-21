@@ -323,7 +323,7 @@ namespace shipmodel
 							!Contains(childName, "flame") && !Contains(childName, "boost") && !Contains(childName, "nozzle")) return;
 						float q[3];
 						toShip(At<game::Vec3>(o, kWorldTranslate), q);
-						logger::Write("Ship vehicle: engine node %s/%s at (%.2f, %.2f, %.2f)", name, childName, q[0], q[1], q[2]);
+						if (logger::Verbose()) logger::Write("Ship vehicle: engine node %s/%s at (%.2f, %.2f, %.2f)", name, childName, q[0], q[1], q[2]);
 						++engineNodesLogged;
 					});
 				}
@@ -383,7 +383,7 @@ namespace shipmodel
 					std::memcpy(g.cockpit, s, sizeof(s));
 				}
 				if (modules <= 40) {
-					logger::Write("Ship model: module %s at (%.1f, %.1f, %.1f)", name[0] ? name : "?", s[0], s[1], s[2]);
+					if (logger::Verbose()) logger::Write("Ship model: module %s at (%.1f, %.1f, %.1f)", name[0] ? name : "?", s[0], s[1], s[2]);
 				}
 			}
 			if (modules == 0) {

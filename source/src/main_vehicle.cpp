@@ -81,8 +81,8 @@ namespace
             const auto now=GetTickCount64();if(!began)began=now;++count;
             for(int i=0;i<8;++i){sum[i]+=sample[i];max[i]=std::max(max[i],sample[i]);}
             if(now-began<60000)return;
-            logger::Write("Vehicle frame cost: total %.3f ms avg / %.3f worst; identity+world %.3f, hits %.3f, map+navigation %.3f, context+profiles %.3f, NPC decisions+squads+rams %.3f, flight %.3f, other %.3f (all engine glue included)",
-                sum[7]/count,max[7],sum[0]/count,sum[1]/count,sum[2]/count,sum[3]/count,sum[4]/count,sum[5]/count,sum[6]/count);
+            logger::Write("Vehicle frame cost: total %.3f ms avg / %.3f worst; identity+world %.3f / %.1f, hits %.3f / %.1f, map+navigation %.3f / %.1f, context+profiles %.3f / %.1f, NPC decisions+squads+rams %.3f / %.1f, flight %.3f / %.1f, other (vehicle registry, placement, scanner, traffic) %.3f / %.1f (avg / worst ms)",
+                sum[7]/count,max[7],sum[0]/count,max[0],sum[1]/count,max[1],sum[2]/count,max[2],sum[3]/count,max[3],sum[4]/count,max[4],sum[5]/count,max[5],sum[6]/count,max[6]);
             *this={};began=now;
         }
     } g_frameCost;

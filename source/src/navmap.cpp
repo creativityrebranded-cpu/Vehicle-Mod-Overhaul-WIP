@@ -418,7 +418,7 @@ namespace navmap
 				if (Valid(c.blockedZ) && now - c.blockedAt < kBlockedLifeMs) ++blocked;
 				if (Valid(c.freeLo)) ++freeCells;
 			}
-			logger::Write("Nav map: %zu cells (ground %u, floors %u, solid %u, free %u); 10 s: %u ground, %u rays, %u contacts noted; "
+			if (logger::Verbose()) logger::Write("Nav map: %zu cells (ground %u, floors %u, solid %u, free %u); 10 s: %u ground, %u rays, %u contacts noted; "
 				"ray hits with a unit vector at +0x10: %u of %u; sampler: used %u, fell back %u; straight way, hull sweep vs thin ray: %u sweeps, both blocked %u, hull only %u, ray only %u",
 				g_cells.size(), ground, floors, blocked, freeCells, g_n.ground, g_n.rays, g_n.contacts,
 				g_n.normals, g_n.hits, g_n.sampUsed, g_n.sampFallback, g_n.sweeps, g_n.hullBoth, g_n.hullOnly, g_n.rayOnly);

@@ -299,9 +299,14 @@ struct Decision
     const char* why = "";
     int impulse = -1;              // the impulse that caused it (-1 none)
     double score = 0;
+    std::uint64_t since = 0;       // when it was chosen (the minimum hold counts from here)
     bool Same(const Decision& o) const { return action == o.action && (action != Action::Bfm || m == o.m) && (action != Action::Tactic || t == o.t); }
 };
 inline constexpr double kHysteresis = 0.15;
+// A chosen engage leaf runs at least this long while it stays possible (2026-10-21 run: cut-off and lag pursuit swapped every
+// few milliseconds, 260 decisions in 3 minutes, because their scores crossed each frame). Interrupts (react, evade,
+// self-preservation) are other branches and still act at once.
+inline constexpr std::uint64_t kMinHoldMs = 1500;
 
 // Node kinds of the tree; the tree itself is static data (kTree) walked by Tick.
 enum class NodeKind : std::uint8_t { Selector, Sequence, Condition, Leaf, DesireSelector };
@@ -435,7 +440,10 @@ inline Decision Tick(const Blackboard& b, const Decision& previous, bool havePre
         if (previous.action == Action::Bfm && b.bfmOn) prevScore = b.bfm[int(previous.m)];
         else if (previous.action == Action::Tactic && b.tacticsOn) prevScore = b.tac[int(previous.t)];
         if (prevScore >= 0 && prevScore + kHysteresis >= d.score) { Decision keep = previous; keep.score = prevScore; keep.why = "held (hysteresis)"; return keep; }
+        if (prevScore > 0 && b.now >= previous.since && b.now - previous.since < kMinHoldMs) { Decision keep = previous; keep.score = prevScore; keep.why = "held (minimum time)"; return keep; }
     }
+    if (!havePrevious || !d.Same(previous) || std::string_view(d.branch) != previous.branch) d.since = b.now;
+    else d.since = previous.since;
     if (d.impulse >= 0 && b.impulses) b.impulses->Handle(Impulse(d.impulse), b.now);
     return d;
 }

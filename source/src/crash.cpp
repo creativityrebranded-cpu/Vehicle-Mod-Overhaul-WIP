@@ -57,6 +57,8 @@ namespace crash
 			}
 		}
 
+		thread_local bool t_unhandled = false;  // called from the unhandled filter: a real crash, reported wherever it is
+
 		LONG CALLBACK Handler(EXCEPTION_POINTERS* info)
 		{
 			const auto* rec = info->ExceptionRecord;
@@ -72,14 +74,19 @@ namespace crash
 			}
 			// The same goes for the other plugins of this mod set (each guards its own reads and ignores its own faults above): two of them in one game must not report each
 			// other's guarded faults (the 2026-10-18 launch logged two at load and used up the three-report cap).
-			if (faulting && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+			{
 				char path[MAX_PATH] = {};
-				GetModuleFileNameA(faulting, path, MAX_PATH);
+				if (faulting) GetModuleFileNameA(faulting, path, MAX_PATH);
 				const char* name = path;
 				for (const char* p = path; *p; ++p) {
 					if (*p == '\\' || *p == '/') name = p + 1;
 				}
-				if (_strnicmp(name, "Seamless", 8) == 0 || _strnicmp(name, "Gravspace", 9) == 0) return EXCEPTION_CONTINUE_SEARCH;
+				if (faulting && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && !t_unhandled &&
+					(_strnicmp(name, "Seamless", 8) == 0 || _strnicmp(name, "Gravspace", 9) == 0)) return EXCEPTION_CONTINUE_SEARCH;
+				// Other mods' DLLs raise and catch their own exceptions as normal work (2026-10-21: CassiopeiaPapyrusExtender's
+				// first-chance faults were logged as "CRASH?"). Before anything handles it only the game's own code is watched;
+				// a real crash anywhere still reaches the unhandled filter and is reported in full.
+				if (!t_unhandled && faulting && _stricmp(name, "Starfield.exe") != 0) return EXCEPTION_CONTINUE_SEARCH;
 			}
 			if (g_reported.fetch_add(1) >= 3) {
 				return EXCEPTION_CONTINUE_SEARCH;  // only the first few (the game may catch some itself)
@@ -88,7 +95,9 @@ namespace crash
 			char where[160];
 			Describe(reinterpret_cast<DWORD64>(rec->ExceptionAddress), where, sizeof(where));
 			const auto* c = info->ContextRecord;
-			logger::WriteUnlocked("CRASH? exception 0x%08X at %s (thread %lu)", rec->ExceptionCode, where, GetCurrentThreadId());
+			logger::WriteUnlocked(t_unhandled ? "CRASH: exception 0x%08X at %s (thread %lu)"
+				: "First-chance fault 0x%08X at %s (thread %lu); the game may handle it, a crash follows only if it does not",
+				rec->ExceptionCode, where, GetCurrentThreadId());
 			if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && rec->NumberParameters >= 2) {
 				logger::WriteUnlocked("  %s address 0x%llX", rec->ExceptionInformation[0] == 0 ? "read" : rec->ExceptionInformation[0] == 1 ? "write" : "execute",
 					static_cast<unsigned long long>(rec->ExceptionInformation[1]));
@@ -146,7 +155,9 @@ namespace crash
 			g_reported.store(0);
 			HMODULE self = g_self;
 			g_self = nullptr;  // report it even when it is inside this plugin
+			t_unhandled = true;
 			Handler(info);
+			t_unhandled = false;
 			g_self = self;
 			t_expected = expected;
 			return g_previous ? g_previous(info) : EXCEPTION_CONTINUE_SEARCH;

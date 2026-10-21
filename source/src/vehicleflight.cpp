@@ -1786,7 +1786,7 @@ namespace vehicleflight
 			// 21:03-21:05: Auto waited with no "marker" line at all. Every 3 s while waiting: what the read sees.
 			static ULONGLONG said = 0;
 			const ULONGLONG now = GetTickCount64();
-			const bool say = now - said >= 3000;
+			const bool say = now - said >= 3000 && logger::Verbose();  // every 3 s while waiting: verbose logging only
 			if (say) said = now;
 			if (!id) {
 				if (say) logger::Write("Rover taxi: waiting; no custom marker (player +0xE40 is 0)");
@@ -2241,7 +2241,7 @@ namespace vehicleflight
 					const ULONGLONG nowMs = GetTickCount64();
 					if (g.hullHit && g.hullDist < g.hullRange && !rayBlocked && nowMs - g.hullLogAt >= 2000) {
 						g.hullLogAt = nowMs;
-						logger::Write("%s: hull sweep blocked %.1f m ahead (layer %u, body %u) where the thin ray saw nothing", Who(idx), sw.distance, sw.layer, sw.bodyId);
+						if (logger::Verbose()) logger::Write("%s: hull sweep blocked %.1f m ahead (layer %u, body %u) where the thin ray saw nothing", Who(idx), sw.distance, sw.layer, sw.bodyId);
 					}
 				}
 			}
@@ -2899,11 +2899,11 @@ namespace vehicleflight
 						else if (ag > 1 && desired < kAiGearTop[ag - 1] * kShiftDown && sp < kAiGearTop[ag - 1]) --ag;
 						if (ag != before) {
 							g.shiftAt = nowMs;
-							logger::Write("%s: gear %d -> %d (want %.0f m/s, at %.0f)", wc, before, ag, desired, sp);
+							if (logger::Verbose()) logger::Write("%s: gear %d -> %d (want %.0f m/s, at %.0f)", wc, before, ag, desired, sp);
 						}
 					}
 					if (ag > g.gearCap) {
-						logger::Write("%s: gear %d -> %d (path cap)", wc, ag, g.gearCap);
+						if (logger::Verbose()) logger::Write("%s: gear %d -> %d (path cap)", wc, ag, g.gearCap);
 						ag = g.gearCap;
 						g.shiftAt = nowMs;
 					}
@@ -3256,14 +3256,14 @@ namespace vehicleflight
 				if (capNow < g.gearCap) {
 					g.gearCap = capNow;
 					g.capClearSince = 0;
-					logger::Write("%s: gear cap %d (%s)", wc, capNow, why);
+					if (logger::Verbose()) logger::Write("%s: gear cap %d (%s)", wc, capNow, why);
 				}
 				else if (capNow > g.gearCap) {
 					if (!g.capClearSince) g.capClearSince = nowMs;
 					else if (nowMs - g.capClearSince >= kCapRaiseMs) {
 						++g.gearCap;
 						g.capClearSince = nowMs;
-						logger::Write("%s: gear cap %d (clear)", wc, g.gearCap);
+						if (logger::Verbose()) logger::Write("%s: gear cap %d (clear)", wc, g.gearCap);
 					}
 				}
 				else {
@@ -4287,7 +4287,7 @@ namespace vehicleflight
 			const unsigned occupied = g_occupiedSteps.exchange(0, std::memory_order_relaxed);
 			const unsigned unoccupied = g_unoccupiedSteps.exchange(0, std::memory_order_relaxed);
 			if (occupied || unoccupied) {
-				logger::Write("Ship vehicle physics probe: last rover stepped %u times while driven, %u times after leaving it (10 s)", occupied, unoccupied);
+				if (logger::Verbose()) logger::Write("Ship vehicle physics probe: last rover stepped %u times while driven, %u times after leaving it (10 s)", occupied, unoccupied);
 			}
 		}
 		const bool boostTap = g_tapBoost.Update(focused && Held(g_mk.vert));

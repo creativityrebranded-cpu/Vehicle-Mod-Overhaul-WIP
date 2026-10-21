@@ -250,7 +250,7 @@ namespace context
 			crash::Crumb("context actor scan", 0);
 			unsigned actors = 0, fighters = 0, inRange = 0, noVehicle = 0, cooling = 0, shown = 0;
 			static ULONGLONG lastDiag = 0;
-			const bool diagnose = now - lastDiag >= 15000;
+			const bool diagnose = now - lastDiag >= 15000 && logger::Verbose();
 			if (diagnose) lastDiag = now;
 			for (const uptr r : modscene::LoadedRefs(kActorLimit)) {
 				if (attempts >= kMaxAttemptsPerScan) break;
@@ -301,7 +301,7 @@ namespace context
 			if (diagnose) {  // proof the scan sees actors at all
 				logger::Write("Context: alive: %u actors scanned, %u in combat, %u vehicles known", actors, fighters, g_snap.count);
 			}
-			if (fighters && now - lastSummary >= 5000) {
+			if (fighters && now - lastSummary >= 5000 && logger::Verbose()) {
 				lastSummary = now;
 				logger::Write("Context: scan: %u actors, %u in combat (%u within %.0f m of you), %u with no free vehicle within %.0f m, %u waiting to retry, %u vehicles known; you %s in combat",
 					actors, fighters, inRange, kActorRange, noVehicle, kBoardRange, cooling, g_snap.count, npcvehicles::IsInCombat(player) ? "are" : "are not");

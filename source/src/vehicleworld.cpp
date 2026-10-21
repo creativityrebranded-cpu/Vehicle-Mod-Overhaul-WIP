@@ -228,7 +228,7 @@ namespace world
 					}
 					else if (d3 > 0.6f && d3 < 50.0f && hopLogged < 40) {
 						++hopLogged;
-						logger::Write("Vehicle hop: %08X (base %08X) moved %.1f m while parked, to (%.1f, %.1f, %.1f)", id, v.baseId, d3, p.x, p.y, p.z);
+						if (logger::Verbose()) logger::Write("Vehicle hop: %08X (base %08X) moved %.1f m while parked, to (%.1f, %.1f, %.1f)", id, v.baseId, d3, p.x, p.y, p.z);
 					}
 				}
 				if (dt > 1e-4 && dt < 0.5 && jump < 50.0f) {

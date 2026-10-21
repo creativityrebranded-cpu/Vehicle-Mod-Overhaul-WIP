@@ -418,9 +418,9 @@ namespace vehicle_probe
 				if (r == 0) continue;
 				if (g_sweepLogged < 8) {
 					++g_sweepLogged;
-					logger::Write("Prefetch: hull sweep #%u (slot %d, %.0f m): %s%s, %d hit(s) kept, %d left out (own body / ground below), %u us",
+					if (logger::Verbose()) logger::Write("Prefetch: hull sweep #%u (slot %d, %.0f m): %s%s, %d hit(s) kept, %d left out (own body / ground below), %u us",
 						g_sweepLogged, i, work[i].range, hit.hit ? "nearest " : "clear", hit.hit ? "" : "", hit.kept, hit.skipped, hit.micros);
-					if (hit.hit) logger::Write("Prefetch:   hit at %.1f m, layer %u, body %u, (%.1f, %.1f, %.1f)", hit.distance, hit.layer, hit.bodyId, hit.x, hit.y, hit.z);
+					if (hit.hit && logger::Verbose()) logger::Write("Prefetch:   hit at %.1f m, layer %u, body %u, (%.1f, %.1f, %.1f)", hit.distance, hit.layer, hit.bodyId, hit.x, hit.y, hit.z);
 				}
 				std::lock_guard lk(g_lock);
 				g_sweeps[i].hit = hit;

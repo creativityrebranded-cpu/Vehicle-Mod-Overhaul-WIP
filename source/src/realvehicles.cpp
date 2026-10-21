@@ -837,17 +837,28 @@ namespace realvehicles
 		void PatchJobs()
 		{
 			const ULONGLONG now = GetTickCount64();
+			static ULONGLONG lastEnable = 0;
+			bool enabledThisFrame = false;
 			for (auto& j : g_patch.jobs) {
 				const uptr r = Lookup(j.ref);
 				if (!r || !Readable(r, 0xD0)) { j.stage = 9; continue; }
 				const int stage = j.stage;
+				// The base change and enable load the new vehicle's model: one per frame, at least 500 ms apart (2026-10-21 11:06-11:07:
+				// four swaps after a load fell in the minute with a 144 ms frame).
+				if (stage == 1 && (enabledThisFrame || now - lastEnable < 500)) continue;
+				LARGE_INTEGER f, t0, t1;
+				QueryPerformanceFrequency(&f);
+				QueryPerformanceCounter(&t0);
 				const std::uint32_t old = PatchStep(r, j, now);
+				QueryPerformanceCounter(&t1);
+				const double ms = 1000.0 * double(t1.QuadPart - t0.QuadPart) / double(f.QuadPart);
+				if (stage == 1 && j.stage == 9) { enabledThisFrame = true; lastEnable = now; }
 				if (old == ~0u) logger::Write("Placement patch: vehicle %08X raised an exception in stage %d; enabled again, left as it was", j.ref, stage);
 				else if (old) {
 					++g_patch.swaps;
 					const auto p = At<game::Vec3>(r, off::kRefPosition);
-					logger::Write("Placement patch: #%u vehicle %08X at (%.0f, %.0f, %.0f): base %08X -> %08X (%s), spot / stand-in %016llX", g_patch.swaps, j.ref, p.x, p.y, p.z,
-						old, At<std::uint32_t>(j.base, 0x28), ModelHint(j.base).c_str(), static_cast<unsigned long long>(j.spot));
+					logger::Write("Placement patch: #%u vehicle %08X at (%.0f, %.0f, %.0f): base %08X -> %08X (%s), spot / stand-in %016llX; %.1f ms", g_patch.swaps, j.ref, p.x, p.y, p.z,
+						old, At<std::uint32_t>(j.base, 0x28), ModelHint(j.base).c_str(), static_cast<unsigned long long>(j.spot), ms);
 				}
 			}
 			std::erase_if(g_patch.jobs, [](const SwapJob& j) { return j.stage == 9; });

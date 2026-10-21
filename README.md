@@ -186,6 +186,10 @@ All of this passes the offline checks; most of it has not been tested in game ye
   vehicle they park becomes one pick per location from every vehicle in your load order, using a fixed seed, so a place always
   looks the same. Nothing is spawned: the parked vehicle itself changes type. `[placement] enabled=0` in `seamless.ini` turns it
   off. Overlapping duplicates left by older builds are cleared.
+- **Steadier enemy vehicles:** a chosen manoeuvre is kept for at least 1.5 s while it stays possible (they no longer switch
+  moves every few milliseconds). Hits, rams and low health still interrupt at once.
+- **Quieter log:** timer diagnostics (navigation stats, seat traces, gear changes, context scans) only with `[log] verbose=1`.
+  Other mods' handled exceptions are no longer reported as crashes; a real crash still gets a full report.
 
 ## Current fixes and controls (0.61.0)
 
