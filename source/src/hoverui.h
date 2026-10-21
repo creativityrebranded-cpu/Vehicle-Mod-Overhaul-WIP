@@ -42,6 +42,9 @@ namespace hoverui
 	void SetAutoKey(const char* key);
 	// Main thread: the vehicle health line (the lifebar) for the status card; empty hides it.
 	void SetLifebar(const char* line);
+	// Main thread: the vehicle bar under the game's enemy bar (the driver's): the vehicle's name and health share (0..1);
+	// an empty name hides it.
+	void SetVehicleBar(const char* name, float share);
 	// Main thread: one line per follower vehicle / rider below Target (at most kMaxRows; count 0 hides them).
 	constexpr int kMaxRows = 4;
 	void SetRows(int count, const char* const* lines);

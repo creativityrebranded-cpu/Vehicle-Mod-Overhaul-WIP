@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include "travelmode.h"
 
 // The vehicle contract (2026-10-18, Profile Fork; agreed with the flight / seat owner on the board). Profiles plug in
 // here and never touch the flight, job or seat code; owners call the hooks below and never look inside a profile. As
@@ -31,6 +32,8 @@ namespace vcontract
 		bool passThrough = false;    // (x, y) is a waypoint: keep speed through it, do not brake to stop
 		float arriveYaw = std::numeric_limits<float>::quiet_NaN();  // park facing this heading (atan2(x, y)); NaN: any
 		bool landOnArrival = false;  // at a held goal: hover off and settle (parked) instead of hovering
+		// NPC vehicles: hover or drive on the ground by default (travelmode.h decides per moment from this and the reasons around it).
+		travelmode::Default travel = travelmode::Default::Auto;
 	};
 
 	// What a profile wants this frame.

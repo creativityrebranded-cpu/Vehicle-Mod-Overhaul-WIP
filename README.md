@@ -45,6 +45,9 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Full vehicle combat AI** | Steering, dogfight manoeuvres, Mad Max tactics, squads, morale and personalities; vehicle health with a wreck state | Untested in game; offline checks pass |
 | **Parked-vehicle patch (optional)** | With Carfield or Parked Vehicles (+ Vehicles - Real) installed, each kind of parked vehicle becomes a seeded pick from every vehicle in your load order, per location | Lightly tested |
 | **Streamlined HUD** | One status card, only the prompts you can use now, control hints that hide after your first rides, J shows everything | Untested in game |
+| **Hover or drive** | NPC vehicles, and yours on autopilot, fly or drive on the ground depending on the terrain, the trip and the fight | Untested in game; offline checks pass |
+| **Enemy vehicle health bar** | Aim at an enemy vehicle: the game's own enemy bar shows its driver, with the vehicle's health in a second bar under it | Untested |
+| **Settings menu toggles** | Every feature can be switched on or off in the game's Settings menu, under *Flying Vehicle Overhaul* | Untested |
 
 ---
 
@@ -166,6 +169,27 @@ The HUD shows what you can do now and one status card (0.62.0). Everything uses 
 - **F7** moves and resizes everything (+ / − on the pick). The card moves with *Status* on foot and *Vehicles* in the vehicle.
 
 ---
+
+## What's new in 0.63.0
+
+None of this has been tested in game yet; the offline checks pass.
+
+- **Hover or drive.** NPC vehicles, and your own on autopilot (summon, follow, cover, guard, Auto), now choose per moment to fly
+  or to drive on the ground. They hover over water, rough ground and obstacles taller than a jump (rays up to 250 m ahead), when
+  catching you, in fights, when the goal is 75 m or more above, and on trips over 500 m. They drive inside settlements, on trips
+  under 300 m, and when the hover is failing (under 30% health). Each navigation profile has its own default (Escort copies
+  you). A reason must hold 2 s and a mode lasts at least 10 s; a blocking reason switches at once and is then held 30 s.
+  "Drive" is the hover held just over the ground; the game's own driving is used only with you aboard, in a tight spot, or
+  when damaged. Building walls are steered around, never flown over.
+- **Enemy vehicle health bar.** Aim at an enemy vehicle (or its driver) and the game's own enemy health bar shows the driver,
+  with a second bar under it for the vehicle's name and health. This needs the driver to be fighting you. The status card
+  shows your own vehicle's health at all times, and the enemy vehicle you aim at, last hit, or the nearest one within 400 m.
+- **Settings menu.** A *Flying Vehicle Overhaul* category in the game's Settings menu (pause menu and main menu), with a
+  toggle per feature (see [Settings](#settings)). Changes apply at once and are saved to `seamless.ini`.
+- **Fixes:** vehicles getting stuck in towns (drive mode turning on 5-6 m above the ground, switching between drive and hover
+  every 10 s); your vehicle's health not showing; you could get into a vehicle an NPC was using (the game had already sat you
+  down, and now stands you back up with "That vehicle is taken").
+- **Source:** `source/` is now the standalone source; it builds on its own (see [Building from source](#building-from-source)).
 
 ## What's new in 0.62.0
 
@@ -371,6 +395,12 @@ never used for traffic.**
 
 ## Settings
 
+**In game:** open **Settings** (pause menu or main menu) and pick **Flying Vehicle Overhaul**. Each feature has its own toggle,
+with a description: NPCs use vehicles, Full vehicle combat AI (off: simpler attack runs), Vehicle rams, Hover or drive, Vehicle
+damage and wrecks, Vehicle health bars, Vehicle status card, Crash witnesses, Parked vehicles (after loading a save) and
+Detailed log. *Reset to defaults* works for this category. Each toggle is the `seamless.ini` key in the table below, so editing
+the file by hand still works (it is read again every 5 s).
+
 All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 
 | File | Section | Key | Default | What it does |
@@ -381,11 +411,33 @@ All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 | `seamless.ini` | `[hits]` | `limit` | `0` | `0` = your own health; any other number = a fixed limit |
 | `seamless.ini` | `[hits]` | `cooldown` | `30` | Seconds the autopilot stays off at the limit |
 | `seamless.ini` | `[witness]` | `enabled` | `1` | `0` = bystanders do not react to crashes |
+| `seamless.ini` | `[combat]` | `ai`, `ram` | `1`, `1` | `0` = simpler attack runs / no rams |
+| `seamless.ini` | `[nav]` | `travel` | `1` | `0` = vehicles hover, and drive only to get out of tight spots |
+| `seamless.ini` | `[nav]` | `jump` | `4` | Metres a vertical boost clears on the ground (taller obstacles make vehicles hover) |
+| `seamless.ini` | `[hits]` | `enabled` | `1` | `0` = vehicles take no damage and never wreck |
+| `seamless.ini` | `[hud]` | `healthBars`, `card` | `1`, `1` | `0` = no vehicle health bars / no status card |
+| `seamless.ini` | `[placement]` | `enabled` | `1` | `0` = the optional parked-vehicle patch is off (after loading a save) |
 | `seamless.ini` | `[scanner]` | `key` | `84` (T) | The scanner marker key (Windows virtual-key code) |
 | `seamless.ini` | `[view]` | `objectFade`, `actorFade` | `3`, `1` | Fade distance multipliers (1 = the game's own, 0 = never fade) |
 | `seamless.ini` | `[keys]` | `debug` | `0` | `1` = manual test keys (listed in the log) |
 | `nav.ini` | `[nav]` | `sampler`, `shape`, `rays` | `1` | `0` turns off the heading sampler, the hull sweeps, or all ray queries |
 | `hoverui.ini` | | | | On-screen layout, written by the F7 editor |
+
+---
+
+## Building from source
+
+`source/` builds on its own: Windows, Visual Studio 2022 Build Tools (MSVC, C++20) and CMake 3.24 or newer. Nothing else is
+needed; the SFSE plugin header is included in `source/third_party/sfse` (MIT).
+
+```
+cd source
+powershell -ExecutionPolicy Bypass -File build.ps1
+```
+
+or `cmake -S . -B build -A x64` then `cmake --build build --config Release`. The plugin is `build/Release/SeamlessVehicle.dll`;
+the `*_test.exe` files next to it are the offline checks (no game needed). The layout is in [source/README.md](source/README.md).
+The plugin targets Starfield 1.16.244 (Steam) only.
 
 ---
 
@@ -395,6 +447,7 @@ All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 - **Follower mods** work: followers come from the game's own list.
 - **Grav jump mods** (Seamless Grav Jumps, FTL, Grav Lanes) do not interact with this mod.
 - Not compatible with other mods that replace the vehicle physics step or the vehicle input handling.
+- Other mods that change the game's Settings menu may conflict with the *Flying Vehicle Overhaul* category.
 
 ---
 

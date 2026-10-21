@@ -1,4 +1,5 @@
 #include "addresses.h"
+#include "features.h"
 #include "context.h"
 #include "core_api.h"
 #include "crash.h"
@@ -91,6 +92,7 @@ namespace
         LARGE_INTEGER frequency,start,previous,stamp;QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&start);previous=start;
         double cost[8]{};auto mark=[&](int i){QueryPerformanceCounter(&stamp);cost[i]=1000.0*double(stamp.QuadPart-previous.QuadPart)/frequency.QuadPart;previous=stamp;};
         modscene::NewFrame();
+        features::Tick();
         vehicleflight::BeginFrame(); // decision owners must renew their commands in this frame
         npcvehicles::BeginFrame();
         world::Publish();mark(0);
@@ -137,6 +139,7 @@ namespace
 		npcvehicles::Install();
 		profiles::Install();
 		vehicleaim::Install();
+		vehiclehits::InstallEnemyBar();
 		flighttune::Load();
 		api.OnFrame(&Frame);
 		api.OnPlayerUpdate(&shipmodel::OnPlayerUpdate);
@@ -161,6 +164,7 @@ namespace
 		npcvehicles::Install();
 		profiles::Install();
 		vehicleaim::Install();
+		vehiclehits::InstallEnemyBar();
 		flighttune::Load();
 		g_tasks->AddTaskPermanent(&g_frameTask);
 		logger::Write("Vehicle: standalone ground and physics service started");
@@ -198,7 +202,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 62, "SeamlessVehicle", "seemless",
+	SFSEPluginVersionData::kVersion, 63, "SeamlessVehicle", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -217,7 +221,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	g_messaging = static_cast<SFSEMessagingInterface*>(sfse->QueryInterface(kInterface_Messaging));
 	g_tasks = static_cast<SFSETaskInterface*>(sfse->QueryInterface(kInterface_Task));
 	if (!g_messaging || !g_messaging->RegisterListener(g_handle, "SFSE", SfseMessage)) return false;
-	logger::Write("SeamlessVehicle 0.62.0 loaded; core optional");
+	logger::Write("SeamlessVehicle 0.63.0 loaded; core optional");
 	return true;
 }
 }

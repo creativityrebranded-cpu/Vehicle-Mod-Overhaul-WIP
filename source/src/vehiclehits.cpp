@@ -1,4 +1,5 @@
 #include "vehiclehits.h"
+#include "features.h"
 
 #include "addresses.h"
 #include "game.h"
@@ -13,7 +14,10 @@
 #include <Windows.h>
 #include <ShlObj.h>
 
+#include "hook.h"
+
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -374,6 +378,7 @@ namespace vehiclehits
 		// Damage to a vehicle (a shot, or a ram from combat_tactics' RamDamage): health, the driver's share, the wreck.
 		void AddDamage(const world::VehicleInfo& v, float amount, std::uint32_t by, int side, ULONGLONG now, const char* what,std::uint32_t attacker=0)
 		{
+			if (!features::On(features::Id::VehicleDamage)) return;  // [hits] enabled, also the settings menu
 			Damage* d = DamageFor(v.formId, true);
 			const float limit = Limit();
 			const float dealt = std::min(amount, std::max(0.0f, limit - d->damage));
@@ -454,6 +459,8 @@ namespace vehiclehits
 		p.at = GetTickCount64();
 	}
 
+	namespace { void EnemyBarTick(const world::Snapshot& snap, bool haveVehicles); }  // below, with the enemy bar hook
+
 	void Tick()
 	{
 		ReadIni();
@@ -469,6 +476,7 @@ namespace vehiclehits
 		}
 		static world::Snapshot snap;
 		const bool haveVehicles = world::Vehicles(snap);
+		EnemyBarTick(snap, haveVehicles);
 		for (int i = 0; i < g_liveCount;) {
 			Proj& pr = g_live[i];
 			if (!pr.resolved) {
@@ -619,6 +627,147 @@ namespace vehiclehits
 	}
 
 	bool ActorHealth(std::uintptr_t actor, float& now, float& max) { return HealthOf(actor, now, max); }
+
+	// ---- The game's enemy bar for a vehicle's driver (2026-10-21, the user: vehicle health as a second bar under the NPC's) ----
+	// FUN_141489B90 builds the HUD's enemy list (HudEnemyData) from PlayerCharacter +0xEF8 / +0xF00 and flags the entry that
+	// matches the crosshair handle DAT_1461FAE94 (FUN_141489EA0); aiming at a vehicle leaves that handle empty, so no bar.
+	// While the view ray passes through a vehicle an enemy drives and the driver is on that list, the driver's handle stands
+	// in for the crosshair during the call (restored after it). The vehicle's own bar is hoverui's, under the driver's.
+	namespace
+	{
+		constexpr std::uint32_t kEnemyListBuild = 0x01489B90;
+		constexpr std::uint32_t kAimedHoldMs = 400;   // the ray may slip off for a moment
+		constexpr double kAimRange = 600.0;
+		using Build_t = void (*)(uptr);
+		Build_t g_buildOriginal = nullptr;
+		std::atomic<std::uint32_t> g_driverHandle{ 0 };
+		std::atomic<unsigned> g_overrides{ 0 };
+		std::uint32_t g_barVehicle = 0, g_aimVehicle = 0;
+		ULONGLONG g_aimAt = 0;
+
+		void BuildDetour(uptr ctx)
+		{
+			const std::uint32_t h = g_driverHandle.load(std::memory_order_relaxed);
+			if (!h) { g_buildOriginal(ctx); return; }
+			auto* cross = reinterpret_cast<volatile std::uint32_t*>(game::Base() + kCrosshairHandle);
+			const std::uint32_t old = *cross;
+			*cross = h;
+			g_buildOriginal(ctx);
+			if (*cross == h) *cross = old;  // the game wrote its own pick meanwhile: keep that
+			g_overrides.fetch_add(1, std::memory_order_relaxed);
+		}
+
+		// The view ray: the camera root's translate and forward row (scantarget's CameraRay); the player's eye without a camera.
+		bool ViewRay(uptr player, double o[3], double d[3])
+		{
+			__try {
+				const auto pp = At<game::Vec3>(player, off::kRefPosition);
+				const uptr cam = Ptr(addr::kPlayerCameraPtr);
+				const uptr root = cam ? At<uptr>(cam, 0x08) : 0;
+				if (!root) return false;
+				const double fx = At<float>(root, 0x90), fy = At<float>(root, 0x94), fz = At<float>(root, 0x98);
+				const double len = std::sqrt(fx * fx + fy * fy + fz * fz);
+				if (!std::isfinite(len) || len < 0.5 || len > 1.5) return false;
+				d[0] = fx / len; d[1] = fy / len; d[2] = fz / len;
+				const auto ct = At<game::Vec3>(root, 0xB0);
+				if (std::isfinite(ct.x) && std::hypot(double(ct.x) - pp.x, double(ct.y) - pp.y) < 20.0 && std::fabs(double(ct.z) - pp.z) < 20.0) {
+					o[0] = ct.x; o[1] = ct.y; o[2] = ct.z;
+				}
+				else {
+					o[0] = pp.x; o[1] = pp.y; o[2] = pp.z + 1.6;
+				}
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		// The driver's handle on the HUD enemy list (0: not listed, so the game has no bar for them).
+		std::uint32_t ListedHandle(uptr player, uptr driver)
+		{
+			__try {
+				const std::uint32_t count = At<std::uint32_t>(player, kHostileCount);
+				const auto* arr = At<const std::uint32_t*>(player, kHostileArray);
+				for (std::uint32_t i = 0; arr && i < count && i < 64; ++i) if (arr[i] && HandleRef(arr[i]) == driver) return arr[i];
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+			return 0;
+		}
+
+		std::uint32_t ReadU32(uptr base, std::uint32_t offset)
+		{
+			__try { return base ? At<std::uint32_t>(base, offset) : 0; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+
+		// Main thread, every frame: which vehicle the view ray passes through, and whether its driver's bar can be shown.
+		void EnemyBarTick(const world::Snapshot& snap, bool haveVehicles)
+		{
+			const uptr player = Ptr(addr::kPlayerCharacterPtr);
+			const ULONGLONG now = GetTickCount64();
+			double o[3], d[3];
+			std::uint32_t hitId = 0;
+			if (player && haveVehicles && ViewRay(player, o, d)) {
+				double best = kAimRange;
+				const std::uint32_t own = vehicleflight::OwnRoverId();
+				for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+					const auto& v = snap.v[k];
+					if (v.formId == own || v.who == world::VehicleInfo::Who::Player) continue;
+					const double c[3] = { v.pos[0] - o[0], v.pos[1] - o[1], v.pos[2] + v.half[2] - o[2] };
+					const double t = c[0] * d[0] + c[1] * d[1] + c[2] * d[2];
+					if (t < 1.0 || t >= best) continue;
+					const double px = c[0] - t * d[0], py = c[1] - t * d[1], pz = c[2] - t * d[2];
+					const double r = std::max({ double(v.half[0]), double(v.half[1]), double(v.half[2]) }) + 0.5 + t * 0.005;  // a little looser far away
+					if (px * px + py * py + pz * pz < r * r) { best = t; hitId = v.formId; }
+				}
+			}
+			if (hitId) { g_aimVehicle = hitId; g_aimAt = now; }
+			else if (now - g_aimAt > kAimedHoldMs) g_aimVehicle = 0;
+			std::uint32_t handle = 0, barVehicle = 0;
+			if (g_aimVehicle && !Wrecked(g_aimVehicle)) {
+				const uptr driver = RefById(npcvehicles::VehicleDriverId(g_aimVehicle));
+				if (driver && driver != player && !npcvehicles::IsDead(driver) && npcvehicles::HostileToPlayer(driver)) {
+					handle = ListedHandle(player, driver);
+					if (handle) barVehicle = g_aimVehicle;
+				}
+			}
+			// The game's own pick (you aim at the driver themselves): the bar under it is that driver's vehicle's.
+			if (!barVehicle) {
+				const std::uint32_t cross = CrosshairTarget();
+				for (std::uint32_t k = 0; cross && haveVehicles && k < snap.count && k < 64; ++k)
+					if (snap.v[k].who != world::VehicleInfo::Who::Player && npcvehicles::VehicleDriverId(snap.v[k].formId) == cross) { barVehicle = snap.v[k].formId; break; }
+			}
+			if (handle != g_driverHandle.load(std::memory_order_relaxed) || barVehicle != g_barVehicle) {
+				static unsigned logs = 0;
+				if (logs < 12 || logger::Verbose()) {
+					++logs;
+					logger::Write("Vehicle hits: enemy bar: aimed vehicle %08X, driver handle %08X (%s), bar vehicle %08X; crosshair handle %08X, player +0xEC8 %08X, overrides so far %u",
+						g_aimVehicle, handle, handle ? "on the enemy list" : g_aimVehicle ? "driver not on the enemy list" : "none", barVehicle,
+						*reinterpret_cast<std::uint32_t*>(game::Base() + kCrosshairHandle), ReadU32(player, 0xEC8), g_overrides.load());
+				}
+			}
+			g_driverHandle.store(g_buildOriginal && features::On(features::Id::HealthBars) ? handle : 0, std::memory_order_relaxed);
+			g_barVehicle = barVehicle;
+		}
+	}
+
+	std::uint32_t EnemyBarVehicle() { return g_barVehicle; }
+
+	void InstallEnemyBar()
+	{
+		// mov r11, rsp; mov [r11+18h], rbx; push rbp; push rsi; push rdi; push r12; push r13; push r14 (16 bytes, no RIP-relative).
+		static const std::uint8_t kPrologue[16] = { 0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56 };
+		void* original = nullptr;
+		if (hook::Install(game::Base() + kEnemyListBuild, kPrologue, sizeof(kPrologue), reinterpret_cast<void*>(&BuildDetour), &original)) {
+			g_buildOriginal = reinterpret_cast<Build_t>(original);
+			logger::Write("Vehicle hits: enemy bar hook installed (FUN_141489B90): aiming at an enemy vehicle shows its driver's bar");
+		}
+		else {
+			logger::Write("Vehicle hits: enemy bar hook NOT installed (FUN_141489B90 bytes differ); vehicle bars only when you aim at the driver");
+		}
+	}
 
 	Ballistics BallisticsOf(std::uint32_t shooter) {
         auto it=g_ballistics.find(shooter);

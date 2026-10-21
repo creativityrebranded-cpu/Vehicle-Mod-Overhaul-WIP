@@ -1,4 +1,5 @@
 #include "realvehicles.h"
+#include "features.h"
 
 #include "addresses.h"
 #include "game.h"
@@ -678,7 +679,7 @@ namespace realvehicles
 			if (g_patch.ready || !g.haveVehicles) return;
 			g_patch.ready = true;
 			const std::wstring ini = IniPath();
-			g_patch.enabled = GetPrivateProfileIntW(L"placement", L"enabled", 1, ini.c_str()) != 0;
+			g_patch.enabled = features::On(features::Id::Placement);  // [placement] enabled, also the settings menu
 			wchar_t seed[40] = L"";
 			GetPrivateProfileStringW(L"placement", L"seed", L"", seed, 40, ini.c_str());
 			if (seed[0]) g_patch.seed = std::wcstoull(seed, nullptr, 0);

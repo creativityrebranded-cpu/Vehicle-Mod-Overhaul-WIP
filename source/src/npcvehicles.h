@@ -83,6 +83,9 @@ namespace npcvehicles
 	bool FighterMayTake(std::uintptr_t actor, std::uintptr_t vehicle);
 	// Main thread: the game's own exit for the player (FUN_141952530, with its obstruction checks); true when it let them out.
 	bool ExitPlayer();
+	// The NPC flying pilot `pilot` (1..) is in a fight / its combat AI chose to retreat or flee (travelmode: both hover).
+	bool PilotFighting(int pilot);
+	bool PilotFleeing(int pilot);
 	bool ActorFree(std::uintptr_t actor);                    // alive, on foot, no job, not a follower
 	// Supply run: drives to (x, y) (another settlement / outpost), waits there, comes back, parks.
 	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);

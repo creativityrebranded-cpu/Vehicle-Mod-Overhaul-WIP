@@ -1,4 +1,5 @@
 #include "context.h"
+#include "features.h"
 #include "addresses.h"
 #include "controlmap.h"
 #include "crash.h"
@@ -6,6 +7,7 @@
 #include "log.h"
 #include "modscene.h"
 #include "npcvehicles.h"
+#include "realvehicles.h"
 #include "vcontract.h"
 #include "vehicleflight.h"
 #include "vehicleworld.h"
@@ -27,6 +29,7 @@ namespace context
 		using uptr = std::uintptr_t;
 		constexpr ULONGLONG kTickMs = 500, kScanMs = 1000, kRetryMs = 5000, kCalmMs = 60000;
 		constexpr double kBoardRange = 40.0;   // m: a free vehicle this close to the NPC
+		constexpr double kSettlementWalk = 400.0;  // m: inside a settlement, trips shorter than this are walked
 		constexpr double kActorRange = 80.0;   // m: NPCs further from the player are left alone
 		constexpr float kStillSpeed = 2.0f;    // m/s: below this the vehicle counts as parked
 		constexpr int kMaxAttemptsPerScan = 2;
@@ -47,12 +50,8 @@ namespace context
 		{
 			if (g_iniAt && now - g_iniAt < 5000) return;
 			g_iniAt = now;
-			PWSTR docs = nullptr;
-			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return;
-			const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
-			CoTaskMemFree(docs);
-			const bool on = GetPrivateProfileIntW(L"context", L"enabled", 1, ini.c_str()) != 0;
-			if (on != g_enabled) logger::Write("Context: %s", on ? "enabled" : "disabled (seamless.ini [context] enabled=0)");
+			const bool on = features::On(features::Id::NpcVehicles);  // [context] enabled, also the settings menu
+			if (on != g_enabled) logger::Write("Context: %s", on ? "enabled" : "disabled (NPCs use vehicles off)");
 			g_enabled = on;
 		}
 
@@ -147,6 +146,8 @@ namespace context
 				if (!traffic::DestinationOf(r, d) || !d.vehicleSuitable) continue;
 				const auto np = PosOf(r);
 				if (std::hypot(d.x - np.x, d.y - np.y) < kTransitMin) continue;
+				// In a settlement people walk (2026-10-21, the user): a trip that stays within one does not take a vehicle.
+				if (realvehicles::PlaceOwner(r) && std::hypot(d.x - np.x, d.y - np.y) < kSettlementWalk) continue;
 				g_civilTried[id] = now;
 				const auto* v = FreeVehicleNear(np, kTransitNear);
 				if (!v || !npcvehicles::MayUse(r, v->ref)) continue;

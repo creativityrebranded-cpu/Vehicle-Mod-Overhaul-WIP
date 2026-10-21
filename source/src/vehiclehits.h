@@ -33,6 +33,10 @@ namespace vehiclehits
 	bool LastHitByYourSide(std::uint32_t& vehicleFormId, unsigned long long& at);
 	// The form id under the crosshair (the HUD enemy list's target handle; 0 none).
 	std::uint32_t CrosshairTarget();
+	// The game's enemy bar (2026-10-21): the vehicle whose driver's bar the HUD shows now (aimed at the vehicle or the driver),
+	// 0 none; the vehicle's own bar goes under it (hoverui). InstallEnemyBar hooks the HUD enemy list (once, at load).
+	std::uint32_t EnemyBarVehicle();
+	void InstallEnemyBar();
 	// An actor's Health now and maximum, as the game's enemy bar computes them.
 	bool ActorHealth(std::uintptr_t actor, float& now, float& max);
 	// Damage from outside the projectile follower (rams: combat_tactics::RamDamage): the same health, driver share and wreck. side as the shots'.

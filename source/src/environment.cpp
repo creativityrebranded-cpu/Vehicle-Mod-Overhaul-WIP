@@ -55,6 +55,27 @@ bool MapBlocked(const float from[3],const float to[3]){
 }
 }
 bool LineBlocked(const float from[3],const float to[3]){return MapBlocked(from,to);}
+// Downward rays along the way (2026-10-21, hover or drive): water (collision layer 11) or rough ground (a steep surface,
+// or a big step between neighbouring points) within `reach` metres. Points snap to a 10 m grid so a moving vehicle keeps
+// asking the same rays (cached 3 s); the answer fills in over a few frames.
+Surface SurfaceAhead(std::uint32_t self,double x,double y,double z,double bearing,double reach){
+ Surface out;
+ static constexpr double kAt[]={20,45,80,130,190,250};
+ double lastZ=0,lastD=0;bool haveLast=false;int known=0;
+ for(const double d:kAt){
+  if(d>reach+10)break;
+  const double px=std::round((x+std::sin(bearing)*d)/10)*10,py=std::round((y+std::cos(bearing)*d)/10)*10,pz=std::round(z/20)*20;
+  const float from[]={float(px),float(py),float(pz+80)},to[]={float(px),float(py),float(pz-200)};
+  prefetch::RayHit hit;
+  if(!Ray(self,from,to,0x22806,hit,3000)||!hit.hit||!std::isfinite(hit.z)){haveLast=false;continue;}
+  ++known;
+  if(hit.layer==11){out.water=true;if(!out.at)out.at=d;}
+  if((hit.normalOk&&hit.nz<0.75f)||(haveLast&&std::fabs(hit.z-lastZ)>0.6*(d-lastD))){out.rough=true;if(!out.at)out.at=d;}
+  lastZ=hit.z;lastD=d;haveLast=true;
+ }
+ out.known=known>=2;
+ return out;
+}
 void Tick(){
  const auto now=GetTickCount64();
  for(int s=0;s<5;++s){auto&f=flights[s];if(!f.key)continue;prefetch::RayHit hit;unsigned age=0;

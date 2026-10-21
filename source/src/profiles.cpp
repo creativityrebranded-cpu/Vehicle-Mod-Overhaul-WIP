@@ -49,6 +49,7 @@ namespace profiles
 		{
 			g.x = c.homeX; g.y = c.homeY; g.stop = 1.5; g.hold = true;
 			g.nav.priority = 10;
+			g.nav.travel = travelmode::Default::Drive;
 			g.nav.landOnArrival = c.user == User::PlayerRemote;  // your parked vehicle settles; NPC drivers hover on station
 			return true;
 		}
@@ -57,6 +58,7 @@ namespace profiles
 		{
 			g.x = c.homeX; g.y = c.homeY; g.stop = 3.0; g.hold = true;  // arrive, then stay
 			g.nav.priority = 15;
+			g.nav.travel = travelmode::Default::Drive;
 			g.nav.landOnArrival = true;
 			return true;
 		}
@@ -71,6 +73,7 @@ namespace profiles
 			g.nav.passThrough = true;   // corners: keep flying
 			g.nav.speedLimit = 25.0f;
 			g.nav.priority = 20;
+			g.nav.travel = travelmode::Default::Drive;
 			if (vehicleflight::AtDestination(c.vehicle, g.x, g.y, g.z, g.stop,false)) {
 				Step(c, c.step + 1);
 				logger::Write("Profiles: [%d] patrol corner %d", c.pilot, c.step & 3);
@@ -91,6 +94,7 @@ namespace profiles
 			g.nav.speedLimit = 18.0f;   // loaded: steady
 			g.nav.height = vcontract::NavParams::Height::Hug;
 			g.nav.priority = 10;
+			g.nav.travel = travelmode::Default::Drive;
 			if (Dist2(c.vehicle, g.x, g.y) < kReach) {
 				g.hold = true;
 				g.nav.landOnArrival = true;
@@ -108,6 +112,7 @@ namespace profiles
 		bool CourierGoal(Context& c, Goal& g)
 		{
 			g.nav.priority = 40;
+			g.nav.travel = travelmode::Default::Hover;
 			g.nav.height = vcontract::NavParams::Height::High;  // fast and over things
 			g.nav.squeeze = true;
 			double mx = 0, my = 0, mz = std::numeric_limits<double>::quiet_NaN();
@@ -128,6 +133,7 @@ namespace profiles
 		bool ScoutGoal(Context& c, Goal& g)
 		{
 			g.nav.priority = 30;
+			g.nav.travel = travelmode::Default::Hover;
 			g.nav.height = vcontract::NavParams::Height::High;  // a look-out: up where it can see
 			double mx = 0, my = 0, mz = std::numeric_limits<double>::quiet_NaN();
 			if (c.step == 0) {
@@ -212,6 +218,7 @@ namespace profiles
 		bool EscortGoal(Context& c, Goal& g)
 		{
 			if (!c.player || !c.vehicle || c.pilot < 1 || c.pilot >= kTracks) return false;
+			g.nav.travel = travelmode::Default::CopyPlayer;  // you drive, it drives; you hover, it hovers
 			// Other allied vehicles defend in combat, then hold their original position.
 			if(!targetsession::CanFollow(c.vehicleId,vehicleflight::OwnRoverId())) {
 				g.x=c.homeX;g.y=c.homeY;g.hold=true;g.stop=3.0;return true;
@@ -271,6 +278,7 @@ namespace profiles
             if(!c.vehicle||c.pilot<1||c.pilot>=kTracks)return false;
             // The combat controller supplies the native enemy's goal. Between
             // fights a non-follower holds its own home, never orbits a neutral player.
+            g.nav.travel=travelmode::Default::Drive;  // a fight makes it hover (travelmode)
             g.x=c.homeX;g.y=c.homeY;g.stop=3.0;g.hold=true;return true;
         }
 

@@ -1,4 +1,5 @@
 #include "hoverui.h"
+#include "features.h"
 
 #include "addresses.h"
 #include "game.h"
@@ -351,6 +352,8 @@ namespace hoverui
 			std::string summonKey, followKey, useKey, status, autoLine, summonLabel, coverLabel, autoKey, lifebar;
 			std::string rows[kMaxRows];
 			int rowCount = 0;
+			std::string vbarName;  // the vehicle bar under the game's enemy bar (empty: hidden)
+			float vbarShare = 0;
 		} g_ctx;
 		std::atomic<bool> g_footShown{ false };
 		std::atomic<int> g_gear{ 2 };
@@ -934,6 +937,296 @@ namespace hoverui
 
 		bool ScannerOpen() { return GetTickCount64() - g_monoSeen.load() < 300; }
 
+		// ---- The game's settings menu: a "Flying Vehicle Overhaul" category (2026-10-21, the user: the mod's features as
+		// toggles in the game's settings menu; notes/SETTINGS_MENU_RESEARCH_20261021.md) ----
+		// pausemenu.swf / mainmenu.swf: root.SettingsPanel_mc (Shared.Components.SystemPanels.SettingsPanel) fills
+		// CategoryPanel_mc.CategoryList_mc from the data model SettingsCategoriesData and OptionsPanel_mc.OptionsList_mc from
+		// SettingsData.aGeneralSettingsList, showing the options whose uCategory is the open category. Ours: one more category
+		// entry, and our checkboxes added to a copy of the game's option array (InitializeEntries, public). The data model is
+		// reached through public members only: root.loaderInfo.applicationDomain.getDefinition("Shared.AS3.Data.BSUIDataManager")
+		// .GetDataFromClient("SettingsData").data. The panel sends SettingsPanel_CheckBoxChanged / _OpenCategory /
+		// _ResetToDefaults to the game through AutoRegisterEvent<TUIEventDispatcher<...>> (vtable slot 1 (this, GFx::Value*
+		// event), FUN_14152DF90 / 14152D810 / 14152DD10); ours are handled here and never reach the game.
+		constexpr std::uint32_t kRvaPauseVtbl = 0x04C909A8, kRvaPauseMessage = 0x01669060;  // PauseMenu (RTTI .?AVPauseMenu@@), slot 8
+		constexpr std::uint32_t kRvaMainVtbl = 0x04D0A7F0, kRvaMainMessage = 0x01ECC710;    // MainMenu (RTTI .?AVMainMenu@@), slot 8
+		constexpr std::uint32_t kRvaCheckDisp = 0x04C6EFE0, kRvaCheckFn = 0x0152DF90;
+		constexpr std::uint32_t kRvaOpenDisp = 0x04C6F040, kRvaOpenFn = 0x0152D810;
+		constexpr std::uint32_t kRvaResetDisp = 0x04C6F080, kRvaResetFn = 0x0152DD10;
+		constexpr int kSlotDispatch = 1;
+		constexpr unsigned kCategoryId = 900;                // far above the game's categories (0..8)
+		constexpr unsigned kSettingBase = 0x46560000;        // "FV": our option ids
+		constexpr int kCheckBox = 3;                          // SettingsOptionListEntry.SDT_CHECKBOX
+		constexpr const char* kCategoryName = "Flying Vehicle Overhaul";
+		using Dispatch_t = void (*)(void*, Value*);
+		Message_t g_pauseOriginal = nullptr, g_mainOriginal = nullptr;
+		Dispatch_t g_checkOriginal = nullptr, g_openOriginal = nullptr, g_resetOriginal = nullptr;
+		std::atomic<uptr> g_setMenu{ 0 }, g_setMovie{ 0 };
+		std::atomic<bool> g_setDirty{ false };  // our options need their values again (reset to defaults)
+		struct SetState { uptr movie = 0; bool failed = false, catLogged = false, optLogged = false, noPanelLogged = false; } g_set;
+
+		std::uint64_t PauseMessageDetour(uptr menu, void* msg)
+		{
+			const auto r = g_pauseOriginal(menu, msg);
+			g_setMovie.store(*reinterpret_cast<uptr*>(menu + 0x88));
+			if (g_setMenu.exchange(menu) != menu) logger::Write("Hover UI: pause menu %p (settings: %s category)", reinterpret_cast<void*>(menu), kCategoryName);
+			return r;
+		}
+
+		std::uint64_t MainMessageDetour(uptr menu, void* msg)
+		{
+			const auto r = g_mainOriginal(menu, msg);
+			g_setMovie.store(*reinterpret_cast<uptr*>(menu + 0x88));
+			if (g_setMenu.exchange(menu) != menu) logger::Write("Hover UI: main menu %p (settings: %s category)", reinterpret_cast<void*>(menu), kCategoryName);
+			return r;
+		}
+
+		bool GetBoolMember(const Value& o, const char* name, bool& out)
+		{
+			Value v;
+			const bool ok = GetMember(o, name, &v) && (v.type & 0x8F) == kBool;
+			if (ok) out = v.boolean;
+			Release(v);
+			return ok;
+		}
+
+		// A new AS3 object of `cls` ("Object", "Array").
+		bool NewObject(uptr movie, Value* out, const char* cls) { return CreateObject(movie, out, cls, nullptr, 0); }
+
+		void SetChild(uptr movie, const Value& o, const char* name, std::initializer_list<std::pair<const char*, Value>> fields)
+		{
+			Value c;
+			if (!NewObject(movie, &c, "Object")) return;
+			for (const auto& [k, v] : fields) SetMember(c, k, v);
+			SetMember(o, name, Arg(c));
+			Release(c);
+		}
+
+		void SetEmptyArray(uptr movie, const Value& o, const char* name)
+		{
+			Value a;
+			if (NewObject(movie, &a, "Array")) SetMember(o, name, Arg(a));
+			Release(a);
+		}
+
+		// Our checkboxes, as the panel's option entries (SettingsOptionListEntry.SetEntryText reads every one of these).
+		bool OurOptions(uptr movie, Value* out)
+		{
+			if (!NewObject(movie, out, "Array")) return false;
+			for (int i = 0; i < int(features::Id::Count); ++i) {
+				const auto& f = features::InfoOf(features::Id(i));
+				Value e;
+				if (!NewObject(movie, &e, "Object")) continue;
+				SetMember(e, "uID", Num(double(kSettingBase + i)));
+				SetMember(e, "uType", Num(kCheckBox));
+				SetMember(e, "uCategory", Num(kCategoryId));
+				SetMember(e, "sText", Str(f.label));
+				SetMember(e, "sDescription", Str(f.description));
+				SetMember(e, "sPreview", Str(""));
+				SetMember(e, "bEnabled", Bool(true));
+				SetMember(e, "bSubSetting", Bool(false));
+				SetMember(e, "bIsPEO", Bool(false));
+				SetChild(movie, e, "checkBoxData", { { "bChecked", Bool(features::On(f.id)) }, { "bOnCustomText", Str("") }, { "bOffCustomText", Str("") } });
+				SetChild(movie, e, "sliderData", { { "fValue", Num(0) }, { "sDisplayValue", Str("") } });
+				{
+					Value st;
+					if (NewObject(movie, &st, "Object")) {
+						SetEmptyArray(movie, st, "aStepperOptions");
+						SetMember(st, "uIndex", Num(0));
+						SetMember(e, "stepperData", Arg(st));
+					}
+					Release(st);
+				}
+				const Value push[1] = { Arg(e) };
+				Invoke(*out, "push", push, 1);
+				Release(e);
+			}
+			return true;
+		}
+
+		// The game's own option array (all categories opened so far), through the public data model.
+		bool GameOptions(const Value& root, Value* out)
+		{
+			Value li, domain, cls, provider, data;
+			const Value name[1] = { Str("Shared.AS3.Data.BSUIDataManager") };
+			const Value model[1] = { Str("SettingsData") };
+			const bool ok = GetMember(root, "loaderInfo", &li) && IsObject(li) && GetMember(li, "applicationDomain", &domain) && IsObject(domain) &&
+				InvokeR(domain, "getDefinition", name, 1, &cls) && IsObject(cls) && InvokeR(cls, "GetDataFromClient", model, 1, &provider) && IsObject(provider) &&
+				GetMember(provider, "data", &data) && IsObject(data) && GetMember(data, "aGeneralSettingsList", out) && IsObject(*out);
+			Release(data); Release(provider); Release(cls); Release(domain); Release(li);
+			return ok;
+		}
+
+		void SettingsWorkBody(uptr menu, uptr movie)
+		{
+			if (movie != g_set.movie) g_set = SetState{ movie };
+			if (g_set.failed) return;
+			const Value& root = *reinterpret_cast<const Value*>(menu + 0x58);
+			if (!IsObject(root)) return;
+			Value panel, catPanel, catList, optPanel, optList;
+			bool visible = false;
+			if (!GetMember(root, "SettingsPanel_mc", &panel) || !IsObject(panel)) {
+				if (!g_set.noPanelLogged) { g_set.noPanelLogged = true; logger::Write("Hover UI: settings: no SettingsPanel_mc in this menu"); }
+				Release(panel);
+				return;
+			}
+			if (GetBoolMember(panel, "visible", visible) && visible && GetMember(panel, "CategoryPanel_mc", &catPanel) && IsObject(catPanel) &&
+				GetMember(catPanel, "CategoryList_mc", &catList) && IsObject(catList) && GetMember(panel, "OptionsPanel_mc", &optPanel) && IsObject(optPanel) &&
+				GetMember(optPanel, "OptionsList_mc", &optList) && IsObject(optList)) {
+				// 1. The category: added after the game's (the list is unfiltered, so its entries are all the categories).
+				double count = 0, lastId = -1;
+				if (GetNumber(catList, "entryCount", count) && count >= 1) {
+					Value last;
+					const Value at[1] = { Num(count - 1) };
+					if (InvokeR(catList, "GetDataForEntry", at, 1, &last) && IsObject(last)) GetNumber(last, "uID", lastId);
+					Release(last);
+					if (unsigned(lastId) != kCategoryId) {
+						Value cats, cat;
+						if (NewObject(movie, &cats, "Array") && NewObject(movie, &cat, "Object")) {
+							for (int i = 0; i < int(count); ++i) {
+								Value e;
+								const Value idx[1] = { Num(i) };
+								if (InvokeR(catList, "GetDataForEntry", idx, 1, &e) && IsObject(e)) {
+									const Value push[1] = { Arg(e) };
+									Invoke(cats, "push", push, 1);
+								}
+								Release(e);
+							}
+							SetMember(cat, "uID", Num(kCategoryId));
+							SetMember(cat, "sText", Str(kCategoryName));
+							SetMember(cat, "bDisabled", Bool(false));
+							SetMember(cat, "bShowSpinner", Bool(false));
+							const Value push[1] = { Arg(cat) };
+							Invoke(cats, "push", push, 1);
+							const Value init[1] = { Arg(cats) };
+							Invoke(catList, "InitializeEntries", init, 1);
+							if (!g_set.catLogged) { g_set.catLogged = true; logger::Write("Hover UI: settings: category \"%s\" added after %d of the game's", kCategoryName, int(count)); }
+						}
+						Release(cat); Release(cats);
+					}
+				}
+				// 2. Our options: while our category is the open one and they are missing (the panel filters the list by category).
+				Value sel;
+				double selId = -1, shown = 0;
+				if (GetMember(catList, "selectedEntry", &sel) && IsObject(sel)) GetNumber(sel, "uID", selId);
+				Release(sel);
+				GetNumber(optList, "entryCount", shown);
+				const bool dirty = g_setDirty.exchange(false);
+				if (unsigned(selId) == kCategoryId && (shown < 1 || dirty)) {
+					Value game, ours, all;
+					const bool haveGame = GameOptions(root, &game);
+					if (OurOptions(movie, &ours)) {
+						const Value with[1] = { Arg(ours) };
+						const bool joined = haveGame && InvokeR(game, "concat", with, 1, &all) && IsObject(all);
+						const Value init[1] = { Arg(joined ? all : ours) };
+						Invoke(optList, "InitializeEntries", init, 1);
+						double index = -1;
+						if (GetNumber(optList, "selectedIndex", index) && index < 0) SetMember(optList, "selectedIndex", Num(0));
+						if (!g_set.optLogged) {
+							g_set.optLogged = true;
+							logger::Write("Hover UI: settings: %d options shown (%s)", int(features::Id::Count), joined ? "with the game's own" : "the game's own list not found");
+						}
+					}
+					Release(all); Release(ours); Release(game);
+				}
+			}
+			Release(optList); Release(optPanel); Release(catList); Release(catPanel); Release(panel);
+		}
+
+		void SettingsWork(uptr menu, uptr movie)
+		{
+			__try {
+				SettingsWorkBody(menu, movie);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				g_set.failed = true;
+				logger::Write("Hover UI: exception 0x%08lX in the settings menu; the %s category is off until the menu opens again", GetExceptionCode(), kCategoryName);
+			}
+		}
+
+		// The event's params.<name> as a number; false when it has none.
+		bool EventNumber(Value* ev, const char* name, double& out)
+		{
+			__try {
+				Value params;
+				const bool ok = ev && IsObject(*ev) && GetMember(*ev, "params", &params) && IsObject(params) && GetNumber(params, name, out);
+				Release(params);
+				return ok;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		bool EventBool(Value* ev, const char* name, bool& out)
+		{
+			__try {
+				Value params;
+				const bool ok = ev && IsObject(*ev) && GetMember(*ev, "params", &params) && IsObject(params) && GetBoolMember(params, name, out);
+				Release(params);
+				return ok;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+
+		void CheckBoxDetour(void* self, Value* ev)
+		{
+			static std::atomic<bool> seen{ false };
+			double id = 0;
+			if (!seen.exchange(true)) logger::Write("Hover UI: settings: first checkbox event (setting %.0f)", EventNumber(ev, "uSettingID", id) ? id : -1.0);
+			if (EventNumber(ev, "uSettingID", id) && id >= kSettingBase && id < double(kSettingBase) + int(features::Id::Count)) {
+				bool checked = false;
+				EventBool(ev, "bChecked", checked);
+				features::Set(features::Id(int(id - kSettingBase)), checked);
+				return;  // ours: the game never sees it
+			}
+			g_checkOriginal(self, ev);
+		}
+
+		void OpenCategoryDetour(void* self, Value* ev)
+		{
+			static std::atomic<bool> seen{ false };
+			double id = -1;
+			if (!seen.exchange(true)) logger::Write("Hover UI: settings: first category event (category %.0f)", EventNumber(ev, "categoryID", id) ? id : -1.0);
+			if (EventNumber(ev, "categoryID", id) && unsigned(id) == kCategoryId) return;  // ours: nothing for the game to load
+			g_openOriginal(self, ev);
+		}
+
+		void ResetDetour(void* self, Value* ev)
+		{
+			double id = -1;
+			if (EventNumber(ev, "categoryID", id) && unsigned(id) == kCategoryId) {
+				features::ResetAll();
+				g_setDirty.store(true);
+				return;
+			}
+			g_resetOriginal(self, ev);
+		}
+
+		bool PatchSlot(std::uint32_t vtblRva, int slot, std::uint32_t expectRva, void* detour, void** original);
+		void InstallSettings()
+		{
+			void* orig = nullptr;
+			int hooks = 0;
+			if (PatchSlot(kRvaPauseVtbl, kSlotMessage, kRvaPauseMessage, reinterpret_cast<void*>(&PauseMessageDetour), &orig)) { g_pauseOriginal = reinterpret_cast<Message_t>(orig); ++hooks; }
+			if (PatchSlot(kRvaMainVtbl, kSlotMessage, kRvaMainMessage, reinterpret_cast<void*>(&MainMessageDetour), &orig)) { g_mainOriginal = reinterpret_cast<Message_t>(orig); ++hooks; }
+			// The change events first: without them our checkboxes would reach the game (an unknown id), so no category at all.
+			const bool check = PatchSlot(kRvaCheckDisp, kSlotDispatch, kRvaCheckFn, reinterpret_cast<void*>(&CheckBoxDetour), &orig);
+			if (check) g_checkOriginal = reinterpret_cast<Dispatch_t>(orig);
+			const bool open = PatchSlot(kRvaOpenDisp, kSlotDispatch, kRvaOpenFn, reinterpret_cast<void*>(&OpenCategoryDetour), &orig);
+			if (open) g_openOriginal = reinterpret_cast<Dispatch_t>(orig);
+			const bool reset = PatchSlot(kRvaResetDisp, kSlotDispatch, kRvaResetFn, reinterpret_cast<void*>(&ResetDetour), &orig);
+			if (reset) g_resetOriginal = reinterpret_cast<Dispatch_t>(orig);
+			if (!check || !open) {
+				g_setMenu.store(0);
+				logger::Write("Hover UI: settings: the panel's event dispatchers do not match (checkbox %d, category %d); no %s category", check, open, kCategoryName);
+				g_set.failed = true;
+				return;
+			}
+			logger::Write("Hover UI: settings: %s category hooked (%d of 2 menus, reset %s)", kCategoryName, hooks, reset ? "on" : "off");
+		}
+
 		// One scanner element: a BasicButton whose key box shows `key`, with `label` under it (empty label: the key box
 		// alone, e.g. the status box). Created in place (managed values never move).
 		struct MonoEl
@@ -1075,6 +1368,13 @@ namespace hoverui
 			static constexpr int kCardLines = 7;  // 3 lines, plus the escorts with every hint on
 			MonoEl fCard[kCardLines], vCard[kCardLines];  // the status card: on foot at the Status place, in the vehicle at the Vehicles place
 			bool built = false, failed = false;
+			// The vehicle bar: a copy of the game's enemy bar clip (HUDMenu_fla.EnemyHealthAnimBase_72) added to EnemyHealthMeter_mc
+			// under the native one, so it follows the driver's bar on screen and fades with it.
+			Value vbMeter, vbBar, vbFill, vbBg, vbName;
+			double vbWidth = 0;
+			bool vbBuilt = false, vbFailed = false, vbShown = false;
+			std::string vbText;
+			int vbPct = -1;
 		} g_ex;
 
 		MonoEl* FootEls[kFootEls] = { &g_ex.fSummon, &g_ex.fFollow, &g_ex.fGetIn, &g_ex.fStatus, &g_ex.fTarget, &g_ex.fPass, &g_ex.fEject, &g_ex.fRows };
@@ -1094,6 +1394,7 @@ namespace hoverui
 			for (MonoEl& e : g_ex.fCard) { if (release) { Release(e.data); Release(e.button); } }
 			for (MonoEl& e : g_ex.vCard) { if (release) { Release(e.data); Release(e.button); } }
 			if (release) { Release(g_ex.meters); Release(g_ex.widget); }
+			if (release) { Release(g_ex.vbName); Release(g_ex.vbBg); Release(g_ex.vbFill); Release(g_ex.vbBar); Release(g_ex.vbMeter); }
 			g_ex = Extras{};
 		}
 
@@ -1141,6 +1442,19 @@ namespace hoverui
 			if (!on) return;
 			MonoSetData(g_ex.movie, e, label);
 			MonoSetKey(e, key.empty() ? std::string(" ") : key);
+		}
+
+		// The lifebar's lines ('\n' between them), each its own card line.
+		void PushLines(std::vector<std::string>& card, const std::string& text)
+		{
+			std::size_t at = 0;
+			while (at < text.size()) {
+				const auto cut = text.find('\n', at);
+				const auto line = text.substr(at, cut == std::string::npos ? std::string::npos : cut - at);
+				if (!line.empty()) card.push_back(line);
+				if (cut == std::string::npos) break;
+				at = cut + 1;
+			}
 		}
 
 		void RefreshExtras()
@@ -1223,7 +1537,7 @@ namespace hoverui
 				std::string first = head;
 				if (escorts) first += std::to_string(escorts) + (escorts == 1 ? " ESCORT" : " ESCORTS");
 				card.push_back(first);
-				if (!lifebar.empty()) card.push_back(lifebar);
+				PushLines(card, lifebar);  // the other vehicle's health, then yours
 				if (!nextStop.empty()) card.push_back(nextStop);
 				else if (autoOn && !autoLine.empty()) card.push_back(autoLine);
 			}
@@ -1231,10 +1545,11 @@ namespace hoverui
 				std::string first = status;
 				if (escorts) first += (first.empty() ? "" : "  \xC2\xB7  ") + std::to_string(escorts) + (escorts == 1 ? " ESCORT" : " ESCORTS");
 				if (!first.empty()) card.push_back(first);
-				if (!lifebar.empty()) card.push_back(lifebar);
+				PushLines(card, lifebar);  // the other vehicle's health, then yours
 				if (!nextStop.empty()) card.push_back(nextStop);
 			}
 			if (g_showAll) for (int i = 0; i < kMaxRows && i < rowCount; ++i) if (!rows[i].empty()) card.push_back(rows[i]);  // every hint on: each escort
+			if (!ed && !features::On(features::Id::StatusCard)) card.clear();  // [hud] card, also the settings menu
 			if (ed && card.empty()) card.push_back(inVehicle ? "GEAR 2  \xC2\xB7  HOVER" : "FOLLOW 42 m");
 			auto& cardEls = inVehicle ? g_ex.vCard : g_ex.fCard;
 			auto& otherEls = inVehicle ? g_ex.fCard : g_ex.vCard;
@@ -1314,8 +1629,83 @@ namespace hoverui
 			}
 		}
 
+		// hudmenu.swf EnemyHealthMeter: the bar (EnemyHealthAnimBase_mc) shows the HudEnemyData entry under the crosshair, at
+		// that enemy's screen position. Ours is the same clip, one bar lower, with the vehicle's name and health.
+		bool BuildVehicleBar(uptr menu, uptr movie)
+		{
+			const Value& root = *reinterpret_cast<const Value*>(menu + 0x58);
+			if (!IsObject(root)) return false;
+			Value base;
+			bool ok = GetMember(root, "EnemyHealthMeter_mc", &g_ex.vbMeter) && IsObject(g_ex.vbMeter) &&
+				GetMember(g_ex.vbMeter, "EnemyHealthAnimBase_mc", &base) && IsObject(base) &&
+				CreateObject(movie, &g_ex.vbBar, "HUDMenu_fla.EnemyHealthAnimBase_72", nullptr, 0);
+			if (ok) {
+				SetMember(g_ex.vbBar, "name", Str("sv_vehiclebar"));
+				const Value addArgs[1] = { Arg(g_ex.vbBar) };
+				Invoke(g_ex.vbMeter, "addChild", addArgs, 1);
+				const Value frame[1] = { Str("Standard") };
+				Invoke(g_ex.vbBar, "gotoAndStop", frame, 1);
+				for (const char* hide : { "LevelNumber_mc", "LegendaryIcon_mc", "EMDamageBar_mc", "EnemyIcon_mc", "EnemyShieldAnim_mc", "EnemyHealthBarAnim_Legendary_mc",
+						 "EnemyLegendaryModIcon1_mc", "EnemyLegendaryModIcon2_mc", "EnemyLegendaryModIcon3_mc" }) {
+					Value c;
+					if (GetMember(g_ex.vbBar, hide, &c) && IsObject(c)) SetMember(c, "visible", Bool(false));
+					Release(c);
+				}
+				Value anim;
+				ok = GetMember(g_ex.vbBar, "EnemyHealthBarAnim_mc", &anim) && IsObject(anim) && GetMember(anim, "Fill_mc", &g_ex.vbFill) && IsObject(g_ex.vbFill) &&
+					GetMember(anim, "BG_mc", &g_ex.vbBg) && IsObject(g_ex.vbBg) && GetNumber(g_ex.vbBg, "width", g_ex.vbWidth) && g_ex.vbWidth > 0;
+				Release(anim);
+				GetMember(g_ex.vbBar, "EnemyName_tf", &g_ex.vbName);
+				double bx = 0, by = 0, bh = 0;
+				GetNumber(base, "x", bx);
+				GetNumber(base, "y", by);
+				GetNumber(base, "height", bh);
+				SetMember(g_ex.vbBar, "x", Num(bx));
+				SetMember(g_ex.vbBar, "y", Num(by + (bh > 0 ? bh : 40.0) + 4.0));
+				SetMember(g_ex.vbBar, "visible", Bool(false));
+				logger::Write("Hover UI: vehicle bar %s (under the enemy bar at %.0f, %.0f, its height %.0f; bar width %.0f)", ok ? "added" : "incomplete", bx, by, bh, g_ex.vbWidth);
+			}
+			Release(base);
+			return ok;
+		}
+
+		void RefreshVehicleBar()
+		{
+			std::string name;
+			float share = 0;
+			{
+				std::lock_guard lk(g_ctx.lock);
+				name = g_ctx.vbarName;
+				share = g_ctx.vbarShare;
+			}
+			const bool on = !name.empty();
+			if (on != g_ex.vbShown) {
+				SetMember(g_ex.vbBar, "visible", Bool(on));
+				g_ex.vbShown = on;
+			}
+			if (!on) return;
+			if (name != g_ex.vbText && IsObject(g_ex.vbName)) {
+				SetMember(g_ex.vbName, "text", Str(name.c_str()));
+				g_ex.vbText = name;
+			}
+			const int pct = int(std::lround(std::clamp(share, 0.0f, 1.0f) * 100.0f));
+			if (pct != g_ex.vbPct) {
+				SetMember(g_ex.vbFill, "width", Num(g_ex.vbWidth * pct / 100.0));
+				g_ex.vbPct = pct;
+			}
+		}
+
 		void WorkExtras(uptr menu, uptr movie)
 		{
+			if (!g_ex.vbBuilt && !g_ex.vbFailed) {
+				g_ex.movie = movie;
+				if (BuildVehicleBar(menu, movie)) g_ex.vbBuilt = true;
+				else {
+					g_ex.vbFailed = true;
+					logger::Write("Hover UI: vehicle bar could not be built (EnemyHealthMeter_mc / EnemyHealthAnimBase_72); the status card line stays");
+				}
+			}
+			if (g_ex.vbBuilt) RefreshVehicleBar();
 			if (!g_ex.built && !g_ex.failed) {
 				g_ex.movie = movie;
 				if (!BuildExtras(menu)) {
@@ -1461,6 +1851,9 @@ namespace hoverui
 			// The scanner screen: only its status box is used (2026-10-18: the scanner marker distance).
 			const uptr mm = g_monoMenu.load();
 			if (mm && movie == g_monoMovie.load()) MonoWork(mm);
+			// The pause / main menu: the settings panel's category (g_set.failed: the hooks are missing).
+			const uptr sm = g_setMenu.load();
+			if (sm && movie == g_setMovie.load() && !g_set.failed) SettingsWork(sm, movie);
 			return r;
 		}
 
@@ -1471,6 +1864,11 @@ namespace hoverui
 			if (hud) {
 				g_hudMenu.store(0);
 				g_hudMovie.store(0);
+			}
+			if (movie && movie == g_setMovie.load()) {
+				g_setMenu.store(0);
+				g_setMovie.store(0);
+				g_set.movie = 0;
 			}
 			if (mono) {
 				g_monoMenu.store(0);
@@ -1540,6 +1938,7 @@ namespace hoverui
 		else {
 			logger::Write("Hover UI: MonocleMenu vtable slot %d is not the expected function; no scanner button", kSlotMessage);
 		}
+		InstallSettings();
 		{
 			std::lock_guard lk(g_lay.lock);
 			LoadLayout();
@@ -1649,6 +2048,13 @@ namespace hoverui
 	{
 		std::lock_guard lk(g_ctx.lock);
 		if (g_ctx.lifebar != line) g_ctx.lifebar = line;
+	}
+
+	void SetVehicleBar(const char* name, float share)
+	{
+		std::lock_guard lk(g_ctx.lock);
+		if (g_ctx.vbarName != name) g_ctx.vbarName = name;
+		g_ctx.vbarShare = share;
 	}
 
 	void SetAutoKey(const char* key)

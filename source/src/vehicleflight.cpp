@@ -1,4 +1,5 @@
 #include "vehicleflight.h"
+#include "features.h"
 #include "overrides.h"
 #include "profileclass.h"
 #include "coverfight.h"
@@ -33,8 +34,11 @@
 #include "telemetry.h"
 #include "vehicleworld.h"
 #include "vehiclehits.h"
+#include "realvehicles.h"
+#include "travelmode.h"
 
 #include <Windows.h>
+#include <ShlObj.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1005,6 +1009,7 @@ namespace vehicleflight
 		{
 			bool active = false;
             bool landing=false;double landGround=0,landHeight=0;ULONGLONG landProofAt=0;
+            bool groundHug=false;  // your empty vehicle "drives": the hover stays just over the ground and hops what a jump clears (travelmode)
 			bool keyDown = false;
 			double hold = 3.0;
 			bool holding = false;
@@ -1095,6 +1100,7 @@ namespace vehicleflight
 			double laneZ = 0;              // metres added to the cruise height by the lane planner
 			bool drive = false;            // drive mode: hover off, the game's controls
 			ULONGLONG driveSince = 0, hopUntil = 0, drvLog = 0;
+			travelmode::Hold travel;       // NPC pilots: hover or drive, held against flicker (travelmode.h)
 			double cramped = 0;            // score that switches drive mode on
 			double drvX = 0, drvY = 0, drvSp = 0, drvHead = 0, steerSign = 1.0, steerResp = 0, drvSteer = 0;
 			ULONGLONG drvT = 0;
@@ -1881,6 +1887,8 @@ namespace vehicleflight
 			Shared& g_sh = g_shs[idx];
 			const auto releasedVehicle = g_hoverVehicles[idx].load();
             g_cmds[idx]={};
+            g.travel = {};  // a new flight decides hover or drive afresh
+            g.groundHug = false;
 			if(g_ram.pilot==idx)g_ram={};
 			if (releasedVehicle) g_clearBoosts[idx] = releasedVehicle;  // its boost flags off at its next boost update
 			g.active = false;
@@ -2542,6 +2550,23 @@ namespace vehicleflight
 
 	namespace
 	{
+		// The height a vertical boost clears on the ground ([nav] jump= in seamless.ini, default 4 m): an obstacle taller than this
+		// makes an NPC vehicle hover (travelmode).
+		double JumpHeight()
+		{
+			static double value = 0;
+			if (value <= 0) {
+				value = 4.0;
+				PWSTR docs = nullptr;
+				if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+					const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+					CoTaskMemFree(docs);
+					value = std::clamp(double(GetPrivateProfileIntW(L"nav", L"jump", 4, ini.c_str())), 1.0, 30.0);
+				}
+			}
+			return value;
+		}
+
 		// Drive mode off: hover on again (a lift-off from where it is), the game's controls are no longer overridden.
 		void LeaveDrive(int idx, std::uintptr_t vehicle, const char* why)
 		{
@@ -2611,6 +2636,7 @@ namespace vehicleflight
 			return true;
 		}
 
+		bool CoverFighting();
 		// One frame of a hovering pilot: the assist, avoidance, height hold and (autopilot) the flight to the goal.
 		void Fly(int idx, std::uintptr_t vehicle, Goal goal, bool focused)
 		{
@@ -2635,7 +2661,7 @@ namespace vehicleflight
                     const auto map=navmap::At(pos.x,pos.y,pos.z);
                     if(map.haveGround){const double floor=map.ground+integrationlogic::Clearance(int(nav.height),nav.minClearance,g_sh.hull.height,kCallSkim)+EnvClimb();goal.z=std::isfinite(goal.z)?std::max(goal.z,floor):floor;}
                 }
-                std::lock_guard lock(g_sh.lock);g_sh.landing=g.landing;
+                std::lock_guard lock(g_sh.lock);g_sh.landing=g.landing||g.groundHug;
             }
 			if(!g.autopilot&&g_ram.pilot==idx)g_ram={};
 			if(g_ram.vehicle==At<std::uint32_t>(vehicle,off::kFormId)&&g_ram.pilot==idx) {
@@ -3286,7 +3312,52 @@ namespace vehicleflight
 				const ULONGLONG tNow = GetTickCount64();
 				g.cramped = std::max(0.0, g.cramped - kCrampedDecay * dt);
 				const bool occupied = idx >= 1 || g_driverVehicle.load(std::memory_order_relaxed) == vehicle;  // never an empty vehicle
-				if (!g.drive && occupied && g.cramped >= kCrampedOn && !g.apClimb && std::fabs(v[2]) < 4.0) {  // not mid-fall or mid-climb (it may stand on a structure the ground rays miss)
+				// NPC pilots choose hover or drive from their profile and the reasons around them (2026-10-21, travelmode.h); your own
+				// vehicle keeps the old rule (drive only while cramped).
+				bool decided = false, wantDrive = false, nativeWanted = false;
+				const char* travelWhy = "cramped";
+				// NPC pilots, and your own vehicle on autopilot (2026-10-21, the user: summon, follow, cover, guard, Auto), except a ram.
+				if ((idx >= 1 || !Ramming(g_roverId)) && features::On(features::Id::HoverOrDrive)) {
+					const auto& nv = PilotNavOf(idx);
+					travelmode::Inputs in;
+					in.profile = nv.travel;
+					in.playerHovering = g_gs[0].active && !g_gs[0].drive && g_driverVehicle.load(std::memory_order_relaxed) != 0;
+					in.tripDist = std::hypot(goal.x - pos.x, goal.y - pos.y);
+					in.goalAbove = std::isfinite(goal.z) ? goal.z - pos.z : 0.0;
+					const double toGoal = std::atan2(goal.x - pos.x, goal.y - pos.y);
+					const auto surface = environment::SurfaceAhead(At<std::uint32_t>(vehicle, off::kFormId), pos.x, pos.y, pos.z, toGoal, std::min(250.0, in.tripDist));
+					in.waterAhead = surface.water;
+					in.roughAhead = surface.rough;
+					in.clearNeed = (g.drive || g.groundHug) && g.lastF >= 1 ? g.lastNeed : 0.0;  // the corridor rays: what the way ahead needs to clear
+					in.jumpHeight = JumpHeight();
+					in.fighting = idx ? npcvehicles::PilotFighting(idx) : CoverFighting();
+					in.fleeing = idx ? npcvehicles::PilotFleeing(idx) : false;
+					in.catching = idx == 0 && g_follow && g_air.air;  // you jumped or fell: it goes under you
+					in.damaged = vehiclehits::HealthShare(At<std::uint32_t>(vehicle, off::kFormId)) < travelmode::kDamaged;
+					in.cramped = g.cramped >= kCrampedOn;
+					in.inSettlement = realvehicles::PlaceOwner(vehicle) != 0;
+					const auto reason = travelmode::Decide(in);
+					if (travelmode::Step(g.travel, reason, tNow))
+						logger::Write("%s: travel: %s (%s)", wc, g.travel.mode == travelmode::Mode::Drive ? "drive" : "hover", reason.why);
+					decided = true;
+					wantDrive = g.travel.mode == travelmode::Mode::Drive;
+					travelWhy = reason.why;
+					// "Drive" is the hover held just over the ground, hopping what a jump clears (2026-10-21 run: the game's own drive
+					// left NPC vehicles stuck at speed 0 in towns, and it freezes an empty vehicle, bFreezeVehicleOnExit). The game's
+					// own drive is kept for you aboard, a cramped spot and a failing hover (damaged), entered only once down low.
+					nativeWanted = wantDrive && occupied && (idx == 0 || in.damaged || in.cramped);
+					const bool hug = wantDrive && !g.drive;
+					if (hug != g.groundHug) {
+						g.groundHug = hug;
+						logger::Write("%s: travel: %s (%s)", wc, hug ? "on the ground (hover held low)" : "flying", reason.why);
+					}
+				}
+				if (!decided && g.groundHug) {  // hover or drive switched off: back to the hover
+					g.groundHug = false;
+					logger::Write("%s: travel: flying (hover or drive off)", wc);
+				}
+				const bool enterDrive = decided ? nativeWanted && above < 2.5 : g.cramped >= kCrampedOn;  // a hovering vehicle comes down first
+				if (!g.drive && occupied && enterDrive && !g.apClimb && std::fabs(v[2]) < 4.0) {  // not mid-fall or mid-climb (it may stand on a structure the ground rays miss)
 					g.drive = true;
 					g.driveSince = tNow;
 					g.drvT = 0;
@@ -3300,9 +3371,13 @@ namespace vehicleflight
 					g_driveOut[idx].on.store(true);
 					g_clearBoosts[idx] = vehicle;
 					g_forwardBoosts[idx] = false;
-					logger::Write("%s: drive mode ON (cramped %.1f): hover off, driving with boost for forward and up", wc, g.cramped);
+					logger::Write("%s: drive mode ON (%s): hover off, driving with boost for forward and up", wc, travelWhy);
 				}
-				else if (g.drive && tNow - g.driveSince > kDriveMinMs && g.cramped < 0.5 && g.lastF == 0 && g.lastL < 2 && g.lastR < 2 && !g.apClimb) {
+				else if (g.drive && decided && !g.apClimb && (!wantDrive ||
+					(!nativeWanted && tNow - g.driveSince > kDriveMinMs && g.lastF == 0 && g.lastL < 2 && g.lastR < 2))) {
+					LeaveDrive(idx, vehicle, wantDrive ? "clear again: on the ground, hover held low" : travelWhy);
+				}
+				else if (g.drive && !decided && tNow - g.driveSince > kDriveMinMs && g.cramped < 0.5 && g.lastF == 0 && g.lastL < 2 && g.lastR < 2 && !g.apClimb) {
 					LeaveDrive(idx, vehicle, "clear again");
 				}
 				if (g.drive) {
@@ -3425,6 +3500,11 @@ namespace vehicleflight
 					// Just over the highest ground in the corridor ahead (cast along the way it is going).
 					const auto& nv=PilotNavOf(idx);
                     double want=integrationlogic::Clearance(int(nv.height),nv.minClearance,g_sh.hull.height,kCallSkim)+(g.autopilot?EnvClimb():0.0);  // night / bad weather: a little higher
+                    if(g.groundHug) {  // "driving": just over the ground; the corridor below still lifts it over what a jump clears
+                        want=g_sh.hull.height*0.5+0.4;
+                        for(unsigned k=0;g_vsnapOk&&k<g_vsnap.count&&k<64;++k)if(g_vsnap.v[k].ref==vehicle)
+                            want=std::max(0.3,double(g_vsnap.v[k].half[2])-(g_vsnap.v[k].center[2]-g_vsnap.v[k].pos[2])+0.4);
+                    }
 					for (int k = 0; k < 3; ++k) {
 						const auto& q = g.corr[k];
 						if (q.valid && !IsWallSample(g, q.h, q.d)) want = std::max(want, q.h + kTerrainClear - refGround);  // walls: the warning, not a climb

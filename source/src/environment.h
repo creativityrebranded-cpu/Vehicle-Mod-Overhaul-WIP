@@ -9,5 +9,9 @@ bool ClearShot(std::uint32_t self,std::uint32_t target,std::uint32_t targetVehic
 bool CombatPosition(std::uint32_t self,const float enemy[3],double&x,double&y,double&z,bool defensive);
 // The nav map's line of sight (terrain, mapped solids, object boxes), answered at once (vehicle manoeuvres hide behind terrain with it).
 bool LineBlocked(const float from[3],const float to[3]);
+// Along the way ahead (downward rays, up to `reach` m, cached): water, or rough ground (steep, or a big step). Answers fill in
+// over a few frames; known = at least two points answered.
+struct Surface {bool known=false,water=false,rough=false;double at=0;};
+Surface SurfaceAhead(std::uint32_t self,double x,double y,double z,double bearing,double reach);
 void Tick();void Reset();
 }

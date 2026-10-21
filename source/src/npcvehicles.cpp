@@ -1,4 +1,5 @@
 #include "npcvehicles.h"
+#include "features.h"
 #include "overrides.h"
 #include "profileclass.h"
 
@@ -157,6 +158,7 @@ namespace npcvehicles
 			int pMode = -1;                    // pursuer in a fight: 10 attack / flank, 12 intercept, 13 overwatch, 14 retreat, 15 block
 			int task = 0;                      // civil task: 0 none, 1 transit, 2 patrol, 3 return home, 4 parking
 			double taskX = 0, taskY = 0;       // transit: where to; parking: the clear spot
+			std::uint32_t startPlace = 0;      // transit: the owner of the place it set out from (0: open ground)
 			double homeX = 0, homeY = 0;       // where the vehicle was taken from
 			bool haveHome = false;
 			int taskStep = 0;
@@ -1451,8 +1453,10 @@ namespace npcvehicles
 			bool ai = true; combatai::Switches sw; } g_combatIni;
 		void ReadCombatIni()
 		{
-			if (g_combatIni.read) return;
+			static unsigned gen = 0;
+			if (g_combatIni.read && gen == features::Generation()) return;
 			g_combatIni.read = true;
+			gen = features::Generation();  // the settings menu changed a switch: read again
 			PWSTR docs = nullptr;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
 				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
@@ -1460,14 +1464,14 @@ namespace npcvehicles
 				g_combatIni.zoneEscort = GetPrivateProfileIntW(L"combat", L"zoneEscort", 150, ini.c_str());
 				g_combatIni.zonePursuit = GetPrivateProfileIntW(L"combat", L"zonePursuit", 400, ini.c_str());
 				g_combatIni.stage = GetPrivateProfileIntW(L"combat", L"stage", 4, ini.c_str());
-				g_combatIni.ai = GetPrivateProfileIntW(L"combat", L"ai", 1, ini.c_str()) != 0;
+				g_combatIni.ai = features::On(features::Id::CombatAi);  // [combat] ai
 				g_combatIni.sw.steering = GetPrivateProfileIntW(L"combat", L"steering", 1, ini.c_str()) != 0;
 				g_combatIni.sw.dogfight = GetPrivateProfileIntW(L"combat", L"dogfight", 1, ini.c_str()) != 0;
 				g_combatIni.sw.tactics = GetPrivateProfileIntW(L"combat", L"tactics", 1, ini.c_str()) != 0;
 				g_combatIni.sw.squads = GetPrivateProfileIntW(L"combat", L"squads", 1, ini.c_str()) != 0;
 				g_combatIni.sw.morale = GetPrivateProfileIntW(L"combat", L"morale", 1, ini.c_str()) != 0;
 				g_combatIni.sw.personality = GetPrivateProfileIntW(L"combat", L"personality", 1, ini.c_str()) != 0;
-				g_combatIni.ram = GetPrivateProfileIntW(L"combat", L"ram", 1, ini.c_str()) != 0;
+				g_combatIni.ram = features::On(features::Id::Rams);  // [combat] ram
 				g_combatIni.boost = GetPrivateProfileIntW(L"combat", L"boost", 1, ini.c_str()) != 0;
 				g_combatIni.breakOff = GetPrivateProfileIntW(L"combat", L"breakOff", 30, ini.c_str()) / 100.0;
 				g_combatIni.holdMs = GetPrivateProfileIntW(L"combat", L"hold", 1500, ini.c_str());
@@ -2285,6 +2289,7 @@ namespace npcvehicles
 			vcontract::Goal g;
 			g.nav.speedLimit = 22.0f;
 			g.nav.priority = 10;
+			g.nav.travel = travelmode::Default::Drive;  // civil trips drive; terrain, water or a long way make them hover
 			if (j.task == 8) {  // convoy: behind the lead vehicle; the lead's job over -> park
 				const uptr lead = RefById(j.lead);
 				if (!lead || !Busy(j.lead)) { BeginPark(j, player, vp.x, vp.y, "convoy: the lead is done"); return; }
@@ -2314,6 +2319,12 @@ namespace npcvehicles
 			if (j.task == 1) {  // transit
 				g.x = j.taskX; g.y = j.taskY; g.stop = 6.0;
 				if (std::hypot(vp.x - j.taskX, vp.y - j.taskY) < kTransitArrive) { BeginPark(j, player, j.taskX, j.taskY, "transit: arrived"); return; }
+				// In settlements people walk (2026-10-21, the user): a trip that reaches another settlement parks at its edge and
+				// the driver walks the rest.
+				if (const uptr place = realvehicles::PlaceOwner(vehicle); place && At<std::uint32_t>(place, off::kFormId) != j.startPlace) {
+					BeginPark(j, player, vp.x, vp.y, "transit: reached a settlement; parks and walks the rest");
+					return;
+				}
 			}
 			else if (j.task == 2) {  // patrol: corners round home
 				static const double kCorner[4][2] = { { 1, 1 }, { 1, -1 }, { -1, -1 }, { -1, 1 } };
@@ -3001,6 +3012,7 @@ namespace npcvehicles
 				bool toMarker = false;
 				if (!rescuer) j.rescueParked = false;
 				if (rescuer) {
+					pg.nav.travel = travelmode::Default::Hover;  // speed first
 					pg.x = pp.x;
 					pg.y = pp.y;
 					pg.z = std::numeric_limits<double>::quiet_NaN();
@@ -3275,30 +3287,9 @@ namespace npcvehicles
 			else std::snprintf(out, cap, "%08X", id);
 		}
 
-		// ---- Vehicle lifebar (2026-10-21, the user approved the HUD row first): the vehicle under the crosshair (and 3 s after), else the one your side
-		// hit last (6 s), else your own vehicle while it is damaged: "REV-8 (Sarah)  [#######---] 70%  driver 94%". The game's own enemy bar needs the
-		// vehiclehits probe's answers first (does a vehicle actor carry Health, is it on the player's enemy list).
-		bool LifebarLine(uptr player, char* out, std::size_t size)
+		// One vehicle's health line: "REV-8 (Sarah)  [#######---] 70%  driver 94%".
+		bool LifeOf(uptr player, std::uint32_t id, uptr driven, char* out, std::size_t size)
 		{
-			static std::uint32_t aimed = 0;
-			static ULONGLONG aimedAt = 0;
-			const ULONGLONG now = GetTickCount64();
-			std::uint32_t id = 0;
-			const std::uint32_t cross = vehiclehits::CrosshairTarget();
-			if (cross) {
-				const uptr r = RefById(cross);
-				const uptr veh = r && IsVehicle(r) ? r : r && IsActorRef(r) ? InVehicle(r) : 0;
-				if (veh) { aimed = At<std::uint32_t>(veh, off::kFormId); aimedAt = now; }
-			}
-			if (aimed && now - aimedAt < 3000) id = aimed;
-			std::uint32_t hit = 0;
-			ULONGLONG hitAt = 0;
-			if (!id && vehiclehits::LastHitByYourSide(hit, hitAt) && now - hitAt < 6000) id = hit;
-			const uptr driven = EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(player);
-			if (!id && driven) {
-				const std::uint32_t d = At<std::uint32_t>(driven, off::kFormId);
-				if (vehiclehits::HealthShare(d) < 0.999f || vehiclehits::Wrecked(d)) id = d;
-			}
 			const uptr veh = RefById(id);
 			if (!veh) return false;
 			char name[40] = "", driverName[40] = "";
@@ -3320,6 +3311,66 @@ namespace npcvehicles
 			std::snprintf(out, size, "%s%s%s%s  [%s] %.0f%%%s%s", name, driverName[0] ? " (" : "", driverName, driverName[0] ? ")" : "", bar, share * 100.0f, drv,
 				vehiclehits::Wrecked(id) ? "  WRECKED" : "");
 			return true;
+		}
+
+		// ---- Vehicle lifebar (2026-10-21, the user approved the HUD row first; enemy health asked for 2026-10-21): up to two
+		// lines in the status card. The other vehicle: the one under the crosshair (and 3 s after), else the one your side hit
+		// last (6 s), else the nearest vehicle an enemy drives within 400 m. Then your own vehicle (the one you drive, else
+		// your own one within 300 m), always.
+		bool LifebarLine(uptr player, char* out, std::size_t size)
+		{
+			static std::uint32_t aimed = 0;
+			static ULONGLONG aimedAt = 0;
+			const ULONGLONG now = GetTickCount64();
+			const uptr driven = EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(player);
+			std::uint32_t mine = driven ? At<std::uint32_t>(driven, off::kFormId) : 0;
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			if (!mine) {
+				const uptr own = RefById(vehicleflight::OwnRoverId());
+				if (own && At<uptr>(own, off::kRefParentCell) && At<uptr>(player, off::kRefParentCell)) {
+					const auto a = At<game::Vec3>(own, off::kRefPosition);
+					if (std::hypot(a.x - pp.x, a.y - pp.y, a.z - pp.z) < 300.0) mine = vehicleflight::OwnRoverId();
+				}
+			}
+			std::uint32_t id = 0;
+			const std::uint32_t cross = vehiclehits::CrosshairTarget();
+			if (cross) {
+				const uptr r = RefById(cross);
+				const uptr veh = r && IsVehicle(r) ? r : r && IsActorRef(r) ? InVehicle(r) : 0;
+				if (veh && At<std::uint32_t>(veh, off::kFormId) != mine) { aimed = At<std::uint32_t>(veh, off::kFormId); aimedAt = now; }
+			}
+			if (aimed && now - aimedAt < 3000) id = aimed;
+			std::uint32_t hit = 0;
+			ULONGLONG hitAt = 0;
+			if (!id && vehiclehits::LastHitByYourSide(hit, hitAt) && now - hitAt < 6000 && hit != mine) id = hit;
+			if (!id) {
+				// The nearest enemy-driven vehicle (checked twice a second; the world snapshot carries the seated driver).
+				static std::uint32_t enemy = 0;
+				static ULONGLONG enemyAt = 0;
+				if (now - enemyAt >= 500) {
+					enemyAt = now;
+					enemy = 0;
+					static world::Snapshot snap;
+					double best = 400.0;
+					if (world::Vehicles(snap)) for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+						const auto& v = snap.v[k];
+						if (!v.driverId || v.formId == mine || vehiclehits::Wrecked(v.formId)) continue;
+						const uptr d = RefById(v.driverId);
+						if (!d || d == player || Dead(d) || IsFollower(player, d) || !(HostileTo(d, player) || HostileTo(player, d))) continue;
+						const double dist = std::hypot(v.pos[0] - pp.x, v.pos[1] - pp.y, v.pos[2] - pp.z);
+						if (dist < best) { best = dist; enemy = v.formId; }
+					}
+				}
+				id = enemy;
+			}
+			out[0] = 0;
+			std::size_t used = 0;
+			if (id && LifeOf(player, id, driven, out, size)) used = std::strlen(out);
+			if (mine && used + 2 < size) {
+				if (used) out[used++] = '\n';
+				if (!LifeOf(player, mine, driven, out + used, size - used) && used) out[--used] = 0;
+			}
+			return out[0] != 0;
 		}
 
 		bool OursVehicle(std::uint32_t id)
@@ -3486,6 +3537,21 @@ namespace npcvehicles
 			(void)player;
 		}
 
+		// The game has already sat the player down when the seat call runs (the sit action calls it afterwards, 2026-10-21 run:
+		// the user could still get into an NPC's vehicle): a refused seat stands the player back up, unless the player is in
+		// another vehicle.
+		ULONGLONG g_activatePressAt = 0;  // the player's last Activate press (SeatTick): only a sit the player asked for is undone
+		void StandPlayerUp(uptr vehicle)
+		{
+			if (GetTickCount64() - g_activatePressAt > 4000) return;  // an NPC's own sit runs the same call
+			const uptr player = Ptr(addr::kPlayerCharacterPtr);
+			const uptr pin = player ? InVehicle(player) : 0;
+			if (!player || (pin && pin != vehicle) || Dist(player, vehicle) >= 12.0) return;
+			const bool out = EndInteraction(player);
+			notify::Show("That vehicle is taken");
+			logger::Write("NPC vehicles: the player stood back up from vehicle %08X -> %s", At<std::uint32_t>(vehicle, off::kFormId), out ? "out" : "FAILED");
+		}
+
 		void SeatPlayerDetour(uptr vehicle)
 		{
 			const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress()) - game::Base();
@@ -3497,13 +3563,21 @@ namespace npcvehicles
 				if (occ) {
 					logger::Write("NPC vehicles: seat rules: you tried vehicle %08X with %s driver %08X -> BLOCKED (%s)", id, RelationName(g_intent.relation),
 						At<std::uint32_t>(occ, off::kFormId), g_intent.relation == Relation::Gang ? "handing over" : "hold to pull out");
+					StandPlayerUp(vehicle);
 					return;
 				}
 			}
-			const bool block = id && OursVehicle(id);
+			// Refused: a vehicle one of our NPC jobs uses, or one another actor drives (the seat rules' hand-over and pull-out
+			// seat the player past this, through SeatPlayerNow).
+			const uptr pc = Ptr(addr::kPlayerCharacterPtr);
+			const bool ours = id && OursVehicle(id);
+			const uptr other = id && pc && id != vehicleflight::OwnRoverId() ? DriverOf(vehicle, pc) : 0;
+			const bool driven = other && !IsFollower(pc, other);  // a follower riding along never keeps you out
+			const bool block = ours || driven;
 			logger::Write("NPC vehicles: the game seats the player in vehicle %08X (caller 14%07llX) -> %s", id, static_cast<unsigned long long>(caller),
-				block ? "BLOCKED (an NPC job's vehicle)" : "allowed");
+				ours ? "BLOCKED (an NPC job's vehicle)" : driven ? "BLOCKED (someone else drives it)" : "allowed");
 			if (block) {
+				StandPlayerUp(vehicle);
 				const uptr npc = JobNpcFor(id);
 				const int r = npc ? SeatNpc(npc, vehicle) : 0;
 				logger::Write("NPC vehicles: seated NPC %08X in vehicle %08X instead of the player -> %d (game says the NPC is in %08X)", npc ? At<std::uint32_t>(npc, off::kFormId) : 0, id, r,
@@ -3813,6 +3887,7 @@ namespace npcvehicles
 				}
 			}
 			if (pressed) {
+				g_activatePressAt = now;
 				const Tap tap = g_tap;
 				g_intent = Intent{};
 				const uptr v = FacingVehicle(player);
@@ -4128,8 +4203,15 @@ namespace npcvehicles
 			int nr = 0;
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
 			{
-				static char life[96];
-				hoverui::SetLifebar(LifebarLine(player, life, sizeof(life)) ? life : "");  // the status card's health line
+				static char life[200];
+				const bool bars = features::On(features::Id::HealthBars);
+				hoverui::SetLifebar(bars && LifebarLine(player, life, sizeof(life)) ? life : "");  // the status card's health line
+				// The bar under the game's enemy bar, while it shows a vehicle's driver (vehiclehits::EnemyBarVehicle).
+				const std::uint32_t barId = bars ? vehiclehits::EnemyBarVehicle() : 0;
+				const uptr barVeh = RefById(barId);
+				char barName[48] = "";
+				if (barVeh) ActorName(barVeh, barId, barName, sizeof(barName));
+				hoverui::SetVehicleBar(barName, barVeh ? vehiclehits::HealthShare(barId) : 0.0f);
 			}
 			for (const auto& j : g_jobs) {
 				if (j.phase == Phase::Idle || !IsFollower(player,RefById(j.npc)) || nr >= hoverui::kMaxRows) continue;
@@ -4541,6 +4623,19 @@ namespace npcvehicles
 		return base == owner || (At<std::uint8_t>(owner, 0x2E) == 0x0D && InFaction(actor, owner));
 	}
 
+	bool PilotFighting(int pilot)
+	{
+		for (const auto& j : g_jobs) if (j.pilot == pilot && j.phase == Phase::Following) return j.fighting;
+		return false;
+	}
+
+	bool PilotFleeing(int pilot)
+	{
+		for (const auto& j : g_jobs) if (j.pilot == pilot && j.phase == Phase::Following && j.aiOn)
+			return j.ai.dec.action == brain::Action::Retreat || j.ai.dec.action == brain::Action::Flee || j.retreating;
+		return false;
+	}
+
 	bool ExitPlayer()
 	{
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
@@ -4671,8 +4766,11 @@ namespace npcvehicles
 
 	bool StartTransit(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y) {
 		traffic::Destination destination;
-		return traffic::DestinationOf(actor,destination)&&destination.vehicleSuitable &&
-			std::hypot(destination.x-x,destination.y-y)<2.0 && StartTask(actor,vehicle,1,x,y);
+		if (!traffic::DestinationOf(actor,destination)||!destination.vehicleSuitable ||
+			std::hypot(destination.x-x,destination.y-y)>=2.0 || !StartTask(actor,vehicle,1,x,y)) return false;
+		const uptr place = realvehicles::PlaceOwner(vehicle);
+		for (auto& j : g_jobs) if (j.phase != Phase::Idle && j.npc == At<std::uint32_t>(actor, off::kFormId)) j.startPlace = place ? At<std::uint32_t>(place, off::kFormId) : 0;
+		return true;
 	}
 	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y) { return StartTask(actor, vehicle, 5, x, y); }
 
@@ -4751,15 +4849,7 @@ namespace npcvehicles
 
 	void WitnessCrash(double x, double y, double z, const char* why)
 	{
-		if (!g_witnessRead) {
-			g_witnessRead = true;
-			PWSTR docs = nullptr;
-			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
-				CoTaskMemFree(docs);
-				g_witnessOn = GetPrivateProfileIntW(L"witness", L"enabled", 1, ini.c_str()) != 0;
-			}
-		}
+		g_witnessOn = features::On(features::Id::Witnesses);  // [witness] enabled, also the settings menu
 		const ULONGLONG now = GetTickCount64();
 		if (!g_witnessOn || now - g_witnessAt < 3000) return;
 		g_witnessAt = now;

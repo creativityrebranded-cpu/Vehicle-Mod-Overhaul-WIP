@@ -1,10 +1,11 @@
 # Known issues and next steps
 
 ## Open bugs and suspects
+- **0.63.0 needs live verification:** hover or drive (NPC vehicles and your own on autopilot), the enemy vehicle health bar and its driver targeting (log: `Vehicle hits: enemy bar ...`), the Settings menu category (log: `Hover UI: settings: ...`), and the fixes for vehicles stuck in towns and for getting into an NPC's vehicle.
 - **0.62.0 needs live verification:** the combat AI and native integration, the parked-vehicle patch's in-place type change on live vehicles, the streamlined HUD (status card, hint hiding, J toggle), exit-while-hovering, and the fight-boarding rule. The patch's first run changed types as designed; shaking near Waggoner Farm came from an old duplicate and is now cleared.
 - **Parked-vehicle patch limits:** Parked Vehicles' procedural (GPO) placements have no baked spot; without *Vehicles - Real* its props stay static. A save made during the 1-3 s of a type change keeps that vehicle disabled.
 - **Frame spikes after loading.** The worst frames (29-144 ms) fell in the first minute after a start or a save load, once together with four parked-vehicle type changes; normal driving peaks at 6-10 ms (0.5-1.5 ms average, mostly navigation). Type changes are now spaced 500 ms apart and timed, and the minute line names each section's worst frame; the cause is not confirmed yet.
-- **Enemy health on the native bar** is not fed yet; the status card shows the health line instead.
+- **Enemy vehicle health bar:** the game lists only enemies in combat with you, so the bar under the driver's appears once the driver is fighting you; before that the status card shows the vehicle's health. The gap between the two bars is estimated from the game bar's height.
 - **Current fixes need a game restart and live verification.** Exact chassis ownership, impact attitude recovery, first-person pitch, native prompt refresh, metered boost, the T gestures and the straight-line ram, N / U tap and hold, the stance key, the ] autopilot modes, the scanner pick provider (`Scanner native pick provider: ready/unavailable` in the log), N recall / U cover / guard points, the profile classes, the empty own vehicle's cover combat, and bounded native exits have offline coverage but are not live-verified. Missing body/path identity fails closed.
 - **Hull sweep on the parked rover.** At autopilot start the sweep reports a hit about 3 to 5 m ahead with 0 hits filtered as "own body". Probably the rover's own neighbour or its own body;
   it clears once the rover moves. Not investigated.
