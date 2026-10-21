@@ -162,7 +162,8 @@ int main(){
  g=key.Update(false,true,2600);check(!g.tap&&!g.hold,"releasing a hold never also taps");
  key.Update(true,true,3000);g=key.Update(false,true,4200);check(g.hold&&!g.tap,"a missed frame still counts as the hold");
  key.Update(true,false,5000);g=key.Update(true,true,5100);check(!g.tap&&!g.hold&&!key.Update(false,true,5200).tap,"a key held while unusable needs a fresh press");
- check(std::string(overrides::SummonLabel(true))=="Recall"&&std::string(overrides::SummonLabel(false))=="Summon","N's name follows the vehicle's context");
- check(std::string(overrides::CoverLabel(Mode::Cover))=="Stop cover"&&std::string(overrides::CoverLabel(Mode::Guard))=="Cover","U's name follows the cover state");
+ check(std::string(overrides::SummonLabel())=="Summon","N is always Summon, never Recall");
+ check(std::string(overrides::CoverLabel(false))=="Follow"&&std::string(overrides::CoverLabel(true))=="Cover","U is Follow out of combat, Cover in combat");
+ check(std::string(overrides::CoverStatus(false))=="FOLLOW"&&std::string(overrides::CoverStatus(true))=="COVER","U's status follows the combat state");
  return failures?1:0;
 }

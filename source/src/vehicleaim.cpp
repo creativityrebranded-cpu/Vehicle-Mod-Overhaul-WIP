@@ -59,8 +59,11 @@ namespace vehicleaim
 			float* heading = reinterpret_cast<float*>(reinterpret_cast<std::uint8_t*>(data) + kAngleZ);
 			const float roll = *reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(data) + kAngleY);
 			const float* org = reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(data) + kOrigin);
-			// The player's own rover: log only (ground truth for the angle convention).
-			if (id && id == vehicleflight::OwnRoverId()) {
+			// The player's own rover: log only (ground truth for the angle convention) for the player's own shots. Its automatic fire (Cover,
+			// npcvehicles::FireVehicleWeapon stores an aim point) is aimed like an NPC's (2026-10-21: those shots flew along the nose, 0 hits).
+			double ax, ay, az;
+			const bool automatic = npcvehicles::AimFor(id, ax, ay, az);
+			if (id && id == vehicleflight::OwnRoverId() && !automatic) {
 				const unsigned n = g_playerShots++;
 				if (n < 20 || n % 50 == 0) {
 					double hc = 0, hr = 0, pr = 0, pc = 0;
@@ -71,9 +74,8 @@ namespace vehicleaim
 				}
 				return;
 			}
-			// An NPC job's vehicle (or its NPC): angles at the led aim point.
-			double ax, ay, az;
-			if (!npcvehicles::AimFor(id, ax, ay, az)) return;
+			// An NPC job's vehicle (or its NPC), or the own rover's automatic fire: angles at the led aim point.
+			if (!automatic) return;
 			const double dx = ax - org[0], dy = ay - org[1], dz = az - org[2];
 			const double horiz = std::hypot(dx, dy);
 			if (horiz + std::fabs(dz) < 1.0) return;

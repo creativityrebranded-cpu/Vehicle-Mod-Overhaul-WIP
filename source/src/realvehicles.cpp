@@ -5,6 +5,8 @@
 #include "log.h"
 #include "npcvehicles.h"
 #include "vehicleflight.h"
+#include "placement_spots.h"
+#include "placementlogic.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -595,6 +597,262 @@ namespace realvehicles
 			}
 		}
 
+		// ---- Placement patch (2026-10-21, the user): the kinds of vehicle that carfield.esm and Vehicles.esm park are
+		// stand-ins. In each location every stand-in resolves to one vehicle from the whole load order, picked from a seeded
+		// random distribution per location: the same every load, so nothing is spawned and no vehicle is added. Optional: a
+		// mod that is not loaded is left alone; with neither loaded nothing here runs. Carfield's own vehicle types are known
+		// wherever they stand; Vehicles.esm parks vanilla REV-8s through pack-ins, so its stand-in is the pack-in kind, known
+		// from the spots baked from the plugin (scripts/bake_placement_spots.py). The vehicle keeps its reference (owner, place, save): only its base
+		// changes, through the game's own SetObjectReference (ref vtable 0xF7: TESObjectREFR 140B4D430, Actor 1418D8950,
+		// the override the game uses on the live player) while the vehicle is disabled, then it is enabled again.
+		constexpr std::uint32_t kLookupModByName = 0x00598430;  // (data handler, name) -> TESFile*, name at +0x38; loaded: +0x218 != 0xFF
+		constexpr std::uint32_t kFileLocalToRuntime = 0x005B78C0;  // (TESFile*, uint32* id): a file-local id -> its run-time id
+		constexpr std::uint32_t kRefSetBaseSlot = 0xF7;
+		constexpr std::uint32_t kSetBaseRefr = 0x00B4D430, kSetBaseActor = 0x018D8950;
+		constexpr float kPatchSpotRadius = 4.0f;    // m: the mods' spots can be 3.4 m apart; the nearest within this wins
+		constexpr float kPatchPlayerClear = 10.0f;  // m: not while the player stands right beside it (the user: closer than 30 m)
+		constexpr std::uint64_t kDefaultSeed = 0x5EA3B1E5C0FFEE21ull;  // the mod's stored seed ([placement] seed= overrides)
+
+		bool Signature(std::uint32_t rva, std::initializer_list<std::uint8_t> bytes)
+		{
+			std::size_t i = 0;
+			for (const auto b : bytes) if (*reinterpret_cast<const std::uint8_t*>(game::Base() + rva + i++) != b) return false;
+			return true;
+		}
+
+		using placementlogic::Mix;
+		using placementlogic::Fnv;
+
+		struct PatchSpot { std::uint32_t world = 0; float x = 0, y = 0, z = 0; std::uint64_t key = 0, location = 0, standin = 0; };
+		struct SwapJob { std::uint32_t ref = 0; uptr base = 0; int stage = 0; ULONGLONG since = 0; std::uint64_t spot = 0; };
+		struct Patch
+		{
+			bool ready = false, active = false;
+			std::uint64_t seed = kDefaultSeed;
+			bool enabled = true;
+			std::vector<PatchSpot> spots;                 // active spots (loaded mods only), run-time worldspace ids
+			std::vector<std::pair<uptr, std::uint64_t>> pool;  // vehicle base, stable key (model + file-local id)
+			std::vector<std::pair<uptr, std::uint64_t>> standins;  // a mod's own vehicle base, its stand-in key
+			std::vector<std::pair<uptr, const char*>> files;   // loaded files a worldspace's location key is named by
+			std::unordered_map<std::uint32_t, std::uint64_t> locations;  // run-time worldspace id -> location key
+			std::unordered_set<std::uint32_t> handled;    // refs decided this session
+			std::vector<SwapJob> jobs;
+			unsigned swaps = 0, kept = 0;
+		} g_patch;
+
+		std::wstring IniPath()
+		{
+			PWSTR docs = nullptr;
+			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return {};
+			std::wstring w = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+			CoTaskMemFree(docs);
+			return w;
+		}
+
+		uptr LoadedFile(const char* name)
+		{
+			__try {
+				const uptr file = EngineFn<uptr (*)(uptr, const char*)>(kLookupModByName)(Ptr(addr::kDataHandlerPtr), name);
+				return file && At<std::uint8_t>(file, 0x218) != 0xFF ? file : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+		}
+
+		std::uint32_t RuntimeId(uptr file, std::uint32_t local)
+		{
+			std::uint32_t id = local;
+			__try {
+				EngineFn<void (*)(uptr, std::uint32_t*)>(kFileLocalToRuntime)(file, &id);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return 0;
+			}
+			return id;
+		}
+
+		// Once the vehicle pool is known: which placement mods are loaded, their spots in run-time ids, the seed.
+		void PreparePatch()
+		{
+			if (g_patch.ready || !g.haveVehicles) return;
+			g_patch.ready = true;
+			const std::wstring ini = IniPath();
+			g_patch.enabled = GetPrivateProfileIntW(L"placement", L"enabled", 1, ini.c_str()) != 0;
+			wchar_t seed[40] = L"";
+			GetPrivateProfileStringW(L"placement", L"seed", L"", seed, 40, ini.c_str());
+			if (seed[0]) g_patch.seed = std::wcstoull(seed, nullptr, 0);
+			if (!Signature(kLookupModByName, { 0x48, 0x89, 0x6C, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x33, 0xFF, 0x48, 0x8B, 0xEA, 0x48 }) ||
+				!Signature(kFileLocalToRuntime, { 0x44, 0x8B, 0x02, 0x4C, 0x8B, 0xD2, 0x45, 0x85, 0xC0, 0x0F, 0x84, 0xD0, 0x00, 0x00, 0x00, 0x8B })) {
+				logger::Write("Placement patch: off (plugin lookup functions do not match this game version)");
+				return;
+			}
+			bool loaded[std::size(placementspots::kMods)] = {};
+			unsigned count = 0;
+			for (std::size_t m = 0; m < std::size(placementspots::kMods); ++m) {
+				loaded[m] = LoadedFile(placementspots::kMods[m]) != 0;
+				logger::Write("Placement patch: %s %s", placementspots::kMods[m], loaded[m] ? "loaded: its parked vehicles get the patch" : "not loaded (nothing to patch)");
+			}
+			uptr files[std::size(placementspots::kFiles)] = {};
+			for (std::size_t f = 0; f < std::size(placementspots::kFiles); ++f) files[f] = LoadedFile(placementspots::kFiles[f]);
+			for (const auto& s : placementspots::kSpots) {
+				if (!loaded[s.mod] || !files[s.worldFile]) continue;
+				PatchSpot p;
+				p.world = RuntimeId(files[s.worldFile], s.worldLocal);
+				if (!p.world) continue;
+				p.x = s.x; p.y = s.y; p.z = s.z; p.key = s.key; p.standin = s.standin;
+				p.location = Fnv(placementspots::kFiles[s.worldFile]) ^ Mix(s.worldLocal);  // a location: the worldspace, load-order independent
+				g_patch.spots.push_back(p);
+				++count;
+			}
+			for (std::size_t f = 0; f < std::size(placementspots::kFiles); ++f) if (files[f]) g_patch.files.push_back({ files[f], placementspots::kFiles[f] });
+			// The mods' own vehicle types, resolved through the file the plugin writes them under, else through the plugin itself.
+			for (const auto& b : placementspots::kStandinBases) {
+				if (!loaded[b.mod]) continue;
+				uptr form = 0;
+				for (const uptr file : { files[b.file], LoadedFile(placementspots::kMods[b.mod]) }) {
+					const uptr f = file ? Lookup(RuntimeId(file, b.local)) : 0;
+					if (f && std::find(g.pool.begin(), g.pool.end(), f) != g.pool.end()) { form = f; break; }
+				}
+				if (form) g_patch.standins.push_back({ form, b.standin });
+				logger::Write("Placement patch: %s vehicle type %06X (%s) %s", placementspots::kMods[b.mod], b.local, placementspots::kFiles[b.file],
+					form ? "found: a stand-in wherever it is parked" : "not found among the vehicles");
+				if (form) logger::Write("Placement patch:   = %08X %s", At<std::uint32_t>(form, 0x28), ModelHint(form).c_str());
+			}
+			// The pool's stable keys: the model path and the file-local part of the id (light FE: 12 bits, medium FD: 16, else 24).
+			// A stand-in is never a target (the 11:05 run: Carfield's REVs became Carfield's Deimog copies, then were rolled again).
+			for (const uptr f : g.pool) {
+				if (std::any_of(g_patch.standins.begin(), g_patch.standins.end(), [&](const auto& e) { return e.first == f; })) continue;
+				const std::uint32_t id = At<std::uint32_t>(f, 0x28);
+				const std::uint32_t local = (id >> 24) == 0xFE ? id & 0xFFF : (id >> 24) == 0xFD ? id & 0xFFFF : id & 0xFFFFFF;
+				g_patch.pool.push_back({ f, Fnv(ModelHint(f)) ^ Mix(local) });
+			}
+			g_patch.active = g_patch.enabled && (count > 0 || !g_patch.standins.empty()) && g_patch.pool.size() > 1;
+			logger::Write("Placement patch: %s; %u spots and %zu stand-in types active, %zu vehicle types, seed %016llX%s", g_patch.active ? "ON" : "off", count,
+				g_patch.standins.size(), g_patch.pool.size(),
+				static_cast<unsigned long long>(g_patch.seed), g_patch.enabled ? "" : " ([placement] enabled=0)");
+		}
+
+		// The vehicle a stand-in becomes in a location (placementlogic::Pick: a seeded mix per location; one vehicle per
+		// stand-in and location).
+		uptr PatchPick(std::uint64_t location, std::uint64_t standin)
+		{
+			std::vector<std::uint64_t> keys;
+			for (const auto& e : g_patch.pool) keys.push_back(e.second);
+			const int i = placementlogic::Pick(g_patch.seed, location, standin, keys.data(), int(keys.size()));
+			return i >= 0 ? g_patch.pool[i].first : 0;
+		}
+
+		// A worldspace's location key, the same the baked spots use: its file's name and its file-local id (load-order
+		// independent); a worldspace from a file the table does not name falls back to its run-time id.
+		std::uint64_t LocationKey(std::uint32_t world)
+		{
+			if (const auto it = g_patch.locations.find(world); it != g_patch.locations.end()) return it->second;
+			std::uint64_t key = Mix(world) ^ 0x6C6F636174696F6Eull;
+			for (const auto& [file, name] : g_patch.files) {
+				bool found = false;
+				for (const std::uint32_t mask : { 0xFFFFFFu, 0xFFFFu, 0xFFFu }) {
+					if (RuntimeId(file, world & mask) == world) { key = Fnv(name) ^ Mix(world & mask); found = true; break; }
+				}
+				if (found) break;
+			}
+			g_patch.locations[world] = key;
+			return key;
+		}
+
+		const PatchSpot* SpotFor(std::uint32_t world, const game::Vec3& p)
+		{
+			const PatchSpot* best = nullptr;
+			double bestD = kPatchSpotRadius;
+			for (const auto& s : g_patch.spots) {
+				if (s.world != world) continue;
+				const double d = std::sqrt(std::pow(p.x - s.x, 2) + std::pow(p.y - s.y, 2) + std::pow(p.z - s.z, 2));
+				if (d < bestD) { bestD = d; best = &s; }
+			}
+			return best;
+		}
+
+		void PatchConsider(uptr r, uptr cell)
+		{
+			if (!g_patch.active || g_patch.jobs.size() >= 2) return;
+			const std::uint32_t id = At<std::uint32_t>(r, 0x28);
+			if (g_patch.handled.count(id) || Protected(r) || std::strcmp(StateOf(r), "parked") != 0) return;
+			const uptr ws = At<uptr>(cell, off::kCellWorldspace);
+			if (!ws) { g_patch.handled.insert(id); return; }
+			const auto p = At<game::Vec3>(r, off::kRefPosition);
+			const uptr base = At<uptr>(r, 0x98);
+			std::uint64_t location = 0, standin = 0, spotKey = 0;
+			// Its spot decides first, whatever its base is now (an earlier swap is kept, never rolled again); off a spot only a
+			// mod's own vehicle type is a stand-in.
+			if (const PatchSpot* spot = SpotFor(At<std::uint32_t>(ws, 0x28), p)) { location = spot->location; standin = spot->standin; spotKey = spot->key; }
+			else for (const auto& [form, key] : g_patch.standins) if (form == base) { location = LocationKey(At<std::uint32_t>(ws, 0x28)); standin = key; }
+			if (!standin) { g_patch.handled.insert(id); return; }
+			const uptr want = PatchPick(location, standin);
+			if (!want || want == At<uptr>(r, 0x98)) {
+				g_patch.handled.insert(id);
+				++g_patch.kept;
+				return;
+			}
+			if (const uptr player = Ptr(addr::kPlayerCharacterPtr)) {
+				const auto pp = At<game::Vec3>(player, off::kRefPosition);
+				if (std::hypot(pp.x - p.x, pp.y - p.y) < kPatchPlayerClear) return;  // later, when the player is not beside it
+			}
+			// Only the game's own base-change functions (the reference's or the actor's override) are ever called.
+			const auto slot = reinterpret_cast<uptr>((*reinterpret_cast<void***>(r))[kRefSetBaseSlot]) - game::Base();
+			if (slot != kSetBaseRefr && slot != kSetBaseActor) {
+				g_patch.handled.insert(id);
+				logger::Write("Placement patch: vehicle %08X skipped (its base-change slot is %08llX, not a known one)", id, static_cast<unsigned long long>(slot));
+				return;
+			}
+			g_patch.handled.insert(id);
+			g_patch.jobs.push_back({ id, want, 0, GetTickCount64(), spotKey ? spotKey : standin });
+		}
+
+		// One step of a swap. 0: disable it; 1: once its 3D is gone (or after 3 s), the new base and enable. Returns the old
+		// base form id after a swap, 0 while waiting, ~0u on an exception (the vehicle is enabled again, unchanged).
+		std::uint32_t PatchStep(uptr r, SwapJob& j, ULONGLONG now)
+		{
+			__try {
+				if (j.stage == 0) {
+					Disable(r);
+					j.stage = 1;
+					j.since = now;
+					return 0;
+				}
+				if (At<uptr>(r, off::kRefLoadedData) != 0 && now - j.since <= 3000) return 0;
+				const uptr old = At<uptr>(r, 0x98);
+				reinterpret_cast<void (*)(uptr, uptr, bool)>((*reinterpret_cast<void***>(r))[kRefSetBaseSlot])(r, j.base, true);
+				EngineFn<void (*)(uptr)>(addr::kEnableReference)(r);
+				j.stage = 9;
+				return old ? At<std::uint32_t>(old, 0x28) : 0xFFFFFFFEu;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				__try { EngineFn<void (*)(uptr)>(addr::kEnableReference)(r); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+				j.stage = 9;
+				return ~0u;
+			}
+		}
+
+		// Each frame: the running swaps (at most two at a time).
+		void PatchJobs()
+		{
+			const ULONGLONG now = GetTickCount64();
+			for (auto& j : g_patch.jobs) {
+				const uptr r = Lookup(j.ref);
+				if (!r || !Readable(r, 0xD0)) { j.stage = 9; continue; }
+				const int stage = j.stage;
+				const std::uint32_t old = PatchStep(r, j, now);
+				if (old == ~0u) logger::Write("Placement patch: vehicle %08X raised an exception in stage %d; enabled again, left as it was", j.ref, stage);
+				else if (old) {
+					++g_patch.swaps;
+					const auto p = At<game::Vec3>(r, off::kRefPosition);
+					logger::Write("Placement patch: #%u vehicle %08X at (%.0f, %.0f, %.0f): base %08X -> %08X (%s), spot / stand-in %016llX", g_patch.swaps, j.ref, p.x, p.y, p.z,
+						old, At<std::uint32_t>(j.base, 0x28), ModelHint(j.base).c_str(), static_cast<unsigned long long>(j.spot));
+				}
+			}
+			std::erase_if(g_patch.jobs, [](const SwapJob& j) { return j.stage == 9; });
+		}
+
 		// Records every real vehicle in the cell; never creates one (the user, 2026-10-17 20:2x: no swapping at run time;
 		// the props become real vehicles in Vehicles.esm itself). Duplicates an older build created at a parked spot are
 		// still cleared once (one kept).
@@ -614,6 +872,7 @@ namespace realvehicles
 				if (IsVehicleBase(base)) {
 					if (!(At<std::uint32_t>(r, 0x20) & 0x800)) {
 						Register(r, cell);
+						PatchConsider(r, cell);
 						if (g.modIndex >= 0 && !Protected(r) && std::strcmp(StateOf(r), "parked") == 0) parked.push_back(r);
 					}
 					continue;
@@ -627,16 +886,21 @@ namespace realvehicles
 				g.done.insert(pid);
 				VehicleAtSpot(At<game::Vec3>(r, off::kRefPosition), refs, count);  // clears old duplicates only
 			}
+			// Vehicles standing inside each other (the 11:05 run at Waggoner Farm: an old swap's V-47 in the pack-in's REV-8 at
+			// (656, 635)) push each other about; the extra created one goes (ClearStacked keeps the spot's own vehicle).
+			if (parked.size() > 1) ClearStacked(parked);
 		}
 	}
 
 	void Tick()
 	{
 		const ULONGLONG now = GetTickCount64();
+		if (!g_patch.jobs.empty()) PatchJobs();  // every frame while a swap runs
 		if (now - g.last < 2000) return;
 		g.last = now;
 		FindMod();
 		DiscoverVehicles();
+		PreparePatch();
 		if (g.dirty && now - g.lastSave >= 30000) {
 			g.lastSave = now;
 			g.dirty = false;
@@ -660,6 +924,21 @@ namespace realvehicles
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 			logger::Write("Real vehicles: exception while scanning cells");
+		}
+	}
+
+	std::uintptr_t PlaceOwner(std::uintptr_t ref)
+	{
+		if (!ref) return 0;
+		const uptr cell = At<uptr>(ref, off::kRefParentCell);
+		uptr* refs = nullptr;
+		std::uint32_t count = 0;
+		__try {
+			if (!cell || !CellRefs(cell, refs, count)) return 0;
+			return LocationOwner(cell, refs, count);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) {
+			return 0;
 		}
 	}
 
@@ -696,5 +975,8 @@ namespace realvehicles
 		g.done.clear();
 		g.cellOwner.clear();
 		g.registry.clear();  // form ids belong to one save
+		g_patch.handled.clear();
+		g_patch.locations.clear();
+		g_patch.jobs.clear();  // a swap in flight belongs to the save being left (a disabled vehicle there stays disabled)
 	}
 }

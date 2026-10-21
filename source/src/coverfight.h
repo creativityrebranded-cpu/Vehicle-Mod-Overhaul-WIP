@@ -9,16 +9,18 @@ namespace coverfight {
 inline constexpr double kRange = 120.0;                 // m around the protected point
 inline constexpr double kKeep = 1.3;                    // the current enemy is kept out to kRange * kKeep
 inline constexpr double kShield = 12.0;                 // m from the player toward the threat (Cover's defend spot)
-inline constexpr double kFireRange = 80.0;              // m (the NPC vehicles' weapon range)
-inline constexpr double kCone = 0.14, kPitchCone = 0.21;  // rad: the weapon fires along the nose
-inline constexpr double kAtSpot = 6.0;                  // m: holding its spot, the vehicle turns to face the threat
+inline constexpr double kFireRange = 100.0;             // m (the NPC vehicles' weapon range)
+// rad: the weapon fires along the nose (8 deg, the approved proposal; the shot is also turned onto the aim point at launch, vehicleaim 2026-10-21).
+inline constexpr double kCone = 0.14, kPitchCone = 0.21;
+inline constexpr double kAtSpot = 15.0;                 // m: near its spot, the vehicle turns to face the threat
 inline constexpr std::uint64_t kOverMs = 8000;          // the fight is over this long after the last enemy was seen
-inline constexpr std::uint64_t kPickMs = 500, kBurstMs = 1200, kGapMs = 1500;
+inline constexpr std::uint64_t kPickMs = 500, kBurstMs = 2000, kGapMs = 600;
+inline constexpr std::uint64_t kJinkHitMs = 1500, kJinkMs = 900;  // hit this recently: jink sideways (break), flipping every kJinkMs
 
 inline bool Allowed(bool playerDrives, bool crewDrives, bool cover, bool guard) { return !playerDrives && !crewDrives && (cover || guard); }
 inline bool Fighting(bool haveFoe, std::uint64_t lastSeen, std::uint64_t now) { return haveFoe && now - lastSeen < kOverMs; }
-inline bool OnTarget(double yawErr, double pitchErr, double range) {
-    return std::fabs(yawErr) < kCone && std::fabs(pitchErr) < kPitchCone && range < kFireRange;
+inline bool OnTarget(double yawErr, double pitchErr, double range, double weaponRange=kFireRange) {
+    return std::isfinite(weaponRange) && weaponRange>0 && std::fabs(yawErr) < kCone && std::fabs(pitchErr) < kPitchCone && range < weaponRange;
 }
 // The defend spot's centre for Cover: kShield from the player toward the threat (the vehicle shields the player).
 inline void ShieldPoint(double px, double py, double ex, double ey, double& x, double& y) {

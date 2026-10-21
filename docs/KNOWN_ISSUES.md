@@ -1,6 +1,9 @@
 # Known issues and next steps
 
 ## Open bugs and suspects
+- **0.62.0 needs live verification:** the combat AI and native integration, the parked-vehicle patch's in-place type change on live vehicles, the streamlined HUD (status card, hint hiding, J toggle), exit-while-hovering, and the fight-boarding rule. The patch's first run changed types as designed; shaking near Waggoner Farm came from an old duplicate and is now cleared.
+- **Parked-vehicle patch limits:** Parked Vehicles' procedural (GPO) placements have no baked spot; without *Vehicles - Real* its props stay static. A save made during the 1-3 s of a type change keeps that vehicle disabled.
+- **Enemy health on the native bar** is not fed yet; the status card shows the health line instead.
 - **Current fixes need a game restart and live verification.** Exact chassis ownership, impact attitude recovery, first-person pitch, native prompt refresh, metered boost, the T gestures and the straight-line ram, N / U tap and hold, the stance key, the ] autopilot modes, the scanner pick provider (`Scanner native pick provider: ready/unavailable` in the log), N recall / U cover / guard points, the profile classes, the empty own vehicle's cover combat, and bounded native exits have offline coverage but are not live-verified. Missing body/path identity fails closed.
 - **Hull sweep on the parked rover.** At autopilot start the sweep reports a hit about 3 to 5 m ahead with 0 hits filtered as "own body". Probably the rover's own neighbour or its own body;
   it clears once the rover moves. Not investigated.
@@ -14,7 +17,6 @@
   Next step: both ask one predicted path (the heading the vehicle will really fly, with its yaw lag and detour) against `navmap`, get back a required altitude profile and the first blocked point, and commit to a choice for a while (hysteresis).
   Details in `ARCHITECTURE.md` ("Navigation and the terrain assist").
 - **The game's own leash / home location.** The 600 m leash is measured from where the NPC stood when the job began, not from the NPC's editor placement.
-- **Per-vehicle HUD rows.** One box lists up to four vehicles, joined with " | ".
 - **The player's seat never fights by itself.** While you drive, combat stays yours: the vehicle never aims or fires on its own.
 - **Cover faces the threat.** The approved Cover rule is opportunistic fire. Your empty vehicle still turns its nose on the threat once it holds its defend spot; NPC drivers under Cover never turn to aim.
 - **A ram ignores traffic.** It flies straight and flat out by design: bystanders or vehicles in the line are not avoided; only the ground clearance is kept.

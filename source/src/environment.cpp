@@ -54,6 +54,7 @@ bool MapBlocked(const float from[3],const float to[3]){
  return false;
 }
 }
+bool LineBlocked(const float from[3],const float to[3]){return MapBlocked(from,to);}
 void Tick(){
  const auto now=GetTickCount64();
  for(int s=0;s<5;++s){auto&f=flights[s];if(!f.key)continue;prefetch::RayHit hit;unsigned age=0;

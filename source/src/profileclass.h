@@ -31,7 +31,7 @@ inline std::string Upper(const char* s) {
     for (auto& c : out) c = char(std::toupper(static_cast<unsigned char>(c)));
     return out;
 }
-// The follower row / status text: an active override shows alone ("RECALL", "COVER", "GUARD POINT", "RAM READY", "RAMMING"); otherwise
+// The follower row / status text: an active override shows alone ("SUMMON", "FOLLOW" / "COVER", "GUARD POINT", "RAM READY", "RAMMING"); otherwise
 // "NAV · COMBAT" with the combat profile only during a fight, and the weapons only when they restrict ("HOLD FIRE").
 inline std::string State(const char* override, const char* nav, const char* combat, bool fighting, Weapons w) {
     if (override && *override) return override;

@@ -1,8 +1,8 @@
 #pragma once
 // The player's overrides for their own vehicle (2026-10-20, the user; notes/VEHICLE_HANDOFF_20261020.md "Approved design decisions"). They sit above the
 // vehicle's Navigation/Combat/Weapons behaviour and set it temporarily:
-//  N Recall: drive to / pull up beside the player to board it; no combat, hold fire. Pressing N again re-issues it, never toggles it off.
-//  U Cover: follow the player and defend them; enemies around the player are shot at, never chased (no attack run, pursuit or combat repositioning).
+//  N Summon: drive to / pull up beside the player to board it; no combat, hold fire. Pressing N again re-issues it, never toggles it off.
+//  U Follow (out of combat) / Cover (in combat): follow the player and defend them; enemies around the player are shot at, never chased (no attack run, pursuit or combat repositioning).
 //  T hold on a place (on foot): Guard the aimed point; the point beats a fight, defend from there.
 namespace overrides {
 enum class Mode : int { None = 0, Recall = 1, Cover = 2, Guard = 3 };
@@ -22,7 +22,9 @@ inline Rules For(Mode m) {
 }
 inline Mode OnSummon(Mode) { return Mode::Recall; }
 inline Mode OnCover(Mode m) { return m == Mode::Cover ? Mode::None : Mode::Cover; }  // guarding: U resumes covering the player
-// The on-foot N label: Summon brings an idle vehicle; Recall when it is busy (a driver aboard, covering, guarding, fighting) and N takes it back.
-inline const char* SummonLabel(bool busy) { return busy ? "Recall" : "Summon"; }
-inline const char* CoverLabel(Mode m) { return m == Mode::Cover ? "Stop cover" : "Cover"; }
+// The player's words are only Summon, Follow and Cover (2026-10-21): N is always Summon; U is Follow out of combat and Cover in combat
+// (the same press, the same mode: only its name follows the player's combat state).
+inline const char* SummonLabel() { return "Summon"; }
+inline const char* CoverLabel(bool inCombat) { return inCombat ? "Cover" : "Follow"; }
+inline const char* CoverStatus(bool inCombat) { return inCombat ? "COVER" : "FOLLOW"; }
 }

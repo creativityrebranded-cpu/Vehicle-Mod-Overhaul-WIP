@@ -509,6 +509,7 @@ namespace scantarget
 		if (scanner != g_lastScanner) { g_input.Cancel(held); g_lastScanner = scanner; }
 		const auto action = g_input.Update(held, enabled, now);
 		if (action.tap && g_pressedInScanner) Select(player, now);
+		else if (action.tap && driving) vehicleflight::ToggleAuto();  // outside the scanner, driving: Auto on / off
 		if (action.capture) {
 			g_pressedTarget = t;
 			g_pressedInScanner = scanner;
@@ -542,6 +543,8 @@ namespace scantarget
 			logger::Write("Scanner marker: looking at (%.0f, %.0f, %.0f), %.0f m%s, form %08X", t.x, t.y, t.z, t.dist, t.estimated ? " (estimated)" : "", t.formId);
 		}
 	}
+
+	std::string KeyName() { ReadKey(); return controlmap::KeyName(g_key); }
 
 	void EndRide()
 	{

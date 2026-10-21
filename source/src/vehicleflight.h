@@ -15,6 +15,7 @@
 namespace vehicleflight
 {
 	bool Install();  // hooks the vehicle physics step
+	void BeginFrame(); // revoke previous-frame command ownership before decision systems run
 	void Tick();     // per frame, main thread (frame task)
 	void LoadReset(); // discard hover/body state before a different save replaces the rover
 	bool Active();
@@ -45,12 +46,16 @@ namespace vehicleflight
 	bool SetGuardPoint(double x, double y);
 	// Hold T on a highlighted actor: the driven or own vehicle rams it in a straight line, flat out (ramlogic); refusals are logged with their reason.
 	bool RequestRam(std::uintptr_t actor);
+	// An NPC pilot's fight rams `actor` (npcvehicles' ram manoeuvre): the same straight run; when it ends the flight goes on. False: refused or a ram runs.
+	bool OrderRam(int pilot, std::uintptr_t vehicle, std::uintptr_t actor);
 	void FreshScannerTarget(); // explicit selection can reuse the same marker coordinates
 	void EndTargetSession(std::uintptr_t vehicle);
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y, double* z = nullptr);
 	// The scanner marker button (scantarget): the player's own vehicle is summoned (as the call key does), and when the player gets in, Auto flies it to the
 	// marker. Driving already: Auto starts at once. Main thread.
 	void RequestScannerTrip();
+	// T tapped outside the scanner while driving (2026-10-21, the user): Auto on (to the marker / route) or off (you drive).
+	void ToggleAuto();
 	void RetryScannerTrip();
     void CancelScannerTrip(); // hold current position, preserving hover and the crew driver
 	struct TripProgress {
@@ -87,6 +92,10 @@ namespace vehicleflight
 		int gear = 0;          // 1-4
 		unsigned holdMs = 300;
 	};
+	void ClearPilotCommand(int pilot);
+    bool ImpactSince(std::uint32_t vehicleId, unsigned long long since);
+    double CruiseLimit(std::uint32_t vehicleId);
+    double TurnLimit(std::uint32_t vehicleId);
 	bool PilotCommand(int pilot, const Command& c);  // false: that pilot is not on autopilot
 
 	// The navigation settings of a profile (vcontract::Goal::nav) travel with the goal: PilotFly(pilot, vehicle, Goal) stores them; nothing else sets them.

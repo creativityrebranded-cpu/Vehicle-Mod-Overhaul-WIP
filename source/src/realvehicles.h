@@ -16,4 +16,7 @@ namespace realvehicles
 	void ForEachLoaded(void (*fn)(std::uintptr_t ref, void* ctx), void* ctx);
 	// A save load: forget the processed list (the save restores the swaps it already holds).
 	void Reset();
+	// Main thread: the owner of the place `ref` stands in (its cell's owner faction, else the faction owning most things
+	// in that cell), 0 when none or unknown (a town square with no owner, open ground).
+	std::uintptr_t PlaceOwner(std::uintptr_t ref);
 }

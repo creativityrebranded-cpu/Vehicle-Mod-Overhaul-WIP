@@ -17,12 +17,12 @@ outside a fight the people around you drive, patrol and run errands on their own
 | Feature | What you get | State |
 |---|---|---|
 | **Hover flight** | Double-tap Space to hover; gears, boost, climb and descend, terrain assist | Tested |
-| **Summon / Recall and Cover** | N brings your vehicle to you over anything it is doing; U makes it follow and defend you | Summon/follow tested; Recall/Cover untested |
+| **Summon, Follow and Cover** | N brings your vehicle to you over anything it is doing; U makes it follow you (Cover in combat: it defends you) | Summon/follow tested; Cover untested |
 | **Guard point and ram** | Hold T on a place: your vehicle guards it. Hold T on a person or vehicle: rammed in a straight line, flat out | Untested |
 | **Stance** | One key cycles Defend / Attack / Hold fire for your vehicle and your escorts | Untested in game; offline checks pass |
 | **Your vehicle defends you** | Under Cover or on a guard point your empty vehicle takes a defensive spot and fires its weapon; never while you drive it | Untested in game; offline checks pass |
 | **Navigation / Combat / Weapons profiles** | Each vehicle keeps where it goes, how it fights and when it shoots separately; a fight picks the combat profile from the trip | Untested in game; offline checks pass |
-| **Auto to the map marker** | Selecting a destination starts the autopilot; any movement key takes over | Untested |
+| **Auto to the map marker** | Selecting a destination starts the autopilot; tap T (scanner closed) while driving to switch Auto on or off; any movement key takes over | Untested |
 | **Scanner markers** | Mark what you look at up to ~1 km away; **chain** several markers into a route | Untested |
 | **Catch from below** | Jump or fall from a height and your following vehicle flies under you to catch you | Untested |
 | **Follower drivers** | With a follower nearby, Cover or a marker sends the follower to drive your vehicle for you | Untested |
@@ -42,6 +42,9 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Bystanders react** | People near a crash flee or cower | Untested |
 | **Passenger, taxi, take the wheel** | Ride with an NPC driver, let them taxi you, or take over | Untested |
 | **Metered boost, view distance** | Hold Left Shift for a 1.75x boost in any gear using the native boost meter; vehicles stay visible farther away | Untested in game; offline checks pass |
+| **Full vehicle combat AI** | Steering, dogfight manoeuvres, Mad Max tactics, squads, morale and personalities; vehicle health with a wreck state | Untested in game; offline checks pass |
+| **Parked-vehicle patch (optional)** | With Carfield or Parked Vehicles (+ Vehicles - Real) installed, each kind of parked vehicle becomes a seeded pick from every vehicle in your load order, per location | Lightly tested |
+| **Streamlined HUD** | One status card, only the prompts you can use now, control hints that hide after your first rides, J shows everything | Untested in game |
 
 ---
 
@@ -139,31 +142,50 @@ the vehicle flies on without stopping. The final point keeps normal arrival brak
 | **Alt** (hold) | Descend after 0.3 seconds; releasing a hold does not change gear |
 | **A / D**, mouse | Turn / roll; the mouse aims |
 | **Q / Z** | Up / down |
-| **T** | See [T: tap, double tap, hold](#t-tap-double-tap-hold-hand-scanner-open-or-while-driving). There is no separate Auto toggle: selecting a destination starts the autopilot. Any of W / A / S / D takes control back. |
+| **T** | See [T: tap, double tap, hold](#t-tap-double-tap-hold-hand-scanner-open-or-while-driving). Selecting a destination starts the autopilot; with the scanner closed a T tap switches Auto on or off. Any of W / A / S / D takes control back. |
+| **E** | Get out. While hovering, the vehicle sets down first, then you get out. |
+| **J** | Show / hide every hint and panel (the basic control hints hide after your first 3 rides). |
 | **]** (when free) | What the autopilot does at your destination: **Stop → Orbit → Patrol** (the route loops) **→ Cruise** (fly where you look at your gear's speed) |
-| **N** (hold) | Recall your escorts |
+| **N** (hold) | Summon your escorts back into formation |
 | **Stance** | Defend / Attack / Hold fire for your escorts (your own seat never fires by itself) |
 | *Shooting* | Always yours. A vehicle you drive never fires or aims by itself. |
 | *Leave the vehicle* | The old destination and queued route are discarded. Set a fresh target for the next trip; an unattended Auto vehicle holds position. |
-| **F7** | Move any on-screen button (Page Up / Down pick, arrows move, Ctrl ×10, Delete resets). Saved to `hoverui.ini`. |
+| **F7** | Move any on-screen button (Page Up / Down pick, arrows move, Ctrl ×10, Delete resets, **+ / −** resize the pick). Saved to `hoverui.ini`. |
 
 ### On-screen buttons
 
-Added prompts use the game's native BasicButton style at a uniform 75% scale. There is no Auto button or Auto destination-mode UI. Ambient NPC notices and rows are suppressed; only your followers appear.
+The HUD shows what you can do now and one status card (0.62.0). Everything uses the game's native button style.
 
-Buttons only show when they can be used:
-- **On foot** (if you own a vehicle): Summon / Recall, Cover / Stop cover, Get in (near your vehicle), and a status box:
-  *SUMMONING 120 m*, *COVER 42 m*, *COVER · DEFEND 42 m* (fighting), *COVER · ATTACK*, *COVER · HOLD FIRE* (the stance), *GUARD POINT*,
-  *GUARD POINT · DEFEND*, *HOLDING*, or the empty vehicle's navigation profile (*SCOUT*, *RETURN HOME*). A stance change shows a notice.
-- **Follower rows**, one per follower in a vehicle: an active order shows alone (*Sarah  RECALL  85 m*, *COVER*, *GUARD POINT*,
-  *HOLDING*, *Sarah  RAMMING*); otherwise the navigation profile, the combat profile during a fight, and *HOLD FIRE* only when
-  the weapons are held (*Sarah  PATROL  120 m*, *Sarah  PATROL · ATTACK  120 m*, *Sarah  HAULER · DEFEND · HOLD FIRE  200 m*).
-- **In the vehicle:** W / A / S / D, Alt hold to descend / Alt tap for gear / Hover, the gear box, the trip line (trip states,
-  *AIM + T* with no destination, *RAMMING*) and the follower rows.
-- **Target:** the scanner readout uses the former Gang box's saved position, with the same native style and size. Select **Target** in F7 to move it. The Gang summary is removed.
-- **Route display on the HUD/scanner:** native status boxes for the destination and queued stops, with native **Retry / Skip** key prompts and *T T: clear route*. Select **Route** in the F7 editor to move the group.
+- **Status card:** in the vehicle *GEAR 3 · HOVER · 2 ESCORTS*, the health bar when it matters, and the next stop or the Auto trip.
+  On foot your vehicle's state (*SUMMONING 120 m*, *FOLLOW 42 m*, *COVER · DEFEND 42 m*, *GUARD POINT*, *HOLDING*…) and the escort count.
+- **Prompts:** in the vehicle **T Auto / Auto off** (beside the game's own E exit); on foot **N Summon** and **U Follow** (*Cover* in
+  combat); facing an occupied vehicle **Passenger** and **eject**.
+- **Control hints** (W / A / S / D, Alt: tap gear, hold descend, Hover / Land: Space double tap) show on your first 3 rides and for
+  10 s after you get in, then hide. **J** shows every hint and panel (the gear box, each escort's row, the HUD route panel).
+- **The scanner** is where you plan: the target readout, the route with Retry / Skip / *T T: clear route*, and your escorts.
+- **F7** moves and resizes everything (+ / − on the pick). The card moves with *Status* on foot and *Vehicles* in the vehicle.
 
 ---
+
+## What's new in 0.62.0
+
+All of this passes the offline checks; most of it has not been tested in game yet.
+
+- **Native integration pass.** Each vehicle has one controller at a time (wreck, ram, order, rescue, combat, search, taxi, task,
+  navigation). Wall, pedestrian and traffic braking always win over combat steering. Rams need real hull contact. Squads share one
+  focus target, a lost target is searched for, finished manoeuvres hand back, and the Hug / High / arrive-heading options work.
+  Weapon range, projectile speed and falloff come from the game, and a driver's share of vehicle damage goes through the game's
+  own actor damage.
+- **Factions decide fights.** A pursuit profile never starts a fight with you by itself, and enemies only take a vehicle their own
+  faction owns or one standing in their own camp. Parked town vehicles stay put.
+- **Labels:** N is always *Summon*, U is *Follow* (*Cover* in combat). *Recall* is gone.
+- **Auto on T:** a T tap with the scanner closed switches Auto on or off while you drive.
+- **Getting out while hovering:** E sets the vehicle down first; the game no longer reports the exit as obstructed.
+- **Streamlined HUD** (see [On-screen buttons](#on-screen-buttons)) and per-element sizes in F7.
+- **Optional parked-vehicle patch** for *Carfield* and *Parked Vehicles* (+ *Vehicles - Real*). Neither is required. Each kind of
+  vehicle they park becomes one pick per location from every vehicle in your load order, using a fixed seed, so a place always
+  looks the same. Nothing is spawned: the parked vehicle itself changes type. `[placement] enabled=0` in `seamless.ini` turns it
+  off. Overlapping duplicates left by older builds are cleared.
 
 ## Current fixes and controls (0.61.0)
 

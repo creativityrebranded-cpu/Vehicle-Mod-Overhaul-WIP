@@ -266,21 +266,13 @@ namespace profiles
 			return true;
 		}
 
-		bool PursuitGoal(Context& c, Goal& g)
-		{
-			if (!c.player || !c.vehicle || c.pilot < 1 || c.pilot >= kTracks) return false;
-			Track& t = g_track[c.pilot];
-			const auto pp = PosOf(c.player);
-			TrackPlayer(t, pp);
-			const auto vp = PosOf(c.vehicle);
-			const double dir = (c.pilot % 2) ? 1.0 : -1.0;  // each pilot its own side of the orbit
-			const double ang = std::atan2(double(vp.x) - pp.x, double(vp.y) - pp.y) + dir * 0.6;
-			g.x = pp.x + std::sin(ang) * kAttackRadius;
-			g.y = pp.y + std::cos(ang) * kAttackRadius;
-			g.z = pp.z + std::clamp(t.pvz * 1.5, -15.0, 15.0) + kAttackAbove;
-			g.stop = kFollowStop;
-			return true;
-		}
+        bool PursuitGoal(Context& c, Goal& g)
+        {
+            if(!c.vehicle||c.pilot<1||c.pilot>=kTracks)return false;
+            // The combat controller supplies the native enemy's goal. Between
+            // fights a non-follower holds its own home, never orbits a neutral player.
+            g.x=c.homeX;g.y=c.homeY;g.stop=3.0;g.hold=true;return true;
+        }
 
 		constexpr std::uint8_t kAll = std::uint8_t(kNpc | kRemote | kDriving);
 		using vcontract::Class;

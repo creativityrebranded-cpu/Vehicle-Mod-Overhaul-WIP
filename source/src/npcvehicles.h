@@ -13,6 +13,7 @@
 namespace npcvehicles
 {
 	void Install(); // hooks the game's put-the-player-in-this-vehicle call (seats the NPC instead)
+	void BeginFrame(); // native driver index once per frame, before world::Publish
 	void Tick();   // main thread, every frame
 	void Reset();  // a save load
 	bool UsesVehicle(std::uint32_t vehicleId);  // an NPC job is boarding / driving it
@@ -77,6 +78,11 @@ namespace npcvehicles
 	int CivilJobs();                                         // jobs running a civil task now
 	// The actor may take this vehicle: unowned, or owned by the actor or a faction it belongs to (never the player's).
 	bool MayUse(std::uintptr_t actor, std::uintptr_t vehicle);
+	// An enemy in a fight may take this vehicle (2026-10-21, the user): one its own faction (or itself) owns, or an unowned one
+	// standing in its own camp (the place's owner is its faction). Parked town vehicles stay put. Never the player's.
+	bool FighterMayTake(std::uintptr_t actor, std::uintptr_t vehicle);
+	// Main thread: the game's own exit for the player (FUN_141952530, with its obstruction checks); true when it let them out.
+	bool ExitPlayer();
 	bool ActorFree(std::uintptr_t actor);                    // alive, on foot, no job, not a follower
 	// Supply run: drives to (x, y) (another settlement / outpost), waits there, comes back, parks.
 	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);
@@ -89,11 +95,18 @@ namespace npcvehicles
 	Stance CurrentStance();
 	// Witness reactions (2026-10-20, notes/VEHICLE_BEHAVIOUR_RESEARCH_20261020.md): a crash at (x, y, z) -> calm bystanders within 10 m flee
 	// (ActionFleeStart), within 25 m cower (ActionCower). Never followers, quest NPCs, anyone fighting or in a vehicle. Seamless.ini [witness] enabled=0 off.
-	void VehicleAggression(std::uintptr_t vehicle, std::uint32_t shooterId);
+	// Native friendship gate for shot hits: neutral drivers remain damageable; player and companion pairs are protected. Main thread only.
+	bool VehicleFriendlyToShooter(std::uintptr_t vehicle, std::uint32_t shooterFormId);
+	// Actual seated driver (player included), 0 when empty or unreadable. Main thread only.
+	std::uint32_t VehicleDriverId(std::uint32_t vehicleId);
+	void VehicleAggression(std::uintptr_t vehicle, std::uint32_t shooterId, bool reportCrime=true);
 	void WitnessCrash(double x, double y, double z, const char* why);
 	// The actor's current AI package (FUN_1418ddb70), 0 when none: a change is a schedule switch (shift change).
 	std::uintptr_t CurrentPackage(std::uintptr_t actor);
 	bool HostileToPlayer(std::uintptr_t actor);
+	std::uint32_t NativeEnemyId(std::uintptr_t actor); // native combat target, validated hostility
+	bool AreHostile(std::uintptr_t a, std::uintptr_t b);
+	bool AreAllies(std::uintptr_t a, std::uintptr_t b);
 	// Enemy patrol convoy: the second vehicle follows `leadVehicleId`'s patrol at 12 m and parks when the lead's job ends.
 	bool StartConvoy(std::uintptr_t actor, std::uintptr_t vehicle, std::uint32_t leadVehicleId);
 }

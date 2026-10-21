@@ -8,7 +8,7 @@
 // bodyIds enumerate the reference's owned collision bodies; native callbacks identify the chassis. rot[] = the 3D
 // root's world rotation (heading-only when not loaded); half[] from the base's bounds (TESBoundObject +0x48 / +0x54),
 // sanity-checked, scaled by the live transform and capped by the 3D's bound sphere radius; vel from smoothed position differences;
-// driverId only for the player (NPC drivers: who = Npc, driverId 0).
+// driverId is the actual native seated driver for player and NPC vehicles (0 when empty/unknown).
 namespace world
 {
 	struct VehicleInfo
@@ -16,6 +16,8 @@ namespace world
 		std::uint32_t formId = 0, baseId = 0;
 		std::uintptr_t ref = 0;  // main thread only, in the frame it was published
 		float pos[3] = {}, vel[3] = {};
+        float center[3]={}; // actual base-bounds centre transformed into the reference frame
+        float mass=1500; bool nativeMass=false;
 		float rot[9] = {};       // rows: right, forward, up (heading only in v1)
 		float heading = 0;       // radians, ref +0x88; forward = (sin, cos)
 		float half[3] = {};      // half-extents x (width), y (length), z (height)
@@ -35,7 +37,7 @@ namespace world
 	void Publish();
 	// A save load: forget everything.
 	void Reset();
-	// Any thread: a consistent copy of the latest snapshot (seqlock); false if none yet or the writer kept it busy.
+	// Any thread: a synchronized copy of the latest snapshot; false before the first publication.
 	bool Vehicles(Snapshot& out);
 	// Any thread: the first vehicle (other than ignoreFormId / ignoreBodyId; 0 = none) a body of half-extents `half`
 	// moving from p along d (metres) would touch, as vertical cylinders; distance along d in *distanceOut. False: clear.

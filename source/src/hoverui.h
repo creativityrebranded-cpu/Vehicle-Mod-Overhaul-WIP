@@ -2,6 +2,10 @@
 #include <string>
 #include <cstdint>
 
+// Streamlined (2026-10-21, the user): one status card (vehicle / gear / health / trip or summon state / escort count),
+// only the prompts that work now (driving: Auto; on foot: Summon, Follow / Cover; facing an occupied vehicle: Passenger,
+// eject), the basic controls on the first rides and 10 s after getting in, the route and escort list in the scanner, and a
+// hints key (J) that shows every hint and panel.
 // Native hover buttons on the HUD's rover widget (hudmenu.swf: root.RightMeters_mc.HUDVehicle_mc, the widget that
 // shows "hold [E] Exit vehicle"). The buttons are the game's own BasicButton (ButtonClips.swf) with ButtonBaseData +
 // UserEventData of the Vehicle input events, so the key glyphs follow the player's bindings like every native prompt.
@@ -34,6 +38,10 @@ namespace hoverui
 	void SetOccupied(bool facing, const char* key);
 	// Main thread: in the vehicle, trip status only; destinations activate autopilot without a separate button.
 	void SetTripStatus(bool on, const char* line);
+	// Main thread: the Auto key shown on the in-vehicle Auto button (empty hides the button while Auto is off).
+	void SetAutoKey(const char* key);
+	// Main thread: the vehicle health line (the lifebar) for the status card; empty hides it.
+	void SetLifebar(const char* line);
 	// Main thread: one line per follower vehicle / rider below Target (at most kMaxRows; count 0 hides them).
 	constexpr int kMaxRows = 4;
 	void SetRows(int count, const char* const* lines);

@@ -51,13 +51,13 @@ int main(){
  check(profileclass::State(nullptr,"hauler","defend",true,Weapons::HoldFire)=="HAULER \xC2\xB7 DEFEND \xC2\xB7 HOLD FIRE","restricting weapons appear in the row");
  check(profileclass::State(nullptr,"escort","defend",false,Weapons::Opportunistic)=="ESCORT","combat and non-restricting weapons stay hidden outside a fight");
  check(profileclass::State("COVER","escort","defend",true,Weapons::HoldFire)=="COVER","an active override shows alone");
- check(!profileclass::ShowsDistance("RAM READY")&&!profileclass::ShowsDistance("RAMMING")&&profileclass::ShowsDistance("RECALL"),"ram rows carry no distance");
+ check(!profileclass::ShowsDistance("RAM READY")&&!profileclass::ShowsDistance("RAMMING")&&profileclass::ShowsDistance("SUMMON"),"ram rows carry no distance");
  check(!coverfight::Allowed(true,false,true,false)&&!coverfight::Allowed(false,true,true,false)&&!coverfight::Allowed(false,false,false,false),
   "own-vehicle combat never runs while you drive, with a crew driver, or without cover or guard");
  check(coverfight::Allowed(false,false,true,false)&&coverfight::Allowed(false,false,false,true),"empty vehicle fights under cover and on a guard point");
  check(coverfight::Fighting(true,1000,1000+coverfight::kOverMs-1)&&!coverfight::Fighting(true,1000,1000+coverfight::kOverMs)&&!coverfight::Fighting(false,1000,1000),
   "the fight ends a while after the last enemy");
- check(coverfight::OnTarget(0.1,0.1,50)&&!coverfight::OnTarget(0.3,0,50)&&!coverfight::OnTarget(0,0.3,50)&&!coverfight::OnTarget(0,0,100),"fires only with the nose on target and in range");
+ check(coverfight::OnTarget(0.1,0.1,50)&&!coverfight::OnTarget(0.3,0,50)&&!coverfight::OnTarget(0,0.3,50)&&!coverfight::OnTarget(0,0,120),"fires only with the nose on target and in range");
  {double x=0,y=0;coverfight::ShieldPoint(0,0,0,100,x,y);check(x==0&&y==coverfight::kShield,"cover's defend spot sits between the player and the threat");
   coverfight::ShieldPoint(0,0,0,10,x,y);check(y==5,"a close threat keeps the spot halfway, never past the enemy");}
  {double x=0,y=0;coverfight::AttackPoint(0,0,0,100,0,0,x,y);check(std::fabs(y-(100-coverfight::kStandOff))<1e-9&&x==0,"attack stance closes to its stand-off on its own side");

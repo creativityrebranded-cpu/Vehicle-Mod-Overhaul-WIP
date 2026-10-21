@@ -21,7 +21,16 @@
 #include "traffic.h"
 #include "vehiclehits.h"
 #include "vehicleworld.h"
+#include "manoeuvre.h"
+#include "combat_ai.h"
+#include "native_personalities.h"
+#include "combat_relations.h"
+#include "integrationlogic.h"
+#include "hulllogic.h"
+#include "navmap.h"
+#include "realvehicles.h"
 #include <ShlObj.h>
+#include <string>
 #include <unordered_map>
 
 #include <Windows.h>
@@ -131,6 +140,8 @@ namespace npcvehicles
 			double aimX = 0, aimY = 0, aimZ = 0, aimVx = 0, aimVy = 0, aimVz = 0;  // the player's last position and smoothed velocity (aim lead)
 			ULONGLONG aimAt = 0;
 			ULONGLONG tAt = 0;
+			std::uint32_t resumeFoe=0, lastEnemyActor=0, squadFocus=0;
+			integrationlogic::Controller controller=integrationlogic::Controller::Navigation;
 			std::uint32_t foe = 0;             // the combat target (an actor; its vehicle is aimed at when it sits in one), 0 = none
 			int foeTier = -1;                  // 0 = in a vehicle, 1 = on foot
 			ULONGLONG foeAt = 0;               // last pick
@@ -152,6 +163,25 @@ namespace npcvehicles
 			ULONGLONG taskAt = 0;
 			std::uint32_t lead = 0;            // convoy (task 8): the lead vehicle
 			bool retreating = false;           // pursuer near its hit limit: pulling back to get out and fight on foot
+			bool defDefensive = false;         // DefendGoal: this escort is held defensive (second escort, high threat)
+			manoeuvre::Mind man;               // the vehicle-vs-vehicle manoeuvre state (manoeuvre.h)
+			bool manOn = false;                // manoeuvring this frame
+			double manMx = 0, manMy = 0, manMvx = 0, manMvy = 0, manFx = 0, manFy = 0, manFvx = 0, manFvy = 0;  // own / enemy position and smoothed velocity
+			ULONGLONG manAt = 0;
+			std::uint32_t manFoe = 0;
+			combatai::State ai;                // the full combat AI (combat_ai.h)
+			bool aiOn = false;                 // the full AI flies it this frame
+			bool aiFire = false;               // its weapon zone says fire
+			double aiAimX = 0, aiAimY = 0, aiAimZ = 0;
+			ULONGLONG aiAt = 0;
+			ULONGLONG stunUntil = 0;           // rammed: out of control until then
+			double stunX = 0, stunY = 0, stunSpin = 0;
+			brain::Role role = brain::Role::Engager;
+			int roleSlot = 0;
+			std::uint32_t coverFor = 0;
+			int squad = -1;                    // native-relation squad slot (neutral actors remain separate)
+			bool sideEvents[3] = {};           // this frame: an ally wrecked, an ally driver killed, the leader killed
+			bool reinforced = false;
 		} g_jobs[kJobs];
 		// Boarding steps (2026-10-17 15:21-15:22: the walk package was accepted, board -> 1, but 5 of 6 NPCs never moved):
 		// 1 walk (FUN_141951FB0); 2 no 2 m of progress after kWalkMs: direct board (FUN_141993710); 3 still out kDirectMs
@@ -192,18 +222,20 @@ namespace npcvehicles
 		// the weapon's FUN_14128EE90 (start); fire falling -> each weapon's vfunc +0x58 (stop). An NPC vehicle gets the
 		// same input from a handler-shaped block of ours.
 		constexpr std::uint32_t kVehicleSystem = 0x023FF640, kSubmitVehicleInput = 0x012C0550;
-		constexpr ULONGLONG kBurstMs = 1200, kBurstGapMs = 1500;
-		constexpr double kFireCone = 0.14;         // rad (8 deg): fires only with the nose on the aim point
+		// 2026-10-21: longer bursts, shorter gaps (1.2 s / 1.5 s fired 44 % of the time, about 2 shots a burst). The cone stays 8 deg (the approved
+		// proposal); the nose is now held on the aim point while moving (manoeuvres), and the shots are also turned onto it at launch (vehicleaim).
+		constexpr ULONGLONG kBurstMs = 2000, kBurstGapMs = 600;
+		constexpr double kFireCone = 0.14;         // rad (8 deg) yaw; pitch 1.5x
 		// Aim: the weapon fires along the vehicle's nose, so the whole vehicle aims. The aim point leads the player by
 		// the shot's flight time (kShotSpeed) and sits at chest height.
-		constexpr double kShotSpeed = 250.0;       // m/s (assumed)
+		// Lead speed comes from the native projectile flight, through vehiclehits::ShotTime.
 		constexpr double kAimHeight = 1.2;         // m above the player's feet
 		// The gate (FUN_141317C90): a vehicle's component applies input only when it is the player's vehicle
 		// (component +0x579 = player vehicle == this). FUN_141324650(component, input) returns at once otherwise, so
 		// an NPC vehicle never took our fire input (2026-10-17 17:53-17:57: 51 bursts sent, no shot). Hooked: for our
 		// own input blocks only, the gate is opened for that one call.
 		constexpr std::uint32_t kApplyVehicleInput = 0x01324650;
-		constexpr double kFireRange = 80.0;        // m
+		constexpr double kFireRange = 100.0;       // m
 		bool g_keyChosen = false;
 		int g_walkKey = 0, g_exitKey = 0, g_aggroKey = 0;
 		std::uint32_t g_ctrlTarget = 0;
@@ -624,13 +656,24 @@ namespace npcvehicles
 			return cell && At<uptr>(cell, off::kCellWorldspace);
 		}
 
-		void Set(Job& j, Phase p)
+		bool Aggro(uptr actor, uptr target);
+        bool HostileTo(uptr actor, uptr target);
+        uptr HandleRef(std::uint32_t handle);
+        void ResumeCombat(Job& j) {
+            const auto npc=RefById(j.npc), enemy=RefById(j.resumeFoe);
+            if(npc&&enemy&&!Dead(enemy)&&(HostileTo(npc,enemy)||HostileTo(enemy,npc))) Aggro(npc,enemy);
+            j.resumeFoe=0;
+        }
+        void Set(Job& j, Phase p)
 		{
 			logger::Write("NPC vehicles: [%d] %s -> %s (NPC %08X, vehicle %08X)", j.pilot, Name(j.phase), Name(p), j.npc, j.vehicle);
-			j.phase = p;
-			j.since = GetTickCount64();
-			if (p != Phase::Following) { j.foe = 0; j.foeTier = -1; j.foeAt = 0; j.rescueParked = j.scoutReported = j.waiting = j.retreating = false; j.pMode = -1; }
-			if (p == Phase::Idle) { j.exitWaitSince=0; j.order = 0; j.task = 0; j.haveHome = false; }
+			if((p==Phase::Following||p==Phase::Idle)&&j.resumeFoe) ResumeCombat(j);
+            vehicleflight::ClearPilotCommand(j.pilot);
+            j.phase = p;
+            j.since = GetTickCount64();
+			if (p != Phase::Following) { j.foe = 0; j.foeTier = -1; j.foeAt = 0; j.rescueParked = j.scoutReported = j.waiting = j.retreating = false; j.pMode = -1;
+				j.manOn = false; j.man = manoeuvre::Mind{}; j.manAt = 0; j.aiOn = false; j.ai = combatai::State{}; j.role = brain::Role::Engager; }
+			if (p == Phase::Idle) { j.resumeFoe=j.lastEnemyActor=j.squadFocus=0; j.exitWaitSince=0; j.order = 0; j.task = 0; j.haveHome = false; }
 			if (p == Phase::Idle && j.vehicle && !j.passenger) {  // the job is over: an escort / pursuit assignment ends with it (other profiles are left alone)
 				vcontract::Unassign(j.vehicle, vcontract::Class::Combat);
 				vcontract::Unassign(j.vehicle, vcontract::Class::Weapons);
@@ -724,7 +767,7 @@ namespace npcvehicles
 		}
 
 		void Leave(Job& j, uptr npc, const char* why);
-		bool ApplyProfile(Job& j, Profile to, uptr player);
+		bool ApplyProfile(Job& j, Profile to, uptr player, bool provokePlayer=true);
 		// escort / pursuit are profiles of the shared table (profiles.cpp); an assignment of one of them decides the job's behaviour.
 
 		bool HasSeatInteraction(uptr npc)
@@ -863,11 +906,12 @@ namespace npcvehicles
 
 		bool SubmitFire(int slot, std::uint32_t vehicleId, bool fire)
 		{
+			if (fire && vehiclehits::Wrecked(vehicleId)) fire = false;  // a wreck's weapon is dead
 			// The one Weapons gate for the player's seat (profileclass "never"): every automatic shot comes through here, and a vehicle the player
 			// drives never fires by itself; the player shoots from it.
 			if (fire) {
 				const uptr player = Ptr(addr::kPlayerCharacterPtr);
-				const uptr driven = player ? EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(player) : 0;
+				const uptr driven = player && VehicleDriverId(vehicleId)==At<std::uint32_t>(player,off::kFormId) ? RefById(vehicleId) : 0;
 				if (!profileclass::MayFire(profileclass::Weapons::Free, driven && At<std::uint32_t>(driven, off::kFormId) == vehicleId)) {
 					static ULONGLONG said = 0;
 					if (GetTickCount64() - said > 10000) { said = GetTickCount64(); logger::Write("NPC vehicles: vehicle %08X weapon refused (the player drives it)", vehicleId); }
@@ -941,7 +985,7 @@ namespace npcvehicles
 			j.aimX = pp.x; j.aimY = pp.y; j.aimZ = pp.z; j.aimAt = now;
 			const double dz = double(pp.z) + kAimHeight - vp.z;
 			const double dist = std::sqrt(std::pow(double(pp.x) - vp.x, 2) + std::pow(double(pp.y) - vp.y, 2) + dz * dz);
-			const double t = dist / kShotSpeed;
+			const double t = vehiclehits::ShotTime(j.vehicle,dist);
 			ax = pp.x + j.aimVx * t;
 			ay = pp.y + j.aimVy * t;
 			az = pp.z + kAimHeight + j.aimVz * t;
@@ -951,7 +995,7 @@ namespace npcvehicles
 		void AttackRun(Job& j, uptr player, uptr vehicle)
 		{
             const auto progress=vehicleflight::ProgressFor(j.vehicle);
-            if(!progress.active || progress.speed>3.0 || progress.distance>12.0)return;
+            if(!progress.active)return;  // (2026-10-21, the proposal: no "nearly stopped" rule; aims while moving)
             double x,y,z;AimPoint(j,player,vehicle,x,y,z);
             const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
             const double heading=At<game::Vec3>(vehicle,off::kRefRotation).z;
@@ -969,12 +1013,106 @@ namespace npcvehicles
 		// the followers, or anyone fighting the driver; with nothing picked it attacks the player (the old behaviour).
 		bool HostileTo(uptr actor, uptr target);
 		bool IsFollower(uptr player, uptr actor);
+		bool PlayerTeam(uptr actor)
+		{
+			const uptr player = Ptr(addr::kPlayerCharacterPtr);
+			if (!actor || !player) return false;
+			if (actor == player || IsFollower(player, actor)) return true;
+			const auto id = At<std::uint32_t>(actor, off::kFormId);
+			for (const auto& j : g_jobs) if (j.phase != Phase::Idle && j.npc == id && (j.gang || j.order)) return true;
+			return false;
+		}
+		int FactionReaction(uptr actor, uptr target)
+		{
+			// GetFactionRelation console/condition wrappers 140C439A0 / 140BEE910 call this exact two-actor function.
+			// 141928140 folds actor relationships, faction reactions and current overrides; 14191F780 treats 2/3 as ally/friend.
+			__try { return EngineFn<int (*)(uptr, uptr)>(0x01927D70)(actor, target); }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+		}
+		using CombatRelation = combatrelations::Relation;
+		struct RelationCache { CombatRelation relation = CombatRelation::Neutral; ULONGLONG until = 0; };
+		std::unordered_map<std::uint64_t, RelationCache> g_relations;
+		CombatRelation CombatRelationOf(uptr a, uptr b)
+		{
+			if (!a || !b) return CombatRelation::Neutral;
+			if (a == b) return CombatRelation::Ally;
+			const auto aid = At<std::uint32_t>(a, off::kFormId), bid = At<std::uint32_t>(b, off::kFormId);
+			const std::uint64_t key = (std::uint64_t(std::min(aid, bid)) << 32) | std::max(aid, bid);
+			const auto now = GetTickCount64();
+			if (auto it = g_relations.find(key); it != g_relations.end() && now < it->second.until) return it->second.relation;
+			const bool protectedPair = PlayerTeam(a) && PlayerTeam(b);
+			const bool hostile = !protectedPair && (HostileTo(a, b) || HostileTo(b, a));
+			const auto relation = protectedPair ? CombatRelation::Ally : hostile ? CombatRelation::Enemy : combatrelations::Classify(false, false, FactionReaction(a, b), FactionReaction(b, a));
+			if (g_relations.size() > 1024) g_relations.clear();
+			g_relations[key] = {relation, now + 500};
+			return relation;
+		}
+		bool FriendlyJobs(const Job& a, const Job& b) { return CombatRelationOf(RefById(a.npc), RefById(b.npc)) == CombatRelation::Ally; }
+		std::uintptr_t SeatKeyword(uptr actor);
+		// Seat proof: the interaction's seat keyword (+0x20) is null or the vehicle's driver-seat keyword. The 2026-10-21 05:20 run showed
+		// the player's driver seat carries a keyword, so "+0x20 == null" alone wrongly called the driver a passenger.
+		bool InDriverSeat(uptr actor)
+		{
+			__try {
+				const uptr extra = At<uptr>(actor, 0xC8);
+				if (!extra || !EngineFn<char (*)(uptr, int)>(0x002C5C90)(extra, 0xA5)) return false;
+				uptr inter = 0;
+				EngineFn<void (*)(uptr, uptr*)>(0x00531E20)(extra, &inter);
+				if (!inter) return false;
+				const uptr seat = At<uptr>(inter, 0x20);
+				if (_InterlockedDecrement(reinterpret_cast<volatile long*>(inter + 8)) == 0)
+					reinterpret_cast<void (*)(uptr, int)>((*reinterpret_cast<void***>(inter))[0])(inter, 1);
+				return !seat || seat == DriverSeatKeyword(InVehicle(actor));
+			} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		std::uintptr_t SeatKeyword(uptr actor)
+		{
+			__try {
+				const uptr extra = At<uptr>(actor, 0xC8);
+				if (!extra || !EngineFn<char (*)(uptr, int)>(0x002C5C90)(extra, 0xA5)) return 0;
+				uptr inter = 0;
+				EngineFn<void (*)(uptr, uptr*)>(0x00531E20)(extra, &inter);
+				if (!inter) return 0;
+				const uptr seat = At<uptr>(inter, 0x20);
+				if (_InterlockedDecrement(reinterpret_cast<volatile long*>(inter + 8)) == 0)
+					reinterpret_cast<void (*)(uptr, int)>((*reinterpret_cast<void***>(inter))[0])(inter, 1);
+				return seat;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+		// The driver test. The player keeps the engine's own rule (the player's vehicle, as every player path reads it), so a seat read
+		// can never take the player's own vehicle away; NPCs need the driver-seat proof.
+		bool Drives(uptr actor, uptr vehicle)
+		{
+			if (!actor || !vehicle || InVehicle(actor) != vehicle) return false;
+			return actor == Ptr(addr::kPlayerCharacterPtr) || InDriverSeat(actor);
+		}
+		std::unordered_map<std::uint32_t,std::uint32_t> g_driverIndex;
+        uptr CombatDriver(uptr vehicle)
+        {
+            if(!vehicle||!IsVehicle(vehicle))return 0;
+            const auto id=At<std::uint32_t>(vehicle,off::kFormId);
+            if(auto it=g_driverIndex.find(id);it!=g_driverIndex.end()) {
+                const auto actor=RefById(it->second);
+                if(actor&&!Dead(actor)&&Drives(actor,vehicle))return actor;
+                g_driverIndex.erase(it);
+            }
+            // A seat may have changed after the frame's index was built.
+            for(const auto& j:g_jobs)if(j.phase!=Phase::Idle&&!j.passenger&&j.vehicle==id) {
+                const auto actor=RefById(j.npc);
+                if(actor&&!Dead(actor)&&Drives(actor,vehicle)) {g_driverIndex[id]=j.npc;return actor;}
+            }
+            const auto player=Ptr(addr::kPlayerCharacterPtr);
+            if(player&&!Dead(player)&&Drives(player,vehicle)) {g_driverIndex[id]=At<std::uint32_t>(player,off::kFormId);return player;}
+            return 0;
+        }
+
+		void CrimeAlarms(uptr victim, uptr vehicle, uptr player, bool assault, bool theft = true);
 		template<class... Args>void FollowerNotice(std::uint32_t id,const char*format,Args...args){
 			const auto player=Ptr(addr::kPlayerCharacterPtr),actor=RefById(id);
 			if(player&&actor&&IsFollower(player,actor))notify::Show(format,args...);
 		}
 
-		struct Aggression {std::uint32_t attacker=0;ULONGLONG until=0,nativeAt=0;};
+		struct Aggression {std::uint32_t attacker=0;ULONGLONG until=0,nativeAt=0;bool crimeRaised=false;};
 		std::unordered_map<std::uint32_t,Aggression> g_aggression;
 		uptr Aggressor(std::uint32_t vehicle,ULONGLONG now) {
 			const auto it=g_aggression.find(vehicle);if(it==g_aggression.end()||now>=it->second.until)return 0;
@@ -1005,7 +1143,7 @@ namespace npcvehicles
 			switch (order) {
 			case CrewOrder::Marker: return "to your marker";
 			case CrewOrder::Hold: return "hold position";
-			case CrewOrder::Recall: return "recall to you";
+			case CrewOrder::Recall: return "summon to you";
 			case CrewOrder::Cover: return "cover you";
 			case CrewOrder::Guard: return "guard the point";
 			default: return "follow you";
@@ -1018,33 +1156,35 @@ namespace npcvehicles
 		bool IsFoe(const Job& j, uptr npc, uptr player, uptr cand)
 		{
 			if (cand == npc || !IsActorRef(cand) || Dead(cand)) return false;
-			if (j.profile == Profile::Escort) {
-				if (cand == player || IsFollower(player, cand)) return false;
-				if (!InCombat(cand)) return false;
-				return HostileTo(cand, player) || HostileTo(cand, npc) || HostileTo(npc, cand);
-			}
-			if (cand == player || IsFollower(player, cand)) return true;
-			return InCombat(cand) && HostileTo(npc, cand) && HostileTo(cand, npc);
+			if (PlayerTeam(npc) && PlayerTeam(cand)) return false;
+			if (CombatRelationOf(npc, cand) == CombatRelation::Ally) return false;
+			const bool hostile = HostileTo(npc, cand) || HostileTo(cand, npc) || (PlayerTeam(npc) && HostileTo(cand, player));
+			return hostile && (InCombat(npc) || InCombat(cand) || (j.profile == Profile::Pursuit && cand == player));
 		}
 
 		// (no __try here: the scan holds a vector)
 		uptr PickFoe(Job& j, uptr npc, uptr vehicle, uptr player, ULONGLONG now)
 		{
 			const bool defend = j.profile == Profile::Escort;
-			if(const auto aggressor=Aggressor(j.vehicle,now);aggressor && aggressor!=npc && InVehicle(aggressor)!=vehicle && Dist3(vehicle,aggressor)<kFoeRange*1.2) {
+			if(const auto aggressor=Aggressor(j.vehicle,now);aggressor && aggressor!=npc && !(PlayerTeam(npc) && PlayerTeam(aggressor)) && InVehicle(aggressor)!=vehicle && Dist3(vehicle,aggressor)<kFoeRange*1.2) {
 				j.foe=At<std::uint32_t>(aggressor,off::kFormId);j.foeAt=now;return aggressor;
 			}
 			if (defend && now < g_recallUntil) {
 				if (j.foe) { logger::Write("NPC vehicles: [%d] recalled: target %08X dropped", j.pilot, j.foe); j.foe = 0; }
 				return 0;
 			}
-			const uptr cur = RefById(j.foe);
+			if(const auto focus=RefById(j.squadFocus);focus&&IsFoe(j,npc,player,focus)&&InVehicle(focus)!=vehicle&&
+                Dist3(vehicle,focus)<kFoeRange*1.2&&(!defend||Dist(focus,player)<kDefendLeash)) {
+                j.foe=At<std::uint32_t>(focus,off::kFormId);j.foeAt=now;return focus;
+            }
+            const uptr cur = RefById(j.foe);
 			const bool curOk = cur && IsFoe(j, npc, player, cur) && Dist3(vehicle, cur) < kFoeRange * 1.2 && (!defend || Dist(cur, player) < kDefendLeash);
 			if (now - j.foeAt < kFoePickMs) return curOk ? cur : 0;
 			j.foeAt = now;
-			uptr best = 0;
-			int bestTier = 9;
-			double bestD = 1e9;
+			uptr best=RefById(NativeEnemyId(npc));
+            if(best&&(!IsFoe(j,npc,player,best)||Dist3(vehicle,best)>kFoeRange||InVehicle(best)==vehicle))best=0;
+            int bestTier=best?(InVehicle(best)?0:1):9;
+			double bestD = best?Dist3(vehicle,best):1e9;
 			if (!defend || InCombat(player) || InCombat(npc)) {
 				for (const uptr r : modscene::LoadedRefs(8000)) {
 					if (!r || r == vehicle || !IsActorRef(r)) continue;
@@ -1059,7 +1199,7 @@ namespace npcvehicles
 					const std::uint32_t rid = At<std::uint32_t>(r, off::kFormId);
 					double score = d;
 					for (const auto& o : g_jobs) {
-						if (&o != &j && o.phase == Phase::Following && o.profile == j.profile && o.foe == rid) score += 25.0;
+						if (&o != &j && o.phase == Phase::Following && FriendlyJobs(j, o) && o.foe == rid) score += 25.0;
 					}
 					if (tier < bestTier || (tier == bestTier && score < bestD)) { best = r; bestTier = tier; bestD = score; }
 				}
@@ -1300,6 +1440,739 @@ namespace npcvehicles
 			return mode;
 		}
 
+		// ---- Vehicle combat AI (2026-10-21, the approved proposal notes/VEHICLE_COMBAT_AI_PROPOSAL_20261021.md, stages 1-4; manoeuvre.h). Replaces the
+		// orbit: steering (carrot, minimum combat speed, separation, zone), manoeuvres (attack run, lag pursuit, break turn, circle, scissors, extend and
+		// re-engage), roles (engage, pincer, overwatch), ram / sideswipe and hiding behind terrain on the way out.
+		// Seamless.ini [combat]: stage= 4 (1-4: the states of stages up to it), zoneEscort= 150, zonePursuit= 400 (m around the player), ram= 1,
+		// boost= 1, breakOff= 30 (percent health), hold= 1500 (ms).
+		// The full AI (notes/VEHICLE_COMBAT_AI_FULL_SPEC_20261021.md, part E): [combat] ai= 1 (0: the staged manoeuvres above), and a switch per part:
+		// steering= dogfight= tactics= squads= morale= personality= (1 on, 0 off).
+		struct CombatIni { double zoneEscort = 150, zonePursuit = 400, breakOff = 0.30; bool ram = true, boost = true; unsigned holdMs = 1500; int stage = 4; bool read = false;
+			bool ai = true; combatai::Switches sw; } g_combatIni;
+		void ReadCombatIni()
+		{
+			if (g_combatIni.read) return;
+			g_combatIni.read = true;
+			PWSTR docs = nullptr;
+			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				CoTaskMemFree(docs);
+				g_combatIni.zoneEscort = GetPrivateProfileIntW(L"combat", L"zoneEscort", 150, ini.c_str());
+				g_combatIni.zonePursuit = GetPrivateProfileIntW(L"combat", L"zonePursuit", 400, ini.c_str());
+				g_combatIni.stage = GetPrivateProfileIntW(L"combat", L"stage", 4, ini.c_str());
+				g_combatIni.ai = GetPrivateProfileIntW(L"combat", L"ai", 1, ini.c_str()) != 0;
+				g_combatIni.sw.steering = GetPrivateProfileIntW(L"combat", L"steering", 1, ini.c_str()) != 0;
+				g_combatIni.sw.dogfight = GetPrivateProfileIntW(L"combat", L"dogfight", 1, ini.c_str()) != 0;
+				g_combatIni.sw.tactics = GetPrivateProfileIntW(L"combat", L"tactics", 1, ini.c_str()) != 0;
+				g_combatIni.sw.squads = GetPrivateProfileIntW(L"combat", L"squads", 1, ini.c_str()) != 0;
+				g_combatIni.sw.morale = GetPrivateProfileIntW(L"combat", L"morale", 1, ini.c_str()) != 0;
+				g_combatIni.sw.personality = GetPrivateProfileIntW(L"combat", L"personality", 1, ini.c_str()) != 0;
+				g_combatIni.ram = GetPrivateProfileIntW(L"combat", L"ram", 1, ini.c_str()) != 0;
+				g_combatIni.boost = GetPrivateProfileIntW(L"combat", L"boost", 1, ini.c_str()) != 0;
+				g_combatIni.breakOff = GetPrivateProfileIntW(L"combat", L"breakOff", 30, ini.c_str()) / 100.0;
+				g_combatIni.holdMs = GetPrivateProfileIntW(L"combat", L"hold", 1500, ini.c_str());
+			}
+			g_combatIni.zoneEscort = std::clamp(g_combatIni.zoneEscort, 40.0, 1000.0);
+			g_combatIni.zonePursuit = std::clamp(g_combatIni.zonePursuit, 40.0, 1000.0);
+			g_combatIni.breakOff = std::clamp(g_combatIni.breakOff, 0.0, 0.9);
+			g_combatIni.holdMs = std::clamp(g_combatIni.holdMs, 300u, 10000u);
+			g_combatIni.stage = std::clamp(g_combatIni.stage, 1, 4);
+			logger::Write("NPC vehicles: combat AI stage %d: fight zone %.0f m (escorts) / %.0f m (pursuers) around you, ram %s, boost %s, break off under %.0f%%, states held %u ms",
+				g_combatIni.stage, g_combatIni.zoneEscort, g_combatIni.zonePursuit, g_combatIni.ram ? "on" : "off", g_combatIni.boost ? "on" : "off", g_combatIni.breakOff * 100.0,
+				g_combatIni.holdMs);
+			const auto& w = g_combatIni.sw;
+			logger::Write("NPC vehicles: full combat AI %s: steering %d, dogfight %d, tactics %d, squads %d, morale %d, personality %d", g_combatIni.ai ? "ON" : "off (staged manoeuvres)",
+				w.steering, w.dogfight, w.tactics, w.squads, w.morale, w.personality);
+		}
+
+		// One frame of the manoeuvre fight: sets the goal (a cruise carrot) and sends the nose / throttle / strafe commands. pursuer: the 250 m zone;
+		// aggressive (the attack profile): may ram. False only while a ram it ordered takes the pilot.
+		bool ManoeuvreTick(Job& j, uptr foe, uptr aimRef, bool foeInVeh, uptr vehicle, uptr player, bool pursuer, bool aggressive, bool mayAim,
+			ULONGLONG now, vcontract::Goal& g)
+		{
+			ReadCombatIni();
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			const auto vr = At<game::Vec3>(vehicle, off::kRefRotation);
+			const auto fp = At<game::Vec3>(aimRef, off::kRefPosition);
+			const auto fr = At<game::Vec3>(aimRef, off::kRefRotation);
+			const std::uint32_t foeId = At<std::uint32_t>(aimRef, off::kFormId);
+			if (j.manFoe != foeId || !j.manAt || now <= j.manAt || now - j.manAt > 1000) {
+				j.manMvx = j.manMvy = j.manFvx = j.manFvy = 0;
+			}
+			else {
+				const double dt = (now - j.manAt) / 1000.0, a = std::min(1.0, dt * 4.0);
+				const auto smooth = [&](double& v, double cur, double was) { const double inst = (cur - was) / dt; if (std::fabs(inst) < 150.0) v += (inst - v) * a; };
+				smooth(j.manMvx, vp.x, j.manMx); smooth(j.manMvy, vp.y, j.manMy);
+				smooth(j.manFvx, fp.x, j.manFx); smooth(j.manFvy, fp.y, j.manFy);
+			}
+			j.manMx = vp.x; j.manMy = vp.y; j.manFx = fp.x; j.manFy = fp.y; j.manAt = now; j.manFoe = foeId;
+			manoeuvre::Input in;
+			in.me = manoeuvre::Body{ vp.x, vp.y, vp.z, j.manMvx, j.manMvy, vr.z };
+			in.foe = manoeuvre::Body{ fp.x, fp.y, fp.z, j.manFvx, j.manFvy, fr.z };
+			in.foeInVehicle = foeInVeh;
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			in.anchorX = pp.x; in.anchorY = pp.y;
+			in.myHealth = vehiclehits::HealthShare(j.vehicle);
+			if (foeInVeh) in.foeHealth = vehiclehits::HealthShare(foeId);
+			else { float hn = 0, hm = 0; if (vehiclehits::ActorHealth(foe, hn, hm)) in.foeHealth = hn / hm; }
+			const auto lastHit = vehiclehits::LastHitMs(j.vehicle);
+			in.hitRecently = lastHit && now - lastHit < manoeuvre::kHitMs;
+			int same = j.manOn ? 0 : 1, rank = 0;
+			for (const auto& o : g_jobs) {
+				if (o.phase != Phase::Following || !o.manOn || o.foe != j.foe || !FriendlyJobs(j, o)) continue;
+				++same;
+				if (o.pilot < j.pilot) ++rank;
+			}
+			in.sameSide = std::max(1, same);
+			in.rank = rank;
+			// Enemy vehicles on me: jobs fighting this NPC (pursuers on an escort, escorts on a pursuer).
+			int onMe = 0;
+			for (const auto& o : g_jobs) if (o.phase == Phase::Following && o.manOn && o.foe == j.npc) ++onMe;
+			in.enemiesOnMe = std::max(1, onMe);
+			// Separation: the other vehicles within 30 m (the enemy's own vehicle too, unless ramming or sideswiping it).
+			static world::Snapshot snap;
+			if (world::Vehicles(snap)) {
+				for (std::uint32_t k = 0; k < snap.count && k < 64 && in.others < manoeuvre::kMaxOthers; ++k) {
+					const auto& v = snap.v[k];
+					if (v.formId == j.vehicle) continue;
+					if (v.formId == foeId && (j.man.state == manoeuvre::State::Ram || j.man.state == manoeuvre::State::Sideswipe)) continue;
+					if (std::hypot(double(v.pos[0]) - vp.x, double(v.pos[1]) - vp.y) > 30.0) continue;
+					in.otherX[in.others] = v.pos[0]; in.otherY[in.others] = v.pos[1]; ++in.others;
+				}
+			}
+			in.hover = true;  // every job vehicle flies (NPC rover hover)
+			in.ramming = vehicleflight::Ramming(j.vehicle);
+			in.now = now;
+			manoeuvre::Settings set;
+			set.zone = pursuer ? g_combatIni.zonePursuit : g_combatIni.zoneEscort;
+			set.allowRam = g_combatIni.ram && aggressive && foeInVeh;
+			set.breakOff = g_combatIni.breakOff;
+			set.holdMs = g_combatIni.holdMs;
+			set.speedScale = g_combatIni.boost ? 1.0 : 0.7;
+			set.stage = g_combatIni.stage;
+			const char* why = "";
+			const auto want = manoeuvre::Choose(in, j.man, set, &why);
+			if (manoeuvre::Enter(j.man, want, in)) {
+				// Stage 4: the way out (extend, break off) goes behind terrain when a direction hides it from the enemy (nav map line of sight).
+				bool hidden = false;
+				if (set.stage >= 4 && (want == manoeuvre::State::Extend || want == manoeuvre::State::BreakOff)) {
+					double dirs[5][2];
+					const int n = manoeuvre::HideCandidates(j.man, dirs);
+					const double out = std::min(j.man.extendOut, 120.0);
+					const float eye[3] = { fp.x, fp.y, fp.z + 1.5f };
+					for (int i = 0; i < n && !hidden; ++i) {
+						const float to[3] = { float(vp.x + dirs[i][0] * out), float(vp.y + dirs[i][1] * out), vp.z + 1.0f };
+						if (environment::LineBlocked(eye, to)) { manoeuvre::Hide(j.man, dirs[i][0], dirs[i][1]); hidden = true; }
+					}
+				}
+				const double behind = std::fabs(manoeuvre::Wrap(std::atan2(double(fp.x) - vp.x, double(fp.y) - vp.y) - vr.z)) > 1.57 ? 1.0 : 0.0;
+				logger::Write("NPC vehicles: [%d] %s: %s; enemy %08X %.0f m %s (health %.0f%%, its %.0f%%%s)", j.pilot, manoeuvre::Name(want), why, foeId,
+					std::hypot(double(fp.x) - vp.x, double(fp.y) - vp.y), behind > 0 ? "behind" : "ahead", in.myHealth * 100.0,
+					std::isnan(in.foeHealth) ? -1.0 : in.foeHealth * 100.0, hidden ? "; out behind terrain" : "");
+			}
+			j.manOn = true;
+			auto plan = manoeuvre::Steer(in, j.man, set);
+			if (plan.ram) {
+				if (in.ramming || vehicleflight::OrderRam(j.pilot, vehicle, foe)) return false;  // the ram owns the pilot
+				j.man.lastRam = now;  // refused (another ram runs, or the vehicle is disabled): extend and come back with an attack run
+				manoeuvre::Enter(j.man, manoeuvre::State::Extend, in);
+				plan = manoeuvre::Steer(in, j.man, set);
+			}
+			g.x = plan.x; g.y = plan.y; g.z = plan.z;
+			g.stop = plan.hold ? 3.0 : 0.0; g.hold = plan.hold; g.cruise = !plan.hold; g.cruiseSpeed = plan.speed;
+			vehicleflight::Command c;
+			c.set = 0;
+			if (plan.aim && mayAim) {
+				const double t = vehiclehits::ShotTime(j.vehicle,Dist3(vehicle,aimRef));
+				const double ax = fp.x + j.manFvx * t, ay = fp.y + j.manFvy * t, az = fp.z + (foeInVeh ? 1.0 : kAimHeight);
+				c.set |= vehicleflight::Command::kYaw | vehicleflight::Command::kPitch;
+				c.yawRate = std::clamp(2.5 * WrapAngle(std::atan2(ax - vp.x, ay - vp.y) - vr.z), -1.6, 1.6);
+				c.pitch = std::clamp(std::atan2(az - vp.z, std::max(5.0, std::hypot(ax - vp.x, ay - vp.y))), -0.6, 0.6);
+				if (!std::isnan(plan.throttle)) { c.set |= vehicleflight::Command::kThrottle | vehicleflight::Command::kGear; c.throttle = plan.throttle; c.gear = 2; }
+				if (!std::isnan(plan.strafe)) { c.set |= vehicleflight::Command::kStrafe; c.strafe = plan.strafe; }
+			}
+			if (!std::isnan(plan.vertical)) { c.set |= vehicleflight::Command::kVertical; c.vertical = plan.vertical; }
+			c.holdMs=100; vehicleflight::PilotCommand(j.pilot,c);
+			return true;
+		}
+
+		// ---- The full combat AI: engine glue (combat_ai.h does the thinking) ----
+		// The world as the steering sees it: the nav map (rays, terrain, object boxes) and its line of sight.
+		struct NavWorld : steer::World
+		{
+			bool Blocked(const steer::V3& a, const steer::V3& b) const override
+			{
+				const float f[3] = { float(a.x), float(a.y), float(a.z) }, t[3] = { float(b.x), float(b.y), float(b.z) };
+				return environment::LineBlocked(f, t);
+			}
+			bool Solid(const steer::V3& p) const override
+			{
+				const auto m = navmap::At(p.x, p.y, p.z);
+				return m.known && (m.blocked || (m.objBlocked && !m.objOverruled));
+			}
+			double Ground(double x, double y) const override
+			{
+				const auto m = navmap::At(x, y, 0.0);
+				return m.haveGround ? double(m.ground) : std::numeric_limits<double>::quiet_NaN();
+			}
+		};
+		bool InFaction(uptr actor, uptr faction);
+		// Personality from the driver's factions: their editor ids, found once in the data handler's faction list (type 0x0D at +0x78 + type * 0x18,
+		// the layout realvehicles found for vehicle forms). Crimson Fleet / pirates / spacers / Ecliptic: reckless; UC security / SysDef / Vanguard,
+		// Freestar / Rangers: disciplined; settlers / farmers / civilians: civilian. Editor ids may be stripped in the release build: then everyone is
+		// the default temper (logged once).
+		struct FactionSet { std::vector<uptr> reckless, disciplined, civilian; bool read = false; } g_factions;
+		const char* FormEditorId(uptr form)
+		{
+			__try {
+				auto** vt = *reinterpret_cast<void***>(form);
+				return reinterpret_cast<const char* (*)(uptr)>(vt[0x4D])(form);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return nullptr;
+			}
+		}
+		bool FactionList(uptr*& data, std::uint32_t& size)
+		{
+			__try {
+				const uptr dh = Ptr(addr::kDataHandlerPtr);
+				if (!dh) return false;
+				const uptr fa = dh + 0x78 + 0x0D * 0x18;
+				size = At<std::uint32_t>(fa, 8);
+				data = At<uptr*>(fa, 16);
+				return data && size && size < 20000;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
+		void ReadFactions()
+		{
+			if (g_factions.read) return;
+			g_factions.read = true;
+			uptr* data = nullptr;
+			std::uint32_t size = 0;
+			unsigned named = 0;
+            unsigned builtins=0;
+            auto add=[](std::vector<uptr>&list,uptr f){if(std::find(list.begin(),list.end(),f)==list.end())list.push_back(f);};
+            for(const auto&known:nativepersonality::factions) {
+                const auto f=RefById(known.id);if(!f||At<std::uint8_t>(f,0x2E)!=0x0D)continue;
+                auto&list=known.temper==brain::Temper::Reckless?g_factions.reckless:known.temper==brain::Temper::Disciplined?g_factions.disciplined:g_factions.civilian;
+                add(list,f);++builtins;
+            }
+			if (FactionList(data, size)) {
+				for (std::uint32_t i = 0; i < size; ++i) {
+					const uptr f = data[i];
+					if (!f || At<std::uint8_t>(f, 0x2E) != 0x0D) continue;
+					const char* id = FormEditorId(f);
+					if (!id || !id[0]) continue;
+					++named;
+					std::string low(id);
+					for (auto& ch : low) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+					auto has = [&](const char* k) { return low.find(k) != std::string::npos; };
+					if (has("crimson") || has("pirate") || has("spacer") || has("ecliptic") || has("scavenger")) add(g_factions.reckless,f);
+					else if (has("ucsecurity") || has("ucsysdef") || has("sysdef") || has("vanguard") || has("freestar") || has("ranger") || has("ucmarine")) add(g_factions.disciplined,f);
+					else if (has("civilian") || has("settler") || has("farmer") || has("colonist")) add(g_factions.civilian,f);
+				}
+			}
+			logger::Write("NPC vehicles: personality factions: %u loaded, %u named, %u native master identities; reckless %zu, disciplined %zu, civilian %zu%s", size, named,builtins,
+				g_factions.reckless.size(), g_factions.disciplined.size(), g_factions.civilian.size(), builtins||named ? "" : " (native faction data unavailable; default temper)");
+		}
+		std::unordered_map<std::uint32_t,brain::Temper> g_temperCache;
+        brain::Temper TemperOf(uptr npc)
+		{
+			auto& cache=g_temperCache;
+			if (!npc) return brain::Temper::Default;
+			const std::uint32_t id = At<std::uint32_t>(npc, off::kFormId);
+			const auto it = cache.find(id);
+			if (it != cache.end()) return it->second;
+			ReadFactions();
+			brain::Temper t = brain::Temper::Default;
+			for (const uptr f : g_factions.reckless) if (t == brain::Temper::Default && InFaction(npc, f)) t = brain::Temper::Reckless;
+			for (const uptr f : g_factions.disciplined) if (t == brain::Temper::Default && InFaction(npc, f)) t = brain::Temper::Disciplined;
+			for (const uptr f : g_factions.civilian) if (t == brain::Temper::Default && InFaction(npc, f)) t = brain::Temper::Civilian;
+			if (cache.size() > 512) cache.clear();
+			cache[id] = t;
+			return t;
+		}
+		// The game's difficulty: the setting uDifficulty:GamePlay (initialiser FUN_1401C5F20, its value at DAT_145F468B0), native byte index 0..6 (AI tuning still caps at 4).
+		int Difficulty()
+		{
+			static int logged = -2;
+			int d = 2;
+			__try {
+				d = int(*reinterpret_cast<std::uint8_t*>(game::Base() + 0x05F468B0));
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				d = 2;
+			}
+			if (d < 0 || d > 6) d = 2;
+			if (d != logged) { logged = d; logger::Write("NPC vehicles: game difficulty native index %d (0..6; AI tuning caps at 4)", d); }
+			return std::clamp(d, 0, 4);
+		}
+		// Native-relation squads, one slot per possible job. A complete-link partition cannot merge two enemies through a shared ally.
+		struct SideState { brain::Squad squad; std::uint32_t members[8] = {}; int count = 0; std::uint32_t leader = 0; bool wrecked[8] = {}; brain::SquadTactic tactic = brain::SquadTactic::Solo; } g_sides[kJobs];
+		int SideOf(const Job& j) { return j.squad; }
+		struct CombatVehicle { world::VehicleInfo vehicle; std::uint32_t driver = 0; };
+		CombatVehicle g_combatVehicles[64];
+		int g_combatVehicleCount = 0;
+		ULONGLONG g_squadRefreshAt = 0;
+		double g_aiUs = 0, g_aiMaxUs = 0;
+		unsigned g_aiFrames = 0;
+		ULONGLONG g_aiLogAt = 0;
+		void RefreshSquads(ULONGLONG now)
+		{
+			if (g_squadRefreshAt && now - g_squadRefreshAt < 500) return;
+			g_squadRefreshAt = now;
+			int active[kJobs] = {}, n = 0;
+			for (int i = 0; i < kJobs; ++i) { g_jobs[i].squad = -1; if (g_jobs[i].phase == Phase::Following && g_jobs[i].aiOn) active[n++] = i; }
+			std::sort(active, active + n, [](int a, int b) { return g_jobs[a].npc < g_jobs[b].npc; });
+			CombatRelation relations[kJobs][kJobs] = {};
+			int groups[kJobs] = {};
+			for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) relations[i][j] = i == j ? CombatRelation::Ally : CombatRelationOf(RefById(g_jobs[active[i]].npc), RefById(g_jobs[active[j]].npc));
+			const int count = combatrelations::Partition(n, relations, groups);
+			SideState previous[kJobs];
+			for (int i = 0; i < kJobs; ++i) previous[i] = g_sides[i];
+			bool used[kJobs] = {};
+			for (int g = 0; g < count; ++g) {
+				int old = -1, overlap = 0;
+				for (int k = 0; k < kJobs; ++k) if (!used[k]) {
+					int matches = 0;
+					for (int i = 0; i < n; ++i) if (groups[i] == g) for (int m = 0; m < previous[k].count; ++m) if (previous[k].members[m] == g_jobs[active[i]].vehicle) ++matches;
+					if (matches > overlap) { old = k; overlap = matches; }
+				}
+				g_sides[g] = old >= 0 ? previous[old] : SideState{};
+				if (old >= 0) used[old] = true;
+				// Do not carry another faction's shared target memory when a relationship has changed.
+				int members = 0; for (int i = 0; i < n; ++i) if (groups[i] == g) ++members;
+				bool changed = members != g_sides[g].count;
+				for (int i = 0; i < n; ++i) if (groups[i] == g) {
+					bool was = false; for (int m = 0; m < g_sides[g].count; ++m) was = was || g_sides[g].members[m] == g_jobs[active[i]].vehicle;
+					changed = changed || !was; g_jobs[active[i]].squad = g;
+				}
+				if (changed) {
+					g_sides[g].squad.memory = {}; g_sides[g].squad.assignedAt = 0;
+					for (int i = 0; i < n; ++i) if (groups[i] == g) { auto& job = g_jobs[active[i]]; job.squadFocus=0; job.ai.mem = {}; job.role = brain::Role::Engager; job.roleSlot = 0; job.coverFor = 0; }
+				}
+				// A truce may change an enemy without changing squad membership. Remove those loaded tracks before memory is merged again.
+				for (int i = 0; i < n; ++i) if (groups[i] == g) {
+					const auto npc = RefById(g_jobs[active[i]].npc);
+					auto prune = [&](brain::Memory& memory) {
+						for (auto& track : memory.t) if (track.id) {
+							const auto target = RefById(track.id); if (!target) continue;
+							const auto actor = IsActorRef(target) ? target : IsVehicle(target) ? CombatDriver(target) : 0;
+							if (actor && CombatRelationOf(npc, actor) != CombatRelation::Enemy) track = {};
+						}
+					};
+					prune(g_jobs[active[i]].ai.mem); prune(g_sides[g].squad.memory);
+				}
+			}
+			for (int g = count; g < kJobs; ++g) g_sides[g] = {};
+			for (auto& job : g_jobs) if (job.squad < 0) { job.squadFocus=0; job.role = brain::Role::Engager; job.coverFor = 0; job.roleSlot = 0; }
+			// Include every occupied hostile vehicle, even before its first shot and even when it has no mod job. Treat unknown weapon capability conservatively.
+			static world::Snapshot snap;
+			g_combatVehicleCount = 0;
+			if (!world::Vehicles(snap)) return;
+			for (std::uint32_t i = 0; i < snap.count && i < 64; ++i) g_combatVehicles[g_combatVehicleCount++] = {snap.v[i], 0};
+            for(int i=0;i<g_combatVehicleCount;++i)
+                g_combatVehicles[i].driver=VehicleDriverId(g_combatVehicles[i].vehicle.formId);
+		}
+		void SquadTick(ULONGLONG now)
+		{
+			if (!g_combatIni.read) return;
+			RefreshSquads(now);
+			for (auto& j : g_jobs) {
+				for (bool& e : j.sideEvents) e = false;
+				j.reinforced = false;
+			}
+			for (int side = 0; side < kJobs; ++side) {
+				SideState& ss = g_sides[side];
+				brain::Squad& sq = ss.squad;
+				// This frame's members: the jobs of the side flown by the AI last frame.
+				std::uint32_t ids[8] = {};
+				int n = 0;
+				for (const auto& j : g_jobs) if (j.phase == Phase::Following && j.aiOn && SideOf(j) == side && n < 8) ids[n++] = j.vehicle;
+				// Events: a member gone wrecked, a member's job gone (its driver dead or out), the leader among them; more members = reinforcements.
+				bool allyWrecked = false, driverLost = false, leaderLost = false;
+				for (int i = 0; i < ss.count; ++i) {
+					bool still = false;
+					for (int k = 0; k < n; ++k) still = still || ids[k] == ss.members[i];
+					const bool wreck = vehiclehits::Wrecked(ss.members[i]);
+					if (wreck && !ss.wrecked[i]) { allyWrecked = true; if (ss.members[i] == ss.leader) leaderLost = true; }
+					if (!still && !wreck) { driverLost = true; if (ss.members[i] == ss.leader) leaderLost = true; }
+				}
+				const bool reinforced = ss.count && n > ss.count;
+				if (allyWrecked || driverLost || leaderLost || reinforced) {
+					for (auto& j : g_jobs) {
+						if (j.phase != Phase::Following || SideOf(j) != side) continue;
+						j.sideEvents[0] = allyWrecked; j.sideEvents[1] = driverLost; j.sideEvents[2] = leaderLost; j.reinforced = reinforced;
+					}
+					logger::Write("NPC vehicles: squad %d: %s%s%s%s", side + 1, allyWrecked ? "an ally wrecked; " : "", driverLost ? "an ally's driver lost; " : "",
+						leaderLost ? "the leader lost; " : "", reinforced ? "reinforcements" : "");
+				}
+				ss.count = n;
+				for (int i = 0; i < n; ++i) { ss.members[i] = ids[i]; ss.wrecked[i] = vehiclehits::Wrecked(ids[i]); }
+				if (!n) { ss.leader = 0; sq.count = 0; continue; }
+				bool leaderIn = false;
+				for (int i = 0; i < n; ++i) leaderIn = leaderIn || ids[i] == ss.leader;
+				if (!leaderIn) ss.leader = ids[0];
+				// The squad brain's input: members and the enemies they fight.
+				sq.count = 0;
+				brain::Enemy enemies[8];
+				int en = 0;
+				sq.convoy = false;
+				for (auto& j : g_jobs) {
+					if (j.phase != Phase::Following || !j.aiOn || SideOf(j) != side || sq.count >= brain::Squad::kMax) continue;
+					const uptr veh = RefById(j.vehicle);
+					if (!veh) continue;
+					brain::Member& m = sq.m[sq.count++];
+					const auto p = At<game::Vec3>(veh, off::kRefPosition);
+					m.id = j.vehicle; m.pos = { p.x, p.y, p.z }; m.vel = { j.manMvx, j.manMvy, 0 }; m.health = vehiclehits::HealthShare(j.vehicle);
+					m.morale = j.ai.moraleInit ? j.ai.morale.value : 0.6; m.role = j.role; m.slot=j.roleSlot; m.coverFor=j.coverFor;
+					sq.convoy = sq.convoy || j.lead != 0;
+					sq.memory.Merge(j.ai.mem);
+					const uptr foe = RefById(j.foe);
+					if (!foe || en >= 8) continue;
+					const uptr fv = InVehicle(foe);
+					const uptr aim = fv ? fv : foe;
+					const std::uint32_t aid = At<std::uint32_t>(aim, off::kFormId);
+					bool dup = false;
+					for (int e = 0; e < en; ++e) dup = dup || enemies[e].id == aid;
+					if (dup) continue;
+					const auto fp = At<game::Vec3>(aim, off::kRefPosition);
+					enemies[en].id = aid; enemies[en].pos = { fp.x, fp.y, fp.z }; enemies[en].vel = { j.manFvx, j.manFvy, 0 };
+					float hn = 0, hm = 0;
+					enemies[en].health = fv ? vehiclehits::HealthShare(aid) : (vehiclehits::ActorHealth(foe, hn, hm) ? hn / hm : 1.0);
+					++en;
+				}
+				// Native hostile drivers in the world snapshot supplement the selected targets (not only g_jobs).
+				for (int k = 0; k < g_combatVehicleCount && en < 8; ++k) {
+					const auto& cv = g_combatVehicles[k]; const auto& v = cv.vehicle;
+					if (!cv.driver || vehiclehits::Wrecked(v.formId)) continue;
+					bool hostile = false, friendly = false, nearby = false;
+					const auto driver = RefById(cv.driver); if (!driver) continue;
+					for (const auto& j : g_jobs) if (j.phase == Phase::Following && j.aiOn && SideOf(j) == side) {
+						const auto npc = RefById(j.npc), veh = RefById(j.vehicle); if (!npc || !veh) continue;
+						const auto relation = CombatRelationOf(npc, driver); hostile = hostile || relation == CombatRelation::Enemy; friendly = friendly || relation == CombatRelation::Ally;
+						const auto mp = At<game::Vec3>(veh, off::kRefPosition); nearby = nearby || std::hypot(double(v.pos[0]) - mp.x, double(v.pos[1]) - mp.y) < 400.0;
+					}
+					if (!hostile || friendly || !nearby) continue;
+					bool duplicate = false; for (int e = 0; e < en; ++e) duplicate = duplicate || enemies[e].id == v.formId;
+					if (!duplicate) { auto& e = enemies[en++]; e.id = v.formId; e.pos = {v.pos[0], v.pos[1], v.pos[2]}; e.vel = {v.vel[0], v.vel[1], v.vel[2]}; e.health = vehiclehits::HealthShare(v.formId); }
+				}
+				if (!g_combatIni.sw.squads) continue;
+				const brain::SquadTactic before = sq.tactic;
+				brain::Assign(sq, enemies, en, now);
+                {
+					for (int i = 0; i < sq.count; ++i) {
+						for (auto& j : g_jobs) {
+							if (j.vehicle != sq.m[i].id || j.phase != Phase::Following) continue;
+							if (j.role != sq.m[i].role) logger::Write("NPC vehicles: [%d] squad role: %s -> %s (%s, %d vehicles)", j.pilot, brain::Name(j.role), brain::Name(sq.m[i].role),
+								brain::Name(sq.tactic), sq.count);
+							j.role = sq.m[i].role; j.roleSlot = sq.m[i].slot; j.coverFor = sq.m[i].coverFor;
+                            const auto focus=RefById(sq.focus);
+                            const auto actor=focus?(IsActorRef(focus)?focus:CombatDriver(focus)):0;
+                            j.squadFocus=actor?At<std::uint32_t>(actor,off::kFormId):0;
+						}
+					}
+				}
+				if (sq.tactic != before) logger::Write("NPC vehicles: squad %d tactic: %s -> %s (%d vehicles, %d enemies)", side + 1, brain::Name(before),
+					brain::Name(sq.tactic), sq.count, en);
+				// The shared memory back to every member.
+				for (auto& j : g_jobs) if (j.phase == Phase::Following && j.aiOn && SideOf(j) == side) j.ai.mem.Merge(sq.memory);
+			}
+		}
+		// Rams: two vehicles touching while one closes on the other at 4 m/s or more: tactics::RamDamage to both (through vehiclehits), the rammed
+		// job vehicle loses control for a moment (stunned: pushed along the hit, PIT: spinning). Only in fights (a job flown by the AI involved).
+		combatrelations::PairCooldown<128> g_ramPairs;
+        world::Snapshot g_ramPrevious; ULONGLONG g_ramPreviousAt=0;
+        struct PendingImpact { std::uint32_t a=0,b=0; ULONGLONG at=0; double closing=0,ux=0,uy=0; float av[3]{},bv[3]{}; } g_pendingImpacts[128];
+        integrationlogic::Box HullBox(const world::VehicleInfo& v) {
+            integrationlogic::Box b;for(int k=0;k<3;++k){b.p[k]=v.center[k];b.half[k]=v.half[k];for(int j=0;j<3;++j)b.axis[k][j]=v.rot[k*3+j];}return b;
+        }
+		void RamTick(ULONGLONG now)
+		{
+			ReadCombatIni();
+			if (!g_combatIni.sw.tactics) return;
+			static world::Snapshot snap;
+			if (!world::Vehicles(snap)) return;
+            const double dt=g_ramPreviousAt&&now>=g_ramPreviousAt?double(now-g_ramPreviousAt)/1000.0:0;
+            auto previous=[&](std::uint32_t id)->const world::VehicleInfo*{for(unsigned k=0;k<g_ramPrevious.count&&k<64;++k)if(g_ramPrevious.v[k].formId==id)return &g_ramPrevious.v[k];return nullptr;};
+            for (std::uint32_t x = 0; x < snap.count && x < 64; ++x) {
+				for (std::uint32_t y = x + 1; y < snap.count && y < 64; ++y) {
+					const auto& A = snap.v[x];
+					const auto& B = snap.v[y];
+                    const double dx=double(B.center[0])-A.center[0],dy=double(B.center[1])-A.center[1],d=std::hypot(dx,dy);
+                    if(!std::isfinite(d)||d<0.01)continue;
+                    const double ra=std::hypot(A.half[0],A.half[1]),rb=std::hypot(B.half[0],B.half[1]);
+                    PendingImpact* pending=nullptr; PendingImpact* oldest=&g_pendingImpacts[0];
+                    for(auto& impact:g_pendingImpacts) {
+                        if(impact.a==A.formId&&impact.b==B.formId&&now>=impact.at&&now-impact.at<=250)pending=&impact;
+                        if(impact.at<oldest->at)oldest=&impact;
+                    }
+                    const auto beforeA=previous(A.formId),beforeB=previous(B.formId);
+                    if(!pending) {
+                        if(!beforeA||!beforeB||dt<=0||dt>0.2)continue;
+                        const double travel=std::hypot(double(A.center[0])-beforeA->center[0],double(A.center[1])-beforeA->center[1])+std::hypot(double(B.center[0])-beforeB->center[0],double(B.center[1])-beforeB->center[1]);
+                        if(d>ra+rb+travel+0.1)continue;
+                        const auto ab=HullBox(A),bb=HullBox(B);
+                        if(!integrationlogic::Touching(ab,bb)&&!integrationlogic::SweptTouch(ab,bb,HullBox(*beforeA),HullBox(*beforeB),dt))continue;
+                        double ux=double(beforeB->center[0])-beforeA->center[0],uy=double(beforeB->center[1])-beforeA->center[1];const double length=std::hypot(ux,uy);
+                        if(length<0.01)continue;ux/=length;uy/=length;
+                        const double closing=(double(beforeA->vel[0])-beforeB->vel[0])*ux+(double(beforeA->vel[1])-beforeB->vel[1])*uy;
+                        if(closing<4.0||!std::isfinite(closing))continue;
+                        *oldest={A.formId,B.formId,now,closing,ux,uy};pending=oldest;
+                        std::copy(beforeA->vel,beforeA->vel+3,pending->av);std::copy(beforeB->vel,beforeB->vel+3,pending->bv);
+                    }
+                    const double ux=pending->ux,uy=pending->uy,closing=pending->closing;
+                    const double afterClosing=(double(A.vel[0])-B.vel[0])*ux+(double(A.vel[1])-B.vel[1])*uy;
+                    const bool nativeImpact=vehicleflight::ImpactSince(A.formId,pending->at>100?pending->at-100:0)||vehicleflight::ImpactSince(B.formId,pending->at>100?pending->at-100:0);
+                    if(!integrationlogic::Impact(closing,afterClosing,nativeImpact))continue;
+                    if(!g_ramPairs.Claim(A.formId,B.formId,now))continue;
+                    const double aInto=pending->av[0]*ux+pending->av[1]*uy,bInto=-(pending->bv[0]*ux+pending->bv[1]*uy);
+                    auto R=aInto>=bInto?A:B; auto V=aInto>=bInto?B:A;
+                    const float* rv=aInto>=bInto?pending->av:pending->bv;const float* vv=aInto>=bInto?pending->bv:pending->av;
+                    std::copy(rv,rv+3,R.vel);std::copy(vv,vv+3,V.vel);
+                    pending->at=0;
+
+					tactics::Unit ru, vu;
+					ru.body.pos = { R.pos[0], R.pos[1], R.pos[2] }; ru.body.vel = { R.vel[0], R.vel[1], R.vel[2] }; ru.body.heading = R.heading; ru.body.radius = aInto >= bInto ? ra : rb;
+					vu.body.pos = { V.pos[0], V.pos[1], V.pos[2] }; vu.body.vel = { V.vel[0], V.vel[1], V.vel[2] }; vu.body.heading = V.heading; vu.body.radius = aInto >= bInto ? rb : ra;
+					const auto kind = tactics::ClassifyRam(ru, vu);
+					auto res = tactics::RamDamage(closing, kind == tactics::RamKind::None ? tactics::RamKind::HeadOn : kind, R.mass, V.mass);
+					if (res.damageIt <= 0.0) continue;
+					// One ram never takes more than ramCap of a vehicle's own max health (every vehicle has the configured health).
+					const double maxHealth = vehiclehits::MaxHealth();
+					double rawIt = 0, rawMe = 0;
+					const bool capped = tactics::CapRam(res, maxHealth, maxHealth, vehiclehits::RamCap(), &rawIt, &rawMe);
+					const uptr rammerVehicle = RefById(R.formId), victimVehicle = RefById(V.formId);
+					const uptr rammer = CombatDriver(rammerVehicle), victim = CombatDriver(victimVehicle), player = Ptr(addr::kPlayerCharacterPtr);
+					// Neutrality must be sampled before StartCombat changes it; a ram raises assault, never a theft alarm.
+					const bool protectedVictim = victim && PlayerTeam(victim);
+					const bool hostileBefore = victim && player && (HostileTo(victim, player) || HostileTo(player, victim) || FactionReaction(victim, player) == 1);
+					const auto policy = combatrelations::RamConsequences(closing, rammer != 0, victim != 0, rammer && rammer == player, protectedVictim, hostileBefore);
+					if (policy.assault) CrimeAlarms(victim, victimVehicle, player, true, false);
+					if (policy.attack && victimVehicle && !VehicleFriendlyToShooter(victimVehicle, At<std::uint32_t>(rammer, off::kFormId)))
+						VehicleAggression(victimVehicle, At<std::uint32_t>(rammer, off::kFormId),false);
+					if (policy.witness) WitnessCrash((double(R.pos[0]) + V.pos[0]) * 0.5, (double(R.pos[1]) + V.pos[1]) * 0.5, (double(R.pos[2]) + V.pos[2]) * 0.5, "hard vehicle ram");
+					const int side = rammer && PlayerTeam(rammer) ? 1 : 0;
+					vehiclehits::ApplyDamage(V.formId, float(res.damageIt), R.formId, side, "a ram");
+					vehiclehits::ApplyDamage(R.formId, float(res.damageMe), V.formId, 0, "its own ram");
+					static const char* const kinds[] = { "bump", "T-bone", "head-on", "rear", "PIT" };
+					char cap[64] = "";
+					if (capped) std::snprintf(cap, sizeof(cap), " (capped from %.0f / %.0f)", rawIt, rawMe);
+					logger::Write("NPC vehicles: ram: %08X -> %08X, %s at %.0f m/s: %.0f / %.0f damage%s, %08X out of control %u ms", R.formId, V.formId, kinds[int(kind)], closing,
+						res.damageIt, res.damageMe, cap, V.formId, res.stunItMs);
+					for (auto& j : g_jobs) {
+						if (j.vehicle != V.formId || j.phase != Phase::Following) continue;
+						j.stunUntil = now + res.stunItMs;
+						j.stunX = ux * (aInto >= bInto ? 1.0 : -1.0); j.stunY = uy * (aInto >= bInto ? 1.0 : -1.0);
+						j.stunSpin = kind == tactics::RamKind::PIT ? 2.5 : 0.8;
+					}
+				}
+			}
+            g_ramPrevious=snap;g_ramPreviousAt=now;
+		}
+		void AiBudget(double us)
+		{
+			g_aiUs += us;
+			g_aiMaxUs = std::max(g_aiMaxUs, us);
+			const ULONGLONG now = GetTickCount64();
+			if (!g_aiLogAt) g_aiLogAt = now;
+			if (now - g_aiLogAt >= 60000) {
+				logger::Write("NPC vehicles: combat decision kernel: %.3f ms per frame over %u frames, worst kernel tick %.3f ms (full frame measured separately)", g_aiFrames ? g_aiUs / g_aiFrames / 1000.0 : 0.0,
+					g_aiFrames, g_aiMaxUs / 1000.0);
+				g_aiLogAt = now; g_aiUs = 0; g_aiMaxUs = 0; g_aiFrames = 0;
+			}
+		}
+		// One frame of the full AI for a job in a fight: fills combatai::Situation, runs it, applies the output (goal, commands, aim, fire).
+		// False only when the AI does not fly it this frame.
+		bool CombatAITick(Job& j, uptr npc, uptr foe, uptr aimRef, bool foeInVeh, uptr vehicle, uptr player, bool pursuer, bool aggressive, bool mayAim,
+			bool protect, ULONGLONG now, vcontract::Goal& g)
+		{
+			LARGE_INTEGER t0, t1, fq;
+			QueryPerformanceCounter(&t0);
+			ReadCombatIni();
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			const auto vr = At<game::Vec3>(vehicle, off::kRefRotation);
+			const auto fp = At<game::Vec3>(aimRef, off::kRefPosition);
+			const auto fr = At<game::Vec3>(aimRef, off::kRefRotation);
+			const std::uint32_t foeId = At<std::uint32_t>(aimRef, off::kFormId);
+			// Velocities (smoothed from positions, as the staged manoeuvres did).
+			if (j.manFoe != foeId || !j.manAt || now <= j.manAt || now - j.manAt > 1000) { j.manMvx = j.manMvy = j.manFvx = j.manFvy = 0; }
+			else {
+				const double dt = (now - j.manAt) / 1000.0, a = std::min(1.0, dt * 4.0);
+				const auto smooth = [&](double& v, double cur, double was) { const double inst = (cur - was) / dt; if (std::fabs(inst) < 150.0) v += (inst - v) * a; };
+				smooth(j.manMvx, vp.x, j.manMx); smooth(j.manMvy, vp.y, j.manMy);
+				smooth(j.manFvx, fp.x, j.manFx); smooth(j.manFvy, fp.y, j.manFy);
+			}
+			j.manMx = vp.x; j.manMy = vp.y; j.manFx = fp.x; j.manFy = fp.y; j.manAt = now; j.manFoe = foeId;
+			static world::Snapshot snap;
+			const bool haveSnap = world::Vehicles(snap);
+            auto verticalOf=[&](std::uint32_t id){if(haveSnap)for(unsigned k=0;k<snap.count&&k<64;++k)if(snap.v[k].formId==id)return double(snap.v[k].vel[2]);return 0.0;};
+			auto radiusOf = [&](std::uint32_t id) { if (haveSnap) for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) if (snap.v[k].formId == id) return std::max(1.5, std::hypot(double(snap.v[k].half[0]), double(snap.v[k].half[1])) * 0.8); return 2.5; };
+			combatai::Situation s;
+			s.now = now;
+			s.dt = j.aiAt && now > j.aiAt ? std::min(0.25, (now - j.aiAt) / 1000.0) : 0.016;
+			j.aiAt = now;
+			s.me.id = j.vehicle;
+			s.me.unit.body.pos = { vp.x, vp.y, vp.z }; s.me.unit.body.vel = { j.manMvx, j.manMvy, verticalOf(j.vehicle) }; s.me.unit.body.heading = vr.z; s.me.unit.body.radius = radiusOf(j.vehicle);
+			if(haveSnap)for(unsigned k=0;k<snap.count&&k<64;++k){if(snap.v[k].formId==j.vehicle)s.me.unit.mass=snap.v[k].mass;if(snap.v[k].formId==foeId)s.foe.unit.mass=snap.v[k].mass;}
+            s.me.unit.maxSpeed=vehicleflight::CruiseLimit(j.vehicle); s.me.turnRate=vehicleflight::TurnLimit(j.vehicle); s.me.unit.health = vehiclehits::HealthShare(j.vehicle); s.me.unit.hover = true;
+			s.me.wrecked = vehiclehits::Wrecked(j.vehicle);
+			s.me.person = brain::PersonalityFor(g_combatIni.sw.personality ? TemperOf(npc) : brain::Temper::Default, j.npc, Difficulty());
+			s.haveFoe = true; j.lastEnemyActor=At<std::uint32_t>(foe,off::kFormId);
+			s.foe.id = foeId; s.foe.inVehicle = foeInVeh;
+			s.foe.unit.body.pos = { fp.x, fp.y, fp.z }; s.foe.unit.body.vel = { j.manFvx, j.manFvy, verticalOf(foeId) }; s.foe.unit.body.heading = fr.z; s.foe.unit.body.radius = foeInVeh ? radiusOf(foeId) : 0.6;
+			s.foe.unit.maxSpeed=foeInVeh?vehicleflight::CruiseLimit(foeId):8.0;
+			float hn = 0, hm = 0;
+			s.foe.unit.health = foeInVeh ? vehiclehits::HealthShare(foeId) : (vehiclehits::ActorHealth(foe, hn, hm) ? hn / hm : 1.0);
+			s.enemies[s.enemyCount++] = s.foe.unit;
+			{
+				const float eye[3] = { vp.x, vp.y, vp.z + 1.5f }, at[3] = { fp.x, fp.y, fp.z + 1.0f };
+				s.foe.visible = !environment::LineBlocked(eye, at);
+			}
+			const std::uint32_t foeActor = At<std::uint32_t>(foe, off::kFormId);
+			const auto shot = std::max(vehiclehits::LastShotBy(foeActor), vehiclehits::LastShotBy(foeId));
+			s.foe.firing = shot && now - shot < 1500;
+			s.foe.heard = brain::Hears(std::hypot(double(fp.x) - vp.x, double(fp.y) - vp.y), s.foe.firing, std::hypot(j.manFvx, j.manFvy));
+			// Nearby vehicles, the squad, the enemies.
+			if (haveSnap) {
+				for (std::uint32_t k = 0; k < snap.count && k < 64 && s.otherCount < 8; ++k) {
+					const auto& v = snap.v[k];
+					if (v.formId == j.vehicle || std::hypot(double(v.pos[0]) - vp.x, double(v.pos[1]) - vp.y) > 40.0) continue;
+					auto& b = s.others[s.otherCount++];
+					b.pos = { v.pos[0], v.pos[1], v.pos[2] }; b.vel = { v.vel[0], v.vel[1], v.vel[2] }; b.heading = v.heading; b.radius = std::max(1.5, std::hypot(double(v.half[0]), double(v.half[1])) * 0.8);
+				}
+			}
+			int rank = 0;
+			for (const auto& o : g_jobs) {
+				if (&o == &j || o.phase != Phase::Following || !o.aiOn) continue;
+				const uptr ov = RefById(o.vehicle);
+				if (!ov) continue;
+				const auto op = At<game::Vec3>(ov, off::kRefPosition);
+				const auto relation = CombatRelationOf(npc, RefById(o.npc));
+				if (relation == CombatRelation::Ally) {
+					if (s.mateCount < 8) { auto& m = s.mates[s.mateCount++]; m.pos = { op.x, op.y, op.z }; m.vel = { o.manMvx, o.manMvy, 0 }; m.heading = At<game::Vec3>(ov, off::kRefRotation).z; }
+					if (o.foe == j.foe) { ++s.alliesOnTarget; if (o.pilot < j.pilot) ++rank; }
+				}
+				else if (relation == CombatRelation::Enemy) {
+					if (o.vehicle != foeId && s.enemyCount < 8) { auto& e = s.enemies[s.enemyCount++]; e.body.pos = { op.x, op.y, op.z }; e.body.vel = { o.manMvx, o.manMvy, 0 }; e.health = vehiclehits::HealthShare(o.vehicle); }
+					if (o.foe == j.npc) ++s.enemiesOnMe;
+				}
+			}
+			// Non-job enemy vehicles count for threat, terrain tactics and squad odds too.
+			for (int k = 0; k < g_combatVehicleCount && s.enemyCount < 8; ++k) {
+				const auto& cv = g_combatVehicles[k]; const auto& v = cv.vehicle;
+				if (!cv.driver || v.formId == j.vehicle || v.formId == foeId || vehiclehits::Wrecked(v.formId)) continue;
+				bool job = false; for (const auto& o : g_jobs) job = job || (o.phase == Phase::Following && o.aiOn && o.vehicle == v.formId);
+				if (job || std::hypot(double(v.pos[0]) - vp.x, double(v.pos[1]) - vp.y) > 400.0 || CombatRelationOf(npc, RefById(cv.driver)) != CombatRelation::Enemy) continue;
+				auto& e = s.enemies[s.enemyCount++]; e.body.pos = {v.pos[0], v.pos[1], v.pos[2]}; e.body.vel = {v.vel[0], v.vel[1], v.vel[2]};
+				e.body.heading = v.heading; e.body.radius = std::max(1.5, std::hypot(double(v.half[0]), double(v.half[1])) * 0.8); e.health = vehiclehits::HealthShare(v.formId);
+			}
+			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			s.anchor = { pp.x, pp.y, pp.z };
+			s.zone = pursuer ? g_combatIni.zonePursuit : g_combatIni.zoneEscort;
+			if (protect) {
+				s.protect = true;
+				s.protectee.pos = { pp.x, pp.y, pp.z };
+				const double dx = pp.x - fp.x, dy = pp.y - fp.y, d = std::max(1.0, std::hypot(dx, dy));
+				s.protectThreat = std::clamp((j.manFvx * dx + j.manFvy * dy) / d / 20.0, 0.0, 1.0);
+			}
+			if (j.lead) {
+				const uptr lv = RefById(j.lead);
+				if (lv) {
+					const auto lp = At<game::Vec3>(lv, off::kRefPosition);
+					s.hasLeader = true; s.leader.pos = { lp.x, lp.y, lp.z }; s.leader.heading = At<game::Vec3>(lv, off::kRefRotation).z;
+					s.slot = tactics::ConvoySlot(j.roleSlot); s.iDefendConvoy = true;
+				}
+			}
+			s.role = g_combatIni.sw.squads ? j.role : brain::Role::Engager;
+			s.roleSlot = j.roleSlot;
+			if (j.coverFor) {
+				const uptr cv = RefById(j.coverFor);
+				if (cv) { const auto cp = At<game::Vec3>(cv, off::kRefPosition); s.haveCover = true; s.coverBody.pos = { cp.x, cp.y, cp.z }; }
+			}
+			const auto lastHit = vehiclehits::LastHitMs(j.vehicle);
+			s.hitRecently = lastHit && now - lastHit < 2000;
+			s.allyWrecked = j.sideEvents[0]; s.allyDriverKilled = j.sideEvents[1]; s.leaderKilled = j.sideEvents[2]; s.reinforcements = j.reinforced;
+			s.playerOnFoot = !EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(player) && Dist(vehicle, player) < 30.0;
+			for (const auto& o : g_jobs) {
+				if (o.phase != Phase::Following || !o.lead) continue;
+				if (o.vehicle == foeId || o.lead == foeId) s.targetInConvoy = true;
+				if (o.lead == foeId) s.targetIsCargo = true;
+			}
+			s.allowRam = g_combatIni.ram && aggressive;
+			s.breakOff = g_combatIni.breakOff;
+			const auto ballistic=vehiclehits::BallisticsOf(j.vehicle);
+            s.weapon.range=ballistic.range;s.weapon.cone=kFireCone;s.weapon.shotSpeed=ballistic.observedSpeed?ballistic.speed:std::numeric_limits<double>::infinity();
+			s.civilian = s.me.person.temper == brain::Temper::Civilian;
+			(void)rank;
+			static NavWorld world;
+			combatai::Output out;
+			combatai::Tick(j.ai, s, world, g_combatIni.sw, out);
+			j.aiOn = true;
+			if (out.changed) {
+				logger::Write("NPC vehicles: [%d] %s; enemy %08X %.0f m, health %.0f%% vs %.0f%%, morale %.2f (%s), %s", j.pilot, out.log, foeId,
+					std::hypot(double(fp.x) - vp.x, double(fp.y) - vp.y), s.me.unit.health * 100.0, s.foe.unit.health * 100.0, j.ai.morale.value, brain::Name(j.ai.mood),
+					out.useCommands ? "steering" : "planner (terrain ahead)");
+			}
+			if (out.moodChanged) logger::Write("NPC vehicles: [%d] morale %.2f: %s", j.pilot, j.ai.morale.value, brain::Name(j.ai.mood));
+			// The goal: the carrot (cruise; a held spot arrives); the planner keeps it safe.
+			g.x = out.carrot.x; g.y = out.carrot.y; g.z = out.carrot.z;
+			g.stop = 0.0; g.hold = false; g.cruise = true; g.cruiseSpeed = out.speed;
+			vehicleflight::Command c;
+			c.set = 0;
+			if (now < j.stunUntil) {
+				// Rammed: out of control, drifting along the hit and spinning.
+				const double h = vr.z;
+				c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kThrottle | vehicleflight::Command::kStrafe;
+				c.yawRate = j.stunSpin; c.throttle = j.stunX * std::sin(h) + j.stunY * std::cos(h); c.strafe = j.stunX * std::cos(h) - j.stunY * std::sin(h);
+			}
+			else if (out.useCommands) {
+				c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kThrottle | vehicleflight::Command::kStrafe | vehicleflight::Command::kVertical |
+					vehicleflight::Command::kGear | vehicleflight::Command::kBrake;
+				c.yawRate = out.cmd.yawRate; c.throttle = out.cmd.throttle; c.strafe = out.cmd.strafe; c.vertical = out.cmd.vertical; c.gear = out.cmd.gear; c.brake = out.cmd.brake;
+				if (out.aim && mayAim && !std::isnan(out.cmd.pitch)) { c.set |= vehicleflight::Command::kPitch; c.pitch = out.cmd.pitch; }
+				if (!mayAim && out.aim) {
+					// Weapons "never": no nose on the target; fly along the desired velocity instead.
+					const double want = std::atan2(out.carrot.x - vp.x, out.carrot.y - vp.y);
+					c.yawRate = std::clamp(2.5 * WrapAngle(want - vr.z), -1.6, 1.6);
+				}
+			}
+			c.holdMs=100; vehicleflight::PilotCommand(j.pilot,c);
+			j.aiFire = out.fire && mayAim;
+			if (out.aim) { j.aiAimX = out.aimPoint.x; j.aiAimY = out.aimPoint.y; j.aiAimZ = out.aimPoint.z; }
+			else { j.aiAimX = fp.x; j.aiAimY = fp.y; j.aiAimZ = fp.z + (foeInVeh ? 1.0 : kAimHeight); }
+			QueryPerformanceCounter(&t1);
+			QueryPerformanceFrequency(&fq);
+			AiBudget(double(t1.QuadPart - t0.QuadPart) * 1e6 / double(fq.QuadPart));
+			return true;
+		}
+
+        bool SearchAITick(Job& j,uptr npc,uptr vehicle,ULONGLONG now,vcontract::Goal& goal) {
+            const auto track=j.ai.mem.Find(j.ai.lastFoe);
+            const auto observed=track?std::max(track->seenAt,track->heardAt):0;
+            const auto actor=RefById(j.lastEnemyActor);
+            if(!track||!observed||now<observed||now-observed>=60000||
+                (actor&&(Dead(actor)||CombatRelationOf(npc,actor)!=CombatRelation::Enemy))) {
+                j.ai.search.active=false;return false;
+            }
+            combatai::Situation situation; situation.now=now;situation.dt=j.aiAt&&now>j.aiAt?std::min(0.25,double(now-j.aiAt)/1000.0):0.016;
+            j.aiAt=now;const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
+            situation.me.id=j.vehicle;situation.me.unit.body.pos={pos.x,pos.y,pos.z};
+            situation.me.unit.body.heading=At<game::Vec3>(vehicle,off::kRefRotation).z;
+            world::Snapshot snap;if(world::Vehicles(snap))for(unsigned k=0;k<snap.count&&k<64;++k)if(snap.v[k].formId==j.vehicle){const auto&v=snap.v[k];situation.me.unit.body.vel={v.vel[0],v.vel[1],v.vel[2]};situation.me.unit.mass=v.mass;situation.me.unit.body.radius=std::hypot(v.half[0],v.half[1]);}
+            situation.me.unit.maxSpeed=vehicleflight::CruiseLimit(j.vehicle);situation.me.turnRate=vehicleflight::TurnLimit(j.vehicle);
+            situation.me.unit.health=vehiclehits::HealthShare(j.vehicle);situation.me.wrecked=vehiclehits::Wrecked(j.vehicle);
+            situation.me.person=brain::PersonalityFor(TemperOf(npc),j.npc,Difficulty());
+            situation.haveFoe=false;situation.foe.visible=false;situation.anchor={j.originX,j.originY,pos.z};situation.zone=g_combatIni.zonePursuit;
+            static NavWorld world;combatai::Output out;combatai::Tick(j.ai,situation,world,g_combatIni.sw,out);
+            if(out.changed)logger::Write("NPC vehicles: [%d] %s (remembered native enemy %08X)",j.pilot,out.log,j.lastEnemyActor);
+            goal.x=out.carrot.x;goal.y=out.carrot.y;goal.z=out.carrot.z;goal.stop=0;goal.hold=false;goal.cruise=true;goal.cruiseSpeed=out.speed;
+            j.aiOn=true;j.aiFire=false;vehicleflight::ClearPilotCommand(j.pilot);return true;
+        }
+
 		// ---- Civil tasks (2026-10-20, the user: transit, drop-off and walk, return home, parking etiquette, outpost patrol) ----
 		constexpr double kPatrolR = 60.0, kTaskReach = 14.0, kTransitArrive = 25.0, kHomeArrive = 20.0;
 		constexpr double kParkClear = 7.0;     // m: no other vehicle this close to a parking spot
@@ -1362,12 +2235,15 @@ namespace npcvehicles
 			if (player && (InCombat(npc) || (InCombat(player) && Dist(vehicle, player) < 120.0)) && HostileTo(npc, player)) {
 				// An enemy driver (a patrol / convoy at a hostile outpost) stays aboard and attacks: the task becomes a pursuit.
 				j.task = 0;
-				ApplyProfile(j, Profile::Pursuit, player);
+				ApplyProfile(j, Profile::Pursuit, player, false);
 				logger::Write("NPC vehicles: [%d] enemy driver %08X turns on you (task ended, pursuit)", j.pilot, j.npc);
 				return;
 			}
-			if (InCombat(npc) || (player && InCombat(player) && Dist(vehicle, player) < 120.0)) {
-				// A fight: the task ends; the NPC gets out (the fight rules may put it back in a vehicle with a combat profile).
+			if(NativeEnemyId(npc)) {
+                j.task=0;ApplyProfile(j,Profile::Pursuit,player,false);return;
+            }
+            if (InCombat(npc) || (player && InCombat(player) && Dist(vehicle, player) < 120.0)) {
+                // A fight: the task ends; the NPC gets out (the fight rules may put it back in a vehicle with a combat profile).
 				vehicleflight::PilotStop(j.pilot, "a fight");
 				logger::Write("NPC vehicles: [%d] task ended by a fight; NPC %08X gets out", j.pilot, j.npc);
 				j.task = 0;
@@ -1536,6 +2412,7 @@ namespace npcvehicles
 				++escorts;
 			}
 			const bool defensive = g_ec.threat >= kThreatHigh || (escorts >= 2 && role == 1);
+			j.defDefensive = defensive;
 			int mode = 0;
 			if (inVehicle && d > kInterceptMin && closing > 3.0) {
 				const double px = fp.x + j.foeVx * kInterceptLead, py = fp.y + j.foeVy * kInterceptLead;
@@ -1555,7 +2432,7 @@ namespace npcvehicles
 				g.hold = false;
 				mode = 3;
 			}
-			else if (defensive || Dist3(vehicle, aimRef) > kFireRange) {
+			else if (defensive || Dist3(vehicle, aimRef) > vehiclehits::BallisticsOf(j.vehicle).range) {
 				const double ux = d > 0.1 ? -dx / d : 0.0, uy = d > 0.1 ? -dy / d : 1.0;  // from the player toward the target
 				g.x = pp.x + ux * kShieldDist;
 				g.y = pp.y + uy * kShieldDist;
@@ -1912,7 +2789,7 @@ namespace npcvehicles
 					}
 				}
 				// The animated entry (when on) gets kAnimWaitMs; then, if the NPC is close, the instant seat finishes the job.
-				if (kAnimatedEntry && j.cmd && !aboard && j.cmdTryAt && !j.cmdInstant && now - j.cmdTryAt >= kAnimWaitMs) {
+				if constexpr(kAnimatedEntry) if (j.cmd && !aboard && j.cmdTryAt && !j.cmdInstant && now - j.cmdTryAt >= kAnimWaitMs) {
 					j.cmdInstant = true;
 					if (Dist(npc, vehicle) < kSnapRange) {
 						pilotquest::Release(j.pilot - 1);
@@ -2021,7 +2898,18 @@ namespace npcvehicles
 				}
 				break;
 			case Phase::Following: {
+				if (aboard && vehiclehits::Wrecked(j.vehicle)) {
+                    j.controller=integrationlogic::Controller::Wreck;
+					// Wrecked (vehiclehits: 0 health): the weapon is dead (SubmitFire), the autopilot banned; the driver gets out and fights on foot.
+					if (j.firing) { SubmitFire(j.pilot - 1, j.vehicle, false); j.firing = false; }
+					vehicleflight::PilotStop(j.pilot, "wrecked");
+					FollowerNotice(j.npc, "Your follower's vehicle is wrecked | they get out");
+					logger::Write("NPC vehicles: [%d] vehicle %08X wrecked; NPC %08X gets out", j.pilot, j.vehicle, j.npc);
+					Set(j, Phase::Settling);
+					break;
+				}
 				if(vehicleflight::Ramming(j.vehicle)) {
+                    j.controller=integrationlogic::Controller::Ram;
 					if(!aboard){vehicleflight::PilotStop(j.pilot,"ram driver exited");vehicleflight::EndTargetSession(vehicle);Set(j,Phase::Idle);}
 					else if(j.firing){SubmitFire(j.pilot-1,j.vehicle,false);j.firing=false;}
 					break; // explicit ram owns this pilot until its bounded order ends
@@ -2031,6 +2919,7 @@ namespace npcvehicles
 					vcontract::Assign(j.vehicle,vcontract::Find("escort"),vp.x,vp.y);
 				}
 				if (j.task) {
+                    j.controller=integrationlogic::Controller::Task;
 					TaskTick(j, npc, vehicle, player, aboard, now);
 					break;
 				}
@@ -2094,7 +2983,7 @@ namespace npcvehicles
 				const bool retaliating=foe && foe==Aggressor(j.vehicle,now);
 				const bool defending = foe && !attacking && !retaliating;
 				if (!defending) j.defMode = -1;
-				if (!foe && j.profile == Profile::Pursuit && mode == overrides::Mode::None) foe = player;
+				// Native target selection is authoritative; a profile never invents an enemy.
 				const uptr foeVeh = foe ? InVehicle(foe) : 0;
 				const uptr aimRef = foeVeh ? foeVeh : foe;
 				const double toFoe = aimRef ? Dist(vehicle, aimRef) : 1e9;
@@ -2106,7 +2995,7 @@ namespace npcvehicles
 				}
 				// Orders and context for escorts: rescue wins over everything, a fight over the rest; then a crew marker order, then scouting.
 				const bool escortJob = j.profile == Profile::Escort && have && escortNav && targetsession::CanFollow(j.vehicle,vehicleflight::OwnRoverId());
-				const bool rescuer = escortJob && g_ec.mode == EscMode::Rescue && g_ec.rescuer == j.pilot;
+				const bool rescuer = escortJob && mode==overrides::Mode::None && j.order!=int(CrewOrder::Marker) && g_ec.mode == EscMode::Rescue && g_ec.rescuer == j.pilot;
 				const bool scouting = escortJob && !defending && !rescuer && g_ec.mode == EscMode::Scout && g_ec.scout == j.pilot && j.order != int(CrewOrder::Marker) &&
 					mode == overrides::Mode::None;
 				bool toMarker = false;
@@ -2150,13 +3039,39 @@ namespace npcvehicles
 						logger::Write("NPC vehicles: [%d] scouted the marker: %d enemies within 80 m", j.pilot, n);
 					}
 				}
-                if(foe && !rescuer && !toMarker && !scouting && rules.chase) {
+				// Manoeuvres replace the orbit for attackers, retaliators and escorts not held on a protective spot (shield when defensive, intercept,
+				// overwatch keep their own goals); a pursuer near its hit limit keeps its retreat.
+				bool manActive = false, manRam = false;
+				ReadCombatIni();
+				if (foe && have && aboard && rules.chase && mode == overrides::Mode::None && !rescuer && !toMarker && !scouting) {
+					const bool use = attacking ? !j.retreating : retaliating || (defending && (defMode == 0 || (defMode == 1 && !j.defDefensive)));
+					const bool shield = defending && defMode == 1 && j.defDefensive;  // the full AI interposes for a defensive escort
+					if (g_combatIni.ai && (use || shield)) {
+						manActive = CombatAITick(j, npc, foe, aimRef, foeVeh != 0, vehicle, player, j.profile == Profile::Pursuit, attacking,
+							profileclass::MayAim(weapons, false), shield || (defending && j.profile == Profile::Escort), now, pg);
+					}
+					else if (use) {
+						manActive = ManoeuvreTick(j, foe, aimRef, foeVeh != 0, vehicle, player, j.profile == Profile::Pursuit, attacking,
+							profileclass::MayAim(weapons, false), now, pg);
+						manRam = !manActive;
+					}
+				}
+				bool searching=false;
+                if(!foe&&have&&aboard&&g_combatIni.ai&&rules.chase&&mode==overrides::Mode::None&&!rescuer&&!toMarker&&!scouting)
+                    searching=SearchAITick(j,npc,vehicle,now,pg);
+                manActive=manActive||searching;
+                const auto owner=integrationlogic::ControllerFor(false,false,mode!=overrides::Mode::None||toMarker,rescuer,foe!=0,searching,passenger::RidingVehicle()==j.vehicle,j.task!=0);
+                j.controller=owner;
+                if (!manActive && j.aiOn) { j.aiOn=false; j.aiFire=false; vehicleflight::ClearPilotCommand(j.pilot); }
+				if (!manActive && !manRam && j.manOn) { j.manOn = false; j.man = manoeuvre::Mind{}; }
+				if (manRam) break;  // the ram order flies this vehicle (the Ramming branch above from the next frame)
+                if(foe && !rescuer && !toMarker && !scouting && rules.chase && !manActive) {
                     const auto enemy=At<game::Vec3>(aimRef,off::kRefPosition);
                     const float threat[]={enemy.x,enemy.y,enemy.z+1.2f};
                     environment::CombatPosition(j.vehicle,threat,pg.x,pg.y,pg.z,defending||j.retreating);
                 }
 				const bool busyGoal = rescuer || toMarker || scouting;
-				const bool attackRun = defMode == 0 && (pMode < 0 || pMode == 10) && toFoe < kAttackRun && !rescuer && rules.chase &&
+				const bool attackRun = !manActive && defMode == 0 && (pMode < 0 || pMode == 10) && toFoe < kAttackRun && !rescuer && rules.chase &&
 					profileclass::MayAim(weapons, false);
 				if (!aboard) {
 					if(j.vehicle==vehicleflight::OwnRoverId() && j.order)vehicleflight::EndTargetSession(vehicle);
@@ -2164,7 +3079,11 @@ namespace npcvehicles
 					vehicleflight::PilotStop(j.pilot, "driver got out");
 					Set(j, Phase::Idle);
 				}
-				else if (passenger::RidingVehicle() == j.vehicle && !defending) {
+				else if(searching) {
+                    vehicleflight::PilotFly(j.pilot,vehicle,pg);
+                    if(j.firing){SubmitFire(j.pilot-1,j.vehicle,false);j.firing=false;}
+                }
+                else if (owner==integrationlogic::Controller::Taxi) {
 					passenger::Steer(j.pilot, vehicle);  // taxi: the map marker, else where the passenger looks (a fight: the escort defends)
 				}
 				else if (!Outdoors(player)) {
@@ -2223,12 +3142,12 @@ namespace npcvehicles
 					if (!attackRun) AimPoint(j, aimRef, vehicle, axp, ayp, azp);  // (inside, AttackRun updated it)
 					else {
 						const auto ppl = At<game::Vec3>(aimRef, off::kRefPosition);
-						const double t = Dist3(vehicle, aimRef) / kShotSpeed;
+						const double t = vehiclehits::ShotTime(j.vehicle,Dist3(vehicle,aimRef));
 						axp = ppl.x + j.aimVx * t; ayp = ppl.y + j.aimVy * t; azp = ppl.z + kAimHeight + j.aimVz * t;
 					}
 					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 					const auto vr = At<game::Vec3>(vehicle, off::kRefRotation);
-					if ((defMode == 3 || pMode == 13 || mode == overrides::Mode::Guard) && profileclass::MayAim(weapons, false) && std::hypot(pg.x - vp.x, pg.y - vp.y) < 12.0) {
+					if (!manActive && (defMode == 3 || pMode == 13 || mode == overrides::Mode::Guard) && profileclass::MayAim(weapons, false) && std::hypot(pg.x - vp.x, pg.y - vp.y) < 12.0) {
 						// Overwatch: in place, the nose on the enemy (yaw and pitch), the autopilot holds the spot.
 						vehicleflight::Command c;
 						c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kPitch;
@@ -2244,12 +3163,14 @@ namespace npcvehicles
 					const double pitchErr = std::fabs(pitchWant + vr.x);
 					const bool onTarget = aimErr < kFireCone && pitchErr < kFireCone * 1.5;
 					const bool inRange = rules.fire && profileclass::MayFire(weapons, false) && (kProfiles[int(j.profile)].fire || defending || retaliating || attacking) &&
-						Dist3(vehicle, aimRef) < kFireRange;
-					const float muzzle[]={vp.x+float(std::sin(vr.z)*4),vp.y+float(std::cos(vr.z)*4),vp.z+1.5f};
+						Dist3(vehicle, aimRef) < vehiclehits::BallisticsOf(j.vehicle).range;
+					if (j.aiOn) { axp=j.aiAimX; ayp=j.aiAimY; azp=j.aiAimZ; }
+                    const float muzzle[]={vp.x+float(std::sin(vr.z)*4),vp.y+float(std::cos(vr.z)*4),vp.z+1.5f};
                     const float shot[]={float(axp),float(ayp),float(azp)};
                     const bool clearShot=environment::ClearShot(j.vehicle,At<std::uint32_t>(aimRef,off::kFormId),
                         aimRef==vehicle?0:At<std::uint32_t>(aimRef,off::kFormId),muzzle,shot);
-                    const bool canFire = inRange && onTarget && clearShot;
+                    const bool canFire = inRange && clearShot && (j.aiOn ? j.aiFire : onTarget);
+					// ClearShot and launch now use the same final AI aim point.
 					StoreAim(j.pilot - 1, AimSnap{ j.vehicle, j.npc, axp, ayp, azp, inRange && clearShot, now });
 					const int slot = j.pilot - 1;
 					if (j.firing) {
@@ -2352,6 +3273,53 @@ namespace npcvehicles
 			const char* n = actor ? RawDisplayName(actor) : nullptr;
 			if (n && n[0]) std::snprintf(out, cap, "%s", n);
 			else std::snprintf(out, cap, "%08X", id);
+		}
+
+		// ---- Vehicle lifebar (2026-10-21, the user approved the HUD row first): the vehicle under the crosshair (and 3 s after), else the one your side
+		// hit last (6 s), else your own vehicle while it is damaged: "REV-8 (Sarah)  [#######---] 70%  driver 94%". The game's own enemy bar needs the
+		// vehiclehits probe's answers first (does a vehicle actor carry Health, is it on the player's enemy list).
+		bool LifebarLine(uptr player, char* out, std::size_t size)
+		{
+			static std::uint32_t aimed = 0;
+			static ULONGLONG aimedAt = 0;
+			const ULONGLONG now = GetTickCount64();
+			std::uint32_t id = 0;
+			const std::uint32_t cross = vehiclehits::CrosshairTarget();
+			if (cross) {
+				const uptr r = RefById(cross);
+				const uptr veh = r && IsVehicle(r) ? r : r && IsActorRef(r) ? InVehicle(r) : 0;
+				if (veh) { aimed = At<std::uint32_t>(veh, off::kFormId); aimedAt = now; }
+			}
+			if (aimed && now - aimedAt < 3000) id = aimed;
+			std::uint32_t hit = 0;
+			ULONGLONG hitAt = 0;
+			if (!id && vehiclehits::LastHitByYourSide(hit, hitAt) && now - hitAt < 6000) id = hit;
+			const uptr driven = EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(player);
+			if (!id && driven) {
+				const std::uint32_t d = At<std::uint32_t>(driven, off::kFormId);
+				if (vehiclehits::HealthShare(d) < 0.999f || vehiclehits::Wrecked(d)) id = d;
+			}
+			const uptr veh = RefById(id);
+			if (!veh) return false;
+			char name[40] = "", driverName[40] = "";
+			ActorName(veh, id, name, sizeof(name));
+			uptr driver = 0;
+			if (veh == driven) driver = player;
+			for (const auto& j : g_jobs) if (!driver && j.vehicle == id && j.phase == Phase::Following) driver = RefById(j.npc);
+			static world::Snapshot snap;
+			if (!driver && world::Vehicles(snap)) for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) if (snap.v[k].formId == id && snap.v[k].driverId) driver = RefById(snap.v[k].driverId);
+			if (driver && driver != player) ActorName(driver, At<std::uint32_t>(driver, off::kFormId), driverName, sizeof(driverName));
+			const float share = vehiclehits::HealthShare(id);
+			char bar[11];
+			const int filled = int(std::lround(share * 10.0f));
+			for (int i = 0; i < 10; ++i) bar[i] = i < filled ? '#' : '-';
+			bar[10] = 0;
+			char drv[40] = "";
+			float hn = 0, hm = 0;
+			if (driver && !Dead(driver) && vehiclehits::ActorHealth(driver, hn, hm)) std::snprintf(drv, sizeof(drv), "  %s %.0f%%", driver == player ? "you" : "driver", hn / hm * 100.0f);
+			std::snprintf(out, size, "%s%s%s%s  [%s] %.0f%%%s%s", name, driverName[0] ? " (" : "", driverName, driverName[0] ? ")" : "", bar, share * 100.0f, drv,
+				vehiclehits::Wrecked(id) ? "  WRECKED" : "");
+			return true;
 		}
 
 		bool OursVehicle(std::uint32_t id)
@@ -2486,11 +3454,11 @@ namespace npcvehicles
 			}
 		}
 
-		void CrimeAlarms(uptr victim, uptr vehicle, uptr player, bool assault)
+		void CrimeAlarms(uptr victim, uptr vehicle, uptr player, bool assault, bool theft)
 		{
 			__try {
 				if (assault) EngineFn<void (*)(uptr, uptr, uptr)>(kAssaultAlarm)(0, 0, victim);
-				if (OwnerId(vehicle) && OwnerId(vehicle) != At<std::uint32_t>(At<uptr>(player, 0x98), off::kFormId))
+				if (theft && OwnerId(vehicle) && OwnerId(vehicle) != At<std::uint32_t>(At<uptr>(player, 0x98), off::kFormId))
 					EngineFn<void (*)(uptr, std::uint32_t, uptr, uptr)>(kStealAlarm)(0, 0, vehicle, player);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2611,6 +3579,7 @@ namespace npcvehicles
 			const bool seat = CanMount(npc, vehicle);
 			// In combat the get-in package never runs (it waits behind the combat AI): calm first.
 			if (seat && InCombat(npc)) {
+                slot.resumeFoe=NativeEnemyId(npc);
 				Calm(npc);
 				logger::Write("NPC vehicles: [%d] NPC %08X was in combat; calmed for the get-in", slot.pilot, npcId);
 			}
@@ -2619,7 +3588,7 @@ namespace npcvehicles
 			const uptr base = At<uptr>(vehicle, 0x98);
 			logger::Write("NPC vehicles: [%d] NPC %08X -> vehicle %08X (base %08X, %.0f m from it); seat %s; get-in -> %d", slot.pilot, npcId,
 				At<std::uint32_t>(vehicle, off::kFormId), base ? At<std::uint32_t>(base, off::kFormId) : 0, Dist(npc, vehicle), seat ? "free" : "REFUSED", r);
-			if (r < 1) return false;
+			if (r < 1) { slot.npc=npcId;ResumeCombat(slot);return false; }
 			slot.npc = npcId;
 			slot.vehicle = At<std::uint32_t>(vehicle, off::kFormId);
 			slot.gang = gang;
@@ -2636,6 +3605,7 @@ namespace npcvehicles
 			// Native, data-driven: SeamlessPilots.esm's quest package (any actor); else the follower command (followers only).
 			// Context: in combat the NPC is calmed (or the fight would outrank the package) and RUNS to the vehicle; otherwise it walks at the package's own pace.
 			if (InCombat(npc)) {
+                slot->resumeFoe=NativeEnemyId(npc);
 				Calm(npc);
 				SetForceRun(npc, true);
 				slot->forcedRun = true;
@@ -2653,6 +3623,8 @@ namespace npcvehicles
 			const bool viaQuest = pilotquest::Assign(slot->pilot - 1, npc, vehicle);
 			if (!viaQuest) {
 				logger::Write("SeamlessPilots.esm is not loaded: NPCs cannot be sent to vehicles");
+                slot->npc=At<std::uint32_t>(npc,off::kFormId); ResumeCombat(*slot);
+                if(slot->forcedRun){SetForceRun(npc,false);slot->forcedRun=false;}
 				return false;
 			}
 			slot->npc = At<std::uint32_t>(npc, off::kFormId);
@@ -3044,7 +4016,7 @@ namespace npcvehicles
 	namespace
 	{
 		// One job's profile (escort / pursuit): pursuit puts the driver in combat with the player, escort calms it and stops the weapon.
-		bool ApplyProfile(Job& j, Profile to, uptr player)
+		bool ApplyProfile(Job& j, Profile to, uptr player, bool provokePlayer)
 		{
 			const uptr npc = RefById(j.npc);
 			if (!npc) return false;
@@ -3064,11 +4036,11 @@ namespace npcvehicles
 					if (!vcontract::AssignedTo(j.vehicle)) vcontract::Assign(j.vehicle, vcontract::Find("escort"), vp.x, vp.y);
 				}
 			}
-			if (kProfiles[int(to)].hostile) {
+			if (kProfiles[int(to)].hostile && provokePlayer) {
 				j.aggroAt = GetTickCount64();
 				Aggro(npc, player);
 			}
-			else {
+			else if(provokePlayer) {
 				Calm(npc);
 				if (j.firing) SubmitFire(j.pilot - 1, j.vehicle, false);
 				j.firing = false;
@@ -3136,6 +4108,14 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: profile %s (%d following)", kProfiles[int(to)].name, n);
 		}
 		g_aggroDown = adown;
+		{
+			const ULONGLONG nowMs = GetTickCount64();
+			SquadTick(nowMs);
+			RamTick(nowMs);
+			bool anyAi = false;
+			for (const auto& j : g_jobs) anyAi = anyAi || j.aiOn;
+			if (anyAi) ++g_aiFrames;
+		}
 		for (int i = 0; i < kJobs; ++i) {
 			g_jobs[i].pilot = i + 1;
 			if (g_jobs[i].phase != Phase::Idle) Update(g_jobs[i], player);
@@ -3147,6 +4127,10 @@ namespace npcvehicles
 			const char* ptrs[hoverui::kMaxRows];
 			int nr = 0;
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			{
+				static char life[96];
+				hoverui::SetLifebar(LifebarLine(player, life, sizeof(life)) ? life : "");  // the status card's health line
+			}
 			for (const auto& j : g_jobs) {
 				if (j.phase == Phase::Idle || !IsFollower(player,RefById(j.npc)) || nr >= hoverui::kMaxRows) continue;
 				const uptr v = RefById(j.vehicle);
@@ -3157,7 +4141,7 @@ namespace npcvehicles
 					// The approved row: an active override alone, else NAV (· COMBAT in a fight) (· HOLD FIRE).
 					const auto mode = ModeOf(j.order);
 					const char* over = vehicleflight::Ramming(j.vehicle) ? "RAMMING" :
-						mode == overrides::Mode::Recall ? "RECALL" : mode == overrides::Mode::Cover ? "COVER" : mode == overrides::Mode::Guard ? "GUARD POINT" :
+						mode == overrides::Mode::Recall ? "SUMMON" : mode == overrides::Mode::Cover ? overrides::CoverStatus(InCombat(player)) : mode == overrides::Mode::Guard ? "GUARD POINT" :
 						j.order == int(CrewOrder::Hold) ? "HOLDING" : nullptr;
 					const auto* nav = vcontract::AssignedTo(j.vehicle);
 					const auto* cmb = vcontract::AssignedTo(j.vehicle, vcontract::Class::Combat);
@@ -3557,6 +4541,25 @@ namespace npcvehicles
 		return base == owner || (At<std::uint8_t>(owner, 0x2E) == 0x0D && InFaction(actor, owner));
 	}
 
+	bool ExitPlayer()
+	{
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		return player && InVehicle(player) && Dismount(player) == 1;
+	}
+
+	bool FighterMayTake(std::uintptr_t actor, std::uintptr_t vehicle)
+	{
+		if (!actor || !vehicle || At<std::uint32_t>(vehicle, off::kFormId) == vehicleflight::OwnRoverId()) return false;
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		const uptr base = At<uptr>(actor, 0x98);
+		auto belongs = [&](uptr owner) {
+			if (!owner || (player && owner == At<uptr>(player, 0x98))) return false;
+			return owner == base || (At<std::uint8_t>(owner, 0x2E) == 0x0D && InFaction(actor, owner));
+		};
+		if (const uptr owner = OwnerForm(vehicle)) return belongs(owner);
+		return belongs(realvehicles::PlaceOwner(vehicle));  // unowned: only in its own camp
+	}
+
 	bool ActorFree(std::uintptr_t actor)
 	{
 		if (!actor || !IsActorRef(actor) || Dead(actor) || InVehicle(actor)) return false;
@@ -3872,7 +4875,7 @@ namespace npcvehicles
 			if (!vehicleId || !player || j.phase != Phase::Following || j.vehicle != vehicleId) continue;
 			const uptr veh = RefById(j.vehicle);
 			if (!veh) return false;
-			return ApplyProfile(j, pursuit ? Profile::Pursuit : Profile::Escort, player);
+			return ApplyProfile(j, pursuit ? Profile::Pursuit : Profile::Escort, player, false);
 		}
 		return false;
 	}
@@ -3910,6 +4913,12 @@ namespace npcvehicles
 		g_riders.clear();
 		g_seatLogged.clear();
 		g_aggression.clear();
+		g_relations.clear();g_temperCache.clear();g_factions={};
+        g_driverIndex.clear();
+		for (auto& side : g_sides) side = {};
+		g_ramPairs = {}; g_ramPrevious={};g_ramPreviousAt=0;for(auto& impact:g_pendingImpacts)impact={};
+		g_squadRefreshAt = 0;
+		g_combatVehicleCount = 0;
 		for(auto&t:g_exitTasks)t={};
 		for(auto&r:g_exitRefused)r=0;
 		for(auto&pending:g_nativeExits)pending.store(0);
@@ -4057,13 +5066,71 @@ namespace npcvehicles
 		}
 		return false;
 	}
-	void VehicleAggression(std::uintptr_t vehicle,std::uint32_t shooterId)
+void BeginFrame()
+    {
+        g_driverIndex.clear();
+        auto note=[](uptr actor) {
+            if(!actor||!IsActorRef(actor)||Dead(actor))return;
+            const auto vehicle=InVehicle(actor);if(!vehicle||!IsVehicle(vehicle)||!Drives(actor,vehicle))return;
+            g_driverIndex[At<std::uint32_t>(vehicle,off::kFormId)]=At<std::uint32_t>(actor,off::kFormId);
+        };
+        const auto player=Ptr(addr::kPlayerCharacterPtr);note(player);
+        {   // Evidence for the seat rule: once per boarding, the player's seat keyword against the vehicle's driver seat.
+            static std::uint32_t told=0;
+            const auto pv=player?InVehicle(player):0;const auto pid=pv?At<std::uint32_t>(pv,off::kFormId):0;
+            if(pid!=told){told=pid;if(pv)logger::Write("NPC vehicles: seat proof: player in %08X, seat keyword %p, driver seat keyword %p -> %s",pid,
+                reinterpret_cast<void*>(SeatKeyword(player)),reinterpret_cast<void*>(DriverSeatKeyword(pv)),InDriverSeat(player)?"driver seat":"NOT the driver seat");}
+        }
+        for(const auto actor:modscene::LoadedRefs(8000))if(actor!=player)note(actor);
+    }
+    bool AreHostile(uptr a,uptr b){return CombatRelationOf(a,b)==CombatRelation::Enemy;}
+    bool AreAllies(uptr a,uptr b){return CombatRelationOf(a,b)==CombatRelation::Ally;}
+    std::uint32_t NativeEnemyId(uptr actor)
+    {
+        __try {
+            if(!actor||!IsActorRef(actor))return 0;
+            const auto enemy=HandleRef(At<std::uint32_t>(actor,0x298));
+            return enemy&&IsActorRef(enemy)&&!Dead(enemy)&&AreHostile(actor,enemy)?At<std::uint32_t>(enemy,off::kFormId):0;
+        } __except(EXCEPTION_EXECUTE_HANDLER){return 0;}
+    }
+    std::uint32_t VehicleDriverId(std::uint32_t vehicleId)
+	{
+		const auto driver = CombatDriver(RefById(vehicleId));
+		return driver ? At<std::uint32_t>(driver, off::kFormId) : 0;
+	}
+
+	bool VehicleFriendlyToShooter(std::uintptr_t vehicle, std::uint32_t shooterFormId)
+	{
+		if (!vehicle || !shooterFormId) return false;
+		uptr shooter = RefById(shooterFormId);
+		if (!shooter) return false;
+		if (!IsActorRef(shooter)) {
+			if (!IsVehicle(shooter)) return false;
+			shooter = CombatDriver(shooter);
+			if (!shooter && shooterFormId == vehicleflight::OwnRoverId()) shooter = Ptr(addr::kPlayerCharacterPtr);
+		}
+		if (!shooter) return false;
+		if (InVehicle(shooter) == vehicle) return true;
+		const uptr driver = CombatDriver(vehicle);
+		if (driver) {
+            const auto player=Ptr(addr::kPlayerCharacterPtr);
+            if(PlayerTeam(shooter)&&PlayerTeam(driver))return true;
+            // The player may initiate an attack against a faction ally. Companions stay protected.
+            return shooter!=player && CombatRelationOf(shooter,driver)==CombatRelation::Ally;
+        }
+		return At<std::uint32_t>(vehicle, off::kFormId) == vehicleflight::OwnRoverId() && PlayerTeam(shooter);
+	}
+
+	void VehicleAggression(std::uintptr_t vehicle,std::uint32_t shooterId,bool reportCrime)
 	{
 		const auto shooter=RefById(shooterId);
 		if(!vehicle||!shooter||!IsActorRef(shooter)||Dead(shooter)||InVehicle(shooter)==vehicle)return;
 		const auto id=At<std::uint32_t>(vehicle,off::kFormId);const auto now=GetTickCount64();
 		if(g_aggression.size()>256)std::erase_if(g_aggression,[&](const auto&p){return now>=p.second.until;});
-		auto&event=g_aggression[id];const bool refresh=event.attacker!=shooterId || now-event.nativeAt>=2000;
+		g_relations.clear();
+		auto&event=g_aggression[id];
+        if(event.attacker!=shooterId||now>=event.until)event={};
+        const bool refresh=event.attacker!=shooterId || now-event.nativeAt>=2000;
 		event.attacker=shooterId;event.until=now+60000;if(!refresh)return;event.nativeAt=now;
 		const auto player=Ptr(addr::kPlayerCharacterPtr);const auto owner=OwnerForm(vehicle);int reacted=0;
 		for(const auto actor:modscene::LoadedRefs(8000)) {
@@ -4071,9 +5138,13 @@ namespace npcvehicles
 			const bool aboard=InVehicle(actor)==vehicle;
 			const bool owns=owner && (At<uptr>(actor,0x98)==owner || (At<std::uint8_t>(owner,0x2E)==0x0D && InFaction(actor,owner)));
 			if(!aboard && (!owns||Dist(actor,vehicle)>80.0))continue;
+			if(PlayerTeam(actor) && PlayerTeam(shooter))continue;
+            if(reportCrime&&!event.crimeRaised&&shooter==player && !HostileTo(actor,shooter)&&!HostileTo(shooter,actor)&&FactionReaction(actor,shooter)!=1) {
+                CrimeAlarms(actor,vehicle,player,true,false);event.crimeRaised=true;
+            }
 			if(Aggro(actor,shooter))++reacted;
 		}
-		logger::Write("Vehicle aggression: %08X shot vehicle %08X; %d occupants/owners reacted",shooterId,id,reacted);
+		logger::Write("Vehicle aggression: %08X attacked vehicle %08X; %d occupants/owners reacted",shooterId,id,reacted);
 	}
 
 }

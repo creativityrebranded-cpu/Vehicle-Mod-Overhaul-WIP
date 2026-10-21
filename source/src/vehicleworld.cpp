@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
+#include <mutex>
 
 namespace world
 {
@@ -36,8 +37,8 @@ namespace world
 		constexpr std::uint32_t kNoBody = 0xFFFFFF;
 		constexpr ULONGLONG kScanMs = 1000;                         // the cell scan; positions update every frame
 
-		// Seqlock: odd while the writer is inside.
-		std::atomic<std::uint32_t> g_seq{ 0 };
+		// Immutable copies published under a short mutex.
+		std::mutex g_pubLock; // a seqlock cannot make concurrent non-atomic memcpy legal C++
 		Snapshot g_pub;
 
 		// Main-thread state.
@@ -47,6 +48,7 @@ namespace world
 			float vel[3] = {};
 			LARGE_INTEGER at{};
 			bool have = false;
+            float mass=0; ULONGLONG massAt=0; std::uint32_t massBody=0;
 		};
 		std::unordered_map<std::uint32_t, Track> g_track;
 		std::uint32_t g_ids[64] = {};
@@ -82,7 +84,7 @@ namespace world
 		}
 
 		// Half-extents from the base's bounds; a fallback (a REV-8-sized box) when they look wrong.
-		void Bounds(uptr base, float half[3])
+		void Bounds(uptr base, float half[3], float centre[3])
 		{
 			const float* mn = reinterpret_cast<const float*>(base + kBoundMin);
 			const float* mx = reinterpret_cast<const float*>(base + kBoundMax);
@@ -90,10 +92,11 @@ namespace world
 			for (int i = 0; i < 3; ++i) {
 				const float h = 0.5f * (mx[i] - mn[i]);
 				if (!std::isfinite(h) || h < 0.25f || h > 100000.0f) ok = false;
-				half[i] = std::max(h, 0.25f);
+				half[i] = std::max(h, 0.25f); centre[i]=(mx[i]+mn[i])*0.5f;
+                if(!std::isfinite(centre[i]))ok=false;
 			}
 			if (!ok) {
-				half[0] = 1.25f; half[1] = 2.3f; half[2] = 1.0f;
+				half[0] = 1.25f; half[1] = 2.3f; half[2] = 1.0f; centre[0]=centre[1]=centre[2]=0;
 			}
 			if (!g_toldBounds) {
 				g_toldBounds = true;
@@ -147,13 +150,18 @@ namespace world
 			}
 		}
 
-		void Write(const Snapshot& s)
+		float NativeMass(uptr ref) {
+            __try {
+                constexpr unsigned char sig[]{0x48,0x83,0xEC,0x48,0x49,0x8B,0x00,0x48,0x8D,0x54,0x24,0x68,0x49,0x8B,0xC8,0xFF};
+                if(std::memcmp(reinterpret_cast<void*>(game::Base()+0x02072450),sig,sizeof(sig)))return 0;
+                const float mass=EngineFn<float(*)(uptr,uptr,uptr)>(0x02072450)(0,0,ref);
+                return std::isfinite(mass)&&mass>0.01f&&mass<100000000.0f?mass:0;
+            }__except(EXCEPTION_EXECUTE_HANDLER){return 0;}
+        }
+        void Write(const Snapshot& s)
 		{
-			g_seq.fetch_add(1, std::memory_order_acq_rel);  // odd
-			std::atomic_thread_fence(std::memory_order_release);
-			std::memcpy(static_cast<void*>(&g_pub), &s, sizeof(Snapshot));
-			std::atomic_thread_fence(std::memory_order_release);
-			g_seq.fetch_add(1, std::memory_order_acq_rel);  // even
+            std::lock_guard lk(g_pubLock);
+            g_pub=s;
 		}
 	}
 
@@ -173,6 +181,7 @@ namespace world
 		s.count = 0;
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		const uptr driven = Driven(player);
+        unsigned massReads=0;
 		for (std::uint32_t i = 0; i < g_idCount; ++i) {
 			const std::uint32_t id = g_ids[i];
 			const uptr r = Lookup(id);
@@ -190,7 +199,7 @@ namespace world
 			const float sn = std::sin(v.heading), cs = std::cos(v.heading);
 			const float rot[9] = { cs, -sn, 0, sn, cs, 0, 0, 0, 1 };  // right, forward, up (heading only)
 			std::memcpy(v.rot, rot, sizeof(rot));
-			Bounds(base, v.half);
+			float localCentre[3]{}; Bounds(base, v.half,localCentre);
 			float sceneRot[9], radius = 0,sceneScale=1;
 			std::uint32_t body = 0;
 			if (FromScene(r, sceneRot, radius, body,v.bodyIds,v.bodyCount,sceneScale)) {
@@ -202,8 +211,12 @@ namespace world
 					for (int k = 0; k < 3; ++k) v.half[k] = std::min(v.half[k], radius);
 				}
 			}
-			// Velocity: smoothed position difference (a jump over 50 m restarts it).
+			for(int axis=0;axis<3;++axis){v.center[axis]=v.pos[axis];for(int local=0;local<3;++local)v.center[axis]+=v.rot[local*3+axis]*localCentre[local]*sceneScale;}
+            // Velocity: smoothed position difference (a jump over 50 m restarts it).
 			Track& t = g_track[id];
+            if(t.massBody!=v.bodyId){t.mass=0;t.massAt=0;t.massBody=v.bodyId;}
+            if(massReads<2&&(!t.massAt||now-t.massAt>5000)){++massReads;t.mass=NativeMass(r);t.massAt=now;}
+            v.nativeMass=t.mass>0; v.mass=v.nativeMass?t.mass:float(std::clamp(1500.0*double(v.half[0])*v.half[1]*v.half[2]/(1.25*2.3),100.0,100000.0));
 			if (t.have) {
 				const double dt = double(qpc.QuadPart - t.at.QuadPart) / double(freq.QuadPart);
 				const float jump = std::hypot(p.x - t.last[0], p.y - t.last[1]);
@@ -231,11 +244,11 @@ namespace world
 			t.at = qpc;
 			t.have = true;
 			std::memcpy(v.vel, t.vel, sizeof(v.vel));
-			if (r == driven) {
-				v.who = VehicleInfo::Who::Player;
-				v.driverId = player ? At<std::uint32_t>(player, off::kFormId) : 0;
-			}
-			else if (npcvehicles::UsesVehicle(id)) {
+			v.driverId=npcvehicles::VehicleDriverId(id);
+            if (player && v.driverId==At<std::uint32_t>(player,off::kFormId)) {
+                v.who=VehicleInfo::Who::Player;
+            }
+			else if (v.driverId || npcvehicles::UsesVehicle(id)) {
 				v.who = VehicleInfo::Who::Npc;
 			}
 			else {
@@ -259,18 +272,9 @@ namespace world
 
 	bool Vehicles(Snapshot& out)
 	{
-		for (int attempt = 0; attempt < 8; ++attempt) {
-			const std::uint32_t a = g_seq.load(std::memory_order_acquire);
-			if (a & 1) {
-				YieldProcessor();
-				continue;
-			}
-			std::atomic_thread_fence(std::memory_order_acquire);
-			std::memcpy(static_cast<void*>(&out), &g_pub, sizeof(Snapshot));
-			std::atomic_thread_fence(std::memory_order_acquire);
-			if (g_seq.load(std::memory_order_acquire) == a) return out.frame != 0;
-		}
-		return false;
+        std::lock_guard lk(g_pubLock);
+        out=g_pub;
+        return out.frame!=0;
 	}
 
 	bool FirstInPath(const float p[3], const float d[3], const float half[3], std::uint32_t ignoreFormId, std::uint32_t ignoreBodyId, VehicleInfo* hit,

@@ -61,7 +61,7 @@ namespace context
 		constexpr double kFetchRange = 150.0;
 
 		// A vehicle nobody drives and no job uses, nearest to `p` within `range` (one whose autopilot the hit counter switched off is left alone).
-		const world::VehicleInfo* FreeVehicleNear(const game::Vec3& p, double range = kBoardRange)
+		const world::VehicleInfo* FreeVehicleNear(const game::Vec3& p, double range = kBoardRange, uptr enemy = 0)
 		{
 			const world::VehicleInfo* best = nullptr;
 			double bestD = range;
@@ -71,7 +71,9 @@ namespace context
 				if (v.formId == vehicleflight::OwnRoverId()) continue;  // your own vehicle: the flight code never lets an NPC fly it
 				if (npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) || vehicleflight::AutopilotDisabled(v.formId)) continue;
 				const double d = std::hypot(double(v.pos[0]) - p.x, double(v.pos[1]) - p.y);
-				if (d < bestD) { bestD = d; best = &v; }
+				if (d >= bestD) continue;
+				if (enemy && !npcvehicles::FighterMayTake(enemy, v.ref)) continue;  // their faction's own, or in their own camp
+				bestD = d; best = &v;
 			}
 			return best;
 		}
@@ -227,16 +229,12 @@ namespace context
 			}
 		}
 
-		// A fight with vehicles in it: the player drives one, or NPC vehicles are following.
+		// Occupancy alone is not combat. Civil traffic yields only to a native fight.
 		bool VehicleFight(uptr player)
 		{
 			for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
-				if (g_snap.v[i].who == world::VehicleInfo::Who::Player) return true;
-			}
-			npcvehicles::JobInfo jobs[8];
-			const int n = npcvehicles::Jobs(jobs, 8);
-			for (int i = 0; i < n; ++i) {
-				if (jobs[i].following) return true;
+				const auto driver=g_snap.v[i].driverId?reinterpret_cast<uptr(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(g_snap.v[i].driverId):0;
+				if(driver && npcvehicles::IsInCombat(driver))return true;
 			}
 			(void)player;
 			return false;
@@ -273,9 +271,10 @@ namespace context
 				const std::uint32_t id = *reinterpret_cast<std::uint32_t*>(r + off::kFormId);
 				const auto it = g_triedAt.find(id);
 				if (it != g_triedAt.end() && now - it->second < kRetryMs) { ++cooling; continue; }
-				const auto* v = FreeVehicleNear(np);
-				if (!v && !npcvehicles::IsAlly(r) && VehicleFight(player)) {
-					v = FreeVehicleNear(np, kFetchRange);
+				const uptr enemy = npcvehicles::IsAlly(r) ? 0 : r;  // the player's followers keep using any free vehicle
+				const auto* v = FreeVehicleNear(np, kBoardRange, enemy);
+				if (!v && enemy && VehicleFight(player)) {
+					v = FreeVehicleNear(np, kFetchRange, enemy);
 					if (v) logger::Write("Context: fight with vehicles: enemy %08X runs to vehicle %08X %.0f m away", *reinterpret_cast<std::uint32_t*>(r + off::kFormId), v->formId,
 						Dist(np, game::Vec3{ v->pos[0], v->pos[1], v->pos[2] }));
 				}
@@ -292,7 +291,7 @@ namespace context
 				}
 				g_triedAt[id] = now;
 				++attempts;
-				const bool pursuit = !npcvehicles::IsAlly(r);
+				const bool pursuit = !npcvehicles::IsAlly(r); // offensive native fighter, not an instruction to attack the player
 				const bool ok = npcvehicles::BoardNpc(r, v->ref, true);
 				logger::Write("Context: fight: NPC %08X -> vehicle %08X (%.0f m), %s -> %s", id, v->formId, Dist(np, game::Vec3{ v->pos[0], v->pos[1], v->pos[2] }),
 					pursuit ? "pursuit" : "escort", ok ? "boarding" : "refused");
@@ -369,6 +368,6 @@ namespace context
 		g_pursuit.clear();
 		g_triedAt.clear();
 		g_calmSince.clear();
-		g_tickAt = g_scanAt = 0;
+		g_tickAt = g_scanAt = g_civilAt = 0; g_civilTried.clear();g_patrolledAt.clear();g_lastPackage.clear();
 	}
 }

@@ -33,6 +33,8 @@
 #include "sfse/PluginAPI.h"
 
 #include <atomic>
+#include <algorithm>
+#include <Windows.h>
 
 namespace plugininfo
 {
@@ -73,27 +75,33 @@ namespace
         environment::Reset();
 	}
 
-	void Frame()
-	{
-		modscene::NewFrame();  // the shared scan of loaded references starts over
-		world::Publish();      // the shared vehicle list (positions, velocities, sizes), once per frame
-		vehiclehits::Tick();   // projectiles through vehicles: the hit counter (needs this frame's vehicle list)
-		navseed::Tick();       // the game's collision objects into the nav map (a slice a frame)
-		routeplan::Frame();    // its copy for the lane planner
-		navfield::Service();
-		environment::Tick();
-		vehicleflight::Tick();
-		navmap::Tick();
-		shipvehicle::Tick();
-		realvehicles::Tick();
-		npcvehicles::Tick();
-		passenger::Tick();
-		scantarget::Tick();
-		traffic::Tick();
-		context::Tick();
-		viewdist::Tick();
-		profiles::Tick();
-	}
+    struct FrameCost {
+        double sum[8]{},max[8]{};unsigned count=0;ULONGLONG began=0;
+        void Finish(const double sample[8]) {
+            const auto now=GetTickCount64();if(!began)began=now;++count;
+            for(int i=0;i<8;++i){sum[i]+=sample[i];max[i]=std::max(max[i],sample[i]);}
+            if(now-began<60000)return;
+            logger::Write("Vehicle frame cost: total %.3f ms avg / %.3f worst; identity+world %.3f, hits %.3f, map+navigation %.3f, context+profiles %.3f, NPC decisions+squads+rams %.3f, flight %.3f, other %.3f (all engine glue included)",
+                sum[7]/count,max[7],sum[0]/count,sum[1]/count,sum[2]/count,sum[3]/count,sum[4]/count,sum[5]/count,sum[6]/count);
+            *this={};began=now;
+        }
+    } g_frameCost;
+    void Frame()
+    {
+        LARGE_INTEGER frequency,start,previous,stamp;QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&start);previous=start;
+        double cost[8]{};auto mark=[&](int i){QueryPerformanceCounter(&stamp);cost[i]=1000.0*double(stamp.QuadPart-previous.QuadPart)/frequency.QuadPart;previous=stamp;};
+        modscene::NewFrame();
+        vehicleflight::BeginFrame(); // decision owners must renew their commands in this frame
+        npcvehicles::BeginFrame();
+        world::Publish();mark(0);
+        vehiclehits::Tick();mark(1);
+        navseed::Tick();routeplan::Frame();navfield::Service();environment::Tick();navmap::Tick();mark(2);
+        profiles::Tick();context::Tick();mark(3);
+        npcvehicles::Tick();passenger::Tick();mark(4);
+        vehicleflight::Tick();mark(5);
+        shipvehicle::Tick();realvehicles::Tick();scantarget::Tick();traffic::Tick();viewdist::Tick();mark(6);
+        cost[7]=1000.0*double(stamp.QuadPart-start.QuadPart)/frequency.QuadPart;g_frameCost.Finish(cost);
+    }
 
 	class FrameTask final : public SFSETaskInterface::ITaskDelegate
 	{
@@ -190,7 +198,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 61, "SeamlessVehicle", "seemless",
+	SFSEPluginVersionData::kVersion, 62, "SeamlessVehicle", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -209,7 +217,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	g_messaging = static_cast<SFSEMessagingInterface*>(sfse->QueryInterface(kInterface_Messaging));
 	g_tasks = static_cast<SFSETaskInterface*>(sfse->QueryInterface(kInterface_Task));
 	if (!g_messaging || !g_messaging->RegisterListener(g_handle, "SFSE", SfseMessage)) return false;
-	logger::Write("SeamlessVehicle 0.61.0 loaded; core optional");
+	logger::Write("SeamlessVehicle 0.62.0 loaded; core optional");
 	return true;
 }
 }
