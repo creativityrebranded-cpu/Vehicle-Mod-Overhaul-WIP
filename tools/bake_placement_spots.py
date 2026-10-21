@@ -56,7 +56,9 @@ def owner(masters, plugin, fid):
 # What counts as a vehicle placement, per mod (file-relative base ids as written in the file).
 MODS = {
     "carfield.esm": {
-        # its six vehicle bases (REV-8 / Deimog copies) and the official REV-8 it also places
+        # Its six vehicle types are recognised wherever they are parked (stand-ins). Its placements are NOT baked: Carfield is a
+        # Creation by Swordhands_Bowman and none of its data ships with this mod (2026-10-21).
+        "spots": False,
         "bases": {0x2000806, 0x2000809, 0x200080B, 0x2000814, 0x2000020, 0x2000021, 0xFE000033, 0xFE001005, 0xFE002005},
     },
     "Vehicles.esm": {
@@ -84,7 +86,7 @@ def main():
                 standin = struct.unpack_from('<Q', hashlib.sha1(f"{plugin.lower()}|{fid:08X}".encode()).digest())[0]
                 own_bases.append((mi, plugin, file, local, standin, ed))
         for t, fid, b, world in recs:
-            if t != 'REFR' or world is None: continue
+            if t != 'REFR' or world is None or not spec.get("spots", True): continue
             name = first(b, b'NAME'); data = first(b, b'DATA')
             if not name or not data or len(data) < 24: continue
             base = struct.unpack_from('<I', name)[0]

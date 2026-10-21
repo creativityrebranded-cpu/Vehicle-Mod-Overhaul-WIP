@@ -7,56 +7,19 @@ namespace placementspots {
 // standin: the kind of vehicle the mod placed (its base or pack-in); every spot of one kind in one location gets the same vehicle.
 struct Spot { std::uint8_t mod, worldFile; std::uint32_t worldLocal; float x, y, z, heading; std::uint64_t key, standin; };
 inline constexpr const char* kMods[] = { "carfield.esm", "Vehicles.esm" };
-inline constexpr const char* kFiles[] = { "Starfield.esm", "ShatteredSpace.esm", "sfbgs00d.esm", "sfbgs004.esm" };
-inline constexpr unsigned kSpotCount = 245;
+inline constexpr const char* kFiles[] = { "Starfield.esm", "sfbgs00d.esm", "sfbgs004.esm" };
+inline constexpr unsigned kSpotCount = 208;
 // A mod's own vehicle types (stand-ins recognised anywhere): the mod, the file its id is written under, the local id, the stand-in.
 struct StandinBase { std::uint8_t mod, file; std::uint32_t local; std::uint64_t standin; };
 inline constexpr StandinBase kStandinBases[] = {
-    { 0, 3, 0x000020, 0x8884A48CD05C7582ull },  // carfield.esm SFBGS019_Deimog_REVCOPY0000
-    { 0, 3, 0x000021, 0xAD38C1480285113Eull },  // carfield.esm SFBGS019_Deimog_rev2
-    { 0, 3, 0x000806, 0x2289B91FCB2A8817ull },  // carfield.esm Rev8_civ1
-    { 0, 3, 0x000809, 0xDA343D20B7F7C82Eull },  // carfield.esm Rev8_UCSEC
-    { 0, 3, 0x00080B, 0x76D80659A481F5CEull },  // carfield.esm Rev8_ship_tech
-    { 0, 3, 0x000814, 0x8CEF76BB102D8D1Dull },  // carfield.esm SFBGS019_Deimog_REV
+    { 0, 2, 0x000020, 0x8884A48CD05C7582ull },  // carfield.esm SFBGS019_Deimog_REVCOPY0000
+    { 0, 2, 0x000021, 0xAD38C1480285113Eull },  // carfield.esm SFBGS019_Deimog_rev2
+    { 0, 2, 0x000806, 0x2289B91FCB2A8817ull },  // carfield.esm Rev8_civ1
+    { 0, 2, 0x000809, 0xDA343D20B7F7C82Eull },  // carfield.esm Rev8_UCSEC
+    { 0, 2, 0x00080B, 0x76D80659A481F5CEull },  // carfield.esm Rev8_ship_tech
+    { 0, 2, 0x000814, 0x8CEF76BB102D8D1Dull },  // carfield.esm SFBGS019_Deimog_REV
 };
 inline constexpr Spot kSpots[] = {
-    { 0, 0, 0x01251B, 94.59f, 427.14f, 241.42f, 4.7832f, 0xF5DCCB1FDBBE76C4ull, 0x5547F1228EA06B12ull },  // carfield.esm 02000001
-    { 0, 0, 0x01251B, 32.00f, 377.15f, 242.42f, 0.1000f, 0xA9617D2A13811504ull, 0xDA343D20B7F7C82Eull },  // carfield.esm 02000002
-    { 0, 0, 0x01251B, -62.29f, 158.18f, 242.42f, 0.0000f, 0xB2C48D2B33891BBCull, 0xDA343D20B7F7C82Eull },  // carfield.esm 02000D5F
-    { 0, 0, 0x01251B, -16.96f, 231.04f, 241.82f, -1.6000f, 0x9FF2AF52E0CC72A4ull, 0x8CEF76BB102D8D1Dull },  // carfield.esm 02000E11
-    { 0, 0, 0x01251B, -15.18f, 253.11f, 242.42f, 0.5000f, 0xC2F5F8DAEA22AD2Cull, 0x76D80659A481F5CEull },  // carfield.esm 02000E62
-    { 0, 0, 0x01251B, -78.50f, -58.05f, 77.48f, 0.0168f, 0xD30901ACB38DE9EEull, 0xDA343D20B7F7C82Eull },  // carfield.esm 02000FB1
-    { 0, 0, 0x01251B, -96.96f, -150.58f, 77.69f, 5.2832f, 0x267FAC6783582692ull, 0x76D80659A481F5CEull },  // carfield.esm 02000003
-    { 0, 0, 0x01251B, -176.70f, -96.08f, 77.47f, 0.0000f, 0x7A23F1FC9C13B0D3ull, 0x76D80659A481F5CEull },  // carfield.esm 02000004
-    { 0, 0, 0x024CA2, 144.14f, 100.98f, 27.47f, 0.0000f, 0xA87CB50839501B2Bull, 0xAD38C1480285113Eull },  // carfield.esm 02000023
-    { 0, 0, 0x024CA2, 120.19f, 84.01f, 27.98f, 0.0000f, 0x3D07F287DCD288E2ull, 0xAD38C1480285113Eull },  // carfield.esm 02000022
-    { 0, 0, 0x08DA69, 214.50f, 272.58f, 7.00f, 1.0000f, 0x6F07ED9B1E081BC3ull, 0x76D80659A481F5CEull },  // carfield.esm 0200001D
-    { 0, 0, 0x08DA69, 220.92f, 298.79f, 7.00f, -2.3832f, 0x31FBC16AD898CBE6ull, 0x76D80659A481F5CEull },  // carfield.esm 0200001E
-    { 0, 0, 0x08DA69, 240.48f, 328.04f, 7.00f, 0.0000f, 0xDDB56158F9D2A888ull, 0x2289B91FCB2A8817ull },  // carfield.esm 0200001F
-    { 0, 0, 0x17910E, 21.15f, 60.36f, 21.40f, 0.4000f, 0x9FB1DAEB55B69021ull, 0x8CEF76BB102D8D1Dull },  // carfield.esm 02000014
-    { 0, 0, 0x17910E, 47.93f, 68.07f, 21.89f, 0.6000f, 0x2C341A888764B1B1ull, 0x8CEF76BB102D8D1Dull },  // carfield.esm 02000015
-    { 0, 0, 0x17910E, 80.37f, 68.26f, 20.98f, 0.8000f, 0x41AF2C2698EA5017ull, 0x2289B91FCB2A8817ull },  // carfield.esm 02000016
-    { 0, 0, 0x27CFA2, 258.38f, 42.06f, 34.06f, 1.6000f, 0x2910516D8176BEB2ull, 0x2289B91FCB2A8817ull },  // carfield.esm 0200000A
-    { 0, 0, 0x27CFA2, 258.54f, 49.86f, 33.74f, 1.7832f, 0xDEB224EB9DB1498Dull, 0x2289B91FCB2A8817ull },  // carfield.esm 0200000B
-    { 0, 0, 0x27CFA2, -7.49f, 40.44f, 36.52f, -1.8000f, 0xDBD7CB76136D1A6Bull, 0x76D80659A481F5CEull },  // carfield.esm 02000005
-    { 0, 0, 0x27CFA2, -16.75f, 27.94f, 36.67f, 0.0000f, 0xBA70F9F8C5DA40EEull, 0x76D80659A481F5CEull },  // carfield.esm 02000006
-    { 0, 0, 0x27CFA2, -23.58f, 97.57f, 36.54f, -0.4000f, 0xC78CE554CCB319F8ull, 0x76D80659A481F5CEull },  // carfield.esm 02000007
-    { 0, 0, 0x27CFA2, -14.59f, 188.72f, 36.44f, 0.7000f, 0xD7D22CD03B131EC4ull, 0x2289B91FCB2A8817ull },  // carfield.esm 02000008
-    { 0, 0, 0x27CFA2, -16.85f, 191.22f, 36.46f, 0.7000f, 0x480F91829A41877Full, 0x2289B91FCB2A8817ull },  // carfield.esm 02000009
-    { 0, 0, 0x29DDD7, 105.19f, -14.51f, 25.66f, -1.8832f, 0x90D909A62565E32Cull, 0x76D80659A481F5CEull },  // carfield.esm 02000017
-    { 0, 0, 0x2B63F0, 56.51f, 35.93f, 97.19f, -0.2424f, 0x1ED02045A7F47FF8ull, 0xD79C7BFD9E66457Aull },  // carfield.esm 02000018
-    { 0, 0, 0x2B63F0, -149.48f, 23.85f, 66.70f, 2.9832f, 0x13D05272E03E3C2Eull, 0x8CEF76BB102D8D1Dull },  // carfield.esm 0200001B
-    { 0, 0, 0x2B63F0, -147.12f, 5.80f, 66.76f, 1.5832f, 0x8B6FD073BD3E9D34ull, 0x2289B91FCB2A8817ull },  // carfield.esm 0200001C
-    { 0, 0, 0x2B63F0, -50.82f, 6.21f, 69.01f, 1.5000f, 0x518E03434D982C49ull, 0x8CEF76BB102D8D1Dull },  // carfield.esm 02000019
-    { 0, 0, 0x2B63F0, -97.69f, 10.64f, 66.66f, 0.0000f, 0xD7D51ABCB0F26412ull, 0x76D80659A481F5CEull },  // carfield.esm 0200001A
-    { 0, 0, 0x2CFC4A, -350.47f, -69.60f, 25.60f, 0.0000f, 0xF4629E9A5D2E2683ull, 0x76D80659A481F5CEull },  // carfield.esm 0200000C
-    { 0, 0, 0x2CFC4A, -312.08f, -79.08f, 25.60f, 1.8000f, 0xEC109767D2F257CFull, 0x76D80659A481F5CEull },  // carfield.esm 0200000D
-    { 0, 0, 0x2CFC4A, -331.30f, -19.82f, 25.60f, 2.9000f, 0x69505392768376CAull, 0x76D80659A481F5CEull },  // carfield.esm 0200000E
-    { 0, 0, 0x2CFC4A, -183.17f, -156.53f, 25.60f, 0.0000f, 0xDB6462E5646E17F8ull, 0x76D80659A481F5CEull },  // carfield.esm 02000012
-    { 0, 0, 0x2CFC4A, -182.92f, -8.68f, 17.30f, -0.1000f, 0xF3D499FED33B106Aull, 0x76D80659A481F5CEull },  // carfield.esm 0200000F
-    { 0, 0, 0x2CFC4A, -68.31f, -136.58f, 25.69f, 1.8168f, 0xBCE76F66FA52E172ull, 0x76D80659A481F5CEull },  // carfield.esm 02000010
-    { 0, 0, 0x2CFC4A, -79.69f, -156.92f, 25.60f, -0.3000f, 0x650051CD4BB84758ull, 0x76D80659A481F5CEull },  // carfield.esm 02000011
-    { 0, 1, 0x0470CB, -123.10f, -203.20f, 80.74f, 2.1000f, 0xF7060522E1E8BB69ull, 0x76D80659A481F5CEull },  // carfield.esm 02000013
     { 1, 0, 0x01251B, 254.80f, 385.86f, 246.47f, 0.0000f, 0x67913567638F228Full, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000B5A
     { 1, 0, 0x01251B, 259.05f, 385.46f, 246.86f, 6.2664f, 0xDF8E6FC810895291ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000B5B
     { 1, 0, 0x01251B, 266.47f, 385.18f, 246.96f, 0.1659f, 0x0629A1970BE50B7Aull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000B5C
@@ -239,31 +202,31 @@ inline constexpr Spot kSpots[] = {
     { 1, 0, 0x2CFC4A, -43.49f, -64.75f, 16.85f, 1.4000f, 0x921241AD6A9847B4ull, 0x510562144A0B3551ull },  // Vehicles.esm 0200086B
     { 1, 0, 0x325868, 221.84f, 152.59f, 10.75f, 1.2000f, 0x23C00C6DFDA05D24ull, 0x6F94839E7124EE60ull },  // Vehicles.esm 02000B4C
     { 1, 0, 0x399C3E, -14.61f, 39.58f, 25.46f, 0.0000f, 0xA2F54C137F90FC92ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000833
-    { 1, 2, 0x002428, 54.67f, -15.21f, 3.02f, 4.2832f, 0x3AA4BFA1C3CFE423ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008EA
-    { 1, 2, 0x0034AE, 35.12f, 48.82f, 7.39f, 0.8000f, 0xA252AF2B05ADE27Full, 0x24A86FEE9136D8CEull },  // Vehicles.esm 0102B03C
-    { 1, 2, 0x0049B6, 14.24f, 52.12f, 2.88f, 1.6000f, 0x285C21D0A368E1B9ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BA8
-    { 1, 2, 0x0056F4, 27.31f, 36.80f, 6.17f, 1.5000f, 0x5DBE4BF739B50BC7ull, 0x67045DC8397EF361ull },  // Vehicles.esm 020008ED
-    { 1, 2, 0x0056F6, 5.14f, 22.39f, 1.44f, 2.5000f, 0x81B337F07472C08Bull, 0x6F94839E7124EE60ull },  // Vehicles.esm 020008EE
-    { 1, 2, 0x006216, 37.76f, 41.62f, 28.83f, 0.0000f, 0x2B8158DA68F8A8B6ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008EF
-    { 1, 2, 0x0079E3, 38.51f, 84.33f, 6.22f, 5.8832f, 0xEC1E754A595401D2ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BA7
-    { 1, 2, 0x007B67, 41.29f, 34.20f, -1.13f, 2.4832f, 0x03FF2B144F37B540ull, 0x67045DC8397EF361ull },  // Vehicles.esm 02000BAD
-    { 1, 2, 0x008DD0, 38.60f, 92.87f, 21.71f, 2.6832f, 0xB3237C11777B45CFull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BA9
-    { 1, 2, 0x00D189, -80.03f, -16.35f, 10.78f, 2.2000f, 0x6CB6AD5E8E31BA4Full, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008EC
-    { 1, 2, 0x00EC6B, 62.73f, 59.27f, 19.28f, 1.4000f, 0xB3843D563008C3E5ull, 0x67045DC8397EF361ull },  // Vehicles.esm 02000BAA
-    { 1, 2, 0x010FB8, 12.43f, 31.00f, 7.45f, 1.2972f, 0x51308BA850E89505ull, 0x67045DC8397EF361ull },  // Vehicles.esm 02000BAF
-    { 1, 2, 0x01FA8E, 69.30f, 60.12f, 18.00f, 1.7000f, 0x628665F0B44B67AAull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F1
-    { 1, 2, 0x021197, 33.15f, 30.39f, 5.00f, 2.3832f, 0xF2A06D284BA24406ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000B46
-    { 1, 2, 0x025683, -1.45f, -59.21f, 2.21f, 1.5000f, 0x88B76CE545F7A387ull, 0x67045DC8397EF361ull },  // Vehicles.esm 020008F2
-    { 1, 2, 0x02A3A9, 31.65f, -3.81f, 8.73f, 0.2000f, 0xCE0CD9D8FE623875ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F7
-    { 1, 2, 0x0300D5, 59.36f, 8.79f, 2.67f, -2.3000f, 0x870098E632AFC76Aull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB4
-    { 1, 2, 0x0300D5, 161.13f, 30.97f, 6.07f, 4.6832f, 0x2DBDAF6DD10442BFull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB3
-    { 1, 2, 0x0300D5, -84.21f, 3.35f, 2.50f, 0.3000f, 0x11F541DD342C888Bull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB5
-    { 1, 2, 0x030717, 24.87f, 43.53f, 3.50f, 3.6832f, 0xAF3672B79182F4F6ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB1
-    { 1, 2, 0x03625A, 22.17f, 6.77f, 5.14f, -0.5000f, 0xAAC73E502922B97Aull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB2
-    { 1, 2, 0x03625A, -12.32f, 39.51f, 5.80f, -0.6000f, 0x7BFF272CFF0C7E17ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BAC
-    { 1, 2, 0x043B20, 41.39f, 81.87f, 1.98f, 1.6000f, 0x388F5EE8EB273876ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F6
-    { 1, 2, 0x044613, 44.91f, 82.24f, 14.27f, 3.3832f, 0xAE9098FA287A9BE1ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F4
-    { 1, 2, 0x0525D4, 47.40f, 77.94f, 14.33f, 3.6832f, 0xDAB3CD7C2B203B50ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F5
-    { 1, 2, 0x05DBFE, 56.38f, 31.56f, 55.76f, 1.4000f, 0x6C4DC400263DBA73ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F3
+    { 1, 1, 0x002428, 54.67f, -15.21f, 3.02f, 4.2832f, 0x3AA4BFA1C3CFE423ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008EA
+    { 1, 1, 0x0034AE, 35.12f, 48.82f, 7.39f, 0.8000f, 0xA252AF2B05ADE27Full, 0x24A86FEE9136D8CEull },  // Vehicles.esm 0102B03C
+    { 1, 1, 0x0049B6, 14.24f, 52.12f, 2.88f, 1.6000f, 0x285C21D0A368E1B9ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BA8
+    { 1, 1, 0x0056F4, 27.31f, 36.80f, 6.17f, 1.5000f, 0x5DBE4BF739B50BC7ull, 0x67045DC8397EF361ull },  // Vehicles.esm 020008ED
+    { 1, 1, 0x0056F6, 5.14f, 22.39f, 1.44f, 2.5000f, 0x81B337F07472C08Bull, 0x6F94839E7124EE60ull },  // Vehicles.esm 020008EE
+    { 1, 1, 0x006216, 37.76f, 41.62f, 28.83f, 0.0000f, 0x2B8158DA68F8A8B6ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008EF
+    { 1, 1, 0x0079E3, 38.51f, 84.33f, 6.22f, 5.8832f, 0xEC1E754A595401D2ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BA7
+    { 1, 1, 0x007B67, 41.29f, 34.20f, -1.13f, 2.4832f, 0x03FF2B144F37B540ull, 0x67045DC8397EF361ull },  // Vehicles.esm 02000BAD
+    { 1, 1, 0x008DD0, 38.60f, 92.87f, 21.71f, 2.6832f, 0xB3237C11777B45CFull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BA9
+    { 1, 1, 0x00D189, -80.03f, -16.35f, 10.78f, 2.2000f, 0x6CB6AD5E8E31BA4Full, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008EC
+    { 1, 1, 0x00EC6B, 62.73f, 59.27f, 19.28f, 1.4000f, 0xB3843D563008C3E5ull, 0x67045DC8397EF361ull },  // Vehicles.esm 02000BAA
+    { 1, 1, 0x010FB8, 12.43f, 31.00f, 7.45f, 1.2972f, 0x51308BA850E89505ull, 0x67045DC8397EF361ull },  // Vehicles.esm 02000BAF
+    { 1, 1, 0x01FA8E, 69.30f, 60.12f, 18.00f, 1.7000f, 0x628665F0B44B67AAull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F1
+    { 1, 1, 0x021197, 33.15f, 30.39f, 5.00f, 2.3832f, 0xF2A06D284BA24406ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000B46
+    { 1, 1, 0x025683, -1.45f, -59.21f, 2.21f, 1.5000f, 0x88B76CE545F7A387ull, 0x67045DC8397EF361ull },  // Vehicles.esm 020008F2
+    { 1, 1, 0x02A3A9, 31.65f, -3.81f, 8.73f, 0.2000f, 0xCE0CD9D8FE623875ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F7
+    { 1, 1, 0x0300D5, 59.36f, 8.79f, 2.67f, -2.3000f, 0x870098E632AFC76Aull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB4
+    { 1, 1, 0x0300D5, 161.13f, 30.97f, 6.07f, 4.6832f, 0x2DBDAF6DD10442BFull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB3
+    { 1, 1, 0x0300D5, -84.21f, 3.35f, 2.50f, 0.3000f, 0x11F541DD342C888Bull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB5
+    { 1, 1, 0x030717, 24.87f, 43.53f, 3.50f, 3.6832f, 0xAF3672B79182F4F6ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB1
+    { 1, 1, 0x03625A, 22.17f, 6.77f, 5.14f, -0.5000f, 0xAAC73E502922B97Aull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BB2
+    { 1, 1, 0x03625A, -12.32f, 39.51f, 5.80f, -0.6000f, 0x7BFF272CFF0C7E17ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 02000BAC
+    { 1, 1, 0x043B20, 41.39f, 81.87f, 1.98f, 1.6000f, 0x388F5EE8EB273876ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F6
+    { 1, 1, 0x044613, 44.91f, 82.24f, 14.27f, 3.3832f, 0xAE9098FA287A9BE1ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F4
+    { 1, 1, 0x0525D4, 47.40f, 77.94f, 14.33f, 3.6832f, 0xDAB3CD7C2B203B50ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F5
+    { 1, 1, 0x05DBFE, 56.38f, 31.56f, 55.76f, 1.4000f, 0x6C4DC400263DBA73ull, 0x3CD923727F40A7C4ull },  // Vehicles.esm 020008F3
 };
 }
