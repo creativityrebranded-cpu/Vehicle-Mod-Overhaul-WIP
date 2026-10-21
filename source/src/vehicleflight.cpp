@@ -2,6 +2,7 @@
 #include "overrides.h"
 #include "profileclass.h"
 #include "coverfight.h"
+#include "keygesture.h"
 
 #include "addresses.h"
 #include "controlmap.h"
@@ -1127,7 +1128,6 @@ namespace vehicleflight
 
 		// Main thread, caller holds Shared::lock. Missing identity disables writes until the scene proves ownership.
 		struct RamOrder{std::uint32_t vehicle=0,actor=0;int pilot=0;ULONGLONG started=0,lastAt=0;game::Vec3 last{};}g_ram;
-		struct ReadyOrder{std::uint32_t vehicle=0;ULONGLONG since=0;}g_ramReady;  // hold T: waiting for the player to pick the ram target
 
 		void BindBody(Shared&s,std::uintptr_t ref)
 		{
@@ -1543,6 +1543,7 @@ namespace vehicleflight
 			int up = 0, down = 0;
 			int call = 0;                  // N: summon / recall (on foot)
 			int follow = 0;                // U: cover on / off (on foot)
+			int stance = 0;                // Defend / Attack / Hold fire for your vehicle and your escorts (on foot and driving)
 		} g_keys;
 
 		struct Tap
@@ -1620,6 +1621,7 @@ namespace vehicleflight
 			for (const int vk : { g_keys.call, g_keys.follow })
 				if (!controlmap::KeyFree(vk)) logger::Write("Rover keys: %s is also bound by the game (%s); kept as the user chose", controlmap::KeyName(vk).c_str(), controlmap::WhoUses(vk).c_str());
 			logger::Write("Rover summon / recall key: %s, cover key: %s", controlmap::KeyName(g_keys.call).c_str(), controlmap::KeyName(g_keys.follow).c_str());
+
 			g_keys.chosen = true;
 			controlmap::Note("flight", "hover toggle", g_keys.toggle);
 			controlmap::Note("flight", "roll left", g_keys.rollLeft);
@@ -1628,6 +1630,12 @@ namespace vehicleflight
 			controlmap::Note("flight", "down", g_keys.down);
 			controlmap::Note("flight", "call", g_keys.call);
 			controlmap::Note("flight", "follow", g_keys.follow);
+			// Stance: one free key besides the ones above, never a number key nor the test keys , . / ' (the user's rule).
+			g_keys.stance = 0;
+			for (const int vk : { 'Y', 'O', 'P', 'B', 'K', 'J', 'G' }) {
+				if (vk != g_keys.toggle && vk != g_keys.up && vk != g_keys.down && controlmap::Claim("flight", "stance", vk)) { g_keys.stance = vk; break; }
+			}
+			logger::Write("Rover stance key: %s", g_keys.stance ? controlmap::KeyName(g_keys.stance).c_str() : "NONE FREE");
 			logger::Write("Rover flight keys: toggle %s, roll %s / %s, up %s / down %s; mouse aims (yaw + pitch), W/S throttle, Shift boost; extra mouse buttons unused",
 				g_keys.toggle ? controlmap::KeyName(g_keys.toggle).c_str() : "NONE FREE", g_keys.rollLeft ? controlmap::KeyName(g_keys.rollLeft).c_str() : "none",
 				g_keys.rollRight ? controlmap::KeyName(g_keys.rollRight).c_str() : "none", g_keys.up ? controlmap::KeyName(g_keys.up).c_str() : "none",
@@ -2591,7 +2599,17 @@ namespace vehicleflight
 				goal.x=target.x+vx*lead+(distance>0.1?(target.x-pos.x)/distance*pass:0);
 				goal.y=target.y+vy*lead+(distance>0.1?(target.y-pos.y)/distance*pass:0);
 				goal.z=target.z+1;goal.stop=0;goal.hold=false;goal.cruise=true;goal.cruiseSpeed=26*g_sh.hull.acceleration;goal.keepGoing=true;
-				if(distance<40&&!other)g.drive=true;
+				// Straight line, flat out (2026-10-21, the user: "fly in a straight line as quickly as possible"): the ram steers the nose at the led
+				// point itself, full throttle in top gear; no planned path, detours or slowing for traffic. The autopilot keeps only the height
+				// (the target's, never under the terrain clearance).
+				g.drive=false;
+				const double speed=std::hypot(g_sh.v[0],g_sh.v[1]);
+				const double err=Wrap(std::atan2(goal.x-pos.x,goal.y-pos.y)-At<game::Vec3>(vehicle,off::kRefRotation).z);
+				Command c;
+				c.set=Command::kThrottle|Command::kYaw|Command::kStrafe|Command::kGear|Command::kBrake;
+				c.throttle=ramlogic::Throttle(err);c.yawRate=ramlogic::SteerRate(err,g_sh.hull.YawAt(speed));
+				c.strafe=0;c.gear=4;c.brake=false;c.holdMs=200;
+				g_cmds[idx]={c,now+c.holdMs};
 			}
 			VehicleWarning(idx, vehicle, wc);
 			if (g.autopilot) PersonAhead(idx, vehicle);
@@ -2721,7 +2739,7 @@ namespace vehicleflight
 			}
 			const double above = groundOk ? pos.z - g.ground : pos.z - g.baseZ;
 
-            if(g.autopilot && !g.routeHold) {
+            if(g.autopilot && !g.routeHold && !g.ramActor) {  // a ram is a bounded straight run: no stuck recovery
                 const double goalHeight=std::isfinite(goal.z) ? goal.z : 0;
                 if(g.recovery.Update(GetTickCount64(),pos.x,pos.y,pos.z,goal.x,goal.y,goalHeight,
                     AtDestination(vehicle,goal.x,goal.y,goal.z,goal.stop),!groundOk || (!matched && !g.drive))) {
@@ -3626,7 +3644,9 @@ namespace vehicleflight
 			if (now - g_cf.posAt >= coverfight::kPickMs) {
 				g_cf.posAt = now;
 				double x = 0, y = 0, z = std::numeric_limits<double>::quiet_NaN();
+				const auto* cmb = vcontract::AssignedTo(g_roverId, vcontract::Class::Combat);
 				if (guard) { x = g.holdX; y = g.holdY; }
+				else if (cmb && profileclass::Is(cmb->name, "attack")) coverfight::AttackPoint(cx, cy, ep.x, ep.y, At<game::Vec3>(rover, off::kRefPosition).x, At<game::Vec3>(rover, off::kRefPosition).y, x, y);
 				else coverfight::ShieldPoint(pp.x, pp.y, ep.x, ep.y, x, y);
 				const float threat[3] = { ep.x, ep.y, ep.z + 1.2f };
 				environment::CombatPosition(g_roverId, threat, x, y, z, true);  // false: the centre itself (no better mapped spot)
@@ -3815,19 +3835,31 @@ namespace vehicleflight
 		// N (on foot): Summon / Recall. The vehicle always comes to the player (far: moved next to them; nearer: flown over), over Cover, a guard point,
 		// a hold, a ram and any fight; pressing it again re-issues it and never cancels it. U: Cover on / off (follow and defend the player, overrides.h).
 		{
-			static bool callDown = false;
-			const bool c = focused && Held(g_keys.call);
+			// N tap: your vehicle only; N hold (1 s): every escort too, which also works while you drive. U tap: your vehicle covers you by itself;
+			// U hold: a free follower drives it to cover you. The stance key cycles Defend / Attack / Hold fire anywhere.
+			static keygesture::Input nKey, uKey;
+			static bool stanceDown = false;
+			const ULONGLONG keyNow = GetTickCount64();
+			const auto nAct = nKey.Update(Held(g_keys.call), focused, keyNow);
+			const auto uAct = uKey.Update(Held(g_keys.follow), focused && !driven, keyNow);
+			const bool stanceHeld = focused && g_keys.stance && Held(g_keys.stance);
+			if (stanceHeld && !stanceDown) {
+				const auto s = npcvehicles::CycleStance();
+				notify::Show("Stance: %s", s == npcvehicles::Stance::Attack ? "Attack" : s == npcvehicles::Stance::HoldFire ? "Hold fire" : "Defend");
+			}
+			stanceDown = stanceHeld;
 			const bool scanCall = g_scanCall.exchange(false);  // the scanner marker button counts as the call key
-			bool callPressed = (c && !callDown) || scanCall;
-			callDown = c;
-			static bool followDown = false;
-			const bool fk = focused && Held(g_keys.follow);
-			bool followPressed = fk && !followDown;
-			followDown = fk;
-			if (callPressed && !scanCall && !driven) {
-				g_ram = {}; g_ramReady = {};
-				npcvehicles::Recall(15000);  // escorts drop their fights and come back into formation as well
-				logger::Write("Rover recall: N pressed");
+			bool callPressed = (!driven && (nAct.tap || nAct.hold)) || scanCall;
+			const bool coverHand = uAct.hold;  // hand your vehicle to a follower
+			bool followPressed = uAct.tap || uAct.hold;
+			if (nAct.hold) {
+				npcvehicles::Recall(15000);  // escorts drop their fights and come back into formation
+				logger::Write("Rover recall: N held; escorts recalled%s", driven ? " (you are driving)" : " with your vehicle");
+				notify::Show("Escorts recalled");
+			}
+			if (callPressed && !scanCall) {
+				g_ram = {};
+				logger::Write("Rover recall: N %s", nAct.hold ? "held" : "tapped");
 			}
 			// Crew: with a follower driving or free, the buttons go to the follower.
 			if (!driven && (callPressed || followPressed) && g_roverId) {
@@ -3850,8 +3882,9 @@ namespace vehicleflight
 					notify::Show("Follower order cancelled");
 					followPressed = false;
 				}
-				else if ((followPressed || scanCall) && Rover() && !g_follow && npcvehicles::FreeFollower(player, ppos.x, ppos.y, 60.0)) {
-					// N is for the player to drive, so only Cover and the scanner trip hand the vehicle to a follower.
+				else if ((coverHand || (scanCall && !g_follow)) && Rover() && npcvehicles::FreeFollower(player, ppos.x, ppos.y, 60.0)) {
+					// N is for the player to drive, so only a U hold and the scanner trip hand the vehicle to a follower.
+					if (g_follow || g_guard) { g_follow = g_guard = false; logger::Write("Rover cover: handed to a follower"); }
 					g_crewPending = scanCall ? npcvehicles::CrewOrder::Marker : npcvehicles::CrewOrder::Cover;
 					g_crewAt = GetTickCount64();
 					g_goOnBoard.store(false);
@@ -3861,8 +3894,12 @@ namespace vehicleflight
 					followPressed = false; // the follower covers, not the empty vehicle
 				}
 			}
+			if (followPressed && coverHand) {
+				logger::Write("Rover crew: no follower free; your vehicle covers you by itself");
+				notify::Show("No follower free | your vehicle covers you");
+			}
 			if (followPressed && !driven) {
-				if (g_follow && !g_guard) {
+				if (g_follow && !g_guard && !coverHand) {
 					g_follow = false;
 					logger::Write("Rover cover: off");
 					if (g.autopilot) Stop("cover off");
@@ -4069,7 +4106,9 @@ namespace vehicleflight
 			const bool covering = g_follow || crew == npcvehicles::CrewOrder::Cover || crew == npcvehicles::CrewOrder::Follow;
 			const bool guarding = (g_guard && g.holdId) || crew == npcvehicles::CrewOrder::Guard;
 			if (!driven) {
-				const char* defend = CoverFighting() ? " \xC2\xB7 DEFEND" : "";
+				const auto stance = npcvehicles::CurrentStance();
+				const char* defend = stance == npcvehicles::Stance::HoldFire ? " \xC2\xB7 HOLD FIRE" : !CoverFighting() ? (stance == npcvehicles::Stance::Attack ? " \xC2\xB7 ATTACK" : "") :
+					stance == npcvehicles::Stance::Attack ? " \xC2\xB7 ATTACK" : " \xC2\xB7 DEFEND";
 				if (guarding) std::snprintf(status, sizeof(status), "GUARD POINT%s", defend);
 				else if (crew == npcvehicles::CrewOrder::Recall) std::snprintf(status, sizeof(status), "SUMMONING  %.0f m", std::min(toRover, 9999.0));
 				else if (g.holdId || crew == npcvehicles::CrewOrder::Hold) std::snprintf(status, sizeof(status), "HOLDING");
@@ -4088,8 +4127,8 @@ namespace vehicleflight
 				overrides::SummonLabel(busy), overrides::CoverLabel(covering && !guarding ? overrides::Mode::Cover : overrides::Mode::None));
 			char line[64] = "";
 			const std::uint32_t drivenId = driven ? At<std::uint32_t>(driven, off::kFormId) : 0;
-			const bool ramLine = driven && (Ramming(drivenId) || RamReady(drivenId));
-			if (ramLine) std::snprintf(line, sizeof(line), "%s", Ramming(drivenId) ? "RAMMING" : "RAM READY \xC2\xB7 SELECT TARGET");
+			const bool ramLine = driven && Ramming(drivenId);
+			if (ramLine) std::snprintf(line, sizeof(line), "RAMMING");
 			else if (driven && g.playerAuto) {
 				if (g.taxiMarker && ProgressFor(g_roverId).phase==triplogic::Phase::Arrived) std::snprintf(line, sizeof(line), "ARRIVED");
 				else if (g.taxiMarker) std::snprintf(line, sizeof(line), "%s  %.0f m", triplogic::Text(ProgressFor(g_roverId).phase), std::min(g.taxiLeft, 99999.0));
@@ -4478,7 +4517,7 @@ namespace vehicleflight
 
 	void CancelScannerTrip()
 	{
-		g_scanCall.store(false); g_goOnBoard.store(false); g_goAt.store(0);g_ram={};g_ramReady={};
+		g_scanCall.store(false); g_goOnBoard.store(false); g_goAt.store(0);g_ram={};
 		if (g_crewPending==npcvehicles::CrewOrder::Marker) g_crewPending=npcvehicles::CrewOrder::None;
 		if (npcvehicles::CrewOrderOf(g_roverId)==npcvehicles::CrewOrder::Marker)
 			npcvehicles::SetCrewOrder(g_roverId,npcvehicles::CrewOrder::Hold);
@@ -4554,30 +4593,12 @@ namespace vehicleflight
 	AutoMode GetAutoMode() { return g_autoMode; }
 
 	bool Ramming(std::uint32_t vehicleId){return ramlogic::Owns(g_ram.vehicle,vehicleId,GetTickCount64()-g_ram.started);}
-	bool RamReady(std::uint32_t vehicleId){return ramlogic::Armed(g_ramReady.vehicle,vehicleId,GetTickCount64()-g_ramReady.since);}
-	void DisarmRam(){if(g_ramReady.vehicle)logger::Write("Ram ready: vehicle %08X disarmed",g_ramReady.vehicle);g_ramReady={};}
-	std::uint32_t ArmRam() {
-		const auto player=Ptr(addr::kPlayerCharacterPtr);if(!player)return 0;
-		const auto driven=PlayerVehicle(player);const auto vehicle=driven?driven:Rover();
-		if(!vehicle){logger::Write("Ram ready: refused (no driven or own vehicle)");return 0;}
-		const auto id=At<std::uint32_t>(vehicle,off::kFormId);
-		if(IsDisabled(id)){logger::Write("Ram ready: vehicle %08X refused (autopilot disabled after hits)",id);return 0;}
-		CancelScannerTrip();g_ram={};
-		const int pilot=npcvehicles::PilotFor(id);
-		if(driven){if(!(g.active&&g_hoverVehicle.load()==driven))Start(driven);}  // the player keeps driving and shooting; the vehicle only hovers
-		else if(pilot){npcvehicles::SetCrewOrder(id,npcvehicles::CrewOrder::Hold);}
-		else {if(!g.active)Start(vehicle);g.autopilot=true;g.playerAuto=false;
-			const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);g.holdId=id;g.holdX=pos.x;g.holdY=pos.y;g.holdZ=pos.z;g.routeHold=true;g.autopilotSince=GetTickCount64();}
-		g_ramReady={id,GetTickCount64()};
-		logger::Write("Ram ready: vehicle %08X hovering and waiting for a target (%s)",id,driven?"player driving":pilot?"crew pilot holding":"empty, holding position");
-		return id;
-	}
 	bool RequestRam(std::uintptr_t actor) {
 		const auto player=Ptr(addr::kPlayerCharacterPtr);if(!player||!actor)return false;
 		const auto vehicle=PlayerVehicle(player)?PlayerVehicle(player):Rover();
 		if(!vehicle){logger::Write("Ram order: refused (no driven or own vehicle)");return false;}
 		const auto id=At<std::uint32_t>(vehicle,off::kFormId),actorId=At<std::uint32_t>(actor,off::kFormId);
-		const char* why=ramlogic::Reject(RamReady(id),npcvehicles::LooksLikeActor(actor),!npcvehicles::IsDead(actor),
+		const char* why=ramlogic::Reject(npcvehicles::LooksLikeActor(actor),!npcvehicles::IsDead(actor),
 			EngineFn<std::uintptr_t(*)(std::uintptr_t)>(addr::kPlayerVehicle)(actor)==vehicle);
 		if(!why&&(!Worldspace(vehicle)||Worldspace(actor)!=Worldspace(vehicle)))why="actor in another world";
 		if(!why&&IsDisabled(id))why="autopilot disabled after hits";
@@ -4590,23 +4611,16 @@ namespace vehicleflight
 			goal.x=target.x;goal.y=target.y;goal.z=target.z+1;goal.cruise=true;goal.cruiseSpeed=26;goal.stop=0;
 			if(!PilotFly(pilot,vehicle,goal)){logger::Write("Ram order: vehicle %08X -> actor %08X refused (crew pilot would not fly)",id,actorId);return false;}
 		}
-		g_ramReady={};
 		g_ram={id,actorId,pilot,GetTickCount64()};
 		logger::Write("Ram order: vehicle %08X -> highlighted actor %08X",id,g_ram.actor);return true;
 	}
 
-	bool CoverActive() {
-		const auto crew=g_roverId?npcvehicles::CrewOrderOf(g_roverId):npcvehicles::CrewOrder::None;
-		return overrides::TargetSetsGuard(crew==npcvehicles::CrewOrder::Cover||crew==npcvehicles::CrewOrder::Follow?overrides::Mode::Cover:
-			crew==npcvehicles::CrewOrder::Guard?overrides::Mode::Guard:g_guard?overrides::Mode::Guard:g_follow?overrides::Mode::Cover:overrides::Mode::None);
-	}
 	bool SetGuardPoint(double x,double y) {
-		if(!CoverActive())return false;
 		const double nan=std::numeric_limits<double>::quiet_NaN();  // skim the terrain there: the aimed height can be an estimate
 		if(npcvehicles::SetCrewGuard(g_roverId,x,y,nan))return true;
 		const auto rover=Rover();
 		if(!rover||IsDisabled(g_roverId)){logger::Write("Rover guard: refused (%s)",rover?"autopilot disabled after hits":"no vehicle");return false;}
-		g_follow=false;g_guard=true;g_ram={};g_ramReady={};
+		g_follow=false;g_guard=true;g_ram={};
 		if(!(g.active&&g_hoverVehicle.load()==rover))Start(rover);
 		g.autopilot=true;g.playerAuto=false;g.holdId=g_roverId;g.holdX=x;g.holdY=y;g.holdZ=nan;g.routeHold=true;g.autopilotSince=GetTickCount64();
 		logger::Write("Rover guard: %08X guards (%.0f, %.0f)",g_roverId,x,y);
@@ -4788,7 +4802,7 @@ namespace vehicleflight
 		g_camRest = CamRest{};
 		g_camPick = CamPick{};
 		g_boostRequest=false;g_meterBoost=false;g_meterVehicle=0;g_meterExhausted=false;
-		g_targetSession={};g_ram={};g_ramReady={};g_guard=false;g_cf=CoverFight{};
+		g_targetSession={};g_ram={};g_guard=false;g_cf=CoverFight{};
 		logger::Write("Rover flight: load reset discarded prior rover motion and body identity");
 	}
 }

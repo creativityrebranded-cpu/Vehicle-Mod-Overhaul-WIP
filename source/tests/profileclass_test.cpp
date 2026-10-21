@@ -60,6 +60,8 @@ int main(){
  check(coverfight::OnTarget(0.1,0.1,50)&&!coverfight::OnTarget(0.3,0,50)&&!coverfight::OnTarget(0,0.3,50)&&!coverfight::OnTarget(0,0,100),"fires only with the nose on target and in range");
  {double x=0,y=0;coverfight::ShieldPoint(0,0,0,100,x,y);check(x==0&&y==coverfight::kShield,"cover's defend spot sits between the player and the threat");
   coverfight::ShieldPoint(0,0,0,10,x,y);check(y==5,"a close threat keeps the spot halfway, never past the enemy");}
+ {double x=0,y=0;coverfight::AttackPoint(0,0,0,100,0,0,x,y);check(std::fabs(y-(100-coverfight::kStandOff))<1e-9&&x==0,"attack stance closes to its stand-off on its own side");
+  coverfight::AttackPoint(0,0,0,300,0,500,x,y);check(std::hypot(x,y)<=coverfight::kRange+1e-9,"attack stance never leaves the protected range");}
  {coverfight::Burst b;check(b.Update(true,2000),"a burst starts on target");check(b.Update(true,2000+coverfight::kBurstMs-1),"a burst continues while on target");
   check(!b.Update(true,2000+coverfight::kBurstMs),"a burst ends after its length");check(!b.Update(true,2000+coverfight::kBurstMs+coverfight::kGapMs-1),"bursts keep a gap");
   check(b.Update(true,2000+coverfight::kBurstMs+coverfight::kGapMs),"the next burst follows the gap");check(!b.Update(false,9000),"off target stops the weapon");}

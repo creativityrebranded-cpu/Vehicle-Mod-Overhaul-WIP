@@ -9,6 +9,7 @@
 #include "targetinput.h"
 #include "ramlogic.h"
 #include "overrides.h"
+#include "keygesture.h"
 #include <cstdio>
 #include <string>
 #include <cmath>
@@ -74,11 +75,13 @@ int main(){
  check(boostlogic::kMultiplier>1,"paid boost multiplies every selected gear");
  check(ramlogic::Owns(8,8,1000),"explicit ram retains its driver over ordinary parking/follow orders");
  check(!ramlogic::Owns(8,9,1000)&&!ramlogic::Owns(8,8,15000),"ram ownership excludes unrelated vehicles and expired orders");
- check(ramlogic::CanSelect(true,true,true,false),"armed vehicle can ram the highlighted living actor");
- check(!ramlogic::CanSelect(false,true,true,false),"an actor selection without a T hold remains navigation");
- check(!ramlogic::CanSelect(true,false,true,false)&&!ramlogic::CanSelect(true,true,true,true),"ram selection excludes places and own occupants");
- check(ramlogic::Reject(true,true,false,false)!=nullptr&&ramlogic::Reject(false,true,true,false)!=nullptr,"refused rams carry a logged reason");
- check(ramlogic::Armed(8,8,1000)&&!ramlogic::Armed(8,9,1000)&&!ramlogic::Armed(8,8,ramlogic::kReadyMs),"ram-ready belongs to one vehicle and expires");
+ check(ramlogic::CanSelect(true,true,false),"a T hold on a highlighted living actor rams it");
+ check(!ramlogic::CanSelect(false,true,false)&&!ramlogic::CanSelect(true,true,true),"ram selection excludes places and own occupants");
+ check(ramlogic::Reject(true,false,false)!=nullptr&&ramlogic::Reject(false,true,false)!=nullptr,"refused rams carry a logged reason");
+ check(ramlogic::Throttle(0.2)==1.0&&ramlogic::Throttle(-1.0)==1.0,"a ram runs flat out toward a target ahead");
+ check(ramlogic::Throttle(2.5)<1.0,"a target behind is turned onto first, then the run is flat out");
+ check(ramlogic::SteerRate(1.0,0.8)==0.8&&ramlogic::SteerRate(-1.0,0.8)==-0.8,"the ram turns as fast as the hull allows");
+ check(std::fabs(ramlogic::SteerRate(0.1,0.8)-0.25)<1e-9,"near the line the ram steers gently onto it");
  check(ramlogic::Finished(true,15000,false,100,4),"ram order has a finite timeout");
  check(ramlogic::Finished(true,1000,true,3,4),"ram ends after nearby impact");
  check(!ramlogic::Finished(true,1000,true,50,4),"distant contact cannot falsely complete ram");
@@ -150,7 +153,15 @@ int main(){
  {const auto r=overrides::For(Mode::Guard);check(r.holdPoint&&!r.chase&&r.fire,"guard holds its point and defends from it");}
  {const auto r=overrides::For(Mode::None);check(r.pickFoe&&r.chase&&r.fire,"without an override the vehicle's own combat behaviour runs");}
  check(overrides::OnCover(Mode::None)==Mode::Cover&&overrides::OnCover(Mode::Cover)==Mode::None&&overrides::OnCover(Mode::Guard)==Mode::Cover,"U toggles cover and resumes it from a guard point");
- check(overrides::OnTarget(Mode::Cover)==Mode::Guard&&overrides::OnTarget(Mode::None)==Mode::None&&overrides::OnTarget(Mode::Recall)==Mode::Recall,"T sets a guard point only while covering");
+ keygesture::Input key; key.Update(false,true,0);
+ key.Update(true,true,10);auto g=key.Update(false,true,200);
+ check(g.tap&&!g.hold,"N/U tap acts on release");
+ key.Update(true,true,1000);check(!key.Update(true,true,1900).hold,"N/U hold waits a full second");
+ g=key.Update(true,true,2010);check(g.hold&&!g.tap,"N/U hold acts once at one second");
+ check(!key.Update(true,true,2500).hold,"N/U hold fires once per press");
+ g=key.Update(false,true,2600);check(!g.tap&&!g.hold,"releasing a hold never also taps");
+ key.Update(true,true,3000);g=key.Update(false,true,4200);check(g.hold&&!g.tap,"a missed frame still counts as the hold");
+ key.Update(true,false,5000);g=key.Update(true,true,5100);check(!g.tap&&!g.hold&&!key.Update(false,true,5200).tap,"a key held while unusable needs a fresh press");
  check(std::string(overrides::SummonLabel(true))=="Recall"&&std::string(overrides::SummonLabel(false))=="Summon","N's name follows the vehicle's context");
  check(std::string(overrides::CoverLabel(Mode::Cover))=="Stop cover"&&std::string(overrides::CoverLabel(Mode::Guard))=="Cover","U's name follows the cover state");
  return failures?1:0;

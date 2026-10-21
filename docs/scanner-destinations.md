@@ -30,9 +30,9 @@ Native range text is parsed with its m/km unit and grouping separators. Selected
 
 ## T gestures
 
-`targetinput.h` turns the key into three gestures. A **tap** is reported only after the 300 ms double-tap window, and it uses the selection captured at its own press. A **double tap** clears the route. A **hold** of 1000 ms or more arms a ram (`vehicleflight::ArmRam`), and releasing it selects nothing. A pending tap is cancelled on focus loss, when the scanner opens or closes, at seat exit and on save load. A tap then routes by state:
-1. **Armed for a ram:** only the exact highlighted actor counts (`vehicleflight::RequestRam`). A tap on a place keeps the vehicle where it is.
-2. **Cover on:** the place becomes the guard point (`vehicleflight::SetGuardPoint`).
-3. **Otherwise:** the place becomes the destination, or a queued stop.
+`targetinput.h` turns the key into three gestures. A **tap** is reported only after the 300 ms double-tap window, and it uses the selection captured at its own press. A **double tap** clears the route. A **hold** of 1000 ms or more acts at once on the selection captured at its press, and releasing it selects nothing. A pending tap is cancelled on focus loss, when the scanner opens or closes, at seat exit and on save load. The meanings never depend on a mode:
+1. **Tap:** the place becomes the destination, or a queued stop.
+2. **Hold on a highlighted actor:** a ram order on that exact actor (`vehicleflight::RequestRam`). It is flown in a straight line (`ramlogic::SteerRate` / `Throttle`, full throttle in top gear); only the height and terrain clearance stay with the autopilot.
+3. **Hold on a place:** on foot, the guard point (`vehicleflight::SetGuardPoint`); driving, the route is replaced by that point.
 
-The highlighted actor comes from the scanner's public `MonoclePickRefData` provider: `BSUIDataManager.GetDataFromClient`, then `.data.uFormID` / `.uHandle`. `CurrentPickRefHandle` / `CurrentFormID` are private MonocleMenu traits and are not read. The actor must resolve from that reference, never from a nearby-actor search. A ram does not depend on the player's combat flag and logs why it was refused or ended. All added prompts use native widgets at 75% scale; there is no Auto button and no Auto Stop/Orbit/Patrol control.
+The highlighted actor comes from the scanner's public `MonoclePickRefData` provider: `BSUIDataManager.GetDataFromClient`, then `.data.uFormID` / `.uHandle`. `CurrentPickRefHandle` / `CurrentFormID` are private MonocleMenu traits and are not read. The actor must resolve from that reference, never from a nearby-actor search. A ram does not depend on the player's combat flag and logs why it was refused or ended. All added prompts use native widgets at 75% scale; there is no Auto button. The autopilot's Stop / Orbit / Patrol / Cruise behaviour is cycled with `]` while driving.

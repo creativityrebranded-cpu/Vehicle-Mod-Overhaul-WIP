@@ -82,6 +82,11 @@ namespace npcvehicles
 	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);
 	// Recall: every escort drops its fight for `ms` and comes back into formation.
 	void Recall(unsigned ms);
+	// The player's stance (the stance key, 2026-10-21): it sets the Combat and Weapons classes of the player's own vehicle and every follower's
+	// vehicle. Defend (the start), Attack, Hold fire (defend, weapons held). The player's seat still never fires by itself.
+	enum class Stance : int { Defend = 0, Attack = 1, HoldFire = 2 };
+	Stance CycleStance();
+	Stance CurrentStance();
 	// Witness reactions (2026-10-20, notes/VEHICLE_BEHAVIOUR_RESEARCH_20261020.md): a crash at (x, y, z) -> calm bystanders within 10 m flee
 	// (ActionFleeStart), within 25 m cower (ActionCower). Never followers, quest NPCs, anyone fighting or in a vehicle. Seamless.ini [witness] enabled=0 off.
 	void VehicleAggression(std::uintptr_t vehicle, std::uint32_t shooterId);

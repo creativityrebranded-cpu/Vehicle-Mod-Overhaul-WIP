@@ -26,6 +26,15 @@ inline void ShieldPoint(double px, double py, double ex, double ey, double& x, d
     x = d > 0.1 ? px + (ex - px) / d * std::fmin(kShield, d * 0.5) : px;
     y = d > 0.1 ? py + (ey - py) / d * std::fmin(kShield, d * 0.5) : py;
 }
+// The attack stance's spot: kStandOff from the enemy on the vehicle's side of it, kept within kRange of the protected point (the player or guard point).
+inline constexpr double kStandOff = 25.0;
+inline void AttackPoint(double cx, double cy, double ex, double ey, double vx, double vy, double& x, double& y) {
+    const double d = std::hypot(vx - ex, vy - ey);
+    x = d > 0.1 ? ex + (vx - ex) / d * kStandOff : ex + kStandOff;
+    y = d > 0.1 ? ey + (vy - ey) / d * kStandOff : ey;
+    const double r = std::hypot(x - cx, y - cy);
+    if (r > kRange) { x = cx + (x - cx) / r * kRange; y = cy + (y - cy) / r * kRange; }
+}
 // Bursts: fire up to kBurstMs while on target, then at least kGapMs off.
 struct Burst {
     bool firing = false;

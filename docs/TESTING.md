@@ -7,10 +7,11 @@ The log timestamps every line; a crash prints `CRASH?` with the stack and the pl
 
 ### Controls, overrides and profile classes (2026-10-20, later)
 
-The Release DLL builds with the T tap / double tap / hold controls, the armed ram, N recall / U cover / guard points, the Navigation / Combat / Weapons classes, and the empty own vehicle's cover combat. Eight offline executables pass **205 assertions**: navfield 15, scannercontext 12, triplogic 17, environment 14, recovery 12, routeplan 7, vehiclelogic 93 (Alt and T gestures, ram arming / ending, override rules, labels) and the new `profileclass_test` 35 (class isolation against the real `vcontract.cpp`, combat defaults, the weapons gate, row texts, cover-combat rules). None of it has been tested in game.
+The Release DLL builds with the revised control scheme (every key one meaning: T tap go / hold ram or guard, T T clear, N and U tap / hold, the stance key, `]` autopilot modes), the straight-line ram, the Navigation / Combat / Weapons classes, and the empty own vehicle's cover combat. Eight offline executables pass **215 assertions**: navfield 15, scannercontext 12, triplogic 17, environment 14, recovery 12, routeplan 7, vehiclelogic 101 (Alt, T and N/U gestures, straight-line ram steering and ending, override rules, labels) and `profileclass_test` 37 (class isolation against the real `vcontract.cpp`, combat defaults, the weapons gate, row texts, cover and attack-spot rules). None of it has been tested in game.
 
 Things to watch in a normal session (no test keys are added):
-- `Scanner native pick provider: ready` (the actor pick), then `Ram ready: ...` after a T hold and `Ram order: ... -> highlighted actor ...` after a tap on someone. A refusal or end line gives the reason.
+- `Scanner native pick provider: ready` (the actor pick), then `Target selection (hold)` and `Ram order: ... -> highlighted actor ...` after a T hold on someone. A refusal or end line gives the reason; the run should be straight with no detours.
+- `Rover stance key: ...` at start-up, `NPC vehicles: stance -> ...` and `Profiles: vehicle ... combat -> attack/defend` when you press it.
 - `Rover recall: N pressed` and `Rover cover: on/off`, plus `Rover guard: ... guards (x, y)` after T while covering.
 - `Rover cover: enemy ...`, `lifting off to defend` and `weapon burst ...` when enemies come near while your empty vehicle covers you. `weapon refused (the player drives it)` must only appear if something tried to fire your driven vehicle.
 - `Profiles: vehicle ... combat -> defend/attack` when a follower's fight starts, then `combat -> default` about 20 s after it ends.

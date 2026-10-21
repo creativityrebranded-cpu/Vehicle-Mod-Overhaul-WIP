@@ -360,9 +360,22 @@ namespace profiles
 			}
 			const uptr driven = EngineFn<uptr (*)(uptr)>(addr::kPlayerVehicle)(player);
 			if (driven && At<std::uint32_t>(driven, 0x28) == own) {
-				const bool on = vcontract::AssignedTo(own) == &kCruise;
-				vcontract::Assign(own, on ? nullptr : &kCruise, 0, 0);
-				notify::Show(on ? "Auto: marker" : "Auto: cruise (where you look)");
+				// Driving: what the autopilot does at your destination, Stop -> Orbit -> Patrol (the route loops) -> Cruise (where you look) -> Stop.
+				using vehicleflight::AutoMode;
+				const bool cruise = vcontract::AssignedTo(own) == &kCruise;
+				const AutoMode mode = vehicleflight::GetAutoMode();
+				if (cruise) {
+					vcontract::Assign(own, nullptr, 0, 0);
+					vehicleflight::SetAutoMode(AutoMode::Stop);
+					notify::Show("Autopilot: stop at the destination");
+				}
+				else if (mode == AutoMode::Stop) { vehicleflight::SetAutoMode(AutoMode::Orbit); notify::Show("Autopilot: orbit the destination"); }
+				else if (mode == AutoMode::Orbit) { vehicleflight::SetAutoMode(AutoMode::Patrol); notify::Show("Autopilot: patrol the route"); }
+				else {
+					vehicleflight::SetAutoMode(AutoMode::Stop);
+					vcontract::Assign(own, &kCruise, 0, 0);
+					notify::Show("Autopilot: cruise (where you look)");
+				}
 				return;
 			}
 			g_remoteIndex = (g_remoteIndex + 1) % int(sizeof(kRemoteCycle) / sizeof(kRemoteCycle[0]));

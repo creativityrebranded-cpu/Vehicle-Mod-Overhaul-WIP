@@ -981,6 +981,18 @@ namespace npcvehicles
 			const auto actor=RefById(it->second.attacker);return actor&&!Dead(actor)?actor:0;
 		}
 		ULONGLONG g_recallUntil = 0;             // escorts recalled into formation until then
+		Stance g_stance = Stance::Defend;
+		// Keeps a player-side vehicle's Combat / Weapons classes on the stance; assigns only on a change (no log spam).
+		void ApplyStance(std::uint32_t vehicleId, double x, double y)
+		{
+			if (!vehicleId) return;
+			const auto* want = vcontract::Find(g_stance == Stance::Attack ? "attack" : "defend");
+			if (want && vcontract::AssignedTo(vehicleId, vcontract::Class::Combat) != want) vcontract::Assign(vehicleId, want, x, y);
+			const auto* hold = vcontract::Find("hold fire");
+			const auto* wp = vcontract::AssignedTo(vehicleId, vcontract::Class::Weapons);
+			if (g_stance == Stance::HoldFire) { if (hold && wp != hold && !profileclass::Is(wp ? wp->name : nullptr, "never")) vcontract::Assign(vehicleId, hold, x, y); }
+			else if (wp == hold) vcontract::Unassign(vehicleId, vcontract::Class::Weapons);
+		}
 		constexpr ULONGLONG kFightOverMs = 20000;  // an automatically chosen combat profile ends this long after the last enemy
 		constexpr double kRecallBoard = 10.0;   // m: a recalled vehicle this close to the player parks and its crew driver gets out
 		overrides::Mode ModeOf(int order)
@@ -2047,6 +2059,13 @@ namespace npcvehicles
 				const vcontract::Profile* ap = vcontract::AssignedTo(j.vehicle);
 				const char* navName = ap ? ap->name : nullptr;
 				const bool escortNav = profileclass::Is(navName, "escort");
+				// Your side (a follower's vehicle, or yours with a crew driver) fights by your stance; everyone else by its navigation profile.
+				const bool playerSide = IsFollower(player, npc) || j.vehicle == vehicleflight::OwnRoverId();
+				if (playerSide && j.profile == Profile::Escort) {
+					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+					ApplyStance(j.vehicle, vp.x, vp.y);
+					j.autoCombat = false;
+				}
 				const vcontract::Profile* cp = vcontract::AssignedTo(j.vehicle, vcontract::Class::Combat);
 				const vcontract::Profile* wp = vcontract::AssignedTo(j.vehicle, vcontract::Class::Weapons);
 				const auto weapons = profileclass::Effective(profileclass::WeaponsFor(wp ? wp->name : nullptr),
@@ -3078,6 +3097,9 @@ namespace npcvehicles
 			return;
 		}
 		deadDone = false;
+		if (const auto own = vehicleflight::OwnRoverId()) {
+			if (const uptr ov = RefById(own)) { const auto op = At<game::Vec3>(ov, off::kRefPosition); ApplyStance(own, op.x, op.y); }
+		}
 		EscortContextTick(player, GetTickCount64());
 		PickUps(player, GetTickCount64());
 		ChooseKey();
@@ -3134,7 +3156,7 @@ namespace npcvehicles
 				if (j.phase == Phase::Following && !j.task) {
 					// The approved row: an active override alone, else NAV (· COMBAT in a fight) (· HOLD FIRE).
 					const auto mode = ModeOf(j.order);
-					const char* over = vehicleflight::Ramming(j.vehicle) ? "RAMMING" : vehicleflight::RamReady(j.vehicle) ? "RAM READY" :
+					const char* over = vehicleflight::Ramming(j.vehicle) ? "RAMMING" :
 						mode == overrides::Mode::Recall ? "RECALL" : mode == overrides::Mode::Cover ? "COVER" : mode == overrides::Mode::Guard ? "GUARD POINT" :
 						j.order == int(CrewOrder::Hold) ? "HOLDING" : nullptr;
 					const auto* nav = vcontract::AssignedTo(j.vehicle);
@@ -3760,6 +3782,15 @@ namespace npcvehicles
 		if (n) logger::Write("NPC vehicles: witnesses of %s: %d near, %d flee, %d cower", why ? why : "a crash", n, fled, cowered);
 		if (g_witnessed.size() > 512) g_witnessed.clear();
 	}
+
+	Stance CycleStance()
+	{
+		g_stance = g_stance == Stance::Defend ? Stance::Attack : g_stance == Stance::Attack ? Stance::HoldFire : Stance::Defend;
+		logger::Write("NPC vehicles: stance -> %s", g_stance == Stance::Attack ? "attack" : g_stance == Stance::HoldFire ? "hold fire" : "defend");
+		return g_stance;
+	}
+
+	Stance CurrentStance() { return g_stance; }
 
 	void Recall(unsigned ms)
 	{
