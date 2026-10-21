@@ -1,6 +1,9 @@
-# Vehicle Mod Overhaul (WIP)
+# Flying Vehicle Overhaul (WIP)
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
+
+Current version: **0.63.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
 map marker, or let a follower drive it. Followers jump into vehicles to defend you, enemies take vehicles to hunt you down, and
@@ -29,7 +32,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Escorts defend you** | Followers in vehicles intercept, shield, give overwatch and attack - enemy vehicles first | Untested |
 | **Rescue, scout, wait** | A follower vehicle picks you up when you are hurt, scouts your marker, waits at the door | Untested |
 | **Smarter enemies** | Enemy vehicles flank, intercept, block, hover overhead, retreat when damaged and call for help | Untested |
-| **Vehicle hit counter** | Vehicles take "damage" from shots; at the limit their autopilot shuts down for a while | Untested |
+| **Vehicle health** | Vehicles take damage from shots and rams, share some with the driver, and wreck at 0 health | Untested |
 | **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
 | **Vehicles respect each other** | No more vehicles "magnetised" together; right of way decides who gives way | Untested |
 | **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
@@ -145,7 +148,7 @@ the vehicle flies on without stopping. The final point keeps normal arrival brak
 | **Alt** (hold) | Descend after 0.3 seconds; releasing a hold does not change gear |
 | **A / D**, mouse | Turn / roll; the mouse aims |
 | **Q / Z** | Up / down |
-| **T** | See [T: tap, double tap, hold](#t-tap-double-tap-hold-hand-scanner-open-or-while-driving). Selecting a destination starts the autopilot; with the scanner closed a T tap switches Auto on or off. Any of W / A / S / D takes control back. |
+| **T** | See [T: tap, double tap, hold](#t-tap-double-tap-hold-aim-with-the-hand-scanner-on-foot-or-driving). Selecting a destination starts the autopilot; with the scanner closed a T tap switches Auto on or off. Any of W / A / S / D takes control back. |
 | **E** | Get out. While hovering, the vehicle sets down first, then you get out. |
 | **J** | Show / hide every hint and panel (the basic control hints hide after your first 3 rides). |
 | **]** (when free) | What the autopilot does at your destination: **Stop → Orbit → Patrol** (the route loops) **→ Cruise** (fly where you look at your gear's speed) |
@@ -215,7 +218,7 @@ All of this passes the offline checks; most of it has not been tested in game ye
 - **Quieter log:** timer diagnostics (navigation stats, seat traces, gear changes, context scans) only with `[log] verbose=1`.
   Other mods' handled exceptions are no longer reported as crashes; a real crash still gets a full report.
 
-## Current fixes and controls (0.61.0)
+## What's new in 0.61.0
 
 - Hover and ground-gear forces bind to the native chassis only after its full body ID matches a collision body owned by that reference. Nearby parked vehicles never inherit your controller. Collision recovery uses signed world-up attitude, without learning reversed controls from impacts. First-person rover pitch is measured relative to the chassis, with separate camera baselines.
 - Flight rates, acceleration, braking distance and swept clearance use each vehicle's width, length, height and live scale. Long hulls turn/pitch more slowly; wide hulls roll more slowly; faster turns are limited by lateral acceleration. Valid large bounds are retained. This applies to compatible native vehicles without a model-name list; missing bounds use a conservative fallback.
@@ -363,10 +366,13 @@ Enemy drivers attack you **and your followers**, vehicles first, and choose what
 Hostile outposts also send **patrol convoys**: a hostile owner patrols in their vehicle, a second hostile vehicle follows, and they
 turn on you when the fight starts.
 
-### The hit counter
-Vehicles have no health in the game, so the mod follows every shot. A shot that passes through a vehicle counts as a hit
-(15 by default). When a vehicle has taken about as much as **you** could (your own health), its **autopilot shuts down for 30 s** and it
-comes down. Friendly fire does not add to the damage counter, but shooting another person's vehicle still counts as aggression toward its occupants/owner. It heals after 15 s without hits.
+### Vehicle health
+Vehicles have no health in the game, so the mod follows every shot. A shot that passes through a vehicle damages it by the
+weapon's own damage (scaled by the game's difficulty); rams damage both vehicles. A vehicle has 300 health by default, and the
+driver takes a share of each hit (25%). At 0 health the vehicle is **wrecked**: its autopilot shuts down until it is repaired
+over 25%, and it heals slowly after a quiet spell. Friendly fire does no damage, but shooting another person's vehicle still
+counts as aggression toward its occupants or owner. An enemy vehicle's health shows in a second bar under its driver's
+health bar.
 
 ---
 
@@ -407,9 +413,12 @@ All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
 |---|---|---|---|---|
 | `seamless.ini` | `[log]` | `verbose` | `0` | `1` = detailed log lines (needed for most bug reports) |
 | `seamless.ini` | `[context]` | `enabled` | `1` | `0` = NPCs never take vehicles on their own (fights and traffic) |
-| `seamless.ini` | `[hits]` | `damage` | `15` | Hit counter: damage per shot |
-| `seamless.ini` | `[hits]` | `limit` | `0` | `0` = your own health; any other number = a fixed limit |
-| `seamless.ini` | `[hits]` | `cooldown` | `30` | Seconds the autopilot stays off at the limit |
+| `seamless.ini` | `[hits]` | `health` | `300` | A vehicle's health |
+| `seamless.ini` | `[hits]` | `limit` | `0` | Any other number replaces `health` |
+| `seamless.ini` | `[hits]` | `driverShare` | `25` | Percent of each hit the driver takes |
+| `seamless.ini` | `[hits]` | `weaponScale` | `1` | Multiplies the weapons' damage to vehicles |
+| `seamless.ini` | `[hits]` | `damage` | `20` | Damage per shot, only when the weapon's own damage cannot be read |
+| `seamless.ini` | `[hits]` | `ramCap` | `35` | Percent of a vehicle's health one ram may take |
 | `seamless.ini` | `[witness]` | `enabled` | `1` | `0` = bystanders do not react to crashes |
 | `seamless.ini` | `[combat]` | `ai`, `ram` | `1`, `1` | `0` = simpler attack runs / no rams |
 | `seamless.ini` | `[nav]` | `travel` | `1` | `0` = vehicles hover, and drive only to get out of tight spots |
@@ -439,6 +448,17 @@ or `cmake -S . -B build -A x64` then `cmake --build build --config Release`. The
 the `*_test.exe` files next to it are the offline checks (no game needed). The layout is in [source/README.md](source/README.md).
 The plugin targets Starfield 1.16.244 (Steam) only.
 
+```
+Data/SFSE/Plugins/SeamlessVehicle.dll   the built plugin
+Data/SeamlessPilots.esm                 the walk-to-vehicle quest package
+Data/Vehicles - Real.esm                Parked Vehicles props -> real vehicles
+source/                                 the C++ source and its build (src/, tests/, third_party/sfse, tools/)
+tools/                                  integrate.sh (build + install), make_vehicles_real.py, make_pilots_esm.py
+docs/                                   ARCHITECTURE, ENGINE_NOTES, TESTING, KNOWN_ISSUES, research/
+```
+
+`tools/integrate.sh` builds `source/` and installs the plugin and the two `.esm` files when the game is closed.
+
 ---
 
 ## Compatibility
@@ -458,7 +478,7 @@ The plugin targets Starfield 1.16.244 (Steam) only.
 **Built, not yet tested in game** (everything else), including: the T tap / double tap / hold controls, the straight-line ram and its
 scanner pick data, N and U tap / hold, the stance key, the ] autopilot modes, guard points, your empty vehicle's defence, the Navigation / Combat / Weapons profiles and their row
 texts, the Target readout in the former Gang slot, Auto and Cruise, scanner markers
-and chains, catch from below, follower drivers, every escort and enemy behaviour, the hit counter, everyday traffic, vehicle-to-vehicle
+and chains, catch from below, follower drivers, every escort and enemy behaviour, vehicle health, everyday traffic, vehicle-to-vehicle
 right of way, the wall warning, night and weather, bystander reactions, passenger / taxi / take the wheel, the seat rules and forced
 exits, drive mode, metered boost, view distance and the vehicle registry.
 
@@ -474,7 +494,7 @@ exits, drive mode, metered boost, view distance and the vehicle registry.
 
 ## Reporting a problem
 
-1. Set `[log] verbose=1` in `seamless.ini`.
+1. Turn on **Detailed log** in Settings > Flying Vehicle Overhaul (or set `[log] verbose=1` in `seamless.ini`).
 2. Play until it goes wrong.
 3. Send `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` (and `SeamlessVehicle.prev.log` for the previous session). A crash
    report in the log lists the faulting address, the stack and what the plugin did in its last moments.
@@ -486,30 +506,6 @@ exits, drive mode, metered boost, view distance and the vehicle registry.
 - **Frame drops with many vehicles:** try `[nav] rays=0`, or a lower `[view] objectFade`.
 
 ---
-
-## For modders: building from source
-
-Needs Visual Studio 2022 Build Tools (C++ workload) and CMake 3.24+.
-
-```
-git clone https://github.com/ianpatt/sfse ref/sfse
-cmake -S source -B source/build -G "Visual Studio 17 2022" -A x64
-cmake --build source/build --config Release --target SeamlessVehicle
-```
-
-Output: `source/build/Release/SeamlessVehicle.dll`. The SFSE headers must be the version for Starfield 1.16.244 (SFSE 0.2.21);
-point `SFSE_ROOT` at them if they are not in `ref/sfse`.
-
-```
-Data/SFSE/Plugins/SeamlessVehicle.dll   the built plugin
-Data/SeamlessPilots.esm                 the walk-to-vehicle quest package
-Data/Vehicles - Real.esm                Parked Vehicles props -> real vehicles
-source/                                 C++ source and CMake build (src/, tests/)
-tools/                                  integrate.sh (build + install), make_vehicles_real.py, make_pilots_esm.py
-docs/                                   ARCHITECTURE, ENGINE_NOTES, TESTING, KNOWN_ISSUES, research/
-```
-
-More detail: `docs/ARCHITECTURE.md`, `docs/ENGINE_NOTES.md`, `docs/TESTING.md`, `docs/KNOWN_ISSUES.md`, `docs/research/`.
 
 ## Credits
 
