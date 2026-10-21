@@ -17,6 +17,7 @@
 #include "hoverlogic.h"
 #include "hulllogic.h"
 #include "boostlogic.h"
+#include "altcontrol.h"
 #include "ramlogic.h"
 #include "targetsession.h"
 #include "scantarget.h"
@@ -44,8 +45,8 @@
 //  - On / off: double-tap the game's vertical boost (Space). Also off: settle onto the ground, hit something, or leave
 //    the vehicle.
 //  - Controls (mouse-aim layout): the mouse aims, the nose follows the camera in yaw and pitch. A / D: roll.
-//    W: boost (hold) at the selected gear; S: brake (hold); Alt + W / Alt + S: gear up / down (4 gears, 1-4 pick
-//    one directly); neither: coast. Up / down keys: lift.
+//    W: boost (hold) at the selected gear; S: brake (hold); tap Alt: cycle gears 1-4; hold Alt: descend.
+//    Neither W nor S: coast. Up / down keys: lift.
 //  - Lift-off: switching on near the ground climbs to a short hover height first.
 //  - Avoidance (terrain assist): three corridors (ahead, left, right) are sampled with ground rays at three distances
 //    scaled by speed. Ahead clear: nothing. Ahead blocked but climbable in time: nose up and climb. Otherwise a clear
@@ -1563,6 +1564,8 @@ namespace vehicleflight
 			}
 		};
 		Tap g_tapBoost, g_tapThrust;
+		altcontrol::Input g_altInput;
+		bool g_altDrop = false;
 
 		// The keys bound to the game's own Vehicle events (followed when the player rebinds them; WASD by default).
 		struct MoveKeys
@@ -1961,7 +1964,7 @@ namespace vehicleflight
 				return;
 			}
 			logger::Write("Rover flight: on at (%.0f, %.0f, %.0f)", pos.x, pos.y, pos.z);
-			notify::Log("Hover on - [W] boost [S] brake [Alt+W/S] gear [LShift] boost  [%s]/[%s] up/down  [RShift+Space] down  [%s]/[%s] turn  [Space x2] off", controlmap::KeyName(g_keys.up).c_str(),
+			notify::Log("Hover on - [W] boost [S] brake [Alt tap] gear [LShift] boost  [%s]/[%s] up/down  [Alt hold] down  [%s]/[%s] turn  [Space x2] off", controlmap::KeyName(g_keys.up).c_str(),
 				controlmap::KeyName(g_keys.down).c_str(), controlmap::KeyName(g_keys.rollLeft).c_str(), controlmap::KeyName(g_keys.rollRight).c_str());
 			telemetry::Record("rover_flight_on", "\"pos\":[%.0f,%.0f,%.0f]", pos.x, pos.y, pos.z);
 		}
@@ -2739,31 +2742,20 @@ namespace vehicleflight
             }
 
 			// ---- Input ----
-			// Alt + W / Alt + S: one gear up / down per press (gears 1-4 set the boost strength and top speed; 1-4 keys
-			// pick a gear directly). Plain W held: boost at the selected gear. Plain S held: brake. Neither: coast.
+			// Alt tap/hold is resolved once in PlayerTick, shared by driving and hover.
+			// W held: boost at the selected gear. S held: brake. Neither: coast.
 			const bool keysOn = focused && !g.autopilot;  // on autopilot the player's keys do not fly the rover
-			const bool gearHeld = keysOn && Held(VK_MENU);
 			const bool paidBoost=keysOn && Held(VK_LSHIFT) && g_meterBoost.load() && g_meterVehicle.load()==vehicle;
 			const bool wHeld = keysOn && Held(g_mk.accel), sHeld = keysOn && Held(g_mk.brake);
 			const bool wWasDown = g.wDown, sWasDown = g.sDown;
 			{
-				const int before = g.gear;
-				if (gearHeld && wHeld && !g.wDown) g.gear = std::min(4, g.gear + 1);
-				if (gearHeld && sHeld && !g.sDown) g.gear = std::max(1, g.gear - 1);
 				g.wDown = wHeld;
 				g.sDown = sHeld;
-				for (int i = 1; i <= 4; ++i) {
-					if (keysOn && Held('0' + i)) g.gear = i;
-				}
-				if (g.gear != before) {
-					if (!idx) notify::Log("Gear %d of 4  (%.0f m/s)", g.gear, kGearTop[g.gear]);
-					logger::Write("%s: gear %d -> %d", wf, before, g.gear);
-				}
 			}
 			// W: accelerate while held; double-tap W: accelerate stays on; the next W or S press releases it.
 			{
-				const bool wPress = wHeld && !gearHeld && !wWasDown;
-				const bool sPress = sHeld && !gearHeld && !sWasDown;
+				const bool wPress = wHeld && !wWasDown;
+				const bool sPress = sHeld && !sWasDown;
 				if (wPress) {
 					const ULONGLONG nowMs = GetTickCount64();
 					if (g.wHold) {
@@ -2783,8 +2775,8 @@ namespace vehicleflight
 					g.wHold = false;
 				}
 			}
-			bool boosting = (wHeld && !gearHeld) || g.wHold || paidBoost;
-			bool sBrake = sHeld && !gearHeld;
+			bool boosting = wHeld || g.wHold || paidBoost;
+			bool sBrake = sHeld;
 			// Autopilot: accelerate while the distance left exceeds the braking distance, then brake; arrive and stop.
 			double apBearing = 0;
 			bool apSteer = false;
@@ -2975,7 +2967,7 @@ namespace vehicleflight
 				(keysOn && Held(g_mk.left) ? 1.0 : 0.0);
 			double lift = (keysOn && Held(g_keys.up) ? 1.0 : 0.0) -
 				(keysOn && Held(g_keys.down) ? 1.0 : 0.0);
-			if (keysOn && Held(VK_RSHIFT) && Held(g_mk.vert)) lift = -1.0;  // Right Shift + Space: descend (the user, 2026-10-17)
+			if (!idx && keysOn && g_altDrop) lift = -1.0;
 			g_forwardBoosts[idx] = boost;
 
 			// ---- Yaw follows the camera gap in the vehicle step. The camera is only read, never written. ----
@@ -3571,6 +3563,7 @@ namespace vehicleflight
 	{
 		const auto player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player || !g_original) {
+			g_altInput = {}; g_altDrop = false;
 			hoverui::SetState(false, false, g.gear, false);
 			g_driverVehicle.store(0, std::memory_order_relaxed);
 			return;
@@ -3579,6 +3572,7 @@ namespace vehicleflight
 		// off until a load brings the player back (the dead check is the actor's vtable +0x868, as for NPCs).
 		static bool deadSaid = false;
 		if (PlayerDead(player)) {
+			g_altInput = {}; g_altDrop = false;
 			if (!deadSaid) {
 				deadSaid = true;
 				logger::Write("Rover: you died%s; vehicle control off", g.active ? " (hover on: ended)" : "");
@@ -3608,6 +3602,15 @@ namespace vehicleflight
 		hoverui::SetState(driven != 0, g.active && (!g.autopilot || g.playerAuto), g.gear, g.wHold);
 		const auto priorDriven=g_driverVehicle.exchange(driven,std::memory_order_relaxed);
 		if(priorDriven && priorDriven!=driven)EndTargetSession(priorDriven);
+		if (priorDriven != driven) g_altInput = {};
+		const auto alt = g_altInput.Update(Held(VK_MENU), driven && focused && !hoverui::IsScannerOpen(), GetTickCount64());
+		g_altDrop = alt.drop;
+		if (alt.cycle) {
+			const int before = g.gear;
+			g.gear = altcontrol::NextGear(g.gear);
+			notify::Log("Gear %d of 4  (%.0f m/s)", g.gear, kGearTop[g.gear]);
+			logger::Write("Rover: gear %d -> %d (Alt tap)", before, g.gear);
+		}
 		// Got out with Auto on: the vehicle holds where it is (it neither follows nor lands).
 		if (!driven && g.playerAuto) {
 			const auto last = g_lastDrivenVehicle.load(std::memory_order_relaxed);
@@ -3665,7 +3668,7 @@ namespace vehicleflight
 					logger::Write("Rover auto: on (%s)", wasHovering ? "already hovering" : "lifting off");
 				}
 			}
-			else if (g.playerAuto && focused && (Held(g_mk.accel) || Held(g_mk.brake) || Held(g_mk.left) || Held(g_mk.right))) {
+			else if (g.playerAuto && focused && (alt.cycle || alt.drop || Held(g_mk.accel) || Held(g_mk.brake) || Held(g_mk.left) || Held(g_mk.right))) {
 				g.playerAuto = false;
 				g.autopilot = false;
 				g.routeHold=false; g.holdId=0;
@@ -3986,7 +3989,7 @@ namespace vehicleflight
 				logger::Write("Ship vehicle physics probe: last rover stepped %u times while driven, %u times after leaving it (10 s)", occupied, unoccupied);
 			}
 		}
-		const bool boostTap = g_tapBoost.Update(focused && Held(g_mk.vert) && !Held(VK_RSHIFT));  // Right Shift + Space is descend, not a tap
+		const bool boostTap = g_tapBoost.Update(focused && Held(g_mk.vert));
 		static std::uintptr_t announced = 0;
 		if (vehicle && vehicle != announced && !g.active) {
 			announced = vehicle;
@@ -4024,15 +4027,10 @@ namespace vehicleflight
 			Start(vehicle);
 		}
 		if (!g.active) {
-			// Driving: Alt + Accelerate / Alt + Brake change gear here too; the gear caps the ground speed.
-			const bool gearHeld = focused && Held(VK_MENU);
+			// Driving uses the same Alt-tap gear as hover; it caps the ground speed.
 			const bool wHeld = focused && Held(g_mk.accel), sHeld = focused && Held(g_mk.brake);
-			const int before = g.gear;
-			if (gearHeld && wHeld && !g.wDown) g.gear = std::min(4, g.gear + 1);
-			if (gearHeld && sHeld && !g.sDown) g.gear = std::max(1, g.gear - 1);
 			g.wDown = wHeld;
 			g.sDown = sHeld;
-			if (g.gear != before) logger::Write("Rover flight: gear %d -> %d (driving)", before, g.gear);
 			const auto gp = At<game::Vec3>(vehicle, off::kRefPosition);
 			constexpr double kGroundShare[5] = { 1.0, 0.25, 0.5, 0.75, 1.0 };
 			std::lock_guard lk(g_sh.lock);
@@ -4040,7 +4038,7 @@ namespace vehicleflight
 			g_sh.px = gp.x; g_sh.py = gp.y; g_sh.pz = gp.z;
 			g_sh.groundOn = true;
 			g_sh.groundFrac = kGroundShare[std::clamp(g.gear, 0, 4)];
-			g_sh.groundLearn = g.gear == 4 && wHeld && !gearHeld && !Held(VK_LSHIFT);
+			g_sh.groundLearn = g.gear == 4 && wHeld && !Held(VK_LSHIFT);
 			return;
 		}
 		{
@@ -4597,6 +4595,7 @@ namespace vehicleflight
 		g_lastDrivenVehicle.store(0);
 		g_tapBoost = Tap{};
 		g_tapThrust = Tap{};
+		g_altInput = {}; g_altDrop = false;
 		g_camRest = CamRest{};
 		g_camPick = CamPick{};
 		g_boostRequest=false;g_meterBoost=false;g_meterVehicle=0;g_meterExhausted=false;

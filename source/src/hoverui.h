@@ -7,7 +7,7 @@
 // UserEventData of the Vehicle input events, so the key glyphs follow the player's bindings like every native prompt.
 // Layout: a WASD cluster (labels under the keys; A and D level with S,
 // W above S, all at the same key distance), a column of three rows right-aligned on their keys with equal spacing
-// (Gear-, Gear+: Alt with Brake / Accelerate; Hover / Land: Space) and a key box reading "GEAR n". All Scaleform work runs inside the HUD movie's own per-frame Advance, never from the plugin task.
+// (Descend: hold Alt; Gear: tap Alt; Hover / Land: Space) and a key box reading "GEAR n". All Scaleform work runs inside the HUD movie's own per-frame Advance, never from the plugin task.
 namespace hoverui
 {
 	bool Install();
@@ -40,7 +40,7 @@ namespace hoverui
 	// A save load or reload: forget the button objects (the HUD movie is rebuilt).
 	void Reset();
 	// Main thread, every frame: layout editor. F7 on / off (saves). In the vehicle, Page Up / Page Down pick one element
-	// (W, A, S, D, Gear-, Gear+, Hover, Gear box, Auto, Auto line, Gang, each of the rover widget's own clips such as the
+	// (W, A, S, D, Descend, Gear, Hover, Gear box, Auto, Auto line, Gang, each of the rover widget's own clips such as the
 	// Exit button) or a group (WASD, Column, Extras, All); the pick is named in a notification and blinks. On foot they pick
 	// Summon, Follow, Get in, Status, Gang or the whole panel. Arrows move (Ctrl: x10); Delete puts the pick back to its
 	// default; Home / End space the WASD keys or the column's rows. While editing every element shows (sample text where

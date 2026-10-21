@@ -112,9 +112,10 @@ the vehicle flies on without stopping. The final point keeps normal arrival brak
 | **Space ×2** | Hover on / off |
 | **W / S** | Accelerate / brake (double-tap W: keep accelerating) |
 | **Left Shift** (hold) | 1.75x boost in the selected gear. Uses the game's boost meter and the vehicle's own burn/recharge timings; release to recover after depletion. |
-| **Alt + W / Alt + S**, **1–4** | Gear up / down, or pick a gear |
+| **Alt** (tap) | Cycle gears: 1 → 2 → 3 → 4 → 1 |
+| **Alt** (hold) | Descend after 0.3 seconds; releasing a hold does not change gear |
 | **A / D**, mouse | Turn / roll; the mouse aims |
-| **Q / Z**, **Right Shift + Space** | Up / down |
+| **Q / Z** | Up / down |
 | **T** | **Auto** on / off: the autopilot flies you to your map marker. Any of W / A / S / D takes control back. |
 | **]** (when free) | While Auto is on: **Cruise** (fly where you look at your gear's speed) |
 | *Leave the vehicle* | The old destination and queued route are discarded. Set a fresh target for the next trip; an unattended Auto vehicle holds position. |
@@ -128,7 +129,7 @@ Buttons only show when they can be used:
 - **On foot** (if you own a vehicle): Summon, Follow, Get in (near your vehicle), a
   status box (*SUMMONING 120 m*, *FOLLOWING 42 m*…), and when your followers use vehicles, who is in them (*Sarah, Barrett +1*) and a line
   per follower (*Sarah  escort  42 m*).
-- **In the vehicle:** W / A / S / D, Gear− / Gear+ / Hover, the gear box, **Auto**, and follower vehicle lines.
+- **In the vehicle:** W / A / S / D, Alt hold to descend / Alt tap for gear / Hover, the gear box, **Auto**, and follower vehicle lines.
 - **Route display on the HUD/scanner:** native status boxes for the destination and queued stops, with native **Retry / Skip / Clear** key prompts. Select **Route** in the F7 editor to move the group.
 
 ---

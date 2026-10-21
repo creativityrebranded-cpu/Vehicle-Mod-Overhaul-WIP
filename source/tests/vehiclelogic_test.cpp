@@ -5,6 +5,7 @@
 #include "travellogic.h"
 #include "hulllogic.h"
 #include "boostlogic.h"
+#include "altcontrol.h"
 #include "ramlogic.h"
 #include <cstdio>
 #include <cmath>
@@ -77,5 +78,30 @@ int main(){
  check(ramlogic::Finished(true,true,1000,true,3,4),"ram ends after nearby impact");
  check(!ramlogic::Finished(true,true,1000,true,50,4),"distant contact cannot falsely complete ram");
  check(ramlogic::Finished(false,true,100,false,50,4),"lost ram target cancels order");
+ altcontrol::Input alt;
+ alt.Update(false,true,0);
+ auto action=alt.Update(true,true,10);
+ check(!action.cycle&&!action.drop,"Alt press waits to distinguish tap from hold");
+ action=alt.Update(false,true,110);
+ check(action.cycle&&!action.drop,"Alt tap changes gear on release");
+ check(!alt.Update(false,true,120).cycle,"Alt tap cannot repeat while released");
+ alt.Update(true,true,200);
+ action=alt.Update(true,true,500);
+ check(action.drop&&!action.cycle,"Alt hold descends after 300 ms without changing gear");
+ check(alt.Update(true,true,800).drop,"descent continues while Alt remains held");
+ action=alt.Update(false,true,810);
+ check(!action.drop&&!action.cycle,"releasing a held Alt ends descent without a gear change");
+ alt.Update(true,true,900);
+ action=alt.Update(false,true,1400);
+ check(!action.cycle,"long press never changes gear even if an intervening frame was missed");
+ alt.Update(true,true,1500);alt.Update(true,false,1510);
+ action=alt.Update(false,true,1520);
+ check(!action.cycle&&!action.drop,"focus loss cancels a pending Alt tap");
+ alt.Update(true,false,1600);
+ action=alt.Update(true,true,2000);
+ check(!action.cycle&&!action.drop,"Alt held while boarding cannot trigger a command");
+ alt.Update(false,true,2010);alt.Update(true,true,2020);
+ check(alt.Update(false,true,2100).cycle,"fresh Alt press works after boarding or focus returns");
+ check(altcontrol::NextGear(1)==2&&altcontrol::NextGear(2)==3&&altcontrol::NextGear(3)==4&&altcontrol::NextGear(4)==1,"Alt cycles all four gears and wraps to first");
  return failures?1:0;
 }

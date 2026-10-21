@@ -122,12 +122,12 @@ namespace hoverui
 		// In the rover widget's own coordinates:
 		//  - WASD cluster: by the S key's centre (cx, cy) and the key distance d (A and D at cx -/+ d level with S, W at
 		//    cy - d). Labels all under (or all above) their keys.
-		//  - Column: Gear-, Gear+, Hover top to bottom, right-aligned on their key boxes' right edge (colRight), key centres
+		//  - Column: Descend, Gear, Hover top to bottom, right-aligned on their key boxes' right edge (colRight), key centres
 		//    colTop, colTop + colStep, colTop + 2 colStep.
 		//  - Gear box: a key box with the gear number only, by its centre (gx, gy).
 		// Saved to Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\hoverui.ini.
 		enum { kW, kA, kS, kD, kGearDown, kGearUp, kHover, kGear, kButtons };
-		// Editor selections: each element (W, A, S, D, Gear-, Gear+, Hover, Gear box, Auto, Auto line, Gang), each of the
+		// Editor selections: each element (W, A, S, D, Descend, Gear, Hover, Gear box, Auto, Auto line, Gang), each of the
 		// rover widget's own clips (kSelNative + i, e.g. the Exit button), then the groups.
 		enum { kSelAuto = kButtons, kSelLine, kSelGang, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelRoute = 90, kSelNative = 100 };
 		constexpr int kFootEls = 8, kCarEls = 4;
@@ -189,7 +189,7 @@ namespace hoverui
 			std::snprintf(line, sizeof(line), "cluster = %.1f %.1f %.1f %d   ; S key centre x y, key distance, labels above (1) or under (0)\n", g_lay.cx, g_lay.cy,
 				g_lay.d, g_lay.labelsAbove ? 1 : 0);
 			out << line;
-			std::snprintf(line, sizeof(line), "column = %.1f %.1f %.1f   ; key boxes' right edge, first key centre y, row step (Gear-, Gear+, Hover)\n", g_lay.colRight,
+			std::snprintf(line, sizeof(line), "column = %.1f %.1f %.1f   ; key boxes' right edge, first key centre y, row step (Descend, Gear, Hover)\n", g_lay.colRight,
 				g_lay.colTop, g_lay.colStep);
 			out << line;
 			std::snprintf(line, sizeof(line), "gearbox = %.1f %.1f   ; centre x y\n", g_lay.gx, g_lay.gy);
@@ -569,21 +569,12 @@ namespace hoverui
 				for (int i = 0; i < kButtons; ++i) Show(i, false);
 				return;
 			}
-			std::string accel, brake;
-			{
-				std::lock_guard lk(g_keyLock);
-				accel = g_accelName;
-				brake = g_brakeName;
-			}
-			char up[32], down[32];
-			std::snprintf(up, sizeof(up), "+%s  Gear+", accel.c_str());
-			std::snprintf(down, sizeof(down), "+%s  Gear-", brake.c_str());
 			SetButton(kW, g_accelHeld.load() ? "Accelerate (hold)" : "Accelerate");
 			SetButton(kA, "Left");
 			SetButton(kS, "Brake");
 			SetButton(kD, "Right");
-			SetButton(kGearDown, down);
-			SetButton(kGearUp, up);
+			SetButton(kGearDown, "Descend (hold)");
+			SetButton(kGearUp, "Gear (tap)");
 			SetButton(kHover, hovering ? "Land" : "Hover");
 			TintHover(hovering);
 			if (std::strcmp(g_ui.text[kGear], " ") != 0) g_ui.gearShown = -1;  // new data: its key text is the key again
@@ -1523,7 +1514,7 @@ namespace hoverui
 			}
 			const int s = g_lay.sel;
 			if(s==kSelRoute)return "Route";
-			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Gear-", "Gear+", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "WASD", "Column", "Extras",
+			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Descend", "Gear", "Hover", "Gear box", "Auto", "Auto line", "Gang", "Vehicles", "WASD", "Column", "Extras",
 				"All" };
 			if (s >= 0 && s <= kSelAll) return names[s];
 			if (s >= kSelNative && s - kSelNative < int(g_lay.natNames.size())) return g_lay.natNames[s - kSelNative];
