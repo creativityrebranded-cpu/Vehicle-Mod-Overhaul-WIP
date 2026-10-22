@@ -27,6 +27,7 @@
 #include "native_personalities.h"
 #include "combat_relations.h"
 #include "integrationlogic.h"
+#include "coverfight.h"
 #include "hulllogic.h"
 #include "navmap.h"
 #include "realvehicles.h"
@@ -228,13 +229,13 @@ namespace npcvehicles
 		constexpr std::uint32_t kVehicleSystem = 0x023FF640, kSubmitVehicleInput = 0x012C0550;
 		// 2026-10-21: longer bursts, shorter gaps (1.2 s / 1.5 s fired 44 % of the time, about 2 shots a burst). The cone stays 8 deg (the approved
 		// proposal); the nose is now held on the aim point while moving (manoeuvres), and the shots are also turned onto it at launch (vehicleaim).
-		constexpr ULONGLONG kBurstMs = 2000, kBurstGapMs = 600;
+		constexpr ULONGLONG kBurstMs = coverfight::kBurstMs, kBurstGapMs = coverfight::kGapMs;
 		// The fire gate (2026-10-21, the user: "vehicles spend too much time nose pointing to shoot"): shots are re-aimed at the
 		// target at launch (vehicleaim), so the nose only needs to be roughly on it: 25 deg, widening up to 40 deg up close (a
 		// near target fills more of the view); pitch 1.5x. Never wider, so a gun never fires sideways or backwards.
 		constexpr double kFireCone = 0.44;         // rad (25 deg) yaw; pitch 1.5x
 		constexpr double kFireConeNear = 0.70;     // rad (40 deg) at close range
-		double FireCone(double dist) { return std::clamp(std::atan2(8.0, std::max(1.0, dist)), kFireCone, kFireConeNear); }
+		double FireCone(double dist) { return coverfight::FireCone(dist); }
 		// Aim: the weapon fires along the vehicle's nose, so the whole vehicle aims. The aim point leads the player by
 		// the shot's flight time (kShotSpeed) and sits at chest height.
 		// Lead speed comes from the native projectile flight, through vehiclehits::ShotTime.
@@ -1177,7 +1178,8 @@ namespace npcvehicles
 			default: return "follow you";
 			}
 		}
-		constexpr double kFoeRange = 150.0;      // m from the vehicle
+		constexpr double kDefendRange = 150.0;
+		std::uint32_t g_combatFocus = 0;
 		constexpr double kDefendLeash = 250.0;   // m: a defender's target stays this close to the player
 		constexpr ULONGLONG kFoePickMs = 500;
 
@@ -1193,7 +1195,13 @@ namespace npcvehicles
 		// (no __try here: the scan holds a vector)
 		uptr PickFoe(Job& j, uptr npc, uptr vehicle, uptr player, ULONGLONG now)
 		{
-			const bool defend = j.profile == Profile::Escort;
+			const auto combat=vcontract::AssignedTo(j.vehicle,vcontract::Class::Combat);
+			const bool defend = j.profile == Profile::Escort && !(combat&&profileclass::Is(combat->name,"attack"));
+			const double kFoeRange = defend ? kDefendRange : coverfight::kChaseRange;
+			if (const auto focus=RefById(CombatFocus()); focus && PlayerTeam(npc) && IsFoe(j,npc,player,focus) &&
+				InVehicle(focus)!=vehicle && Dist3(vehicle,focus)<coverfight::kChaseKeep) {
+				j.foe=At<std::uint32_t>(focus,off::kFormId);j.foeAt=now;return focus;
+			}
 			if(const auto aggressor=Aggressor(j.vehicle,now);aggressor && aggressor!=npc && !(PlayerTeam(npc) && PlayerTeam(aggressor)) && InVehicle(aggressor)!=vehicle && Dist3(vehicle,aggressor)<kFoeRange*1.2) {
 				j.foe=At<std::uint32_t>(aggressor,off::kFormId);j.foeAt=now;return aggressor;
 			}
@@ -1509,7 +1517,7 @@ namespace npcvehicles
 				g_combatIni.holdMs = GetPrivateProfileIntW(L"combat", L"hold", 1500, ini.c_str());
 			}
 			g_combatIni.zoneEscort = std::clamp(g_combatIni.zoneEscort, 40.0, 1000.0);
-			g_combatIni.zonePursuit = std::clamp(g_combatIni.zonePursuit, 40.0, 1000.0);
+			g_combatIni.zonePursuit = std::clamp(g_combatIni.zonePursuit, coverfight::kChaseRange, 1000.0);
 			g_combatIni.breakOff = std::clamp(g_combatIni.breakOff, 0.0, 0.9);
 			g_combatIni.holdMs = std::clamp(g_combatIni.holdMs, 300u, 10000u);
 			g_combatIni.stage = std::clamp(g_combatIni.stage, 1, 4);
@@ -1580,7 +1588,7 @@ namespace npcvehicles
 			in.ramming = vehicleflight::Ramming(j.vehicle);
 			in.now = now;
 			manoeuvre::Settings set;
-			set.zone = pursuer ? g_combatIni.zonePursuit : g_combatIni.zoneEscort;
+			set.zone = pursuer || aggressive ? g_combatIni.zonePursuit : g_combatIni.zoneEscort;
 			set.allowRam = g_combatIni.ram && aggressive && foeInVeh;
 			set.breakOff = g_combatIni.breakOff;
 			set.holdMs = g_combatIni.holdMs;
@@ -1929,7 +1937,6 @@ namespace npcvehicles
 		void RamTick(ULONGLONG now)
 		{
 			ReadCombatIni();
-			if (!g_combatIni.sw.tactics) return;
 			static world::Snapshot snap;
 			if (!world::Vehicles(snap)) return;
             const double dt=g_ramPreviousAt&&now>=g_ramPreviousAt?double(now-g_ramPreviousAt)/1000.0:0;
@@ -1991,7 +1998,7 @@ namespace npcvehicles
 					const auto policy = combatrelations::RamConsequences(closing, rammer != 0, victim != 0, rammer && rammer == player, protectedVictim, hostileBefore);
 					if (policy.assault) CrimeAlarms(victim, victimVehicle, player, true, false);
 					if (policy.attack && victimVehicle && !VehicleFriendlyToShooter(victimVehicle, At<std::uint32_t>(rammer, off::kFormId)))
-						VehicleAggression(victimVehicle, At<std::uint32_t>(rammer, off::kFormId),false);
+						VehicleAggression(victimVehicle, At<std::uint32_t>(rammer, off::kFormId), !policy.assault);
 					if (policy.witness) WitnessCrash((double(R.pos[0]) + V.pos[0]) * 0.5, (double(R.pos[1]) + V.pos[1]) * 0.5, (double(R.pos[2]) + V.pos[2]) * 0.5, "hard vehicle ram");
 					const int side = rammer && PlayerTeam(rammer) ? 1 : 0;
 					vehiclehits::ApplyDamage(V.formId, float(res.damageIt), R.formId, side, "a ram");
@@ -2110,7 +2117,7 @@ namespace npcvehicles
 			}
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
 			s.anchor = { pp.x, pp.y, pp.z };
-			s.zone = pursuer ? g_combatIni.zonePursuit : g_combatIni.zoneEscort;
+			s.zone = pursuer || aggressive ? g_combatIni.zonePursuit : g_combatIni.zoneEscort;
 			if (protect) {
 				s.protect = true;
 				s.protectee.pos = { pp.x, pp.y, pp.z };
@@ -2509,8 +2516,12 @@ namespace npcvehicles
             const auto vehicle=InVehicle(npc);
             if(!eject&&vehicle&&environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe)return false;
 			g_allowDismount = true;
+			const auto freeze=At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit);
 			__try {
-				EngineFn<void (*)(uptr)>(0x01A9C530)(npc);
+				__try {
+					if(eject)At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit)=0;
+					EngineFn<void (*)(uptr)>(0x01A9C530)(npc);
+				} __finally { if(eject)At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit)=freeze; }
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				g_allowDismount = false;
@@ -2590,7 +2601,35 @@ namespace npcvehicles
 		};
 		constexpr int kExitTasks = 12;
 		ExitTask g_exitTasks[kExitTasks];
+		struct FallWatch { std::uint32_t npc=0; float z=0; ULONGLONG at=0; } g_fallWatch[kExitTasks];
 		std::uint32_t g_exitRefused[8] = {};  // actors whose last exit was Refused (polled by ExitStateOf)
+
+		bool WarpExitController(uptr npc, float x, float y, float z)
+		{
+			__try {
+				const auto process = At<uptr>(npc, 0x228);
+				const auto high = process ? At<uptr>(process, 8) : 0;
+				if (!high || !At<uptr>(high, 0x458)) return false;
+				constexpr unsigned char sig[]{0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,0x44,0x88,0x48,0x20,0x55,0x56,0x57,0x41,0x54};
+				if(std::memcmp(reinterpret_cast<void*>(game::Base()+addr::kActorFurnitureState),sig,sizeof(sig)))return false;
+				const auto state=npc+0xF0;
+				const int before=reinterpret_cast<int(*)(uptr)>((*reinterpret_cast<void***>(state))[0x1A0/8])(state);
+				const auto freeze=At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit);
+				__try {
+					At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit)=0;
+					// Native furniture state 0 performs controller and graph cleanup,
+					// including restoring normal movement; clearing extra A5 alone does not.
+					EngineFn<void(*)(uptr,uptr,int,char)>(addr::kActorFurnitureState)(process,npc,0,1);
+				} __finally {At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit)=freeze;}
+				const int after=reinterpret_cast<int(*)(uptr)>((*reinterpret_cast<void***>(state))[0x1A0/8])(state);
+				logger::Write("NPC vehicles: eject cleanup %08X: furniture state %d -> %d",At<std::uint32_t>(npc,off::kFormId),before,after);
+				alignas(16) float point[4]{x,y,z,0};
+				// Native warp clears the controller's support/velocity and synchronizes
+				// its physics proxy. A generic MoveReference leaves stale seat support.
+				EngineFn<void(*)(uptr,float*,char)>(addr::kActorSetPosition)(npc, point, 1);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
 
 		ExitTask* ExitTaskFor(std::uint32_t npcId)
 		{
@@ -2615,7 +2654,11 @@ namespace npcvehicles
 			if (hasPoint) {
 				const uptr cell = At<uptr>(vehicle, off::kRefParentCell);
 				const float z = std::isnan(req.z) ? At<game::Vec3>(npc, off::kRefPosition).z : req.z;
-				const bool ok = PlaceAt(npc, cell, req.x, req.y, z, At<game::Vec3>(npc, off::kRefRotation).z);
+				const bool ok = req.mode == vcontract::ExitMode::Eject ? WarpExitController(npc, req.x, req.y, z) :
+					PlaceAt(npc, cell, req.x, req.y, z, At<game::Vec3>(npc, off::kRefRotation).z);
+				if (ok && req.mode == vcontract::ExitMode::Eject) for (auto& watch : g_fallWatch) if (!watch.npc) {
+					watch = {At<std::uint32_t>(npc, off::kFormId), z, GetTickCount64()}; break;
+				}
 				logger::Write("NPC vehicles: exit: NPC %08X placed at the requested point (%.0f, %.0f) (%s)", At<std::uint32_t>(npc, off::kFormId), req.x, req.y, ok ? "ok" : "FAILED");
 				return;
 			}
@@ -2657,6 +2700,11 @@ namespace npcvehicles
 		void ExitTick()
 		{
 			const ULONGLONG now = GetTickCount64();
+			for (auto& watch : g_fallWatch) if (watch.npc && now - watch.at >= 1500) {
+				const auto actor = RefById(watch.npc);
+				if (actor && !InVehicle(actor)) logger::Write("NPC vehicles: air eject fall check %08X: height %.2f -> %.2f after %.2f s", watch.npc, watch.z, At<game::Vec3>(actor, off::kRefPosition).z, (now-watch.at)/1000.0);
+				watch = {};
+			}
 			for (auto& t : g_exitTasks) {
 				if (!t.used) continue;
 				const uptr npc = RefById(t.npc), vehicle = RefById(t.veh);
@@ -2666,6 +2714,13 @@ namespace npcvehicles
 				}
 				if (InVehicle(npc) != vehicle) {
 					if(InVehicle(npc)){t.used=false;continue;} // a different seat must not be moved back to the old vehicle
+					// Allow native interaction cleanup to complete before the one-shot
+					// controller warp. Repeated warps would erase the falling velocity.
+					if (t.req.mode == vcontract::ExitMode::Eject && t.stage == 5) {
+						if (now - t.tStage < 100) continue;
+						const auto process = At<uptr>(npc, 0x228), high = process ? At<uptr>(process, 8) : 0;
+						if ((!high || !At<uptr>(high, 0x458)) && now - t.tStage < 2000) continue;
+					}
 					FinishExit(t, npc, vehicle, true);
 					continue;
 				}
@@ -2696,7 +2751,8 @@ namespace npcvehicles
 					const bool out = !InVehicle(npc);
 					t.req.x = float(point[0]); t.req.y = float(point[1]); t.req.z = float(point[2]);
 					logger::Write("NPC vehicles: air eject NPC %08X from %08X at altitude %.1f: native %s, %s", t.npc, t.veh, point[2], called ? "called" : "failed", out ? "OUT" : "still aboard");
-					if (out || now - t.t0 > t.req.timeoutMs) FinishExit(t, npc, vehicle, out);
+					if (out) { t.stage = 5; t.tStage = now; }
+					else if (now - t.t0 > t.req.timeoutMs) FinishExit(t, npc, vehicle, false);
 					continue;
 				}
                 const auto site=environment::BoardingSite(vehicle);
@@ -3189,7 +3245,7 @@ namespace npcvehicles
 					logger::Write("NPC vehicles: [%d] recall: %.0f m from you; NPC %08X gets out for you", j.pilot, toPlayer, j.npc);
 					Set(j, Phase::Settling);
 				}
-				else if (!j.order && (j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) > kLeash : toPlayer > kGiveUp)) {
+				else if (!j.order && (!foe || !rules.chase) && (j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) > kLeash : toPlayer > kGiveUp)) {
 					logger::Write("NPC vehicles: [%d] stopped following (%s, %.0f m from you, %.0f m from where it started)", j.pilot, Outdoors(player) ? "too far from its origin" : "you went indoors", toPlayer,
 						j.haveOrigin ? std::hypot(double(At<game::Vec3>(vehicle, off::kRefPosition).x) - j.originX, double(At<game::Vec3>(vehicle, off::kRefPosition).y) - j.originY) : 0.0);
 					vehicleflight::PilotStop(j.pilot, "gave up");
@@ -4741,11 +4797,24 @@ namespace npcvehicles
 	{
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player || !InVehicle(player)) return false;
-		if (Dismount(player) == 1) return true;
-		if (!force) return false;
+		if (!force) return Dismount(player)==1;
+		const auto vehicle=InVehicle(player);
+		double point[3]{};bool havePoint=false;world::Snapshot snapshot;
+		if(world::Vehicles(snapshot))for(unsigned i=0;i<snapshot.count&&i<64;++i)if(snapshot.v[i].ref==vehicle){
+			const auto& hull=snapshot.v[i];
+			for(int side:{1,-1})if(integrationlogic::EjectPosition(HullBox(hull),hull.heading,side,point)){
+				const float from[]={hull.center[0],hull.center[1],hull.center[2]+1},to[]={float(point[0]),float(point[1]),float(point[2])+1};
+				if(!environment::LineBlocked(from,to)){havePoint=true;break;}
+			}
+			break;
+		}
 		g_allowDismount = true;
-		const bool out = EndInteraction(player);
+		const bool out = InstantExit(player,true) && !InVehicle(player);
 		g_allowDismount = false;
+		if(out){
+			const auto pos=At<game::Vec3>(player,off::kRefPosition);
+			WarpExitController(player,havePoint?float(point[0]):pos.x,havePoint?float(point[1]):pos.y,havePoint?float(point[2]):pos.z);
+		}
 		return out;
 	}
 
@@ -4759,7 +4828,10 @@ namespace npcvehicles
 			return owner == base || (At<std::uint8_t>(owner, 0x2E) == 0x0D && InFaction(actor, owner));
 		};
 		if (const uptr owner = OwnerForm(vehicle)) return belongs(owner);
-		return belongs(realvehicles::PlaceOwner(vehicle));  // unowned: only in its own camp
+		// Unowned: in an owned place (a settlement, a town, a camp) only the place's own people take it; out in the open anyone may
+		// (2026-10-21, the user: unowned vehicles outside any settlement are free for enemies too).
+		const uptr place = realvehicles::PlaceOwner(vehicle);
+		return !place || belongs(place);
 	}
 
 	bool ActorFree(std::uintptr_t actor)
@@ -5106,6 +5178,7 @@ namespace npcvehicles
 
 	void Reset()
 	{
+		g_combatFocus=0;
 		for (auto& member : g_damageCrew) member.store(0, std::memory_order_relaxed);
 		for (auto& j : g_jobs) j = Job{};
 		g_riders.clear();
@@ -5118,6 +5191,7 @@ namespace npcvehicles
 		g_squadRefreshAt = 0;
 		g_combatVehicleCount = 0;
 		for(auto&t:g_exitTasks)t={};
+		for(auto&watch:g_fallWatch)watch={};
 		for(auto&r:g_exitRefused)r=0;
 		for(auto&pending:g_nativeExits)pending.store(0);
 		g_told = false;
@@ -5237,16 +5311,45 @@ namespace npcvehicles
 		}
 	}
 
-	bool FireVehicleWeapon(std::uint32_t vehicleId, bool fire, double x, double y, double z)
+	bool FireVehicleWeapon(std::uint32_t vehicleId, bool fire, double x, double y, double z, std::uint32_t target, std::uint32_t targetVehicle)
 	{
 		if (!vehicleId) return false;
-		StoreAim(7, AimSnap{ vehicleId, 0, x, y, z, fire, GetTickCount64() });  // vehicleaim turns the shot at launch
         const auto vehicle=RefById(vehicleId);
         if(fire&&vehicle){const auto p=At<game::Vec3>(vehicle,off::kRefPosition);const double h=At<game::Vec3>(vehicle,off::kRefRotation).z;
             const float from[]={p.x+float(std::sin(h)*4),p.y+float(std::cos(h)*4),p.z+1.5f},to[]={float(x),float(y),float(z)};
-            fire=environment::ClearShot(vehicleId,0,0,from,to);
+            fire=environment::ClearShot(vehicleId,target,targetVehicle,from,to);
         }
+		StoreAim(7, AimSnap{ vehicleId, 0, x, y, z, fire, GetTickCount64() });
 		return SubmitFire(kJobs, vehicleId, fire);
+	}
+
+	std::uint32_t CombatFocus()
+	{
+		if(!g_combatFocus)return 0;
+		const auto player=Ptr(addr::kPlayerCharacterPtr), target=RefById(g_combatFocus);
+		// Dropped by itself (polled every frame by the scanner key): said once, so the player knows targeting is automatic again.
+		const char* why=!player?nullptr:!target?"gone":Dead(target)?"down":PlayerTeam(target)||!AreHostile(player,target)?"no longer hostile":
+			Dist3(player,target)>coverfight::kChaseKeep?"out of range":nullptr;
+		if(why||!player) {
+			logger::Write("Combat focus: %08X %s; normal target selection resumes",g_combatFocus,why?why:"(no player)");
+			if(why)notify::Show("Focus target %s | automatic targeting",why);
+			g_combatFocus=0;
+		}
+		return g_combatFocus;
+	}
+	bool SetCombatFocus(std::uint32_t id)
+	{
+		if(!id){g_combatFocus=0;logger::Write("Combat focus cleared; normal target selection resumes");return true;}
+		const auto player=Ptr(addr::kPlayerCharacterPtr);auto target=RefById(id);
+		if(target&&IsVehicle(target))target=CombatDriver(target);
+		if(!player||!target||!IsActorRef(target)||Dead(target)||PlayerTeam(target)||!AreHostile(player,target)||Dist3(player,target)>coverfight::kChaseKeep)return false;
+		g_combatFocus=At<std::uint32_t>(target,off::kFormId);
+		for(auto& job:g_jobs)if(job.phase!=Phase::Idle)if(const auto npc=RefById(job.npc);npc&&PlayerTeam(npc)) {
+			job.foe=g_combatFocus;job.foeAt=0;job.aimAt=0;job.squadFocus=0;
+			Aggro(npc,target);
+		}
+		logger::Write("Combat focus: player ordered allied vehicles onto %08X",g_combatFocus);
+		return true;
 	}
 
 	bool AimFor(std::uint32_t shooterFormId, double& x, double& y, double& z)
@@ -5316,6 +5419,29 @@ void BeginFrame()
 	{
 		const auto driver = CombatDriver(RefById(vehicleId));
 		return driver ? At<std::uint32_t>(driver, off::kFormId) : 0;
+	}
+
+	bool VehicleInCombat(std::uint32_t vehicleId, std::uint32_t departedDriver)
+	{
+		const auto now = GetTickCount64();
+		const auto attack = g_aggression.find(vehicleId);
+		if (attack != g_aggression.end() && now < attack->second.until) return true;
+		const auto vehicle = RefById(vehicleId), driver = CombatDriver(vehicle);
+		for (const auto actor : {driver, RefById(departedDriver)}) {
+			if (!actor || Dead(actor)) continue;
+			if (InCombat(actor) || NativeEnemyId(actor)) return true;
+			const auto shot = vehiclehits::LastShotBy(At<std::uint32_t>(actor, off::kFormId));
+			if (shot && now >= shot && now - shot < 15000) return true;
+		}
+		for (const auto& j : g_jobs) if (j.vehicle == vehicleId && j.phase != Phase::Idle) {
+			if (j.firing) return true;
+			if (j.boardingFight.target && now < j.boardingFight.until) {
+				const auto enemy = RefById(j.boardingFight.target);
+				if (enemy && !Dead(enemy)) return true;
+			}
+		}
+		const auto shot = vehiclehits::LastShotBy(vehicleId);
+		return shot && now >= shot && now - shot < 15000;
 	}
 
 	bool VehicleFriendlyToShooter(std::uintptr_t vehicle, std::uint32_t shooterFormId)

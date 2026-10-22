@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current version: **0.63.1** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current version: **0.64.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -32,7 +32,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Escorts defend you** | Followers in vehicles intercept, shield, give overwatch and attack - enemy vehicles first | Untested |
 | **Rescue, scout, wait** | A follower vehicle picks you up when you are hurt, scouts your marker, waits at the door | Untested |
 | **Smarter enemies** | Enemy vehicles flank, intercept, block, hover overhead, retreat when damaged and call for help | Untested |
-| **Vehicle health** | Vehicles take damage from shots and rams, share some with the driver, and wreck at 0 health | Untested |
+| **Vehicle health** | Every compatible vehicle takes damage and wrecks at 0 health, occupied or empty; a seated driver takes a share of damage | Latest hit fixes need live verification |
 | **Friendly-fire protection** | Allied vehicle shots/rams and attributed native actor damage are blocked | Offline checks pass; needs live verification |
 | **NPC air ejection** | Wrecked NPC occupants and the airborne exit command release the seat without waiting for a landing | Offline checks pass; needs live verification |
 | **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
@@ -174,6 +174,21 @@ The HUD shows what you can do now and one status card (0.62.0). Everything uses 
 - **F7** moves and resizes everything (+ / − on the pick). The card moves with *Status* on foot and *Vehicles* in the vehicle.
 
 ---
+
+## What's new in 0.64.0
+
+Not tested in game yet; the offline checks pass. Details: [docs/RELEASE_0.64.0.md](docs/RELEASE_0.64.0.md).
+
+- **Own vehicle placements**: 36 spots in New Atlantis (spaceport, tarmac, Embassy District, Varuun embassy, Sanctum
+  Universum, Commercial District), recorded in game. Side-by-side spots form a row with one vehicle type, parked in parallel.
+  A spot places its vehicle when the area loads (never within 20 m of you) and stays empty while that vehicle still exists.
+- **Parked Vehicles in cities**: the placement patch now finds Parked Vehicles' spots in cities laid over a planet (New Atlantis
+  moves 7 cells west and 17 north at run time), so city vehicles get the per-location mix.
+- **Exact scanner destinations**: a real surface hit is the destination; no more pull to building centres. Map points only
+  when nothing is hit.
+- **Focus fire** shows a notice when it ends by itself (target down, gone, no longer hostile, out of 840 m).
+- **Enemies mount up from further away**: fighters up to 250 m from you (was 80 m) take vehicles. They run to one up to 150 m
+  away when you're 60 m+ off or driving. Unowned vehicles in the open are free to take; settlements keep theirs.
 
 ## What's new in 0.63.1
 
@@ -402,7 +417,13 @@ weapon's own damage (scaled by the game's difficulty); rams damage both vehicles
 driver takes a share of each hit (25%). At 0 health the vehicle is **wrecked**: its autopilot shuts down until it is repaired
 over 25%, and it heals slowly after a quiet spell. Friendly fire does no damage, but shooting another person's vehicle still
 counts as aggression toward its occupants or owner. An enemy vehicle's health shows in a second bar under its driver's
-health bar.
+health bar. Repair pauses during combat, recent attacks and recent firing, including while a departed pilot is still fighting.
+Damage records stay with the same chassis across boarding and driver changes; a busy session cannot evict an older damaged vehicle's record.
+Every accepted shot and ram logs its damage and remaining health. Physical ram detection runs independently of the AI tactics switch.
+
+The vehicle first-person camera allows looking 80 degrees up or down while driving; the original limits return on exit.
+NPC air ejection now waits briefly for seat cleanup and uses the native character-controller warp so physics can resume at the exit point.
+These follow-up changes need a game restart and live verification.
 
 ---
 
@@ -543,3 +564,16 @@ exits, drive mode, metered boost, view distance and the vehicle registry.
 - **SFSE** team (ianpatt and contributors) for the script extender.
 - **SarthesArai** for Parked Vehicles; **Aurelianis** for The Gang's All Here.
 - Built with the help of Claude (Anthropic).
+
+### Current local follow-up
+
+Cover now holds a usable target/position longer and uses the same wider firing cone as NPCs, with 3-second bursts and 0.4-second pauses.
+Chase range is 700 m (840 m retention), without changing weapon range. On foot in combat, tap T on an enemy to focus allied vehicle fire;
+double-tap T clears that focus. Hold-T guard/ram commands remain available.
+
+Wrecks no longer use summon relocation or automatic upright placement; hover release preserves momentum. Ejection also clears the native
+furniture state so NPCs can leave their seated pose and resume normal character physics. Live verification remains necessary.
+
+A separate authoring mode records scanner T markers as this mod's own vehicle-placement candidates. See
+[source recording instructions](source/README.md#placement-recording). These records will be reviewed and baked after collection;
+they do not depend on Carfield or Parked Vehicles.

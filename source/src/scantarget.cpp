@@ -8,6 +8,8 @@
 #include "ramlogic.h"
 #include "targetinput.h"
 #include "npcvehicles.h"
+#include "vehiclehits.h"
+#include "realvehicles.h"
 #include "hoverui.h"
 #include "log.h"
 #include "notify.h"
@@ -40,7 +42,6 @@ namespace scantarget
 		constexpr float kMaxEstimate = 1000.0f;         // m: the farthest estimated target (the user, 2026-10-20: "as far as ~1K max")
 		constexpr float kEstHeight = 15.0f;             // m: the eye height the estimate maps the view angle with
 		constexpr float kEye = 1.6f;                    // m: eye height above the player's origin
-		constexpr float kMagnet = 40.0f;                // m: the structure the ray hit pulls the marker to its own position inside this
 		constexpr ULONGLONG kAskEveryMs = 70;
 		constexpr std::uint32_t kLookupForm = 0x005DE3B0;
 
@@ -58,6 +59,11 @@ namespace scantarget
 		Target g_pressedTarget;
 		std::uint32_t g_pressedActor = 0;
 		bool g_pressedInScanner = false, g_lastScanner = false;
+		bool g_pressedCombat = false;
+		bool g_lastDriving = false;
+		std::uint32_t g_pressedFocus = 0;
+		bool g_pressedPlacement=false;
+		double g_pressedHeading=0;
 		ULONGLONG g_lastAsk = 0, g_setAt = 0;
 		float g_setDist = 0;
 		bool g_setEstimated = false;
@@ -198,7 +204,7 @@ namespace scantarget
 		}
 
 		// The point the player is looking at.
-		Target Look(uptr player, ULONGLONG now)
+		Target Look(uptr player, ULONGLONG now, bool placement = false)
 		{
 			Target t;
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
@@ -223,20 +229,11 @@ namespace scantarget
 			prefetch::RayHit h;
 			unsigned age = 0;
 			if (prefetch::LatestRay(kSlot, h, age) && h.hit && age < 30 && std::isfinite(h.x)) {
+				// The surface the ray landed on, as it is (2026-10-21, the user: destinations as exact as the recorded placements;
+				// the old 40 m pull to a structure's own origin put the marker in the middle of buildings).
 				t = { true, false, false, false, h.x, h.y, h.z, 0, h.formId };
-				// A small magnetic pull: a structure's own position when it is close to where the ray landed.
-				if (h.formId) {
-					if (const uptr r = RefById(h.formId)) {
-						const auto rp = At<game::Vec3>(r, off::kRefPosition);
-						if (std::hypot(double(rp.x) - h.x, double(rp.y) - h.y) <= kMagnet && std::isfinite(rp.x)) {
-							t.x = rp.x;
-							t.y = rp.y;
-							t.snapped = true;
-						}
-					}
-				}
 			}
-			else if (dz < 0.34f) {
+			else if (!placement && dz < 0.34f) {
 				// Nothing loaded that far (collision only exists ~250 m around the player): an estimate along the view heading, marked "~". The old flat
 				// plane at eye height needed a fraction of a degree under the horizon for anything past ~250 m (2026-10-20, the user: "only maxing out to
 				// ~250m"); now the angle under the horizon maps to the distance as if the eye were kEstHeight up: 1 degree ~860 m, level or up to
@@ -247,6 +244,12 @@ namespace scantarget
 					const float s = down > 1e-4f ? std::min(kMaxEstimate, kEstHeight / down) : kMaxEstimate;
 					if (s > 1.0f) t = { true, true, false, false, pp.x + dx / hl * s, pp.y + dy / hl * s, pp.z, 0, 0 };
 				}
+			}
+			// Authoring records the physical surface, never a building origin,
+			// navigation landmark or estimated terrain height.
+			if (placement) {
+				if (t.valid) t.dist = float(scannercontext::Range3D(double(t.x)-pp.x,double(t.y)-pp.y,double(t.z)-pp.z));
+				return t;
 			}
 			const auto selected = hoverui::ScannerDestinationContext();
 			if (!selected.name.empty()) {
@@ -262,7 +265,9 @@ namespace scantarget
 					t.name = selected.name;
 				}
 			}
-			SnapToMapPoint(t, pp, dx, dy, now, selected);
+			// A map point only stands in where nothing real was hit (past loaded collision) or for the game's selected marker; a
+			// real surface hit is never pulled to a landmark near the view line.
+			if (!selected.name.empty() || !t.valid || t.estimated) SnapToMapPoint(t, pp, dx, dy, now, selected);
 			if (t.valid) {
 				t.dist = selected.distance > 0 && !selected.name.empty() ? float(selected.distance) :
 					float(scannercontext::Range3D(double(t.x)-pp.x,double(t.y)-pp.y,double(t.z)-pp.z));
@@ -500,24 +505,45 @@ namespace scantarget
 		RouteTick(now);
 		ChainTick(now);
 		const bool scanner = hoverui::IsScannerOpen();
-		const Target t = scanner ? Look(player, now) : Target{};
-		const bool held = (GetAsyncKeyState(g_key) & 0x8000) != 0;
 		const bool driving = reinterpret_cast<uptr (*)(uptr)>(game::Base() + addr::kPlayerVehicle)(player) != 0;
-		const bool enabled = Focused() && (scanner || driving || g_haveCurrent || !g_chain.empty() ||
+		const Target t = scanner ? Look(player, now, !driving && realvehicles::RecordingPlacements()) : Target{};
+		const bool held = (GetAsyncKeyState(g_key) & 0x8000) != 0;
+		const bool combatFocusMode = !driving && (npcvehicles::CombatOf(player).fighting || npcvehicles::CombatFocus());
+		const bool enabled = Focused() && (combatFocusMode || scanner || driving || g_haveCurrent || !g_chain.empty() ||
 			vehicleflight::Ramming(vehicleflight::OwnRoverId()));
 		// A tap captured in the scanner must not land after it closed (or a tap outside it inside the scanner).
-		if (scanner != g_lastScanner) { g_input.Cancel(held); g_lastScanner = scanner; }
+		if (scanner != g_lastScanner || driving != g_lastDriving) {
+			g_input.Cancel(held);g_lastScanner=scanner;g_lastDriving=driving;g_pressedCombat=false;
+		}
 		const auto action = g_input.Update(held, enabled, now);
-		if (action.tap && g_pressedInScanner) Select(player, now);
+		if(action.tap && g_pressedPlacement && scanner && !driving && realvehicles::RecordingPlacements()) {
+			const auto& point=g_pressedTarget;
+			if(realvehicles::RecordPlacement(point.x,point.y,point.z,g_pressedHeading,!point.valid||point.estimated,point.name.c_str())) {
+				const float pos[]{point.x,point.y,point.z};readout::SetPlayerMarker(pos);
+			}
+		}
+		else if (action.tap && g_pressedCombat && !driving) {
+			notify::Show(g_pressedFocus && npcvehicles::SetCombatFocus(g_pressedFocus) ? "Focus fire set | double-tap T to clear" : "Aim at a hostile target to focus fire");
+		}
+		else if (action.tap && g_pressedInScanner) Select(player, now);
 		else if (action.tap && driving) vehicleflight::ToggleAuto();  // outside the scanner, driving: Auto on / off
 		if (action.capture) {
 			g_pressedTarget = t;
 			g_pressedInScanner = scanner;
+			g_pressedCombat = combatFocusMode;
+			g_pressedPlacement=scanner&&!driving&&realvehicles::RecordingPlacements();
+			g_pressedHeading=At<game::Vec3>(player,off::kRefRotation).z;vehicleflight::ViewHeading(g_pressedHeading);
 			const auto actor = scanner ? HighlightedActor() : 0;
 			g_pressedActor = actor ? At<std::uint32_t>(actor, off::kFormId) : 0;
+			g_pressedFocus=g_pressedActor;
+			if(!g_pressedFocus)g_pressedFocus=scanner?hoverui::ScannerPickContext().form:vehiclehits::CrosshairTarget();
 		}
-		if (action.doubleTap) { logger::Write("Scanner key: double tap clears the route"); ClearRoute(); }
-		if (action.hold) Hold(driving, now);
+		if (action.doubleTap) {
+			if(scanner&&!driving&&realvehicles::RecordingPlacements())notify::Show("Placement recording: tap T to save a surface");
+			else if(!driving && (combatFocusMode||g_pressedCombat)) {npcvehicles::SetCombatFocus(0);notify::Show("Focus cleared | automatic targeting");}
+			else { logger::Write("Scanner key: double tap clears the route"); ClearRoute(); }
+		}
+		if (action.hold && !(scanner&&!driving&&realvehicles::RecordingPlacements())) Hold(driving, now);
 		if (!scanner) { hoverui::SetScan(""); return; }
 		char buf[256];
 		if (g_setAt && now - g_setAt < 3000) {
@@ -536,6 +562,7 @@ namespace scantarget
 			const size_t n = std::strlen(buf);
 			std::snprintf(buf + n, sizeof(buf) - n, "  +%zu queued", g_chain.size());
 		}
+		if(realvehicles::RecordingPlacements())std::snprintf(buf,sizeof(buf),"VEHICLE PLACEMENTS | %s | tap T to save",t.valid?(t.estimated?"aim closer: estimated surface":"surface ready"):"aim at a surface");
 		hoverui::SetScan(buf);
 		static ULONGLONG lastLog = 0;
 		if (logger::Verbose() && now - lastLog > 2000) {
@@ -557,6 +584,8 @@ namespace scantarget
 	void Reset()
 	{
 		g_input = {}; g_pressedActor = 0; g_pressedInScanner = false; g_lastScanner = false;
+		g_pressedCombat=false;g_pressedFocus=0;g_lastDriving=false;
+		g_pressedPlacement=false;
 		g_setAt = 0;
 		g_setName.clear();
 		g_chain.clear();

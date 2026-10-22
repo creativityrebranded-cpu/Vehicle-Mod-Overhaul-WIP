@@ -112,6 +112,8 @@ namespace addr
 	inline constexpr std::uint32_t kPlanetCoordDecode = 0x0096FB40;      // (grid, out coord 0x2C, u64 packed): decode a packed planet cell id; zeroed output on grid mismatch
 	inline constexpr std::uint32_t kSaveGame = 0x01814220;               // BGSSaveLoadGame::SaveGame (all saves; started by the save task FUN_141821B70)
 	inline constexpr std::uint32_t kActorSetPosition = 0x0193B410;       // (actor, float pos[4], char warp): position; warp also sets the character controller (+0x228 -> +8 -> +0x458 vtbl +0x240), zeroes its velocity and re-syncs its proxy
+	inline constexpr std::uint32_t kActorFurnitureState = 0x01A03F70; // (AIProcess*,actor,newState,quick): native state 0 restores on-foot movement/controller
+	inline constexpr std::uint32_t kFreezeVehicleOnExit = 0x05F5CA90; // bool read by 14219C480 and 1419FFFD0
 	inline constexpr std::uint32_t kRefSetPosition = 0x00B4E410;         // (ref, float pos[3]): writes ref +0x8C..+0x94; the body->actor sync and the player movement update end here
 	inline constexpr std::uint32_t kLoadedCellsVisit = 0x005781C0;
 	inline constexpr std::uint32_t kLoadedCellsVisitPerFrameReturn = 0x017C8B5B;  // return address of the per-frame call (FUN_1417C8B50); other callers: grid relocation FUN_140666C00, load grid rebuild, FUN_14059BA60, FUN_141844B30      // (unused, char): per-frame visit of the loaded cells in the game update, before the body->actor sync
@@ -156,6 +158,8 @@ namespace addr
 	inline constexpr std::uint32_t kCondIsInSpace = 0x00C05F70;       // (ref** subject, 0, 0, float* result) -> 1.0 in space
 	// PlayerCamera: current state +0x10, first-person state +0x188, third-person state +0x228.
 	inline constexpr std::uint32_t kPlayerCameraPtr = 0x061DD460;   // PlayerCamera*
+	inline constexpr std::uint32_t kVehicleFirstPersonMinPitch = 0x05F07540; // degrees; registered by 140153F20, clamped in 140FB4D80
+	inline constexpr std::uint32_t kVehicleFirstPersonMaxPitch = 0x05F07560; // degrees; registered by 140153F50 (stock +15 downward)
 	inline constexpr std::uint32_t kForceThirdPerson = 0x01E8C840;  // (camera): Papyrus Game.ForceThirdPerson
 	inline constexpr std::uint32_t kLookHandlerVtbl = 0x04C41F28;    // PlayerControls::LookHandler::vftable; [6] +0x30 = mouse
 	inline constexpr std::uint32_t kLookHandlerMouse = 0x012BC700;   // FUN_1412bc700(handler, event): data(+0x40) +0xC/+0x10 = counts (y flipped)

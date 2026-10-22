@@ -57,7 +57,7 @@ int main(){
  check(coverfight::Allowed(false,false,true,false)&&coverfight::Allowed(false,false,false,true),"empty vehicle fights under cover and on a guard point");
  check(coverfight::Fighting(true,1000,1000+coverfight::kOverMs-1)&&!coverfight::Fighting(true,1000,1000+coverfight::kOverMs)&&!coverfight::Fighting(false,1000,1000),
   "the fight ends a while after the last enemy");
- check(coverfight::OnTarget(0.1,0.1,50)&&!coverfight::OnTarget(0.3,0,50)&&!coverfight::OnTarget(0,0.3,50)&&!coverfight::OnTarget(0,0,120),"fires only with the nose on target and in range");
+ check(coverfight::OnTarget(0.4,0.5,50)&&!coverfight::OnTarget(0.5,0,50)&&!coverfight::OnTarget(0,0.7,50)&&!coverfight::OnTarget(0,0,120),"fires within the wider aim cone and weapon range");
  {double x=0,y=0;coverfight::ShieldPoint(0,0,0,100,x,y);check(x==0&&y==coverfight::kShield,"cover's defend spot sits between the player and the threat");
   coverfight::ShieldPoint(0,0,0,10,x,y);check(y==5,"a close threat keeps the spot halfway, never past the enemy");}
  {double x=0,y=0;coverfight::AttackPoint(0,0,0,100,0,0,x,y);check(std::fabs(y-(100-coverfight::kStandOff))<1e-9&&x==0,"attack stance closes to its stand-off on its own side");

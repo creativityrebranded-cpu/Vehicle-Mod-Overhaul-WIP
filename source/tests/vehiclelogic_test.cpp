@@ -1,5 +1,6 @@
 #include "bodybinding.h"
 #include "hoverlogic.h"
+#include "healthlogic.h"
 #include "targetsession.h"
 #include "interactionlogic.h"
 #include "travellogic.h"
@@ -38,6 +39,16 @@ int main(){
  check(std::fabs(hoverlogic::RelativePitch(tilted,attached))<1e-7,"first-person body pitch is removed from camera command");
  const double looking[]={0,std::cos(angle+0.2),std::sin(angle+0.2)};
  check(std::fabs(hoverlogic::RelativePitch(tilted,looking)-0.2)<1e-7,"first-person look input still commands pitch");
+ const double lookingDown[]={0,std::cos(angle-0.6),std::sin(angle-0.6)};
+ check(std::fabs(hoverlogic::RelativePitch(tilted,lookingDown)+0.6)<1e-7,"first-person look down remains negative through a pitched chassis");
+ check(healthlogic::RepairSeconds(60000,59000,1000,15000,true)==0,"combat blocks repair even long after the last hit");
+ check(healthlogic::RepairSeconds(74999,74000,60000,15000,false)==0,"leaving combat starts a fresh quiet interval");
+ check(healthlogic::RepairSeconds(75500,74000,60000,15000,false)==.5,"cooldown crossing heals only time after its deadline");
+ check(healthlogic::RepairSeconds(80000,79000,60000,15000,false)==1,"quiet vehicle repairs at the normal per-second rate");
+ check(healthlogic::RepairSeconds(80000,79000,60000,30000,false)==0,"wreck keeps its longer quiet interval after ejection");
+ check(healthlogic::RepairSeconds(100000,99000,60000,30000,false)==1,"wreck resumes slow repair after a full quiet interval");
+ check(healthlogic::RepairSeconds(80000,0,60000,15000,false)==0,"new record cannot heal a whole session in one tick");
+ check(healthlogic::RepairSeconds(78000,79000,60000,15000,false)==0,"clock rollback cannot create repair credit");
  targetsession::Session session;targetsession::Marker marker{12,10,20,30};session.Exit(marker);
  check(!session.Accept(marker),"driver exit consumes the previous target");
  check(session.Accept({12,20,20,30}),"moving a reused native marker re-arms destination");

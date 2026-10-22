@@ -30,7 +30,7 @@ namespace context
 		constexpr ULONGLONG kTickMs = 500, kScanMs = 1000, kRetryMs = 5000, kCalmMs = 60000;
 		constexpr double kBoardRange = 40.0;   // m: a free vehicle this close to the NPC
 		constexpr double kSettlementWalk = 400.0;  // m: inside a settlement, trips shorter than this are walked
-		constexpr double kActorRange = 80.0;   // m: NPCs further from the player are left alone
+		constexpr double kActorRange = 250.0;  // m: NPCs further from the player are left alone (2026-10-21, the user: 80 m left enemies standing by vehicles)
 		constexpr float kStillSpeed = 2.0f;    // m/s: below this the vehicle counts as parked
 		constexpr int kMaxAttemptsPerScan = 2;
 		constexpr unsigned kActorLimit = 8000;  // the old force key searched 8000; 2000 cut off NPCs far down the cell list (13:41 fight never seen)
@@ -55,9 +55,9 @@ namespace context
 			g_enabled = on;
 		}
 
-		// Fetch (2026-10-20, the user: enemy behaviours by context): in a fight with vehicles in it (the player in one, or NPC vehicles following),
-		// an enemy with no free vehicle within kBoardRange runs to one within kFetchRange.
-		constexpr double kFetchRange = 150.0;
+		// Fetch (2026-10-20, the user: enemy behaviours by context): in a fight with vehicles in it (an NPC driver fighting), with the player in a
+		// vehicle, or with the player kFetchFar or more away (2026-10-21), an enemy with no free vehicle within kBoardRange runs to one within kFetchRange.
+		constexpr double kFetchRange = 150.0, kFetchFar = 60.0;
 
 		// A vehicle nobody drives and no job uses, nearest to `p` within `range` (one whose autopilot the hit counter switched off is left alone).
 		const world::VehicleInfo* FreeVehicleNear(const game::Vec3& p, double range = kBoardRange, uptr enemy = 0)
@@ -71,7 +71,7 @@ namespace context
 				if (npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) || vehicleflight::AutopilotDisabled(v.formId)) continue;
 				const double d = std::hypot(double(v.pos[0]) - p.x, double(v.pos[1]) - p.y);
 				if (d >= bestD) continue;
-				if (enemy && !npcvehicles::FighterMayTake(enemy, v.ref)) continue;  // their faction's own, or in their own camp
+				if (enemy && !npcvehicles::FighterMayTake(enemy, v.ref)) continue;  // their faction's own, unowned in their own camp, or unowned in the open
 				bestD = d; best = &v;
 			}
 			return best;
@@ -247,6 +247,7 @@ namespace context
 			if (now - g_scanAt < kScanMs) return;
 			g_scanAt = now;
 			const auto pp = PosOf(player);
+			const bool playerDriving = reinterpret_cast<uptr (*)(uptr)>(game::Base() + addr::kPlayerVehicle)(player) != 0;
 			int attempts = 0;
 			crash::Crumb("context actor scan", 0);
 			unsigned actors = 0, fighters = 0, inRange = 0, noVehicle = 0, cooling = 0, shown = 0;
@@ -274,9 +275,9 @@ namespace context
 				if (it != g_triedAt.end() && now - it->second < kRetryMs) { ++cooling; continue; }
 				const uptr enemy = npcvehicles::IsAlly(r) ? 0 : r;  // the player's followers keep using any free vehicle
 				const auto* v = FreeVehicleNear(np, kBoardRange, enemy);
-				if (!v && enemy && VehicleFight(player)) {
+				if (!v && enemy && (playerDriving || Dist(np, pp) >= kFetchFar || VehicleFight(player))) {
 					v = FreeVehicleNear(np, kFetchRange, enemy);
-					if (v) logger::Write("Context: fight with vehicles: enemy %08X runs to vehicle %08X %.0f m away", *reinterpret_cast<std::uint32_t*>(r + off::kFormId), v->formId,
+					if (v) logger::Write("Context: fetch: enemy %08X runs to vehicle %08X %.0f m away", *reinterpret_cast<std::uint32_t*>(r + off::kFormId), v->formId,
 						Dist(np, game::Vec3{ v->pos[0], v->pos[1], v->pos[2] }));
 				}
 				if (!v) {

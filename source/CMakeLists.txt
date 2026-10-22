@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(SeamlessVehicle VERSION 0.63.1 LANGUAGES CXX)
+project(SeamlessVehicle VERSION 0.64.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

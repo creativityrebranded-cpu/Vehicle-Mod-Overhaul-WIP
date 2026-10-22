@@ -12,6 +12,7 @@
 #include "weapondamage.h"
 #include "combat_relations.h"
 #include "environment.h"
+#include "healthlogic.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -85,9 +86,9 @@ namespace vehiclehits
         Proj g_live[kMax];                                  // main thread
 		int g_liveCount = 0;
 
-		struct Damage { std::uint32_t id = 0; float damage = 0; ULONGLONG lastHit = 0, lastHeal = 0, wreckRenew = 0; unsigned hits = 0; bool wrecked = false;
+		struct Damage { std::uint32_t id = 0, lastDriver = 0; float damage = 0, wreckZ=0; ULONGLONG lastHit = 0, lastHeal = 0, quietSince = 0, wreckRenew = 0, wreckAt=0; unsigned hits = 0,fallSamples=0; bool wrecked = false;
 			int lastSide = 0; std::uint32_t lastShooter = 0; };
-		Damage g_dmg[64];
+		std::unordered_map<std::uint32_t, Damage> g_dmg;
 
 		bool g_iniRead = false;
 		float g_hitDamage = 20.0f, g_weaponScale = 1.0f, g_limitIni = 0.0f, g_playerHealth = 0.0f, g_vehicleHealth = 300.0f, g_driverShare = 0.25f, g_ramCap = 0.35f, g_shotCap = 0.20f;
@@ -431,19 +432,12 @@ namespace vehiclehits
 
 		Damage* DamageFor(std::uint32_t id, bool create)
 		{
-			Damage* freeSlot = nullptr;
-			for (auto& d : g_dmg) {
-				if (d.id == id) return &d;
-				if (!d.id && !freeSlot) freeSlot = &d;
-			}
+			if (!id) return nullptr;
+			const auto found = g_dmg.find(id);
+			if (found != g_dmg.end()) return &found->second;
 			if (!create) return nullptr;
-			if (!freeSlot) {  // full: the longest-quiet one goes
-				freeSlot = &g_dmg[0];
-				for (auto& d : g_dmg) if (d.lastHit < freeSlot->lastHit) freeSlot = &d;
-			}
-			*freeSlot = Damage{};
-			freeSlot->id = id;
-			return freeSlot;
+			auto& record = g_dmg[id]; record.id = id;
+			return &record;
 		}
 
 		int ShooterSide(const Proj& pr)
@@ -465,6 +459,7 @@ namespace vehiclehits
 		void AddDamage(const world::VehicleInfo& v, float amount, std::uint32_t by, int side, ULONGLONG now, const char* what,std::uint32_t attacker=0)
 		{
 			if (!features::On(features::Id::VehicleDamage)) return;  // [hits] enabled, also the settings menu
+			if (!std::isfinite(amount) || amount <= 0) return;
 			// Every damage source (shots, rams and driver health share) uses the same friendship gate.
 			if (npcvehicles::VehicleFriendlyToShooter(v.ref, by ? by : attacker)) return;
 			Damage* d = DamageFor(v.formId, true);
@@ -472,19 +467,22 @@ namespace vehiclehits
 			const float dealt = std::min(amount, std::max(0.0f, limit - d->damage));
 			d->damage += dealt;
 			d->lastHit = now;
+			d->quietSince = now;
+			d->lastHeal = now;
+			if (const auto driver = npcvehicles::VehicleDriverId(v.formId)) d->lastDriver = driver;
 			d->lastSide = side;
 			d->lastShooter = by;
 			++d->hits;
 			++g_hitsTotal;
-			if (logger::Verbose() || d->hits <= 3) {
-				logger::Write("Vehicle hits: %08X hit by %s from %08X (health %.0f / %.0f)", v.formId, what, by, limit - d->damage, limit);
-			}
-			if (dealt > 0.0f) DriverShare(v,dealt,attacker?attacker:by);
+			logger::Write("Vehicle hits: %08X hit by %s from %08X: damage %.3f (health %.3f / %.0f), driver %08X", v.formId, what, by, dealt, limit - d->damage, limit, d->lastDriver);
+			if (dealt > 0.0f) DriverShare(v,dealt,attacker?attacker:ShooterActorId(by));
 			if (d->damage < limit || d->wrecked) return;
 			const bool own = v.formId == vehicleflight::OwnRoverId();
 			d->wrecked = true;
+			d->wreckAt=now;d->wreckZ=v.pos[2];d->fallSamples=0;
 			d->wreckRenew = now;
 			logger::Write("Vehicle hits: %08X WRECKED (%u hits): autopilot, hover and weapon off until repaired over %.0f%%", v.formId, d->hits, kRepairedShare * 100.0f);
+			logger::Write("Vehicle fall: %08X released at height %.2f, velocity (%.2f, %.2f, %.2f); native gravity keeps momentum",v.formId,v.pos[2],v.vel[0],v.vel[1],v.vel[2]);
 			vehicleflight::DisableAutopilot(v.formId, unsigned(kWreckRenewMs + 5000), "wrecked");
 			vcontract::ExitRequest eject;
 			eject.mode = vcontract::ExitMode::Eject; eject.waitLanded = false;
@@ -711,14 +709,20 @@ namespace vehiclehits
 		}
 		// Healing after a quiet spell (a wreck: later and slower); a wreck's autopilot ban is renewed until it is repaired.
 		const float limit = Limit();
-		for (auto& d : g_dmg) {
+		for (auto& [id, d] : g_dmg) {
 			if (!d.id || d.damage <= 0) continue;
+			if(d.wrecked && d.fallSamples<2 && now-d.wreckAt>=(d.fallSamples?1500:250)) {
+				if(const auto vehicle=RefById(id))logger::Write("Vehicle fall: %08X height %.2f -> %.2f after %.3f s",id,d.wreckZ,At<game::Vec3>(vehicle,off::kRefPosition).z,(now-d.wreckAt)/1000.0);
+				++d.fallSamples;
+			}
 			if (d.wrecked && now - d.wreckRenew >= kWreckRenewMs) {
 				d.wreckRenew = now;
 				vehicleflight::DisableAutopilot(d.id, unsigned(kWreckRenewMs + 5000), "wrecked");
 			}
-			if (now - d.lastHit < (d.wrecked ? kWreckHealAfterMs : kHealAfterMs)) { d.lastHeal = now; continue; }
-			const double dt = d.lastHeal && now > d.lastHeal ? (now - d.lastHeal) / 1000.0 : 0.0;
+			const bool busy = npcvehicles::VehicleInCombat(d.id, d.lastDriver);
+			if (busy) d.quietSince = now;
+			const double dt = healthlogic::RepairSeconds(now, d.lastHeal, d.quietSince,
+				d.wrecked ? kWreckHealAfterMs : kHealAfterMs, busy);
 			d.lastHeal = now;
 			d.damage = std::max(0.0f, d.damage - float(limit * (d.wrecked ? kWreckHealShare : kHealShare) * dt));
 			if (d.wrecked && d.damage < limit * (1.0f - kRepairedShare)) {
@@ -744,7 +748,7 @@ namespace vehiclehits
 			g_newImpactCount=0;
 		}
 		g_liveCount=0;g_ballistics.clear();g_projectileHits={};g_playerHealth=0;g_playerHealthNow=NAN;
-		for (auto& d : g_dmg) d = Damage{};
+		g_dmg.clear();
 	}
 
 	bool ActorHealthShare(std::uintptr_t actor, float& share)
@@ -786,7 +790,7 @@ namespace vehiclehits
 	bool LastHitByYourSide(std::uint32_t& vehicleFormId, unsigned long long& at)
 	{
 		const Damage* best = nullptr;
-		for (const auto& d : g_dmg) if (d.id && d.lastSide == 1 && (!best || d.lastHit > best->lastHit)) best = &d;
+		for (const auto& [id, d] : g_dmg) if (d.id && d.lastSide == 1 && (!best || d.lastHit > best->lastHit)) best = &d;
 		if (!best) return false;
 		vehicleFormId = best->id;
 		at = best->lastHit;

@@ -72,6 +72,20 @@ int main() {
     check(coverfight::OnTarget(0,0,150,200),"remote cover uses native long weapon range");
     check(!coverfight::OnTarget(0,0,50,30),"remote cover respects native short weapon range");
     check(!coverfight::OnTarget(0,0,50,NAN),"invalid weapon range never enables firing");
+    check(coverfight::OnTarget(.4,.5,60,100),"own cover accepts launch re-aim within the wider firing cone");
+    check(coverfight::OnTarget(.65,.8,5,100),"close enemy has a wider bounded firing cone");
+    check(!coverfight::OnTarget(1.0,0,5,100)&&!coverfight::OnTarget(3.0,0,5,100),"own cover never fires sideways or backwards");
+    check(!coverfight::OnTarget(0,0,150,100),"700 metre pursuit never grants extra weapon range");
+    coverfight::Burst burst;
+    check(burst.Update(true,1000)&&burst.Update(true,3999),"clear target receives a full three-second burst");
+    check(!burst.Update(true,4000)&&!burst.Update(true,4399)&&burst.Update(true,4400),"completed burst has a 400 ms pause");
+    check(!burst.Update(false,4450)&&burst.Update(true,4460),"brief alignment loss stops fire immediately without a full pause penalty");
+    check(coverfight::KeepTarget(true,true,3999)&&!coverfight::KeepTarget(true,true,4000),"higher-priority threat waits for minimum target commitment");
+    check(coverfight::KeepTarget(true,false,10000)&&!coverfight::KeepTarget(false,false,1000),"valid same-tier target stays while invalid target drops immediately");
+    check(!coverfight::Reposition(true,true,false,false,10000,1000),"firing from a useful position prevents combat repositioning");
+    check(!coverfight::Reposition(true,false,false,false,3999,1000)&&!coverfight::Reposition(true,false,false,false,5000,749),"new positions require both hold time and sustained obstruction");
+    check(coverfight::Reposition(true,false,false,false,5000,750),"sustained blocked lane permits a new firing position");
+    check(coverfight::Reposition(true,true,true,false,100,0)&&coverfight::Reposition(true,true,false,true,100,0),"moving protectee or immediate danger overrides position commitment");
     brain::Squad squad;squad.count=3;for(int i=0;i<3;++i){squad.m[i].id=i+1;squad.m[i].pos={double(i*20),0,5};}
     brain::Enemy enemies[2];enemies[0].id=10;enemies[0].pos={0,150,5};enemies[0].vel={20,0,0};enemies[1]=enemies[0];enemies[1].id=11;enemies[1].health=.5;
     brain::Assign(squad,enemies,2,10000,true);

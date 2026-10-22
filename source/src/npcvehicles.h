@@ -54,7 +54,9 @@ namespace npcvehicles
 	// fighting actors hostile to the player, enemies in vehicles first; `count` = how many enemies there are; 0 when none.
 	std::uintptr_t EnemyNear(std::uintptr_t player, double x, double y, double z, double range, bool& inVehicle, int& count);
 	// The vehicle weapon of a vehicle no NPC job drives (the player's own rover on overwatch): held while `fire`; the shots are turned at (x, y, z).
-	bool FireVehicleWeapon(std::uint32_t vehicleId, bool fire, double x, double y, double z);
+	bool FireVehicleWeapon(std::uint32_t vehicleId, bool fire, double x, double y, double z, std::uint32_t target = 0, std::uint32_t targetVehicle = 0);
+	bool SetCombatFocus(std::uint32_t target); // 0 clears the player's explicit focus; native hostility is retained
+	std::uint32_t CombatFocus();
 	// Crew orders (2026-10-20, the user: with followers, the vehicle buttons send a follower to drive the player's own vehicle and do what was asked).
 	// Follow: the follower drives it after the player (an escort: it defends, rescues, scouts); Marker: it flies to the player's map marker and
 	// does the Auto behaviour there (vehicleflight::GetAutoMode: stop / orbit / patrol).
@@ -103,6 +105,7 @@ namespace npcvehicles
 	bool VehicleFriendlyToShooter(std::uintptr_t vehicle, std::uint32_t shooterFormId);
 	// Actual seated driver (player included), 0 when empty or unreadable. Main thread only.
 	std::uint32_t VehicleDriverId(std::uint32_t vehicleId);
+	bool VehicleInCombat(std::uint32_t vehicleId, std::uint32_t departedDriver = 0);
 	void VehicleAggression(std::uintptr_t vehicle, std::uint32_t shooterId, bool reportCrime=true);
 	void WitnessCrash(double x, double y, double z, const char* why);
 	// The actor's current AI package (FUN_1418ddb70), 0 when none: a change is a schedule switch (shift change).
