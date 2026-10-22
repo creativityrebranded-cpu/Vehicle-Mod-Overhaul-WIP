@@ -5,6 +5,7 @@
 #include "hook.h"
 #include "log.h"
 #include "physicssetup.h"
+#include "vehiclehits.h"
 #include "vehicleworld.h"
 
 #include <Windows.h>
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace vehiclediag
@@ -368,6 +370,49 @@ namespace vehiclediag
 					double(until - now) / 1000.0);
 		}
 
+		// Wreck glide slots (physicssetup::Glide). Armed by GuardTick when a vehicle becomes wrecked; applied in the
+		// physics step for kGlideMs. floorVz / last belong to the stepping thread of that instance.
+		struct GlideSlot { std::atomic<uptr> instance{0}; std::atomic<std::uint32_t> formId{0}; std::atomic<unsigned long long> until{0}; float floorVz = 0; LONGLONG last = 0; std::atomic<bool> logged{false}; };
+		GlideSlot g_glides[8];
+		std::unordered_set<std::uint32_t> g_wreckSeen;  // main thread: wrecked vehicles already given their glide
+
+		void GlideInstance(GlideSlot& g, uptr instance)
+		{
+			if (GetTickCount64() >= g.until.load(std::memory_order_relaxed)) { g.instance.store(0); return; }
+			LARGE_INTEGER qpc, freq;
+			QueryPerformanceCounter(&qpc);
+			QueryPerformanceFrequency(&freq);
+			const float dt = g.last ? float(double(qpc.QuadPart - g.last) / double(freq.QuadPart)) : 1.0f / 60.0f;
+			g.last = qpc.QuadPart;
+			__try {
+				const uptr read = At<uptr>(instance, 0x28);
+				if (!read) return;
+				const uptr body = reinterpret_cast<uptr (*)(uptr, std::uint32_t)>((*reinterpret_cast<void***>(read))[0x70 / 8])(read, At<std::uint32_t>(instance, 0x20));
+				if (!body) return;
+				const uptr motion = reinterpret_cast<uptr (*)(uptr, std::uint32_t)>((*reinterpret_cast<void***>(read))[0xD0 / 8])(read, At<std::uint32_t>(body, 0x80));
+				if (!motion) return;
+				physicssetup::Glide(reinterpret_cast<float*>(motion + 0x60), g.floorVz, dt);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return; }
+			if (!g.logged.exchange(true))
+				logger::Write("Vehicle wreck glide: %08X sinks for %.1f s (fall builds at %.0f m/s^2, sideways speed bleeds off)", g.formId.load(),
+					physicssetup::kGlideMs / 1000.0, physicssetup::kGlideAccel);
+		}
+
+		void ArmGlide(std::uint32_t formId, uptr instance, float vz)
+		{
+			for (auto& g : g_glides) {
+				if (g.instance.load(std::memory_order_relaxed) && GetTickCount64() < g.until.load(std::memory_order_relaxed)) continue;
+				g.formId.store(formId);
+				g.floorVz = std::min(vz, 0.0f);
+				g.last = 0;
+				g.logged.store(false);
+				g.until.store(GetTickCount64() + physicssetup::kGlideMs);
+				g.instance.store(instance, std::memory_order_release);
+				return;
+			}
+		}
+
 		// Main thread, every frame: arm a guard for each instance that appears on a parked vehicle; disarm when someone
 		// takes the vehicle or the instance goes away.
 		void GuardTick()
@@ -388,6 +433,8 @@ namespace vehiclediag
 				const Read r = ReadComponent(it->second);
 				if (!r.ok || !r.instance) continue;
 				present[r.instance] = v.formId;
+				if (vehiclehits::Wrecked(v.formId)) { if (g_wreckSeen.insert(v.formId).second) ArmGlide(v.formId, r.instance, v.vel[2]); }
+				else g_wreckSeen.erase(v.formId);
 				const bool parked = v.who == world::VehicleInfo::Who::Parked || v.who == world::VehicleInfo::Who::None;
 				for (auto& g : g_guards)
 					if (g.instance.load(std::memory_order_relaxed) == r.instance && !parked) g.instance.store(0);  // taken: drive freely
@@ -463,6 +510,8 @@ namespace vehiclediag
 		if (!instance) return;
 		for (auto& g : g_guards)
 			if (g.instance.load(std::memory_order_acquire) == instance) { ClampInstance(g, instance); break; }
+		for (auto& g : g_glides)
+			if (g.instance.load(std::memory_order_acquire) == instance) { GlideInstance(g, instance); break; }
 		std::lock_guard lk(g_lock);
 		++g_steps[instance];
 	}

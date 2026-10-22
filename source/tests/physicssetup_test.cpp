@@ -62,6 +62,22 @@ int main()
         set.Add(0);
         check(set.Size() == 21, "an empty form id is never listed");
     }
+    {
+        // A wreck hovering still, then native gravity pulls 10 m/s^2: over 1 s the glide lets it reach only ~4 m/s down.
+        float v[3] = {-4.5f, -20.8f, 0.0f}, floorVz = 0.0f;
+        for (int i = 0; i < 60; ++i) { v[2] -= 10.0f / 60.0f; physicssetup::Glide(v, floorVz, 1.0f / 60.0f); }
+        check(v[2] < -3.9f && v[2] > -4.1f, "the fall builds up at the glide rate, not full gravity");
+        check(std::hypot(v[0], v[1]) < 21.3f * 0.56f && std::hypot(v[0], v[1]) > 21.3f * 0.54f, "sideways speed bleeds off");
+        float up[3] = {0.0f, 0.0f, 5.0f}, f2 = 0.0f;
+        physicssetup::Glide(up, f2, 1.0f / 60.0f);
+        check(up[2] == 5.0f, "the glide never stops or adds an upward motion");
+        float slow[3] = {0.0f, 0.0f, -1.0f}, f3 = -1.0f;  // wrecked while already sinking at 1 m/s
+        physicssetup::Glide(slow, f3, 1.0f / 60.0f);
+        check(slow[2] == -1.0f, "a fall slower than the glide floor is left alone");
+        float bad[3] = {0.0f, 0.0f, -50.0f}, f4 = 0.0f;
+        physicssetup::Glide(bad, f4, 1.0f);
+        check(bad[2] == -50.0f, "a long gap between steps is skipped, not applied as one jump");
+    }
     std::printf("physicssetup: %d checks, %d failures\n", checks, failed);
     return failed ? 1 : 0;
 }

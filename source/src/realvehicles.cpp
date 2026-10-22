@@ -826,6 +826,8 @@ namespace realvehicles
 			return best;
 		}
 
+		bool OwnRowFor(const game::Vec3& p, std::uint64_t& location, std::uint64_t& row, std::uint64_t& key);
+
 		void PatchConsider(uptr r, uptr cell)
 		{
 			if (!g_patch.active || g_patch.jobs.size() >= 2) return;
@@ -839,7 +841,10 @@ namespace realvehicles
 			// Its spot decides first, whatever its base is now (an earlier swap is kept, never rolled again); off a spot only a
 			// mod's own vehicle type is a stand-in.
 			bool pending = false;
-			if (const PatchSpot* spot = SpotFor(cell, At<std::uint32_t>(ws, 0x28), p, pending)) { location = spot->location; standin = spot->standin; spotKey = spot->key; }
+			// One of the mod's own spots (the placements plugin parks a REV-8 there): the row's type, seeded per location and
+			// row, as runtime spawning chose it before the plugin (2026-10-21, the user: vehicle randomization back on).
+			if (OwnRowFor(p, location, standin, spotKey)) {}
+			else if (const PatchSpot* spot = SpotFor(cell, At<std::uint32_t>(ws, 0x28), p, pending)) { location = spot->location; standin = spot->standin; spotKey = spot->key; }
 			else if (pending) return;  // the cell's shift is not known yet: decided on a later scan
 			else for (const auto& [form, key] : g_patch.standins) if (form == base) { location = LocationKey(At<std::uint32_t>(ws, 0x28)); standin = key; }
 			if (!standin) { g_patch.handled.insert(id); return; }
@@ -936,6 +941,7 @@ namespace realvehicles
 		{
 			bool ready = false, active = false;
 			bool retire = false;  // the placements plugin is loaded: the vehicles spawned into saves before it are retired
+			bool plugin = false;  // the placements plugin is loaded: its REV-8s get their row's type through the patch's swap
 			std::vector<OwnSpot> spots;
 			std::map<std::uint64_t, std::uint32_t> spawned;  // spot key -> the vehicle it spawned
 			std::vector<std::size_t> queue;
@@ -993,6 +999,10 @@ namespace realvehicles
 			if (LoadedFile(kPlacementsPlugin)) {
 				g_own.active = false;
 				g_own.retire = !g_own.spawned.empty();
+				g_own.plugin = g_patch.enabled && !g_own.spots.empty() && g_patch.pool.size() > 1;
+				if (g_own.plugin && !g_patch.active) g_patch.active = true;  // also with no other placement mod loaded
+				logger::Write("Own placements: plugin vehicles get a random type per row (%zu spots, %zu vehicle types)%s", g_own.spots.size(), g_patch.pool.size(),
+					g_own.plugin ? "" : ": OFF ([placement] enabled=0, or no vehicle types)");
 				logger::Write("Own placements: %s loaded: placed by the plugin, nothing spawned at run time; %zu earlier spawned vehicles to retire",
 					kPlacementsPlugin, g_own.spawned.size());
 				return;
@@ -1061,6 +1071,20 @@ namespace realvehicles
 				s.queued = true;
 				g_own.queue.push_back(i);
 			}
+		}
+
+		// The own spot a vehicle stands on (x/y within kOwnRowRadius, z within kOwnOccupied), when the plugin places them.
+		constexpr float kOwnRowRadius = 2.0f;
+		bool OwnRowFor(const game::Vec3& p, std::uint64_t& location, std::uint64_t& row, std::uint64_t& key)
+		{
+			if (!g_own.plugin) return false;
+			for (const auto& s : g_own.spots) {
+				if (std::hypot(p.x - s.p.x, p.y - s.p.y) < kOwnRowRadius && std::fabs(p.z - s.p.z) < kOwnOccupied) {
+					location = s.location; row = s.row; key = s.key;
+					return true;
+				}
+			}
+			return false;
 		}
 
 		// Each frame while spots are queued: one spawn, kOwnSpawnGap apart.

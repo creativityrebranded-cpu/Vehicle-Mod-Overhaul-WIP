@@ -2613,10 +2613,16 @@ namespace npcvehicles
 			ULONGLONG t0 = 0, tStage = 0, stillSince = 0, lastAsk = 0;
 			double lx = 0, ly = 0, lz = 0;
 			bool refused = false;  // finished with the actor still aboard (the instant exit failed too)
+			bool landed = false;   // Eject with waitLanded: the vehicle came to rest (or the wait ran out)
 		};
+		constexpr ULONGLONG kEjectLandMs = 6000;
 		constexpr int kExitTasks = 12;
 		ExitTask g_exitTasks[kExitTasks];
-		struct FallWatch { std::uint32_t npc=0; float z=0; ULONGLONG at=0; } g_fallWatch[kExitTasks];
+		// After an eject: did the actor fall? One that hangs where it was placed (no drop in 1.5 s, still out of the
+		// vehicle) is put on the ground beside the vehicle once the vehicle's boarding site is safe (it has landed),
+		// retried every second up to kHangTries times.
+		struct FallWatch { std::uint32_t npc=0, veh=0; float z=0; ULONGLONG at=0; int tries=0; } g_fallWatch[kExitTasks];
+		constexpr int kHangTries = 10;
 		std::uint32_t g_exitRefused[8] = {};  // actors whose last exit was Refused (polled by ExitStateOf)
 
 		// The native furniture-state cleanup alone (state 0: controller and graph restored to on-foot), no position change.
@@ -2698,7 +2704,7 @@ namespace npcvehicles
 				const bool ok = req.mode == vcontract::ExitMode::Eject ? WarpExitController(npc, req.x, req.y, z) :
 					PlaceAt(npc, cell, req.x, req.y, z, At<game::Vec3>(npc, off::kRefRotation).z);
 				if (ok && req.mode == vcontract::ExitMode::Eject) for (auto& watch : g_fallWatch) if (!watch.npc) {
-					watch = {At<std::uint32_t>(npc, off::kFormId), z, GetTickCount64()}; break;
+					watch = {At<std::uint32_t>(npc, off::kFormId), At<std::uint32_t>(vehicle, off::kFormId), z, GetTickCount64(), 0}; break;
 				}
 				logger::Write("NPC vehicles: exit: NPC %08X placed at the requested point (%.0f, %.0f) (%s)", At<std::uint32_t>(npc, off::kFormId), req.x, req.y, ok ? "ok" : "FAILED");
 				return;
@@ -2741,10 +2747,21 @@ namespace npcvehicles
 		void ExitTick()
 		{
 			const ULONGLONG now = GetTickCount64();
-			for (auto& watch : g_fallWatch) if (watch.npc && now - watch.at >= 1500) {
+			for (auto& watch : g_fallWatch) if (watch.npc && now - watch.at >= (watch.tries ? 1000u : 1500u)) {
 				const auto actor = RefById(watch.npc);
-				if (actor && !InVehicle(actor)) logger::Write("NPC vehicles: air eject fall check %08X: height %.2f -> %.2f after %.2f s", watch.npc, watch.z, At<game::Vec3>(actor, off::kRefPosition).z, (now-watch.at)/1000.0);
-				watch = {};
+				if (!actor || InVehicle(actor)) { watch = {}; continue; }
+				const float z = At<game::Vec3>(actor, off::kRefPosition).z;
+				if (!watch.tries) logger::Write("NPC vehicles: air eject fall check %08X: height %.2f -> %.2f after %.2f s", watch.npc, watch.z, z, (now-watch.at)/1000.0);
+				if (watch.z - z >= 0.3f) { watch = {}; continue; }  // it falls (or stands where it was put): fine
+				const uptr vehicle = RefById(watch.veh);
+				const bool placed = vehicle && PlaceBeside(actor, vehicle, 0, 3.0);
+				if (placed || ++watch.tries >= kHangTries) {
+					logger::Write("NPC vehicles: ejected NPC %08X hung at height %.2f: %s", watch.npc, z,
+						placed ? "put on the ground beside the vehicle" : "the vehicle never offered a safe spot; left where it is");
+					watch = {};
+					continue;
+				}
+				watch.at = now;
 			}
 			for (auto& t : g_exitTasks) {
 				if (!t.used) continue;
@@ -2766,6 +2783,21 @@ namespace npcvehicles
 					continue;
 				}
 				if (t.req.mode == vcontract::ExitMode::Eject) {
+					// A wreck falls (hover off, native gravity): its occupants ride it down and get out once it rests
+					// (2026-10-21 23:24 / 23:25 runs: NPCs ejected 18-37 m up hung where they were placed; the
+					// game's exit is only made for a vehicle on the ground). waitLanded = at rest for 0.5 s, at most
+					// kEjectLandMs; then the eject goes ahead wherever the vehicle is.
+					if (t.req.waitLanded && !t.landed) {
+						const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+						const double moved = std::sqrt(std::pow(double(vp.x) - t.lx, 2) + std::pow(double(vp.y) - t.ly, 2) + std::pow(double(vp.z) - t.lz, 2));
+						t.lx = vp.x; t.ly = vp.y; t.lz = vp.z;
+						if (!t.stillSince || moved > 0.08) t.stillSince = now;
+						const bool rest = now - t.stillSince >= 500;
+						if (!rest && now - t.t0 < kEjectLandMs) continue;
+						t.landed = true;
+						logger::Write("NPC vehicles: eject NPC %08X: vehicle %08X %s after %.1f s (height %.1f)", t.npc, t.veh,
+							rest ? "came to rest" : "still moving, ejecting anyway", (now - t.t0) / 1000.0, vp.z);
+					}
 					world::Snapshot ejectWorld;
 					const world::VehicleInfo* hull = nullptr;
 					if (world::Vehicles(ejectWorld)) for (unsigned k = 0; k < ejectWorld.count && k < 64; ++k)
@@ -3163,7 +3195,7 @@ namespace npcvehicles
 					FollowerNotice(j.npc, "Your follower's vehicle is wrecked | they get out");
 					logger::Write("NPC vehicles: [%d] vehicle %08X wrecked; NPC %08X gets out", j.pilot, j.vehicle, j.npc);
 					vcontract::ExitRequest eject;
-					eject.mode = vcontract::ExitMode::Eject; eject.waitLanded = false;
+					eject.mode = vcontract::ExitMode::Eject; eject.waitLanded = true; eject.timeoutMs = 12000;  // ride the wreck down, out at rest
 					StartExit(npc, eject);
 					break;
 				}

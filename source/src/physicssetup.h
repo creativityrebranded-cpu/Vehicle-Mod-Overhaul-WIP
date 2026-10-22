@@ -71,6 +71,25 @@ namespace physicssetup
         std::unordered_set<std::uint32_t> ids_;
     };
 
+    // Wreck glide (2026-10-21 23:24 recording: a hovering vehicle shot down went from hovering still to falling in one
+    // frame, which reads as a yank down). For a short while after the wreck its fall builds up at kGlideAccel instead of
+    // full gravity and its sideways speed bleeds off, so it sinks and slides down like a damaged craft; then native
+    // gravity takes over. floorVz: the slowest downward speed allowed so far (starts at the speed when it was wrecked).
+    constexpr float kGlideAccel = 4.0f;               // m/s^2 (gravity here is ~10)
+    constexpr float kGlideDrag = 0.6f;                // 1/s: sideways speed falls to ~22% over the glide
+    constexpr unsigned long long kGlideMs = 2500;
+
+    // v: chassis linear velocity (z up), dt in seconds. Only slows a fall and bleeds sideways speed; never pushes up.
+    inline void Glide(float* v, float& floorVz, float dt)
+    {
+        if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]) || !(dt > 0.0f) || dt > 0.25f) return;
+        floorVz -= kGlideAccel * dt;
+        if (v[2] < floorVz) v[2] = floorVz;
+        const float keep = std::exp(-kGlideDrag * dt);
+        v[0] *= keep;
+        v[1] *= keep;
+    }
+
     // The guard window opens at the first physics step (instances built during a load screen step only when it ends).
     // until: 0 = not stepped yet. Returns true while the window is open.
     inline bool GuardOpen(unsigned long long& until, unsigned long long now)

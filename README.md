@@ -197,6 +197,9 @@ Details: [docs/RELEASE_0.71.0.md](docs/RELEASE_0.71.0.md).
   like the Creation Kit writes them; nothing is created at run time any more.
 - **Controls toolkit** (`bindings.ini`, keys, mouse, controller buttons and chords), **combat boarding** through the game's
   combat movement, and **exit fixes** (no more flinging a stood-up player). Not tested in game yet.
+- **Random vehicle type per row** for the New Atlantis placements again (the plugin's REV-8s are swapped to each row's seeded type).
+- **Wrecks**: occupants ride a shot-down vehicle down and get out on the ground instead of hanging in the air, and the wreck
+  sinks and slides for 2.5 s instead of dropping in one frame. Not tested in game yet.
 - Known: placed REV-8s stand 0.5 m in the ground (the guard holds them; a height fix is next).
 
 ## What's new in 0.64.0

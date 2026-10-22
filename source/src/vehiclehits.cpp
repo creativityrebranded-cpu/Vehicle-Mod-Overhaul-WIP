@@ -485,7 +485,7 @@ namespace vehiclehits
 			logger::Write("Vehicle fall: %08X released at height %.2f, velocity (%.2f, %.2f, %.2f); native gravity keeps momentum",v.formId,v.pos[2],v.vel[0],v.vel[1],v.vel[2]);
 			vehicleflight::DisableAutopilot(v.formId, unsigned(kWreckRenewMs + 5000), "wrecked");
 			vcontract::ExitRequest eject;
-			eject.mode = vcontract::ExitMode::Eject; eject.waitLanded = false;
+			eject.mode = vcontract::ExitMode::Eject; eject.waitLanded = true; eject.timeoutMs = 12000;  // ride the wreck down, out at rest
 			npcvehicles::UnloadVehicle(v.ref, eject, true);
 			npcvehicles::WitnessCrash(v.pos[0], v.pos[1], v.pos[2], "a vehicle wrecked");
 			if (own) notify::Show("Your vehicle is wrecked: it repairs itself slowly");
