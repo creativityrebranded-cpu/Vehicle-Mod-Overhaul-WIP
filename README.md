@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current version: **0.65.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current version: **0.71.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -184,9 +184,9 @@ controller chords (`Pad:LB+DUp`). `default` keeps the mod's own key, and for the
 controller button. Saved changes apply while the game runs. Any XInput controller works; hover flies on RT / LT / the left stick
 by default, and the file has a commented controller layout to start from.
 
-## What's new in 0.65.0
+## What's new in 0.71.0
 
-Details: [docs/RELEASE_0.65.0.md](docs/RELEASE_0.65.0.md).
+Details: [docs/RELEASE_0.71.0.md](docs/RELEASE_0.71.0.md).
 
 - **Every vehicle gets its physics (game bug fixed)**: the game sets up at most 8 vehicles that load at once and silently
   drops the rest (its waiting list is emptied when a ninth arrives). The mod keeps its own list with no limit. Verified in game:

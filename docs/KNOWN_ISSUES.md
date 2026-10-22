@@ -1,8 +1,8 @@
 # Known issues and next steps
 
 ## Open bugs and suspects
-- **Placed vehicles start in the ground (0.65.0):** `FlyingVehicleOverhaul - Placements.esm` puts each REV-8's origin 0.3 m above the recorded surface, but a REV-8 reaches 0.81 m below its origin, so it starts about 0.5 m in the ground and is pushed out hard when its physics starts. The launch guard (10 s) holds them. Next: place at the base's lowest bound plus a small clearance (`tools/make_placements_esm.py`).
-- **Load-end pushes on other vehicles (0.65.0):** vehicles the mod does not place, the player's own included, were also pushed at the end of a load screen (up to ~80 m/s). The guard covers parked vehicles; the cause is still open.
+- **Placed vehicles start in the ground (0.71.0):** `FlyingVehicleOverhaul - Placements.esm` puts each REV-8's origin 0.3 m above the recorded surface, but a REV-8 reaches 0.81 m below its origin, so it starts about 0.5 m in the ground and is pushed out hard when its physics starts. The launch guard (10 s) holds them. Next: place at the base's lowest bound plus a small clearance (`tools/make_placements_esm.py`).
+- **Load-end pushes on other vehicles (0.71.0):** vehicles the mod does not place, the player's own included, were also pushed at the end of a load screen (up to ~80 m/s). The guard covers parked vehicles; the cause is still open.
 - **Current follow-up needs live verification:** Cover target/position commitment, 3 s/0.4 s firing cadence, 700 m chase range, T focus fire, native on-foot cleanup after ejection and wreck relocation prevention have offline checks. Recordings must be collected with the new DLL installed; old log entries lack complete worldspace and full-precision position data.
 
 - **Ejected NPCs walking in air (reported 2026-10-21):** the native exit released the seat, but the old placement path did not resynchronize its character controller; stale movement support is the current suspect. The follow-up build delays placement until seat cleanup, then synchronizes the character controller through the native warp once. Falling needs live verification; `air eject fall check` logs the height change after 1.5 seconds.

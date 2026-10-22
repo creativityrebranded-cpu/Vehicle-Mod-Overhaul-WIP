@@ -1,4 +1,4 @@
-# Flying Vehicle Overhaul 0.65.0
+# Flying Vehicle Overhaul 0.71.0
 
 For Starfield 1.16.244 (Steam) and SFSE. Early work in progress.
 
@@ -21,8 +21,8 @@ Combat boarding, the controls toolkit and the exit fixes have not been tested in
 
 ## Downloads
 
-- `FlyingVehicleOverhaul-0.65.0.zip`: extract into the game's `Data` folder. It includes `SeamlessPilots.esm`, `FlyingVehicleOverhaul - Placements.esm` and `SFSE/Plugins/SeamlessVehicle.dll`. Enable both ESMs in your load order. The placements plugin is optional, but without it no vehicles are parked in New Atlantis.
-- `FlyingVehicleOverhaul-0.65.0-source.zip`: standalone CMake/MSVC source with the bundled SFSE interface header, the test suites, the placement tools and the recorded placements.
-- `FlyingVehicleOverhaul-0.65.0-SHA256SUMS.txt`: checksums for both ZIPs.
+- `FlyingVehicleOverhaul-0.71.0.zip`: extract into the game's `Data` folder. It includes `SeamlessPilots.esm`, `FlyingVehicleOverhaul - Placements.esm` and `SFSE/Plugins/SeamlessVehicle.dll`. Enable both ESMs in your load order. The placements plugin is optional, but without it no vehicles are parked in New Atlantis.
+- `FlyingVehicleOverhaul-0.71.0-source.zip`: standalone CMake/MSVC source with the bundled SFSE interface header, the test suites, the placement tools and the recorded placements.
+- `FlyingVehicleOverhaul-0.71.0-SHA256SUMS.txt`: checksums for both ZIPs.
 
 The optional `Vehicles - Real.esm` patch remains in the repository's `Data` directory; the main ZIP does not require it.

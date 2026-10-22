@@ -1,4 +1,4 @@
-# Flying Vehicle Overhaul 0.65.0: source
+# Flying Vehicle Overhaul 0.71.0: source
 
 The source of Flying Vehicle Overhaul for Starfield (SFSE plugin `SeamlessVehicle.dll`). It builds on its own: nothing else
 from the author's project is needed, and the optional SeamlessPlanets core, Carfield and Parked Vehicles are not required.
