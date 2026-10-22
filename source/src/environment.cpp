@@ -151,6 +151,21 @@ Site BoardingSite(std::uintptr_t ref){
  if(result.verdict==Verdict::Safe&&!sitelogic::Standing(result.z-0.1,result.ground,std::hypot(std::hypot(v.vel[0],v.vel[1]),v.vel[2]),v.pos[2])){result.verdict=Verdict::Unsafe;result.reason="Vehicle must stop and descend before boarding or exit";}
  return result;
 }
+// Getting in only needs the vehicle at rest: the game's own seat walk / snap finds the way in. The full site (headroom, a free
+// side, no vehicle beside it) is for putting someone OUT; on entry it refused every vehicle parked in a row (2026-10-21 20:37:
+// 6 of 6 fight boardings timed out on "no validated boarding site", the instant seat behind the same gate).
+Site EntrySite(std::uintptr_t ref){
+ auto result=BoardingSite(ref);
+ if(!ref||result.verdict==Verdict::Safe)return result;
+ const auto v=Vehicle(*reinterpret_cast<std::uint32_t*>(ref+off::kFormId));
+ const double speed=std::hypot(std::hypot(v.vel[0],v.vel[1]),v.vel[2]);
+ if(result.supported){
+  if(sitelogic::Standing(result.ground,result.ground,speed,v.pos[2])){result.verdict=Verdict::Safe;result.reason="At rest (entry)";}
+  else{result.verdict=Verdict::Unsafe;result.reason="Vehicle must stop and descend before boarding";}
+ }
+ else if(result.verdict==Verdict::Unsafe&&speed<=0.75){result.verdict=Verdict::Safe;result.reason="At rest on uneven ground (entry)";}
+ return result;
+}
 bool ClearShot(std::uint32_t self,std::uint32_t target,std::uint32_t targetVehicle,const float from[3],const float to[3]){
  float origin[3]={from[0],from[1],from[2]};const auto v=Vehicle(self);
  const double length=std::hypot(std::hypot(to[0]-from[0],to[1]-from[1]),to[2]-from[2]);

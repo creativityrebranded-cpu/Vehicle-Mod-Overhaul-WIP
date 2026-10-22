@@ -18,6 +18,8 @@
 #include "profiles.h"
 #include "routeplan.h"
 #include "scantarget.h"
+#include "bindings.h"
+#include "vehiclediag.h"
 #include "mappoints.h"
 #include "vehicleworld.h"
 #include "vehiclehits.h"
@@ -92,7 +94,7 @@ namespace
         LARGE_INTEGER frequency,start,previous,stamp;QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&start);previous=start;
         double cost[8]{};auto mark=[&](int i){QueryPerformanceCounter(&stamp);cost[i]=1000.0*double(stamp.QuadPart-previous.QuadPart)/frequency.QuadPart;previous=stamp;};
         modscene::NewFrame();
-        features::Tick();
+        features::Tick();bindings::Tick();
         vehicleflight::BeginFrame(); // decision owners must renew their commands in this frame
         npcvehicles::BeginFrame();
         world::Publish();mark(0);
@@ -100,7 +102,7 @@ namespace
         navseed::Tick();routeplan::Frame();navfield::Service();environment::Tick();navmap::Tick();mark(2);
         profiles::Tick();context::Tick();mark(3);
         npcvehicles::Tick();passenger::Tick();mark(4);
-        vehicleflight::Tick();mark(5);
+        vehicleflight::Tick();vehiclediag::Tick();mark(5);
         shipvehicle::Tick();realvehicles::Tick();scantarget::Tick();traffic::Tick();viewdist::Tick();mark(6);
         cost[7]=1000.0*double(stamp.QuadPart-start.QuadPart)/frequency.QuadPart;g_frameCost.Finish(cost);
     }
@@ -139,6 +141,7 @@ namespace
 		npcvehicles::Install();
 		profiles::Install();
 		vehicleaim::Install();
+		vehiclediag::Install();
 		vehiclehits::InstallEnemyBar();
 		flighttune::Load();
 		api.OnFrame(&Frame);
@@ -164,6 +167,7 @@ namespace
 		npcvehicles::Install();
 		profiles::Install();
 		vehicleaim::Install();
+		vehiclediag::Install();
 		vehiclehits::InstallEnemyBar();
 		flighttune::Load();
 		g_tasks->AddTaskPermanent(&g_frameTask);
@@ -221,7 +225,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	g_messaging = static_cast<SFSEMessagingInterface*>(sfse->QueryInterface(kInterface_Messaging));
 	g_tasks = static_cast<SFSETaskInterface*>(sfse->QueryInterface(kInterface_Task));
 	if (!g_messaging || !g_messaging->RegisterListener(g_handle, "SFSE", SfseMessage)) return false;
-	logger::Write("SeamlessVehicle 0.64.0 loaded; core optional");
+	logger::Write("SeamlessVehicle 0.65.0 loaded; core optional");
 	return true;
 }
 }

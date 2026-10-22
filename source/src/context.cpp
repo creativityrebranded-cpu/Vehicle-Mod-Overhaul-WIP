@@ -16,6 +16,7 @@
 
 #include <Windows.h>
 #include <ShlObj.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -28,17 +29,20 @@ namespace context
 	{
 		using uptr = std::uintptr_t;
 		constexpr ULONGLONG kTickMs = 500, kScanMs = 1000, kRetryMs = 5000, kCalmMs = 60000;
+		constexpr ULONGLONG kFailRetryMs = 30000;  // after its vehicle job ends, an NPC waits this long so the others get a turn
 		constexpr double kBoardRange = 40.0;   // m: a free vehicle this close to the NPC
 		constexpr double kSettlementWalk = 400.0;  // m: inside a settlement, trips shorter than this are walked
 		constexpr double kActorRange = 250.0;  // m: NPCs further from the player are left alone (2026-10-21, the user: 80 m left enemies standing by vehicles)
 		constexpr float kStillSpeed = 2.0f;    // m/s: below this the vehicle counts as parked
 		constexpr int kMaxAttemptsPerScan = 2;
+		constexpr int kMaxEnemyVehicles = 4;  // non-allied NPCs boarding or driving at once (2026-10-21, the user: 3-4; the other job slots stay for followers)
 		constexpr unsigned kActorLimit = 8000;  // the old force key searched 8000; 2000 cut off NPCs far down the cell list (13:41 fight never seen)
 
 		ULONGLONG g_tickAt = 0, g_scanAt = 0, g_iniAt = 0;
 		bool g_enabled = true;
 		std::unordered_map<std::uint32_t, bool> g_pursuit;           // npc form id -> chosen profile (true = pursuit)
 		std::unordered_map<std::uint32_t, ULONGLONG> g_triedAt;      // npc form id -> last board attempt
+		std::unordered_map<std::uint32_t, ULONGLONG> g_jobSeen;      // npc form id -> last seen in a vehicle job (its job ending = a turn used)
 		std::unordered_map<std::uint32_t, ULONGLONG> g_calmSince;    // vehicle form id -> calm and still since
 		world::Snapshot g_snap;
 
@@ -254,8 +258,12 @@ namespace context
 			static ULONGLONG lastDiag = 0;
 			const bool diagnose = now - lastDiag >= 15000 && logger::Verbose();
 			if (diagnose) lastDiag = now;
+			// Candidates first, then the ones waiting longest go first (2026-10-21, the user: the cap is how many at a time; when one fails,
+			// the others get their turn). An NPC already in a vehicle job is skipped, and one whose job just ended (it failed to get in,
+			// or got out) waits kFailRetryMs, so the same few never hold every turn.
+			struct Candidate { uptr r; std::uint32_t id; game::Vec3 np; ULONGLONG last; };
+			std::vector<Candidate> candidates;
 			for (const uptr r : modscene::LoadedRefs(kActorLimit)) {
-				if (attempts >= kMaxAttemptsPerScan) break;
 				if (r == player || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r)) continue;
 				++actors;
 				const auto cs = npcvehicles::CombatOf(r);
@@ -271,13 +279,24 @@ namespace context
 				if (Dist(np, pp) > kActorRange) continue;
 				++inRange;
 				const std::uint32_t id = *reinterpret_cast<std::uint32_t*>(r + off::kFormId);
+				if (npcvehicles::UsesVehicle(id)) { g_jobSeen[id] = now; continue; }  // boarding or aboard already
+				if (const auto seen = g_jobSeen.find(id); seen != g_jobSeen.end() && now - seen->second < kFailRetryMs) { ++cooling; continue; }
 				const auto it = g_triedAt.find(id);
 				if (it != g_triedAt.end() && now - it->second < kRetryMs) { ++cooling; continue; }
+				candidates.push_back({ r, id, np, it != g_triedAt.end() ? it->second : 0 });
+			}
+			std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.last < b.last; });
+			for (const auto& c : candidates) {
+				if (attempts >= kMaxAttemptsPerScan) break;
+				const uptr r = c.r;
+				const std::uint32_t id = c.id;
+				const auto np = c.np;
 				const uptr enemy = npcvehicles::IsAlly(r) ? 0 : r;  // the player's followers keep using any free vehicle
+				if (enemy && npcvehicles::EnemyJobs() >= kMaxEnemyVehicles) { ++cooling; continue; }
 				const auto* v = FreeVehicleNear(np, kBoardRange, enemy);
 				if (!v && enemy && (playerDriving || Dist(np, pp) >= kFetchFar || VehicleFight(player))) {
 					v = FreeVehicleNear(np, kFetchRange, enemy);
-					if (v) logger::Write("Context: fetch: enemy %08X runs to vehicle %08X %.0f m away", *reinterpret_cast<std::uint32_t*>(r + off::kFormId), v->formId,
+					if (v) logger::Write("Context: fetch: enemy %08X runs to vehicle %08X %.0f m away", id, v->formId,
 						Dist(np, game::Vec3{ v->pos[0], v->pos[1], v->pos[2] }));
 				}
 				if (!v) {
@@ -297,7 +316,7 @@ namespace context
 				const bool ok = npcvehicles::BoardNpc(r, v->ref, true);
 				logger::Write("Context: fight: NPC %08X -> vehicle %08X (%.0f m), %s -> %s", id, v->formId, Dist(np, game::Vec3{ v->pos[0], v->pos[1], v->pos[2] }),
 					pursuit ? "pursuit" : "escort", ok ? "boarding" : "refused");
-				if (ok) g_pursuit[id] = pursuit;
+				if (ok) { g_pursuit[id] = pursuit; g_jobSeen[id] = now; }
 			}
 			static ULONGLONG lastSummary = 0;
 			if (diagnose) {  // proof the scan sees actors at all
@@ -369,6 +388,7 @@ namespace context
 	{
 		g_pursuit.clear();
 		g_triedAt.clear();
+		g_jobSeen.clear();
 		g_calmSince.clear();
 		g_tickAt = g_scanAt = g_civilAt = 0; g_civilTried.clear();g_patrolledAt.clear();g_lastPackage.clear();
 	}

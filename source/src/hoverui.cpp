@@ -1,4 +1,5 @@
 #include "hoverui.h"
+#include "bindings.h"
 #include "features.h"
 
 #include "addresses.h"
@@ -2003,7 +2004,7 @@ namespace hoverui
 				SaveLayout();
 			}
 			if (rides == kTeachRides + 1 && g_hintsKey > 0)
-				notify::Show("Control hints now hide after 10 s | %s shows them", controlmap::KeyName(g_hintsKey).c_str());
+				notify::Show("Control hints now hide after 10 s | %s shows them", bindings::Label(bindings::Action::ShowHints, g_hintsKey > 0 ? int(g_hintsKey) : 0).c_str());
 		}
 		was = inVehicle;
 		g_inVehicle = inVehicle;
@@ -2164,7 +2165,7 @@ namespace hoverui
 				logger::Write("Hover UI: hints key %s (shows every hint and panel; on now: %d; rides %d)", g_hintsKey > 0 ? controlmap::KeyName(g_hintsKey).c_str() : "NONE FREE",
 					g_showAll ? 1 : 0, g_rides.load());
 			}
-			const bool hd = focused && g_hintsKey > 0 && (GetAsyncKeyState(g_hintsKey) & 0x8000) != 0;
+			const bool hd = focused && bindings::Held(bindings::Action::ShowHints, g_hintsKey > 0 ? int(g_hintsKey) : 0);
 			if (hd && !hintsDown) {
 				g_showAll = !g_showAll;
 				SaveLayout();

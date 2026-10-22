@@ -1,4 +1,5 @@
 #include "profiles.h"
+#include "bindings.h"
 
 #include "addresses.h"
 #include "controlmap.h"
@@ -324,9 +325,9 @@ namespace profiles
 				g_ownKey ? controlmap::KeyName(g_ownKey).c_str() : "NONE FREE");
 		}
 
-		bool Pressed(int vk, bool& down)
+		bool Pressed(bool& down, bool held)
 		{
-			const bool h = vk && Focused() && (GetAsyncKeyState(vk) & 0x8000) != 0;
+			const bool h = Focused() && held;
 			const bool p = h && !down;
 			down = h;
 			return p;
@@ -406,8 +407,8 @@ namespace profiles
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player) return;
 		ChooseKeys();
-		if (Pressed(g_npcKey, g_npcDown)) CycleNpc();
-		if (Pressed(g_ownKey, g_ownDown)) CycleOwn(player);
+		if (Pressed(g_npcDown, g_npcKey && (GetAsyncKeyState(g_npcKey) & 0x8000) != 0)) CycleNpc();  // debug key: keyboard only
+		if (Pressed(g_ownDown, bindings::Held(bindings::Action::OwnProfile, g_ownKey))) CycleOwn(player);
 	}
 
 	void Reset()

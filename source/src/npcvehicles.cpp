@@ -86,6 +86,7 @@ namespace npcvehicles
 		constexpr double kGiveUp = 300.0;        // m: farther than this from the player ends following when the job has no origin (never, normally)
 		constexpr double kLeash = 600.0;         // m: following ends when the vehicle is this far from where the NPC started (its origin: an outpost, wherever it stood)
 		constexpr ULONGLONG kBoardTimeoutMs = 45000, kSettleMs = 2500, kLeaveTimeoutMs = 10000;
+		constexpr ULONGLONG kIdleAboardMs = 10000;  // the aboard watchdog's window and line interval
 
 		enum class Phase { Idle, Boarding, Following, Settling, Leaving };
 		const char* Name(Phase p)
@@ -110,10 +111,17 @@ namespace npcvehicles
 			ULONGLONG relaunchAt = 0;          // following: no relaunch before this (after a collision stop)
 			double stillX = 0, stillY = 0;
 			ULONGLONG stillSince = 0;
+			double watchX = 0, watchY = 0, watchZ = 0;  // the aboard watchdog: where the vehicle stood when it last moved
+			ULONGLONG watchAt = 0, watchLog = 0;
 			bool directTried = false;
 			bool standing = false;           // the get-in only stood the NPC up: ask again shortly
 			bool pkgSampled = false;         // the 1 s package check of this boarding was logged
 			bool reasked = false;            // the get-in was asked a second time (its package was gone at 1 s)
+			bool calmChecked = false;        // walk boarding: the 2.5 s Ignore Combat check ran (calm only if the NPC did not come closer)
+			uptr combatReq = 0;              // boarding as a combat move: our reference to the CombatMovementRequestActivateTarget (0 = none)
+			ULONGLONG combatReqAt = 0, combatDoneAt = 0;
+			int combatReqState = -1;         // its last state (flags >> 29), for the log
+			bool combatSeatTried = false;    // the instant seat at the vehicle ran (once per request)
 			bool moved = false;                // moved next to the vehicle (step 3)
 			double startDist = 0;              // NPC -> vehicle when boarding began
 			ULONGLONG directAt = 0;
@@ -315,7 +323,7 @@ namespace npcvehicles
 		constexpr std::uint32_t kInteraction = 0x01995460;
 		int InstantSeat(uptr actor, uptr vehicle, int& seated)
 		{
-            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe){seated=0;return 0;}
+            if(environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe){seated=0;return 0;}
 			seated = -1;
 			uptr link = 0;
 			__try {
@@ -669,6 +677,11 @@ namespace npcvehicles
 		bool Aggro(uptr actor, uptr target);
         bool HostileTo(uptr actor, uptr target);
         uptr HandleRef(std::uint32_t handle);
+        void CombatBoardRelease(uptr& req);
+        int CombatBoardState(uptr req);
+        const char* CombatBoardStateName(int st);
+        uptr CombatBoardStart(uptr npc, uptr vehicle, const char*& why);
+        constexpr ULONGLONG kCombatBoardMs = 25000, kCombatStartMs = 3000, kCombatActivatedMs = 8000;  // combat boarding: run limit, start limit, after activating
         bool PlayerTeam(uptr actor);
         bool InCombat(uptr actor);
         std::uint32_t BoardingEnemy(uptr npc) {
@@ -696,6 +709,7 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: [%d] %s -> %s (NPC %08X, vehicle %08X)", j.pilot, Name(j.phase), Name(p), j.npc, j.vehicle);
 			if((p==Phase::Following||p==Phase::Idle)&&j.resumeFoe) ResumeCombat(j);
             vehicleflight::ClearPilotCommand(j.pilot);
+            if (p != Phase::Boarding && j.combatReq) CombatBoardRelease(j.combatReq);
             j.phase = p;
             j.since = GetTickCount64();
 			if (p != Phase::Following) { j.foe = 0; j.foeTier = -1; j.foeAt = 0; j.rescueParked = j.scoutReported = j.waiting = j.retreating = false; j.pMode = -1;
@@ -713,6 +727,7 @@ namespace npcvehicles
 				j.cmdTries = 0;
 				j.cmdTryAt = 0;
 				j.cmdInstant = false;
+				j.calmChecked = false;
 				const uptr n = RefById(j.npc), v = RefById(j.vehicle);
 				j.startDist = n && v ? Dist(n, v) : 0.0;
 			}
@@ -2604,6 +2619,28 @@ namespace npcvehicles
 		struct FallWatch { std::uint32_t npc=0; float z=0; ULONGLONG at=0; } g_fallWatch[kExitTasks];
 		std::uint32_t g_exitRefused[8] = {};  // actors whose last exit was Refused (polled by ExitStateOf)
 
+		// The native furniture-state cleanup alone (state 0: controller and graph restored to on-foot), no position change.
+		bool ClearSeatState(uptr actor)
+		{
+			__try {
+				constexpr unsigned char sig[]{0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,0x44,0x88,0x48,0x20,0x55,0x56,0x57,0x41,0x54};
+				if(std::memcmp(reinterpret_cast<void*>(game::Base()+addr::kActorFurnitureState),sig,sizeof(sig)))return false;
+				const auto process = At<uptr>(actor, 0x228);
+				const auto high = process ? At<uptr>(process, 8) : 0;
+				if (!high || !At<uptr>(high, 0x458)) return false;
+				const auto state=actor+0xF0;
+				const int before=reinterpret_cast<int(*)(uptr)>((*reinterpret_cast<void***>(state))[0x1A0/8])(state);
+				const auto freeze=At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit);
+				__try {
+					At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit)=0;
+					EngineFn<void(*)(uptr,uptr,int,char)>(addr::kActorFurnitureState)(process,actor,0,1);
+				} __finally {At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit)=freeze;}
+				const int after=reinterpret_cast<int(*)(uptr)>((*reinterpret_cast<void***>(state))[0x1A0/8])(state);
+				logger::Write("NPC vehicles: seat state cleanup %08X: furniture state %d -> %d",At<std::uint32_t>(actor,off::kFormId),before,after);
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
 		bool WarpExitController(uptr npc, float x, float y, float z)
 		{
 			__try {
@@ -2623,6 +2660,10 @@ namespace npcvehicles
 				} __finally {At<std::uint8_t>(game::Base(),addr::kFreezeVehicleOnExit)=freeze;}
 				const int after=reinterpret_cast<int(*)(uptr)>((*reinterpret_cast<void***>(state))[0x1A0/8])(state);
 				logger::Write("NPC vehicles: eject cleanup %08X: furniture state %d -> %d",At<std::uint32_t>(npc,off::kFormId),before,after);
+				// A spot away from where the actor is was a bad spot (21:19: the player put 161 m up and flung 27 km): cleaned up, not moved.
+				const auto here=At<game::Vec3>(npc,off::kRefPosition);
+				const double away=std::hypot(std::hypot(double(x)-here.x,double(y)-here.y),double(z)-here.z);
+				if(!std::isfinite(away)||away>8.0){logger::Write("NPC vehicles: exit warp for %08X refused: the spot is %.1f m away (cleaned up in place)",At<std::uint32_t>(npc,off::kFormId),away);return true;}
 				alignas(16) float point[4]{x,y,z,0};
 				// Native warp clears the controller's support/velocity and synchronizes
 				// its physics proxy. A generic MoveReference leaves stale seat support.
@@ -2888,11 +2929,87 @@ namespace npcvehicles
 			}
 			const bool aboard = InVehicle(npc) == vehicle;
 			const double toPlayer = Dist(vehicle, player);
+			// Watchdog (2026-10-21, the user: "an NPC sat in the vehicle and did nothing"; log it instead of asking): an NPC aboard whose
+			// vehicle has not moved 2 m in kIdleAboardMs gets one line every kIdleAboardMs with what the job, the pilot and the vehicle say.
+			if (aboard && j.phase != Phase::Boarding) {
+				const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+				if (!j.watchAt || std::hypot(std::hypot(vp.x - j.watchX, vp.y - j.watchY), vp.z - j.watchZ) > 2.0) {
+					j.watchX = vp.x; j.watchY = vp.y; j.watchZ = vp.z; j.watchAt = now;
+				}
+				else if (now - j.watchAt >= kIdleAboardMs && now - j.watchLog >= kIdleAboardMs && !(j.phase == Phase::Following && j.parked)) {
+					j.watchLog = now;
+					const auto rot = At<game::Vec3>(vehicle, off::kRefRotation);
+					const uptr base = At<uptr>(vehicle, 0x98);
+					const uptr foe = j.foe ? RefById(j.foe) : 0;
+					logger::Write("NPC vehicles: [%d] IDLE ABOARD %.0f s: NPC %08X in %08X (base %08X) at (%.0f, %.0f, %.0f); phase %s, profile %s, foe %08X%s %.0f m, you %.0f m; "
+						"pilot %s (last end: %s); pitch %.0f roll %.0f deg", j.pilot, (now - j.watchAt) / 1000.0, j.npc, j.vehicle, base ? At<std::uint32_t>(base, off::kFormId) : 0,
+						vp.x, vp.y, vp.z, Name(j.phase), kProfiles[int(j.profile)].name, j.foe, foe && Dead(foe) ? " (dead)" : "", foe ? Dist(vehicle, foe) : -1.0, toPlayer,
+						vehicleflight::PilotActive(j.pilot) ? "flying" : "OFF", vehicleflight::PilotEndReason(j.pilot) ? vehicleflight::PilotEndReason(j.pilot) : "-", rot.x * 57.29578, rot.y * 57.29578);
+				}
+			}
+			else j.watchAt = 0;
 			if (j.phase == Phase::Following) vehicleflight::WatchFlip(vehicle, "NPC vehicles");
 			switch (j.phase) {
 			case Phase::Boarding:
-                if(!aboard && environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe) {
-                    if(now-j.since>kBoardTimeoutMs){pilotquest::Release(j.pilot-1);Set(j,Phase::Idle);logger::Write("Boarding refused: no validated boarding site");}
+                // Boarding as a combat move: its state decides until the NPC is aboard, or it ends and the get-in package takes over.
+                if (j.combatReq) {
+                    const int st = CombatBoardState(j.combatReq);
+                    const double d = Dist(npc, vehicle);
+                    if (st != j.combatReqState) {
+                        logger::Write("NPC vehicles: [%d] combat boarding: %s (%.1f s, %.1f m from the vehicle, NPC in combat %d)", j.pilot, CombatBoardStateName(st),
+                            (now - j.combatReqAt) / 1000.0, d, InCombat(npc) ? 1 : 0);
+                        j.combatReqState = st;
+                        if ((st == 2 || st == 4) && !j.combatDoneAt) j.combatDoneAt = now;
+                    }
+                    // Arrived: the request's own activation does not seat anyone in a vehicle (21:17 run: "done" at 0.4 m, not aboard 8 s
+                    // later), and seating mid-combat left the NPC in a weapon-up seat pose. So at the vehicle: calm for this moment (the combat
+                    // AI lets go of the body), the game's instant seat, and the enemy is restored once aboard (Set Following -> ResumeCombat).
+                    if (!aboard && !j.combatSeatTried && (st == 2 || st == 4 || (st == 1 && d < 2.5)) && d <= 4.0) {
+                        j.combatSeatTried = true;
+                        Calm(npc);
+                        int seated = 0;
+                        const int r = InstantSeat(npc, vehicle, seated);
+                        const bool in = InVehicle(npc) == vehicle;
+                        logger::Write("NPC vehicles: [%d] combat move brought NPC %08X to the vehicle (%.1f m, %.1f s): instant seat -> %d, seat %d, %s", j.pilot, j.npc, d,
+                            (now - j.combatReqAt) / 1000.0, r, seated, in ? "aboard (its enemy is restored next)" : "NOT aboard");
+                        if (in) { CombatBoardRelease(j.combatReq); return; }
+                    }
+                    const char* end = aboard ? nullptr :
+                        st == 3 ? "the request failed" :
+                        st == 0 && now - j.combatReqAt > kCombatStartMs ? "the combat AI never started it" :
+                        st == 1 && now - j.combatReqAt > kCombatBoardMs ? "it ran too long" :
+                        j.combatDoneAt && now - j.combatDoneAt > kCombatActivatedMs ? "it activated the vehicle but the NPC is not aboard" : nullptr;
+                    if (aboard) {
+                        logger::Write("NPC vehicles: [%d] NPC %08X aboard by the combat move after %.1f s (still in combat %d)", j.pilot, j.npc,
+                            (now - j.combatReqAt) / 1000.0, InCombat(npc) ? 1 : 0);
+                        CombatBoardRelease(j.combatReq);
+                    }
+                    else if (end) {
+                        CombatBoardRelease(j.combatReq);
+                        const bool pkg = pilotquest::Assign(j.pilot - 1, npc, vehicle);
+                        logger::Write("NPC vehicles: [%d] combat boarding ended (%s, %.1f s, %.1f m): %s", j.pilot, end, (now - j.combatReqAt) / 1000.0, d,
+                            pkg ? "falling back to the get-in package (Ignore Combat, then calm)" : "no get-in package either");
+                        if (!pkg) { Set(j, Phase::Idle); return; }
+                        j.since = now;
+                        j.startDist = d;
+                        j.calmChecked = false;
+                        return;
+                    }
+                    else return;  // the combat AI is bringing it in
+                }
+                // Walk boarding (quest package, j.cmd) has no 1 s package check: at 2.5 s a fighter that came no closer is calmed once (the
+                // Ignore Combat package did not outrank its fight); one that did keeps fighting status all the way in.
+                if (j.cmd && !aboard && !j.calmChecked && now - j.since > 2500) {
+                    j.calmChecked = true;
+                    const double d = Dist(npc, vehicle);
+                    if (InCombat(npc) && d > j.startDist - 1.0) {
+                        Calm(npc);
+                        logger::Write("NPC vehicles: [%d] NPC %08X still fighting and no closer (%.1f -> %.1f m): Ignore Combat was not enough, calmed (fallback)", j.pilot, j.npc, j.startDist, d);
+                    }
+                    else logger::Write("NPC vehicles: [%d] NPC %08X on its way without calm (%.1f -> %.1f m, in combat %d)", j.pilot, j.npc, j.startDist, d, InCombat(npc) ? 1 : 0);
+                }
+                if(const auto entry=environment::EntrySite(vehicle);!aboard && entry.verdict!=environment::Verdict::Safe) {
+                    if(now-j.since>kBoardTimeoutMs){pilotquest::Release(j.pilot-1);Set(j,Phase::Idle);logger::Write("Boarding refused: vehicle %08X not at rest (%s)",j.vehicle,entry.reason);}
                     return;
                 }
 				if (logger::Verbose() && j.cmd && now - j.cmdLog >= 1000) {
@@ -2982,7 +3099,7 @@ namespace npcvehicles
 							Calm(npc);
 						}
 						const int r = Mount(npc, vehicle);
-						logger::Write("NPC vehicles: [%d] NPC %08X get-in asked again (%s) -> %d", j.pilot, j.npc, combat == 1 ? "calmed first" : "package was replaced", r);
+						logger::Write("NPC vehicles: [%d] NPC %08X get-in asked again (%s) -> %d", j.pilot, j.npc, combat == 1 ? "Ignore Combat was not enough: calmed first (fallback)" : "package was replaced", r);
 						if (r >= 1) {
 							Set(j, Phase::Boarding);
 							j.standing = r == 2;
@@ -3698,8 +3815,13 @@ namespace npcvehicles
 			const uptr pin = player ? InVehicle(player) : 0;
 			if (!player || (pin && pin != vehicle) || Dist(player, vehicle) >= 12.0) return;
 			const bool out = EndInteraction(player);
+			// Ending the interaction alone left the player stuck in the seat pose (2026-10-21 20:41, the user: "I entered and got stuck"):
+			// the native furniture-state cleanup, WITHOUT moving the player. (21:19: the forced exit's warp to a spot beside the hull put
+			// the player 161 m up and flung them 27 km; the hull-side spot is only for NPC ejection.)
+			const bool clean = out && ClearSeatState(player);
 			notify::Show("%s", why);
-			logger::Write("NPC vehicles: the player stood back up from vehicle %08X -> %s", At<std::uint32_t>(vehicle, off::kFormId), out ? "out" : "FAILED");
+			logger::Write("NPC vehicles: the player stood back up from vehicle %08X -> %s, seat cleanup %s (not moved)", At<std::uint32_t>(vehicle, off::kFormId), out ? "out" : "FAILED",
+				clean ? "done" : "FAILED");
 		}
 
 		void SeatPlayerDetour(uptr vehicle)
@@ -3806,12 +3928,10 @@ namespace npcvehicles
 				if (kw) GiveKeyword(npc, kw);
 			}
 			const bool seat = CanMount(npc, vehicle);
-			// In combat the get-in package never runs (it waits behind the combat AI): calm first.
+			// In combat: no calm up front any more (2026-10-21, the user: make the get-in the highest priority instead). The get-in
+			// packages carry Ignore Combat (SeamlessPilots.esm); the 1 s check in Boarding calms only if the package still did not take over.
 			if(seat)slot.resumeFoe=BoardingEnemy(npc);
-			if (seat && InCombat(npc)) {
-				Calm(npc);
-				logger::Write("NPC vehicles: [%d] NPC %08X was in combat; calmed for the get-in", slot.pilot, npcId);
-			}
+			if (seat && InCombat(npc)) logger::Write("NPC vehicles: [%d] NPC %08X is in combat; get-in with Ignore Combat (no calm)", slot.pilot, npcId);
 			const int r = seat ? Mount(npc, vehicle) : 0;
 			slot.standing = r == 2;
 			const uptr base = At<uptr>(vehicle, 0x98);
@@ -3832,13 +3952,13 @@ namespace npcvehicles
 		{
 			// The Walk key: the game's own follower command. The job only watches (no instant seat); Enter and the seated check follow.
 			// Native, data-driven: SeamlessPilots.esm's quest package (any actor); else the follower command (followers only).
-			// Context: in combat the NPC is calmed (or the fight would outrank the package) and RUNS to the vehicle; otherwise it walks at the package's own pace.
+			// Context: in combat the NPC RUNS to the vehicle, still hostile (the package's Ignore Combat outranks the fight; calm is the 1 s fallback); otherwise it walks at the package's own pace.
 			slot->resumeFoe=BoardingEnemy(npc);
 			if (InCombat(npc)) {
-				Calm(npc);
+				// Still hostile: the get-in package's Ignore Combat outranks the fight; the 1 s check in Boarding calms only as a fallback.
 				SetForceRun(npc, true);
 				slot->forcedRun = true;
-				logger::Write("NPC vehicles: [%d] NPC %08X is in combat: calmed, running to the vehicle", slot->pilot, At<std::uint32_t>(npc, off::kFormId));
+				logger::Write("NPC vehicles: [%d] NPC %08X is in combat: running to the vehicle (Ignore Combat, no calm)", slot->pilot, At<std::uint32_t>(npc, off::kFormId));
 			}
 			else if (Dist(npc, vehicle) > kRunRange) {
 				// 12:04: a vehicle 160-290 m away took over 2 minutes at walking pace (the 120 s timeout ended it); far = run, cleared again once aboard.
@@ -3849,7 +3969,15 @@ namespace npcvehicles
 			else {
 				logger::Write("NPC vehicles: [%d] NPC %08X is calm: walking to the vehicle", slot->pilot, At<std::uint32_t>(npc, off::kFormId));
 			}
-			const bool viaQuest = pilotquest::Assign(slot->pilot - 1, npc, vehicle);
+			// In combat (a driver): the combat AI's own path-and-activate first; the get-in package (Ignore Combat, then calm) is its fallback.
+			uptr combatReq = 0;
+			if (InCombat(npc) && !seat) {
+				const char* why = "";
+				combatReq = CombatBoardStart(npc, vehicle, why);
+				logger::Write("NPC vehicles: [%d] NPC %08X in combat: %s%s", slot->pilot, At<std::uint32_t>(npc, off::kFormId),
+					combatReq ? "boarding as a combat move (CombatMovementRequestActivateTarget)" : "combat move not possible, get-in package: ", combatReq ? "" : why);
+			}
+			const bool viaQuest = combatReq || pilotquest::Assign(slot->pilot - 1, npc, vehicle);
 			if (!viaQuest) {
 				logger::Write("SeamlessPilots.esm is not loaded: NPCs cannot be sent to vehicles");
                 slot->npc=At<std::uint32_t>(npc,off::kFormId); ResumeCombat(*slot);
@@ -3866,6 +3994,11 @@ namespace npcvehicles
 			Set(*slot, Phase::Boarding);
 			slot->cmd = true;
 			slot->cmdLog = 0;
+			slot->combatReq = combatReq;
+			slot->combatReqAt = GetTickCount64();
+			slot->combatDoneAt = 0;
+			slot->combatReqState = -1;
+			slot->combatSeatTried = false;
 			return true;
 		}
 
@@ -3958,6 +4091,94 @@ namespace npcvehicles
 			EngineFn<void (*)(uptr, std::uint32_t, void*)>(addr::kHandleLookup)(Ptr(addr::kRefHandleTablePtr), handle, &lookup);
 			if (ref) EngineFn<void (*)(uptr)>(addr::kRefRelease)(ref);  // the world keeps the actor; we only read it this frame
 			return ref;
+		}
+
+		// ---- Boarding as a combat move (2026-10-21, the user: make the get-in part of the fight instead of calming the NPC first;
+		// notes/COMBAT_ACTIVATE_REQUEST_20261021.md). The combat AI's own CombatMovementRequestActivateTarget: the NPC paths to the
+		// vehicle and activates it (the native get-in) while it stays in combat. Built like FUN_141cfd5b0 builds it (no item),
+		// registered (FUN_1410856c0) and submitted to the NPC's combat controller (FUN_1410858f0). State = flags (+0x10) >> 29:
+		// 0 not started, 1 running, 2 done, 3 failed, 4 handed to the AI's activate procedure.
+		constexpr std::uint32_t kCmrActivateVtbl = 0x04C32C78, kCmrDestructor = 0x01084EC0, kGameAlloc = 0x022C7320, kCmrInit = 0x010856C0,
+			kCmrSubmit = 0x010858F0, kNiRefCount = 0x05E7A41C;
+		bool CodeIs(std::uint32_t rva, std::initializer_list<std::uint8_t> bytes)
+		{
+			std::size_t i = 0;
+			for (const auto b : bytes) if (*reinterpret_cast<const std::uint8_t*>(game::Base() + rva + i++) != b) return false;
+			return true;
+		}
+		bool CombatBoardReady()
+		{
+			static int ok = -1;
+			if (ok >= 0) return ok == 1;
+			ok = CodeIs(kGameAlloc, { 0x40, 0x53, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x30 }) &&
+				CodeIs(kCmrInit, { 0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x60, 0x48, 0x8B, 0xF9 }) &&
+				CodeIs(kCmrSubmit, { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xDA, 0x33, 0xFF }) &&
+				*reinterpret_cast<const uptr*>(game::Base() + kCmrActivateVtbl) == game::Base() + kCmrDestructor ? 1 : 0;
+			logger::Write("NPC vehicles: combat boarding (CombatMovementRequestActivateTarget) %s", ok ? "available" : "UNAVAILABLE (code differs); get-in package only");
+			return ok == 1;
+		}
+		// A reference's own handle (ref +0x24, as FUN_141cfd5b0 reads it), only when it resolves back to the reference.
+		std::uint32_t OwnHandle(uptr ref)
+		{
+			const std::uint32_t h = ref ? At<std::uint32_t>(ref, 0x24) : 0;
+			return h && HandleRef(h) == ref ? h : 0;
+		}
+		int CombatBoardState(uptr req) { return req ? int(At<std::uint32_t>(req, 0x10) >> 29) : -1; }
+		const char* CombatBoardStateName(int st)
+		{
+			switch (st) {
+			case 0: return "not started";
+			case 1: return "running";
+			case 2: return "done";
+			case 3: return "failed";
+			case 4: return "activating";
+			default: return "?";
+			}
+		}
+		void CombatBoardRelease(uptr& req)
+		{
+			const uptr r = req;
+			req = 0;
+			if (!r) return;
+			__try {
+				if (_InterlockedDecrement(reinterpret_cast<volatile long*>(r + 8)) == 0)
+					reinterpret_cast<void (*)(uptr)>((*reinterpret_cast<void***>(r))[1])(r);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+			}
+		}
+		// The submitted request (we hold one reference), or 0 with `why`.
+		uptr CombatBoardStart(uptr npc, uptr vehicle, const char*& why)
+		{
+			why = "";
+			if (!CombatBoardReady()) { why = "unavailable"; return 0; }
+			if (!At<uptr>(npc, 0x250)) { why = "no combat controller"; return 0; }
+			const std::uint32_t hn = OwnHandle(npc), hv = OwnHandle(vehicle);
+			if (!hn || !hv) { why = !hn ? "no NPC handle" : "no vehicle handle"; return 0; }
+			uptr req = 0;
+			__try {
+				req = EngineFn<uptr (*)(std::uint64_t)>(kGameAlloc)(0x40);
+				if (!req) { why = "allocation failed"; return 0; }
+				std::memset(reinterpret_cast<void*>(req), 0, 0x40);
+				At<uptr>(req, 0x00) = game::Base() + kCmrActivateVtbl;
+				At<std::uint32_t>(req, 0x08) = 1;            // our reference
+				At<std::uint32_t>(req, 0x0C) = 0xFFFFFFFFu;
+				At<std::uint32_t>(req, 0x10) = 0x08000000u;  // as the game's node sets it
+				At<std::uint32_t>(req, 0x28) = hn;           // the mover
+				At<std::uint32_t>(req, 0x2C) = hv;           // the target: the vehicle
+				_InterlockedIncrement(reinterpret_cast<volatile long*>(game::Base() + kNiRefCount));  // the NiRefObject count its destructor lowers
+				EngineFn<void (*)(uptr)>(kCmrInit)(req);
+				if (!EngineFn<char (*)(uptr, uptr)>(kCmrSubmit)(npc, req)) {
+					why = "the combat controller refused it";
+					CombatBoardRelease(req);
+					return 0;
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				why = "exception";
+				return 0;  // a half-built request is left alone
+			}
+			return req;
 		}
 
 		int Followers(uptr player, uptr* out, int max)
@@ -5099,6 +5320,16 @@ namespace npcvehicles
 		int n = 0;
 		for (const auto& j : g_jobs) {
 			if (j.phase != Phase::Idle && j.task) ++n;
+		}
+		return n;
+	}
+
+	int EnemyJobs()
+	{
+		int n = 0;
+		for (const auto& j : g_jobs) {
+			if (j.phase == Phase::Idle || j.task) continue;
+			if (const uptr npc = RefById(j.npc); npc && !PlayerTeam(npc)) ++n;
 		}
 		return n;
 	}

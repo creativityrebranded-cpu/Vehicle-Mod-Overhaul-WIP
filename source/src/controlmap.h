@@ -20,6 +20,9 @@ namespace controlmap
 	// The keyboard key (virtual-key code) bound to this event in this context, or the fallback. The map is re-read
 	// every 5 s so rebinding in the game's settings is followed.
 	int KeyFor(const char* context, const char* event, int fallback);
+	// The gamepad code the game binds to this event in this context (the game's own code space; bindings.cpp maps it to a
+	// controller button), 0 when none or unreadable. Also written to controlmap.txt as "gamepad" lines.
+	std::uint32_t PadFor(const char* context, const char* event);
 	// Key name for messages ("H", "F9").
 	std::string KeyName(int vk);
 	// ---- The one key table of the mod: every key we use is claimed here by (owner, action), so two of our modules never take the same key and the

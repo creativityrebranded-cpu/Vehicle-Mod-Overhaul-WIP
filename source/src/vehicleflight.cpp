@@ -1,4 +1,6 @@
 #include "vehicleflight.h"
+#include "vehiclediag.h"
+#include "bindings.h"
 #include "features.h"
 #include "overrides.h"
 #include "profileclass.h"
@@ -685,15 +687,48 @@ namespace vehicleflight
 			}
 		}
 
+		// Diagnostics (2026-10-21: "0 steps, body NOT BOUND" with the body listed): the body ids the hook was called with lately,
+		// and bodies more than one flight slot claimed (Owner() then gives nobody).
+		std::atomic<std::uint32_t> g_seenIds[16]{};
+		std::atomic<unsigned> g_seenNext{0};
+		std::atomic<unsigned> g_ambiguous{0};
+		std::atomic<std::uint32_t> g_ambiguousBody{0};
+		void NoteSeen(std::uint32_t body)
+		{
+			for (const auto& x : g_seenIds) if (x.load(std::memory_order_relaxed) == body) return;
+			g_seenIds[g_seenNext.fetch_add(1, std::memory_order_relaxed) % 16].store(body, std::memory_order_relaxed);
+		}
+		std::string StepDiag(const Shared& me)
+		{
+			char b[640];
+			int n = std::snprintf(b, sizeof(b), "listed");
+			for (std::uint32_t i = 0; i < me.sceneCount && i < 4; ++i) n += std::snprintf(b + n, sizeof(b) - n, " %08X", me.sceneBodies[i]);
+			n += std::snprintf(b + n, sizeof(b) - n, "; hook saw");
+			for (const auto& x : g_seenIds) if (const auto v = x.load()) n += std::snprintf(b + n, sizeof(b) - n, " %08X", v);
+			n += std::snprintf(b + n, sizeof(b) - n, "; claimed twice %u (last %08X)", g_ambiguous.load(), g_ambiguousBody.load());
+			for (int i = 0; i < kPilots; ++i) {
+				const Shared& o = g_shs[i];
+				if (&o == &me || !o.vehicle.load()) continue;
+				for (std::uint32_t k = 0; k < o.sceneCount; ++k)
+					for (std::uint32_t m = 0; m < me.sceneCount; ++m)
+						if (o.sceneBodies[k] == me.sceneBodies[m]) n += std::snprintf(b + n, sizeof(b) - n, "; slot %d lists it too (active %d, ground %d)", i, o.active ? 1 : 0, o.groundOn ? 1 : 0);
+			}
+			return b;
+		}
+
 		std::uint64_t StepDetour(std::uintptr_t vehicle, std::uintptr_t world)
 		{
 			// This hook sees every vehicle. Unowned steps must never default to the player's controller.
+			vehiclediag::NoteStep(vehicle);
 			const auto body=PhysicsBodyId(vehicle);const auto now=GetTickCount64();
 			bodybinding::Binding bindings[kPilots];
 			for(int i=0;i<kPilots;++i){auto&s=g_shs[i];std::lock_guard lk(s.lock);
 				const bool owns=bodybinding::Contains({s.sceneBodies,s.sceneCount},body) && (!s.instance.load()||s.bodyId.load()==body);
 				bindings[i]={owns?body:0,s.vehicle.load()&&(s.active||s.groundOn||(s.guardInstance&&now<s.guardUntil))};}
 			const int owner=bodybinding::Owner(body,bindings);
+			NoteSeen(body);
+			if(owner<0){int claims=0;for(const auto&bb:bindings)if(bb.enabled&&bodybinding::Matches(body,bb.body))++claims;
+				if(claims>1){g_ambiguous.fetch_add(1,std::memory_order_relaxed);g_ambiguousBody.store(body,std::memory_order_relaxed);}}
 			Shared*s=owner>=0?&g_shs[owner]:nullptr;
 			if(s){
 				{std::lock_guard lk(s->lock);if(!bodybinding::Contains({s->sceneBodies,s->sceneCount},body)||
@@ -1626,7 +1661,7 @@ namespace vehicleflight
 			g_mk.right = controlmap::KeyFor("Vehicle", "VehicleTurnRight", 'D');
 			g_mk.boost = controlmap::KeyFor("Vehicle", "VehicleBoost", VK_LSHIFT);
 			g_mk.vert = controlmap::KeyFor("Vehicle", "VehicleVertBoost", VK_SPACE);
-			hoverui::SetKeyNames(controlmap::KeyName(g_mk.accel).c_str(), controlmap::KeyName(g_mk.brake).c_str());
+			hoverui::SetKeyNames(bindings::Label(bindings::Action::Accelerate, g_mk.accel).c_str(), bindings::Label(bindings::Action::Brake, g_mk.brake).c_str());
 		}
 
 		void ChooseKeys()
@@ -2008,8 +2043,8 @@ namespace vehicleflight
 				return;
 			}
 			logger::Write("Rover flight: on at (%.0f, %.0f, %.0f)", pos.x, pos.y, pos.z);
-			notify::Log("Hover on - [W] boost [S] brake [Alt tap] gear [LShift] boost  [%s]/[%s] up/down  [Alt hold] down  [%s]/[%s] turn  [Space x2] off", controlmap::KeyName(g_keys.up).c_str(),
-				controlmap::KeyName(g_keys.down).c_str(), controlmap::KeyName(g_keys.rollLeft).c_str(), controlmap::KeyName(g_keys.rollRight).c_str());
+			notify::Log("Hover on - [W] boost [S] brake [Alt tap] gear [LShift] boost  [%s]/[%s] up/down  [Alt hold] down  [%s]/[%s] turn  [Space x2] off", bindings::Label(bindings::Action::LiftUp, g_keys.up).c_str(),
+				bindings::Label(bindings::Action::LiftDown, g_keys.down).c_str(), bindings::Label(bindings::Action::TurnLeft, g_mk.left).c_str(), bindings::Label(bindings::Action::TurnRight, g_mk.right).c_str());
 			telemetry::Record("rover_flight_on", "\"pos\":[%.0f,%.0f,%.0f]", pos.x, pos.y, pos.z);
 		}
 		void Start(std::uintptr_t vehicle) { Start(0, vehicle); }
@@ -2867,8 +2902,8 @@ namespace vehicleflight
 			// Alt tap/hold is resolved once in PlayerTick, shared by driving and hover.
 			// W held: boost at the selected gear. S held: brake. Neither: coast.
 			const bool keysOn = focused && !g.autopilot;  // on autopilot the player's keys do not fly the rover
-			const bool paidBoost=keysOn && Held(VK_LSHIFT) && g_meterBoost.load() && g_meterVehicle.load()==vehicle;
-			const bool wHeld = keysOn && Held(g_mk.accel), sHeld = keysOn && Held(g_mk.brake);
+			const bool paidBoost=keysOn && bindings::Held(bindings::Action::Boost, VK_LSHIFT) && g_meterBoost.load() && g_meterVehicle.load()==vehicle;
+			const bool wHeld = keysOn && bindings::Held(bindings::Action::Accelerate, g_mk.accel), sHeld = keysOn && bindings::Held(bindings::Action::Brake, g_mk.brake);
 			const bool wWasDown = g.wDown, sWasDown = g.sDown;
 			{
 				g.wDown = wHeld;
@@ -2968,7 +3003,11 @@ namespace vehicleflight
 					const bool overFloor = GetTickCount64() >= g.floorUntil || pos.z >= g.floorZ + kFloorClear;
 					if ((freshGround && overFloor && above >= kCallClimb + g.cruiseExtra - 0.5) || GetTickCount64() - g.autopilotSince > kCallClimbMs + ULONGLONG(g.cruiseExtra * 150.0)) {
 						g.apClimb = false;
-						logger::Write("%s: climbed to %.1f m; flying to the target", wc, above);
+						// What the physics step saw (2026-10-21: every climb ended at -0.6 m; the line alone could not tell a missing body from
+						// a lift that does nothing): steps run on the body, its binding, the lift asked, gravity measured, vertical speed.
+						logger::Write("%s: climbed to %.1f m; flying to the target (physics: %u steps, body %s, lift %.2f, gravity %.1f, vz %.2f, launches %u, bad velocities %d)",
+							wc, above, g_sh.steps, g_sh.instance.load() ? "bound" : "NOT BOUND", g_sh.lift, g_sh.gEst, double(g_sh.lastV[2]), g_sh.launches, g_sh.fixedVel);
+						if (!g_sh.steps) logger::Write("%s: no physics steps: %s", wc, StepDiag(g_sh).c_str());
 					}
 					else {
 						boosting = false;  // straight up first
@@ -3085,10 +3124,10 @@ namespace vehicleflight
 				g_camRest.Observe(camPitch,firstPerson,false);
 				pitchAim = std::clamp(camPitch - g_camRest.pitch, -kPitchMax, kPitchMax);
 			}
-			double rollIn = (keysOn && Held(g_mk.right) ? 1.0 : 0.0) -
-				(keysOn && Held(g_mk.left) ? 1.0 : 0.0);
-			double lift = (keysOn && Held(g_keys.up) ? 1.0 : 0.0) -
-				(keysOn && Held(g_keys.down) ? 1.0 : 0.0);
+			double rollIn = (keysOn && bindings::Held(bindings::Action::TurnRight, g_mk.right) ? 1.0 : 0.0) -
+				(keysOn && bindings::Held(bindings::Action::TurnLeft, g_mk.left) ? 1.0 : 0.0);
+			double lift = (keysOn && bindings::Held(bindings::Action::LiftUp, g_keys.up) ? 1.0 : 0.0) -
+				(keysOn && bindings::Held(bindings::Action::LiftDown, g_keys.down) ? 1.0 : 0.0);
 			if (!idx && keysOn && g_altDrop) lift = -1.0;
 			g_forwardBoosts[idx] = boost;
 
@@ -3953,12 +3992,12 @@ namespace vehicleflight
 		ChooseKeys();
 		ReadMoveKeys();
 		hoverui::EditTick(focused);
-		const bool h = focused && Held(g_keys.toggle);
+		const bool h = focused && bindings::Held(bindings::Action::HoverToggle, g_keys.toggle);
 		const bool pressed = h && !g.keyDown;
 		g.keyDown = h;
 		const auto driven = PlayerVehicle(player);
 		FirstPersonLookLimits(driven != 0);
-		g_boostRequest.store(driven && focused && !g.playerAuto && Held(VK_LSHIFT));
+		g_boostRequest.store(driven && focused && !g.playerAuto && bindings::Held(bindings::Action::Boost, VK_LSHIFT));
 		if(!driven)g_meterBoost.store(false);
 		hoverui::SetState(driven != 0, g.active && (!g.autopilot || g.playerAuto), g.gear, g.wHold);
 		const auto priorDriven=g_driverVehicle.exchange(driven,std::memory_order_relaxed);
@@ -3969,7 +4008,7 @@ namespace vehicleflight
 		}
 		if(priorDriven && priorDriven!=driven)EndTargetSession(priorDriven);
 		if (priorDriven != driven) g_altInput = {};
-		const auto alt = g_altInput.Update(Held(VK_MENU), driven && focused && !hoverui::IsScannerOpen(), GetTickCount64());
+		const auto alt = g_altInput.Update(bindings::Held(bindings::Action::Gear, VK_MENU), driven && focused && !hoverui::IsScannerOpen(), GetTickCount64());
 		g_altDrop = alt.drop;
 		if (alt.cycle) {
 			const int before = g.gear;
@@ -4075,7 +4114,7 @@ namespace vehicleflight
 					notify::Log("Destination selected - navigating; W/A/S/D takes over");
 					logger::Write("Rover auto: on (%s)", wasHovering ? "already hovering" : "lifting off");
 			}
-			else if (g.playerAuto && focused && (alt.cycle || alt.drop || Held(g_mk.accel) || Held(g_mk.brake) || Held(g_mk.left) || Held(g_mk.right))) {
+			else if (g.playerAuto && focused && (alt.cycle || alt.drop || bindings::Held(bindings::Action::Accelerate, g_mk.accel) || bindings::Held(bindings::Action::Brake, g_mk.brake) || bindings::Held(bindings::Action::TurnLeft, g_mk.left) || bindings::Held(bindings::Action::TurnRight, g_mk.right))) {
 				g.playerAuto = false;
 				g.autopilot = false;
 				g.routeHold=false; g.holdId=0;
@@ -4118,9 +4157,9 @@ namespace vehicleflight
 			static keygesture::Input nKey, uKey;
 			static bool stanceDown = false;
 			const ULONGLONG keyNow = GetTickCount64();
-			const auto nAct = nKey.Update(Held(g_keys.call), focused, keyNow);
-			const auto uAct = uKey.Update(Held(g_keys.follow), focused && !driven, keyNow);
-			const bool stanceHeld = focused && g_keys.stance && Held(g_keys.stance);
+			const auto nAct = nKey.Update(bindings::Held(bindings::Action::Summon, g_keys.call), focused, keyNow);
+			const auto uAct = uKey.Update(bindings::Held(bindings::Action::Cover, g_keys.follow), focused && !driven, keyNow);
+			const bool stanceHeld = focused && bindings::Held(bindings::Action::Stance, g_keys.stance);
 			if (stanceHeld && !stanceDown) {
 				const auto s = npcvehicles::CycleStance();
 				notify::Show("Stance: %s", s == npcvehicles::Stance::Attack ? "Attack" : s == npcvehicles::Stance::HoldFire ? "Hold fire" : "Defend");
@@ -4400,8 +4439,8 @@ namespace vehicleflight
 				else if (g.autopilot) std::snprintf(status, sizeof(status), "SUMMONING  %.0f m", std::min(toRover, 9999.0));
 				else if (g_move.pending || (g_movedAt && nowMs - g_movedAt < 4000)) std::snprintf(status, sizeof(status), "MOVED TO YOU");
 			}
-			const std::string callKey = g_keys.call ? controlmap::KeyName(g_keys.call) : std::string();
-			const std::string followKey = g_keys.follow ? controlmap::KeyName(g_keys.follow) : std::string();
+			const std::string callKey = bindings::Label(bindings::Action::Summon, g_keys.call);
+			const std::string followKey = bindings::Label(bindings::Action::Cover, g_keys.follow);
 			const std::string useKey = controlmap::KeyName(controlmap::KeyFor("MainGameplay", "Activate", 'E'));
 			// The names: N is always Summon; U is Follow, or Cover while you are in combat.
 			hoverui::SetFoot(!driven && g_roverId != 0, rover && !driven && !g.autopilot && toRover <= kNearBoard, callKey.c_str(), followKey.c_str(), useKey.c_str(), status,
@@ -4439,7 +4478,7 @@ namespace vehicleflight
 				if (logger::Verbose()) logger::Write("Ship vehicle physics probe: last rover stepped %u times while driven, %u times after leaving it (10 s)", occupied, unoccupied);
 			}
 		}
-		const bool boostTap = g_tapBoost.Update(focused && Held(g_mk.vert));
+		const bool boostTap = g_tapBoost.Update(focused && bindings::Held(bindings::Action::VerticalBoost, g_mk.vert));
 		static std::uintptr_t announced = 0;
 		if (vehicle && vehicle != announced && !g.active) {
 			announced = vehicle;
@@ -4471,14 +4510,14 @@ namespace vehicleflight
 		}
 		if (pressed && driven) {
 			if (g.active) {
-				Stop(controlmap::KeyName(g_keys.toggle).c_str());
+				Stop(bindings::Label(bindings::Action::HoverToggle, g_keys.toggle).c_str());
 				return;
 			}
 			Start(vehicle);
 		}
 		if (!g.active) {
 			// Driving uses the same Alt-tap gear as hover; it caps the ground speed.
-			const bool wHeld = focused && Held(g_mk.accel), sHeld = focused && Held(g_mk.brake);
+			const bool wHeld = focused && bindings::Held(bindings::Action::Accelerate, g_mk.accel), sHeld = focused && bindings::Held(bindings::Action::Brake, g_mk.brake);
 			g.wDown = wHeld;
 			g.sDown = sHeld;
 			const auto gp = At<game::Vec3>(vehicle, off::kRefPosition);
@@ -4488,7 +4527,7 @@ namespace vehicleflight
 			g_sh.px = gp.x; g_sh.py = gp.y; g_sh.pz = gp.z;
 			g_sh.groundOn = true;
 			g_sh.groundFrac = kGroundShare[std::clamp(g.gear, 0, 4)];
-			g_sh.groundLearn = g.gear == 4 && wHeld && !Held(VK_LSHIFT);
+			g_sh.groundLearn = g.gear == 4 && wHeld && !bindings::Held(bindings::Action::Boost, VK_LSHIFT);
 			return;
 		}
 		{

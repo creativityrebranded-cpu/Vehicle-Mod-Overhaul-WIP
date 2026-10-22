@@ -1,4 +1,5 @@
 #include "passenger.h"
+#include "bindings.h"
 
 #include "addresses.h"
 #include "controlmap.h"
@@ -147,7 +148,7 @@ namespace passenger
 		// Seats the player in the vehicle's companion seat: the game's interaction build, the seat set before it completes.
 		int SeatPlayer(uptr player, uptr vehicle, uptr seatKw)
 		{
-            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe)return 0;
+            if(environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe)return 0;
 			uptr link = 0;
 			__try {
 				EngineFn<void (*)(uptr, uptr, uptr*)>(kSeatLink)(player, vehicle, &link);
@@ -276,7 +277,7 @@ namespace passenger
 		// The companion seat of `vehicle` (any occupied vehicle: a gang driver, a job, a hijacker).
 		void BoardTo(uptr player, uptr vehicle)
 		{
-            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe){notify::Show("Waiting for a safe boarding site");return;}
+            if(environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe){notify::Show("Waiting for a safe boarding site");return;}
 			const std::uint32_t id = At<std::uint32_t>(vehicle, off::kFormId);
 			const uptr seat = PassengerSeat(vehicle);
 			if (!seat) {
@@ -308,7 +309,7 @@ namespace passenger
 
 	bool BoardVehicle(std::uintptr_t player, std::uintptr_t vehicle)
 	{
-		if (!player || !vehicle || VehicleOf(player) || environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe) return false;
+		if (!player || !vehicle || VehicleOf(player) || environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe) return false;
 		BoardTo(player, vehicle);
 		return g_riding.load() == At<std::uint32_t>(vehicle, off::kFormId);
 	}
@@ -343,8 +344,8 @@ namespace passenger
 		g_lastTick = now;
 		if (Focused()) {
 			const int fwd = controlmap::KeyFor("Vehicle", "VehicleAccel", 'W'), back = controlmap::KeyFor("Vehicle", "VehicleBrake", 'S');
-			if (GetAsyncKeyState(fwd) & 0x8000) g_lead = std::min(kLeadMax, g_lead + kLeadStep * dt);
-			if (GetAsyncKeyState(back) & 0x8000) g_lead = std::max(kLeadMin, g_lead - kLeadStep * 2.0 * dt);
+			if (bindings::Held(bindings::Action::Accelerate, fwd)) g_lead = std::min(kLeadMax, g_lead + kLeadStep * dt);
+			if (bindings::Held(bindings::Action::Brake, back)) g_lead = std::max(kLeadMin, g_lead - kLeadStep * 2.0 * dt);
 		}
 		double yaw = 0;
 		if (!vehicleflight::ViewHeading(yaw)) yaw = At<game::Vec3>(vehicle, off::kRefRotation).z;
@@ -368,7 +369,7 @@ namespace passenger
 			logger::Write("Passenger: key %s (near a vehicle an NPC flies: ride along; again: get out)", g_key ? controlmap::KeyName(g_key).c_str() : "NONE FREE");
 			if (!g_key) g_key = -1;
 		}
-		const bool down = g_key > 0 && Focused() && (GetAsyncKeyState(g_key) & 0x8000) != 0;
+		const bool down = Focused() && bindings::Held(bindings::Action::RideAlong, g_key > 0 ? g_key : 0);
 		const bool press = down && !g_keyDown;
 		const bool release = !down && g_keyDown;
 		g_keyDown = down;

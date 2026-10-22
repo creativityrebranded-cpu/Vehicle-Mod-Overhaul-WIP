@@ -78,6 +78,7 @@ namespace npcvehicles
 	// Return home: a following job's vehicle flies back to where it was taken from and parks there (false: no home known, or already there).
 	bool SendHome(std::uint32_t vehicleId);
 	int CivilJobs();                                         // jobs running a civil task now
+	int EnemyJobs();                                         // jobs of non-allied NPCs (fight boarding, pursuit) now
 	// The actor may take this vehicle: unowned, or owned by the actor or a faction it belongs to (never the player's).
 	bool MayUse(std::uintptr_t actor, std::uintptr_t vehicle);
 	// An enemy in a fight may take this vehicle (2026-10-21, the user): one its own faction (or itself) owns, or an unowned one

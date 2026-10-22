@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current version: **0.64.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current version: **0.65.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -85,13 +85,14 @@ before installing or upgrading.
 1. Install SFSE: copy `sfse_1_16_244.dll` and `sfse_loader.exe` into the Starfield folder (next to `Starfield.exe`).
 2. Copy this mod's **`Data`** folder into the Starfield folder (merge it). The plugin ends up at
    `<Starfield>\Data\SFSE\Plugins\SeamlessVehicle.dll`.
-3. Enable the two data plugins that came with it (below Parked Vehicles in your load order):
+3. Enable the data plugins that came with it (below Parked Vehicles in your load order):
    - **`SeamlessPilots.esm`** - lets NPCs walk to a vehicle and get in. **Without it, NPCs never use vehicles.**
+   - **`FlyingVehicleOverhaul - Placements.esm`** - the mod's own parked vehicles (35 in New Atlantis). Optional.
    - **`Vehicles - Real.esm`** - turns the Parked Vehicles props into real, drivable vehicles (needs Parked Vehicles).
 4. Start the game with **`sfse_loader.exe`** (Steam running).
 5. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` starts with `SeamlessVehicle ... loaded`.
 
-**Uninstall:** delete `Data\SFSE\Plugins\SeamlessVehicle.dll` (and the two `.esm` files if you like). Vehicles in your save are kept.
+**Uninstall:** delete `Data\SFSE\Plugins\SeamlessVehicle.dll` (and the `.esm` files if you like). Vehicles in your save are kept.
 
 ---
 
@@ -174,6 +175,29 @@ The HUD shows what you can do now and one status card (0.62.0). Everything uses 
 - **F7** moves and resizes everything (+ / − on the pick). The card moves with *Status* on foot and *Vehicles* in the vehicle.
 
 ---
+
+## Controls and controllers
+
+Every control of the mod is set in `Documents/My Games/Starfield/SFSE/Logs/SeamlessVehicle/bindings.ini`, written on the first
+start. Each line lists alternatives: keys, mouse buttons, controller buttons (`Pad:A`, `Pad:RT`, `Pad:LStickLeft` ...) and
+controller chords (`Pad:LB+DUp`). `default` keeps the mod's own key, and for the game's vehicle controls also the game's
+controller button. Saved changes apply while the game runs. Any XInput controller works; hover flies on RT / LT / the left stick
+by default, and the file has a commented controller layout to start from.
+
+## What's new in 0.65.0
+
+Details: [docs/RELEASE_0.65.0.md](docs/RELEASE_0.65.0.md).
+
+- **Every vehicle gets its physics (game bug fixed)**: the game sets up at most 8 vehicles that load at once and silently
+  drops the rest (its waiting list is emptied when a ninth arrives). The mod keeps its own list with no limit. Verified in game:
+  all 22 New Atlantis vehicles get physics at load, up from 6.
+- **Launch guard**: a parked vehicle whose physics starts partly in the ground or another vehicle is no longer thrown; for
+  10 s after its physics starts, big sideways or upward pushes are removed. Verified in game.
+- **Own placements are plugin references** (`FlyingVehicleOverhaul - Placements.esm`, 35 REV-8s in New Atlantis), written
+  like the Creation Kit writes them; nothing is created at run time any more.
+- **Controls toolkit** (`bindings.ini`, keys, mouse, controller buttons and chords), **combat boarding** through the game's
+  combat movement, and **exit fixes** (no more flinging a stood-up player). Not tested in game yet.
+- Known: placed REV-8s stand 0.5 m in the ground (the guard holds them; a height fix is next).
 
 ## What's new in 0.64.0
 
@@ -503,6 +527,7 @@ The plugin targets Starfield 1.16.244 (Steam) only.
 ```
 Data/SFSE/Plugins/SeamlessVehicle.dll   the built plugin
 Data/SeamlessPilots.esm                 the walk-to-vehicle quest package
+Data/FlyingVehicleOverhaul - Placements.esm  the mod's own parked vehicles (New Atlantis)
 Data/Vehicles - Real.esm                Parked Vehicles props -> real vehicles
 source/                                 the C++ source and its build (src/, tests/, third_party/sfse, tools/)
 tools/                                  integrate.sh (build + install), make_vehicles_real.py, make_pilots_esm.py

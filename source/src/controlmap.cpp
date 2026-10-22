@@ -29,6 +29,7 @@ namespace controlmap
 
 		std::mutex g_lock;
 		std::vector<Binding> g_keys;  // keyboard bindings
+		std::vector<Binding> g_pads;  // gamepad bindings (device 2), read on their own so an odd layout never costs the keyboard map
 		bool g_loaded = false;
 
 		[[maybe_unused]] std::string FixedString(std::uintptr_t s)
@@ -96,6 +97,33 @@ namespace controlmap
 			return n;
 		}
 
+		// Gamepad list of every context (device 2: +0x20 count, +0x28 entries, the keyboard / mouse lists' shape). Its own SEH read.
+		int ReadPadRaw(std::uintptr_t cm, Raw* out, int max)
+		{
+			int n = 0;
+			__try {
+				for (int i = 0; i < kContexts; ++i) {
+					const auto ctx = *reinterpret_cast<const std::uintptr_t*>(cm + 0x10 + i * 8);
+					if (!ctx) continue;
+					const auto count = *reinterpret_cast<const std::uint32_t*>(ctx + 0x20);
+					const auto data = *reinterpret_cast<const std::uintptr_t*>(ctx + 0x28);
+					for (std::uint32_t e = 0; data && e < count && e < 4096 && n < max; ++e) {
+						const auto entry = data + e * 40;
+						out[n].context = i;
+						out[n].event = FixedChars(*reinterpret_cast<const std::uintptr_t*>(entry));
+						out[n].key = *reinterpret_cast<const std::uint32_t*>(entry + 8);
+						out[n].key2 = *reinterpret_cast<const std::uint32_t*>(entry + 0xC);
+						out[n].device = 2;
+						++n;
+					}
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return -1;
+			}
+			return n;
+		}
+
 		bool Load()
 		{
 			if (g_loaded) {
@@ -115,6 +143,17 @@ namespace controlmap
 			for (int i = 0; i < n; ++i) {
 				const auto namePtr = *reinterpret_cast<const char* const*>(game::Base() + kContextNames + raw[i].context * 8);
 				g_keys.push_back({ namePtr ? namePtr : "?", raw[i].event ? raw[i].event : "", raw[i].key, raw[i].key2, raw[i].device });
+			}
+			g_pads.clear();
+			const int np = ReadPadRaw(cm, raw, 8192);
+			for (int i = 0; i < np; ++i) {
+				const auto namePtr = *reinterpret_cast<const char* const*>(game::Base() + kContextNames + raw[i].context * 8);
+				g_pads.push_back({ namePtr ? namePtr : "?", raw[i].event ? raw[i].event : "", raw[i].key, raw[i].key2, 2 });
+			}
+			{
+				static bool saidPad = false;
+				if (!saidPad) logger::Write("Control map: %s", np < 0 ? "gamepad bindings unreadable (layout differs)" : (std::to_string(np) + " gamepad bindings read").c_str());
+				saidPad = true;
 			}
 			{
 				static bool said = false;  // it is re-read every few seconds: say it once
@@ -189,6 +228,16 @@ namespace controlmap
 			}
 		}
 		return fallback;
+	}
+
+	std::uint32_t PadFor(const char* context, const char* event)
+	{
+		std::lock_guard lk(g_lock);
+		if (!Load()) return 0;
+		for (const auto& b : g_pads) {
+			if (b.context == context && b.event == event && b.key && b.key != 0xFF) return b.key;
+		}
+		return 0;
 	}
 
 	bool KeyFreeIn(int vk, const char* context)
@@ -360,7 +409,8 @@ namespace controlmap
 			}
 			std::fprintf(f, "%s\tkeyboard\t%s\t0x%02X\t%s (VK %02X)\t0x%02X\n", b.context.c_str(), b.event.c_str(), b.key, name, vk, b.key2);
 		}
+		for (const auto& b : g_pads) std::fprintf(f, "%s\tgamepad\t%s\t0x%04X\t-\t0x%04X\n", b.context.c_str(), b.event.c_str(), b.key, b.key2);
 		std::fclose(f);
-		logger::Write("Control map: %zu keyboard bindings written to controlmap.txt", g_keys.size());
+		logger::Write("Control map: %zu keyboard and %zu gamepad bindings written to controlmap.txt", g_keys.size(), g_pads.size());
 	}
 }

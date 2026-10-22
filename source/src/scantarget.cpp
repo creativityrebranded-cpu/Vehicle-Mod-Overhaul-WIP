@@ -1,4 +1,5 @@
 #include "scantarget.h"
+#include "bindings.h"
 
 #include "addresses.h"
 #include "controlmap.h"
@@ -384,8 +385,8 @@ namespace scantarget
 			}
 			if(g_retryKey<0) g_retryKey=controlmap::ClaimFirst("route","Retry trip",{VK_OEM_1,VK_F8,VK_F12});
             if(g_skipKey<0) g_skipKey=controlmap::ClaimFirst("route","Skip stop",{VK_OEM_4,VK_F9,VK_F10,'K'});
-			const bool skip=Focused() && g_skipKey && (GetAsyncKeyState(g_skipKey)&0x8000)!=0;
-			const bool retry=Focused() && g_retryKey && (GetAsyncKeyState(g_retryKey)&0x8000)!=0;
+			const bool skip=Focused() && bindings::Held(bindings::Action::SkipStop, g_skipKey);
+			const bool retry=Focused() && bindings::Held(bindings::Action::RetryTrip, g_retryKey);
             const bool available=(marker || !g_chain.empty()) && !g_routeCleared;
 			if(retry && !g_retryDown && available) vehicleflight::RetryScannerTrip();
 			else if(skip && !g_skipDown && available) {
@@ -421,8 +422,8 @@ namespace scantarget
 				panel+="\n"+std::to_string(i+1)+". "+RouteName(g_chain[i].name,"Map point");
 			}
 			if(g_chain.size()>3) panel+="\n+"+std::to_string(g_chain.size()-3)+" more stops";
-			const std::string retryKey=progress.phase==triplogic::Phase::Unreachable?(g_retryKey?controlmap::KeyName(g_retryKey):"unbound"):"";
-			const std::string skipKey=g_skipKey?controlmap::KeyName(g_skipKey):"unbound",clearKey=controlmap::KeyName(g_key);
+			const std::string retryKey=progress.phase==triplogic::Phase::Unreachable?bindings::Label(bindings::Action::RetryTrip, g_retryKey):"";
+			const std::string skipKey=bindings::Label(bindings::Action::SkipStop, g_skipKey),clearKey=bindings::Label(bindings::Action::Scanner, g_key);
 			hoverui::SetRoute(panel.c_str(),skipKey.c_str(),clearKey.c_str(),retryKey.c_str());
 		}
 
@@ -471,7 +472,7 @@ namespace scantarget
 		// on foot your vehicle guards it and defends from it, driving you fly there and hold (the route is replaced).
 		void Hold(bool driving, ULONGLONG now)
 		{
-			if (!g_pressedInScanner) { notify::Show("Aim with the scanner, then hold %s", controlmap::KeyName(g_key).c_str()); return; }
+			if (!g_pressedInScanner) { notify::Show("Aim with the scanner, then hold %s", bindings::Label(bindings::Action::Scanner, g_key).c_str()); return; }
 			const auto actor = RefById(g_pressedActor);
 			const auto pick = hoverui::ScannerPickContext();
 			logger::Write("Target selection (hold): native form %08X handle %08X actor %08X driving %d", pick.form, pick.handle, g_pressedActor, driving ? 1 : 0);
@@ -507,7 +508,7 @@ namespace scantarget
 		const bool scanner = hoverui::IsScannerOpen();
 		const bool driving = reinterpret_cast<uptr (*)(uptr)>(game::Base() + addr::kPlayerVehicle)(player) != 0;
 		const Target t = scanner ? Look(player, now, !driving && realvehicles::RecordingPlacements()) : Target{};
-		const bool held = (GetAsyncKeyState(g_key) & 0x8000) != 0;
+		const bool held = bindings::Held(bindings::Action::Scanner, g_key);
 		const bool combatFocusMode = !driving && (npcvehicles::CombatOf(player).fighting || npcvehicles::CombatFocus());
 		const bool enabled = Focused() && (combatFocusMode || scanner || driving || g_haveCurrent || !g_chain.empty() ||
 			vehicleflight::Ramming(vehicleflight::OwnRoverId()));
@@ -571,7 +572,7 @@ namespace scantarget
 		}
 	}
 
-	std::string KeyName() { ReadKey(); return controlmap::KeyName(g_key); }
+	std::string KeyName() { ReadKey(); return bindings::Label(bindings::Action::Scanner, g_key); }
 
 	void EndRide()
 	{

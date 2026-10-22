@@ -929,11 +929,13 @@ namespace realvehicles
 		constexpr float kOwnOccupied = 3.0f;      // m: a vehicle this close to a spot is standing on it
 		constexpr float kOwnPlayerClear = 20.0f;  // m: not popped in right beside the player
 		constexpr ULONGLONG kOwnSpawnGap = 500;   // ms between spawns (each loads a model; the patch's spacing)
+		constexpr const char* kPlacementsPlugin = "FlyingVehicleOverhaul - Placements.esm";
 
 		struct OwnSpot { std::uint32_t cell = 0; game::Vec3 p{}; float heading = 0; std::uint64_t key = 0, row = 0, location = 0; bool done = false, queued = false; };
 		struct Own
 		{
 			bool ready = false, active = false;
+			bool retire = false;  // the placements plugin is loaded: the vehicles spawned into saves before it are retired
 			std::vector<OwnSpot> spots;
 			std::map<std::uint64_t, std::uint32_t> spawned;  // spot key -> the vehicle it spawned
 			std::vector<std::size_t> queue;
@@ -985,9 +987,46 @@ namespace realvehicles
 				}
 				std::fclose(f);
 			}
-			g_own.active = g_patch.enabled && !g_own.spots.empty() && g_patch.pool.size() > 1;
-			logger::Write("Own placements: %s; %zu of %u spots resolved, %zu remembered vehicles%s", g_own.active ? "ON" : "off", g_own.spots.size(),
-				ownspots::kSpotCount, g_own.spawned.size(), g_patch.enabled ? "" : " ([placement] enabled=0)");
+			// The placements now ship as plugin references (FlyingVehicleOverhaul - Placements.esm, scripts/make_placements_esm.py; Carfield's
+			// way). With it loaded nothing is spawned at run time any more (runtime-created vehicles live in the save, and on the
+			// 2026-10-21 runs every vehicle there loaded frozen), and the ones spawned before are retired.
+			if (LoadedFile(kPlacementsPlugin)) {
+				g_own.active = false;
+				g_own.retire = !g_own.spawned.empty();
+				logger::Write("Own placements: %s loaded: placed by the plugin, nothing spawned at run time; %zu earlier spawned vehicles to retire",
+					kPlacementsPlugin, g_own.spawned.size());
+				return;
+			}
+			// Runtime spawning stays off (2026-10-21: every runtime-created vehicle loaded frozen and never got its physics vehicle; the
+			// placements plugin crashed the cell streaming in its first run). Earlier spawned vehicles are retired.
+			g_own.active = false;
+			g_own.retire = !g_own.spawned.empty();
+			logger::Write("Own placements: runtime spawning off (plugin not loaded); %zu earlier spawned vehicles to retire", g_own.spawned.size());
+		}
+
+		// Every 2 s while some remain: a vehicle the runtime placements spawned is disabled once it is loaded, unless someone uses it.
+		void OwnRetire()
+		{
+			if (!g_own.retire) return;
+			bool changed = false;
+			for (auto it = g_own.spawned.begin(); it != g_own.spawned.end();) {
+				const uptr r = Lookup(it->second);
+				if (!r || !Readable(r, 0xD0)) { ++it; continue; }  // not loaded (yet)
+				if (!IsVehicleBase(At<uptr>(r, 0x98))) {        // that id is something else in this save
+					it = g_own.spawned.erase(it);
+					changed = true;
+					continue;
+				}
+				if (Protected(r) || std::strcmp(StateOf(r), "parked") != 0) { ++it; continue; }  // in use: later
+				if (!(At<std::uint32_t>(r, 0x20) & 0x800)) Disable(r);
+				logger::Write("Own placements: retired runtime-spawned vehicle %08X (spot %016llX); the plugin places that spot now", it->second,
+					static_cast<unsigned long long>(it->first));
+				g.ownVehicles.erase(it->second);
+				it = g_own.spawned.erase(it);
+				changed = true;
+			}
+			if (changed) SaveOwnSpawned();
+			if (g_own.spawned.empty()) g_own.retire = false;
 		}
 
 		bool IsLiveVehicle(std::uint32_t id)
@@ -1131,6 +1170,7 @@ namespace realvehicles
 			return;
 		}
 		OwnConsider();
+		OwnRetire();
 	}
 
 	bool RecordingPlacements()
