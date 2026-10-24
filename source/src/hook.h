@@ -9,4 +9,7 @@
 namespace hook
 {
 	bool Install(std::uintptr_t target, const std::uint8_t* expected, std::size_t prologueLen, void* detour, void** original);
+	// Startup-only redirect of one E8 call. Checks the original destination and uses a near relay;
+	// the shared callee and all other call sites remain unchanged. Successful relays live until exit.
+	bool RedirectCall(std::uintptr_t site, void* expectedTarget, void* detour);
 }

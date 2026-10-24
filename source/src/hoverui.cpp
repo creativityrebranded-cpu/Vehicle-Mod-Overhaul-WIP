@@ -7,7 +7,10 @@
 #include "log.h"
 #include "notify.h"
 #include "controlmap.h"
+#include "controlspage.h"
 #include "scannercontext.h"
+#include "vehiclecamera.h"
+#include "cameraroll.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -137,7 +140,7 @@ namespace hoverui
 		enum { kW, kA, kS, kD, kGearDown, kGearUp, kHover, kGear, kButtons };
 		// Editor selections: each element (W, A, S, D, Descend, Gear, Hover, Gear box, Trip status, Target), each of the
 		// rover widget's own clips (kSelNative + i, e.g. the Exit button), then the groups.
-		enum { kSelLine = kButtons, kSelTarget, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelRoute = 90, kSelNative = 100 };
+		enum { kSelLine = kButtons, kSelTarget, kSelRows, kSelCluster, kSelColumn, kSelExtras, kSelAll, kSelRoute = 90, kSelAttitude = 91, kSelAttitudeText = 92, kSelNative = 100 };
 		constexpr int kFootEls = 8, kCarEls = 3;
 		constexpr double kBaseScale = 0.75;
 		// Each element has its own size (F7 editor: + / - on the selection; hoverui.ini "size_<name>"). 1 = the default look.
@@ -152,6 +155,8 @@ namespace hoverui
 		constexpr double kDefFoot[kFootEls][2] = { { -9.0, 45.0 }, { 165.0, 44.0 }, { -167.0, 42.0 }, { 64.0, -90.0 }, { 65.0, -175.0 }, { -29.0, -7.0 }, { -143.0, -53.0 }, { 66.0, -178.0 } };
 		constexpr double kDefCar[kCarEls][2] = { { 845.0, 8.0 }, { 1007.0, -324.0 }, { 1006.0, -261.0 } };
 		constexpr double kDefRouteX = 38.0, kDefRouteY = 160.0;
+		// VTOL instrument and its P/B readout: separate F7 elements; the readout starts where it sat above the instrument.
+		constexpr double kDefAttX = 0.0, kDefAttY = 170.0, kDefAttTextX = 0.0, kDefAttTextY = 64.0, kAttTextScale = 0.65;
 		struct Layout_t
 		{
 			std::mutex lock;
@@ -164,6 +169,8 @@ namespace hoverui
 			double fx = 1665.0, fy = 961.0;  // the scanner follow button's key box centre
 			double tx = 1701.0, ty = 908.0;  // the scanner status box's centre
 			double routeX=kDefRouteX,routeY=kDefRouteY; // route group in HUD/scanner root coordinates
+			double attitudeX=kDefAttX,attitudeY=kDefAttY,attitudeSize=1; // offset from screen centre, in HUD coordinates
+			double attitudeTextX=kDefAttTextX,attitudeTextY=kDefAttTextY,attitudeTextSize=1; // the P/B readout, same frame
 			int msel = 3;                    // scanner editor: 0 Summon, 1 Follow, 2 status, 3 all
 			// The contextual HUD (2026-10-17): the on-foot panel (Summon, Follow, Get in, status, target) in RightMeters_mc's
 			// coordinates (Summon's key centre; measured from the rover widget once), and the in-vehicle extras' offset.
@@ -237,6 +244,8 @@ namespace hoverui
 			std::snprintf(line, sizeof(line), "scanner_status = %.1f %.1f   ; the scanner's status box, centre x y\n", g_lay.tx, g_lay.ty);
 			out << line;
 			std::snprintf(line,sizeof(line),"route = %.1f %.1f\n",g_lay.routeX,g_lay.routeY);out<<line;
+			std::snprintf(line,sizeof(line),"attitude = %.1f %.1f\n",g_lay.attitudeX,g_lay.attitudeY);out<<line;
+			std::snprintf(line,sizeof(line),"attitude_text = %.1f %.1f\n",g_lay.attitudeTextX,g_lay.attitudeTextY);out<<line;
 			std::snprintf(line,sizeof(line),"rides = %d   ; vehicle boardings seen (the basic controls show for the first %d)\n",g_rides.load(),kTeachRides);out<<line;
 			std::snprintf(line,sizeof(line),"show_all = %d   ; every hint and panel shown (the hints key toggles it)\n",g_showAll.load()?1:0);out<<line;
 			// Sizes (F7 editor: + / - on the selection), 1 = default.
@@ -245,6 +254,8 @@ namespace hoverui
 			for(int i=0;i<kFootEls;++i)size((std::string("foot_")+kFootNames[i]).c_str(),g_lay.footSize[i]);
 			for(int i=0;i<kCarEls;++i)size(kCarNames[i],g_lay.carSize[i]);
 			size("route",g_lay.routeSize);
+			size("attitude",g_lay.attitudeSize);
+			size("attitude_text",g_lay.attitudeTextSize);
 			if (g_lay.haveFoot) {
 				std::snprintf(line, sizeof(line), "foot = %.1f %.1f   ; on-foot panel: Summon's key centre x y\n", g_lay.fpx, g_lay.fpy);
 				out << line;
@@ -271,6 +282,7 @@ namespace hoverui
 			std::string line;
 			double row[5][2] = {};
 			int rows = 0;
+			bool haveAttText = false;
 			while (std::getline(in, line)) {
 				double a = 0, b = 0, c = 0;
 				int above = 0, i = -1;
@@ -282,6 +294,8 @@ namespace hoverui
 					g_lay.colRight = a; g_lay.colTop = b; g_lay.colStep = c; g_lay.haveColumn = true;
 				}
 				else if (std::sscanf(line.c_str(),"route = %lf %lf",&a,&b)==2) {g_lay.routeX=a;g_lay.routeY=b;}
+				else if (std::sscanf(line.c_str(),"attitude = %lf %lf",&a,&b)==2 && std::isfinite(a) && std::isfinite(b)) {g_lay.attitudeX=a;g_lay.attitudeY=b;}
+				else if (std::sscanf(line.c_str(),"attitude_text = %lf %lf",&a,&b)==2 && std::isfinite(a) && std::isfinite(b)) {g_lay.attitudeTextX=a;g_lay.attitudeTextY=b;haveAttText=true;}
 				else if (std::sscanf(line.c_str(),"rides = %d",&i)==1) g_rides=std::max(0,i);
 				else if (std::sscanf(line.c_str(),"show_all = %d",&i)==1) g_showAll=i!=0;
 				else if (line.rfind("size_",0)==0) {
@@ -292,6 +306,8 @@ namespace hoverui
 						for(int k=0;k<kFootEls;++k)if(n==std::string("foot_")+kFootNames[k])g_lay.footSize[k]=a;
 						for(int k=0;k<kCarEls;++k)if(n==kCarNames[k])g_lay.carSize[k]=a;
 						if(n=="route")g_lay.routeSize=a;
+						if(n=="attitude")g_lay.attitudeSize=a;
+						if(n=="attitude_text")g_lay.attitudeTextSize=a;
 					}
 				}
 				else if (line.rfind("nudge_", 0) == 0) {
@@ -346,6 +362,11 @@ namespace hoverui
 				g_lay.haveColumn = false;
 			}
 			if (g_lay.oldRows) g_lay.haveColumn = false;
+			if (!haveAttText) {
+				// Before the split the readout rode inside the instrument at (0, -106), 0.65 of its size: keep it there.
+				g_lay.attitudeTextX=g_lay.attitudeX; g_lay.attitudeTextY=g_lay.attitudeY-106.0*g_lay.attitudeSize;
+				g_lay.attitudeTextSize=g_lay.attitudeSize;
+			}
 			logger::Write("Hover UI: layout read (cluster %d, column %d, gear box %d, earlier rows %d)", g_lay.haveCluster, g_lay.haveColumn, g_lay.haveGearBox,
 				g_lay.oldRows);
 		}
@@ -412,6 +433,7 @@ namespace hoverui
 		ULONGLONG g_lastReport = 0;
 
 		void DropExtras(bool release);
+		void DropAttitude(bool release);
 		void Drop(bool release)
 		{
 			for (int i = 0; i < kButtons; ++i) {
@@ -439,6 +461,7 @@ namespace hoverui
 			if (release) Release(g_ui.widget);
 			g_ui.widget = Value{};
 			DropExtras(release);
+			DropAttitude(release);
 			g_ui.gearShown = -1;
 			g_ui.hoverTint = -1;
 			g_ui.built = false;
@@ -448,7 +471,7 @@ namespace hoverui
 		{
 			if (std::strcmp(g_ui.text[i], label) == 0 && IsObject(g_ui.data[i])) return true;
 			Value ued;
-			const Value uedArgs[1] = { Str(i==kGear||i==kGearDown||i==kGearUp?"":kEvents[i]) };
+			const Value uedArgs[1] = { Str(i==kGear||i==kGearDown||i==kGearUp||i==kHover?"":kEvents[i]) };
 			if (!CreateObject(g_ui.movie, &ued, "Shared.Components.ButtonControls.ButtonData.UserEventData", uedArgs, 1)) {
 				logger::Write("Hover UI: could not create UserEventData (%s)", kEvents[i]);
 				return false;
@@ -627,12 +650,13 @@ namespace hoverui
 			SetButton(kD, "Right");
 			// One Alt button (2026-10-21 UI review: "Descend (hold)" and "Gear (tap)" were two buttons with one key).
 			SetButton(kGearDown, "Tap: gear  Hold: descend");
-			SetButton(kHover, hovering ? "Land (double tap)" : "Hover (double tap)");
+			// The hover key (2026-10-24: the hover toggle only; the vertical boost double tap is gone), shown in its key box.
+			SetButton(kHover, hovering ? "Land" : "Hover");
 			TintHover(hovering);
 			if (std::strcmp(g_ui.text[kGear], " ") != 0) g_ui.gearShown = -1;  // new data: its key text is the key again
 			SetButton(kGear, " ");
-			for(const int i:{kGearDown}){Value pc,inst;
-				if(GetMember(g_ui.buttons[i],"PCButton_mc",&pc)&&GetMember(pc,"ButtonInstance_mc",&inst)){SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));const Value args[]={Str("Alt")};Invoke(inst,"SetText",args,1);}
+			for(const int i:{kGearDown,kHover}){Value pc,inst;
+				if(GetMember(g_ui.buttons[i],"PCButton_mc",&pc)&&GetMember(pc,"ButtonInstance_mc",&inst)){SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));const auto key=i==kHover?bindings::Label(bindings::Action::HoverToggle):bindings::Label(bindings::Action::Gear,VK_MENU);const Value args[]={Str(key.c_str())};Invoke(inst,"SetText",args,1);}
 				Release(inst);Release(pc);
 			} // no label: "GEAR n" is all inside the key box
 			// The basic controls: the first rides and 10 s after getting in, then hidden (the hints key or F7 shows them).
@@ -857,6 +881,7 @@ namespace hoverui
 		}
 
 		void RenderRoute(uptr menu, uptr movie, bool scanner);
+		void RenderAttitude(uptr menu, uptr movie);
 
 		void Work(uptr menu)
 		{
@@ -881,6 +906,7 @@ namespace hoverui
 				}
 				if (!movie || g_ui.failed) return;
 				RenderRoute(menu, movie, false);
+				RenderAttitude(menu, movie);
 				WorkExtras(menu, movie);
 				if (!g_ui.built && !(g_inVehicle.load() && Build(menu))) {
 					if (g_inVehicle.load()) g_ui.failed = !g_ui.built;
@@ -945,14 +971,13 @@ namespace hoverui
 
 		bool ScannerOpen() { return GetTickCount64() - g_monoSeen.load() < 300; }
 
-		// ---- The game's settings menu: a "Flying Vehicle Overhaul" category (2026-10-21, the user: the mod's features as
-		// toggles in the game's settings menu; notes/SETTINGS_MENU_RESEARCH_20261021.md) ----
+		// Vehicle settings and controls inside Gameplay Options (2026-10-22).
 		// pausemenu.swf / mainmenu.swf: root.SettingsPanel_mc (Shared.Components.SystemPanels.SettingsPanel) fills
 		// CategoryPanel_mc.CategoryList_mc from the data model SettingsCategoriesData and OptionsPanel_mc.OptionsList_mc from
-		// SettingsData.aGeneralSettingsList, showing the options whose uCategory is the open category. Ours: one more category
-		// entry, and our checkboxes added to a copy of the game's option array (InitializeEntries, public). The data model is
+		// Gameplay uses PEOPanel_mc.OptionsList_mc and PEOData.aGeneralSettingsList.
+		// Our rows join the live gameplay entries; no extra category is added. The data model is
 		// reached through public members only: root.loaderInfo.applicationDomain.getDefinition("Shared.AS3.Data.BSUIDataManager")
-		// .GetDataFromClient("SettingsData").data. The panel sends SettingsPanel_CheckBoxChanged / _OpenCategory /
+		// .GetDataFromClient("PEOData").data. The panel sends SettingsPanel_CheckBoxChanged / _OpenCategory /
 		// _ResetToDefaults to the game through AutoRegisterEvent<TUIEventDispatcher<...>> (vtable slot 1 (this, GFx::Value*
 		// event), FUN_14152DF90 / 14152D810 / 14152DD10); ours are handled here and never reach the game.
 		constexpr std::uint32_t kRvaPauseVtbl = 0x04C909A8, kRvaPauseMessage = 0x01669060;  // PauseMenu (RTTI .?AVPauseMenu@@), slot 8
@@ -961,16 +986,23 @@ namespace hoverui
 		constexpr std::uint32_t kRvaOpenDisp = 0x04C6F040, kRvaOpenFn = 0x0152D810;
 		constexpr std::uint32_t kRvaResetDisp = 0x04C6F080, kRvaResetFn = 0x0152DD10;
 		constexpr int kSlotDispatch = 1;
-		constexpr unsigned kCategoryId = 900;                // far above the game's categories (0..8)
+		constexpr unsigned kCategoryId = 0;                  // SettingsPanel.PEO_CATEGORY = Gameplay Options
+		constexpr unsigned kOldCategoryId = 900;
 		constexpr unsigned kSettingBase = 0x46560000;        // "FV": our option ids
+		constexpr unsigned kControlBase = kSettingBase + 0x100;
+		constexpr unsigned kRestoreControls = kControlBase + unsigned(bindings::Action::Count);
+		constexpr unsigned kFeatureHeader = kSettingBase + 0x200, kControlsHeader = kFeatureHeader + 1;
+		constexpr std::uint32_t kRvaLinkDisp = 0x04C6F0C0, kRvaLinkFn = 0x0152CE10;
 		constexpr int kCheckBox = 3;                          // SettingsOptionListEntry.SDT_CHECKBOX
 		constexpr const char* kCategoryName = "Flying Vehicle Overhaul";
 		using Dispatch_t = void (*)(void*, Value*);
 		Message_t g_pauseOriginal = nullptr, g_mainOriginal = nullptr;
-		Dispatch_t g_checkOriginal = nullptr, g_openOriginal = nullptr, g_resetOriginal = nullptr;
+		Dispatch_t g_checkOriginal = nullptr, g_openOriginal = nullptr, g_resetOriginal = nullptr, g_linkOriginal = nullptr;
+		bool g_controlsAvailable = false;
 		std::atomic<uptr> g_setMenu{ 0 }, g_setMovie{ 0 };
 		std::atomic<bool> g_setDirty{ false };  // our options need their values again (reset to defaults)
-		struct SetState { uptr movie = 0; bool failed = false, catLogged = false, optLogged = false, noPanelLogged = false; } g_set;
+		struct SetState { uptr movie = 0; bool failed = false, catLogged = false, optLogged = false, noPanelLogged = false, captureUI=false; unsigned bindingGeneration=0, featureGeneration=0;
+			bool ctlVisible=false, ctlLogged=false, ctlSampled=false; unsigned ctlGeneration=0; } g_set;
 
 		std::uint64_t PauseMessageDetour(uptr menu, void* msg)
 		{
@@ -1016,10 +1048,33 @@ namespace hoverui
 			Release(a);
 		}
 
-		// Our checkboxes, as the panel's option entries (SettingsOptionListEntry.SetEntryText reads every one of these).
+		bool OurSetting(double id)
+		{
+			return (id>=kSettingBase&&id<kSettingBase+unsigned(features::Id::Count)) ||
+				(id>=kControlBase&&id<=kRestoreControls) || id==kFeatureHeader || id==kControlsHeader;
+		}
+		void NeutralPeoData(uptr movie,const Value& entry)
+		{
+			Value data;if(NewObject(movie,&data,"Object")){
+				SetEmptyArray(movie,data,"aDescriptions");SetEmptyArray(movie,data,"aRewards");
+				SetMember(entry,"peoData",Arg(data));
+			}Release(data);
+		}
+		void TextOption(uptr movie,const Value& list,unsigned id,int type,const char* label,const char* description,bool enabled=true)
+		{
+			Value entry;if(NewObject(movie,&entry,"Object")){
+				SetMember(entry,"uID",Num(id));SetMember(entry,"uType",Num(type));SetMember(entry,"uCategory",Num(kCategoryId));
+				SetMember(entry,"sText",Str(label));SetMember(entry,"sDescription",Str(description));SetMember(entry,"sPreview",Str(""));
+				SetMember(entry,"bEnabled",Bool(enabled));SetMember(entry,"bSubSetting",Bool(false));SetMember(entry,"bIsPEO",Bool(false));
+				Value stepper;if(NewObject(movie,&stepper,"Object")){SetEmptyArray(movie,stepper,"aStepperOptions");SetMember(stepper,"uIndex",Num(0));SetMember(entry,"stepperData",Arg(stepper));}Release(stepper);
+				NeutralPeoData(movie,entry);const Value push[]={Arg(entry)};Invoke(list,"push",push,1);
+			}Release(entry);
+		}
+		// Gameplay uses PEOPanel / PEOData, not the general OptionsPanel / SettingsData.
 		bool OurOptions(uptr movie, Value* out)
 		{
 			if (!NewObject(movie, out, "Array")) return false;
+			TextOption(movie,*out,kFeatureHeader,5,kCategoryName,"Vehicle gameplay and display settings.",false);
 			for (int i = 0; i < int(features::Id::Count); ++i) {
 				const auto& f = features::InfoOf(features::Id(i));
 				Value e;
@@ -1033,6 +1088,7 @@ namespace hoverui
 				SetMember(e, "bEnabled", Bool(true));
 				SetMember(e, "bSubSetting", Bool(false));
 				SetMember(e, "bIsPEO", Bool(false));
+				NeutralPeoData(movie,e);
 				SetChild(movie, e, "checkBoxData", { { "bChecked", Bool(features::On(f.id)) }, { "bOnCustomText", Str("") }, { "bOffCustomText", Str("") } });
 				SetChild(movie, e, "sliderData", { { "fValue", Num(0) }, { "sDisplayValue", Str("") } });
 				{
@@ -1048,6 +1104,17 @@ namespace hoverui
 				Invoke(*out, "push", push, 1);
 				Release(e);
 			}
+			// The controls live on the game's Controls page when its hooks are in (controlspage.h); these rows are the fallback.
+			if(g_controlsAvailable&&!controlspage::Installed()){
+				TextOption(movie,*out,kControlsHeader,5,"Vehicle controls","Select an action, then press its new key or controller button.",false);
+				for(int i=0;i<int(bindings::Action::Count);++i){
+					const auto action=bindings::Action(i);
+					const auto label=std::string(bindings::ActionName(action))+": "+bindings::MenuLabel(action);
+					const auto help=std::string(bindings::ActionDescription(action))+"\nSelect, release the select input, then press a key or mouse button. For a controller chord, hold the first button and press the second; release a single button to bind it. Esc cancels. Backspace restores this action's defaults. Delete clears this action. Remapping one device preserves the other.";
+					TextOption(movie,*out,kControlBase+unsigned(i),4,label.c_str(),help.c_str());
+				}
+				TextOption(movie,*out,kRestoreControls,4,"Restore vehicle controls to defaults","Restores all vehicle controls to their default bindings.");
+			}
 			return true;
 		}
 
@@ -1056,12 +1123,165 @@ namespace hoverui
 		{
 			Value li, domain, cls, provider, data;
 			const Value name[1] = { Str("Shared.AS3.Data.BSUIDataManager") };
-			const Value model[1] = { Str("SettingsData") };
+			const Value model[1] = { Str("PEOData") };
 			const bool ok = GetMember(root, "loaderInfo", &li) && IsObject(li) && GetMember(li, "applicationDomain", &domain) && IsObject(domain) &&
 				InvokeR(domain, "getDefinition", name, 1, &cls) && IsObject(cls) && InvokeR(cls, "GetDataFromClient", model, 1, &provider) && IsObject(provider) &&
 				GetMember(provider, "data", &data) && IsObject(data) && GetMember(data, "aGeneralSettingsList", out) && IsObject(*out);
 			Release(data); Release(provider); Release(cls); Release(domain); Release(li);
 			return ok;
+		}
+
+		// A GFx string value's text (managed strings hold a pointer to the text pointer).
+		std::string StringOf(const Value& v)
+		{
+			if ((v.type & 0x8F) != kString) return {};
+			const char* p = (v.type & kManaged) ? *reinterpret_cast<const char* const*>(v.string) : v.string;
+			return p ? p : "";
+		}
+		// row.<binding>.<array>.join("|") split: the names a row shows for one slot.
+		std::vector<std::string> SlotNames(const Value& row, const char* binding, const char* array)
+		{
+			std::vector<std::string> out;
+			Value b, a, joined;
+			const Value sep[] = { Str("|") };
+			if (GetMember(row, binding, &b) && IsObject(b) && GetMember(b, array, &a) && IsObject(a) && InvokeR(a, "join", sep, 1, &joined)) {
+				const auto text = StringOf(joined);
+				for (std::size_t at = 0; !text.empty();) {
+					const auto bar = text.find('|', at);
+					out.push_back(text.substr(at, bar == std::string::npos ? std::string::npos : bar - at));
+					if (bar == std::string::npos) break;
+					at = bar + 1;
+				}
+			}
+			Release(joined); Release(a); Release(b);
+			return out;
+		}
+		void PushStrings(uptr movie, const Value& o, const char* name, const std::vector<std::string>& items)
+		{
+			Value a;
+			if (NewObject(movie, &a, "Array")) {
+				for (const auto& t : items) { const Value push[] = { Str(t.c_str()) }; Invoke(a, "push", push, 1); }
+				SetMember(o, name, Arg(a));
+			}
+			Release(a);
+		}
+
+		// The mod's controls under their own header on the game's Controls page (controlspage.h). The rows show the game's own
+		// names for keys and buttons, learnt from its rows (their control-map binding -> what they show); our labels otherwise.
+		struct NativeNames { std::map<int, std::string> keys; std::map<std::uint32_t, std::string> pads; };
+		std::string NameOf(const NativeNames& n, const bindlogic::Input& in)
+		{
+			if (in.vk) { const auto it = n.keys.find(in.vk); return it != n.keys.end() ? it->second : bindlogic::KeyLabel(in.vk); }
+			const auto it = n.pads.find(in.pad);
+			return it != n.pads.end() ? it->second : bindings::PadName(in.pad);
+		}
+		// action < 0: the header (divider) row.
+		void OurControlRow(uptr movie, const Value& list, const NativeNames& names, int action, bool pad, double category, double sort)
+		{
+			Value e;
+			if (!NewObject(movie, &e, "Object")) return;
+			const bool divider = action < 0;
+			SetMember(e, "sInputName", Str(divider ? "" : bindings::EventName(bindings::Action(action))));
+			SetMember(e, "sContextName", Str(controlspage::kContextName));
+			SetMember(e, "uContextID", Num(controlspage::kContextId));
+			SetMember(e, "uCategory", Num(category));
+			SetMember(e, "uSortIndex", Num(sort));
+			SetMember(e, "bIsDivider", Bool(divider));
+			SetMember(e, "bRequired", Bool(false));
+			SetMember(e, "bGamepadEntry", Bool(pad));
+			SetMember(e, "bReadOnly", Bool(divider));
+			const auto slots = divider ? std::vector<bindlogic::Input>{} : bindings::Slots(bindings::Action(action), pad);
+			for (int s = 0; s < 2; ++s) {
+				Value b;
+				if (!NewObject(movie, &b, "Object")) continue;
+				std::vector<std::string> shown;
+				if (std::size_t(s) < slots.size()) {
+					const auto& in = slots[std::size_t(s)];
+					if (in.mod) shown.push_back(NameOf(names, { 0, in.mod, 0 }));
+					shown.push_back(NameOf(names, in));
+				}
+				PushStrings(movie, b, "aButtonName", pad ? shown : std::vector<std::string>{});
+				PushStrings(movie, b, "aPCKeyName", pad ? std::vector<std::string>{} : shown);
+				SetMember(e, s ? "AltBinding" : "MainBinding", Arg(b));
+				Release(b);
+			}
+			const Value push[] = { Arg(e) };
+			Invoke(list, "push", push, 1);
+			Release(e);
+		}
+		std::string JoinNames(const std::vector<std::string>& v) { std::string t; for (const auto& x : v) { if (!t.empty()) t += ","; t += x; } return t; }
+		void ControlsPageWork(uptr movie, const Value& panel)
+		{
+			Value cp, list;
+			bool shown = false;
+			const bool ok = controlspage::Installed() && GetMember(panel, "ControlsPanel_mc", &cp) && IsObject(cp) && GetBoolMember(cp, "visible", shown) && shown &&
+				GetMember(cp, "ControlsList_mc", &list) && IsObject(list);
+			g_set.ctlVisible = ok;
+			double count = 0;
+			if (ok) GetNumber(list, "entryCount", count);
+			Value all;
+			if (ok && count > 0 && NewObject(movie, &all, "Array")) {
+				bool haveOurs = false, anyPad = false, anyKbm = false;
+				double category = 0, sort = 0;
+				NativeNames names;
+				for (int i = 0; i < int(count); ++i) {
+					Value e;
+					const Value at[] = { Num(i) };
+					if (InvokeR(list, "GetDataForEntry", at, 1, &e) && IsObject(e)) {
+						const auto ctx = GetString(e, "sContextName"), ev = GetString(e, "sInputName");
+						if (ctx == controlspage::kContextName) haveOurs = true;
+						else {
+							bool gp = false, div = false;
+							GetBoolMember(e, "bGamepadEntry", gp);
+							GetBoolMember(e, "bIsDivider", div);
+							(gp ? anyPad : anyKbm) = true;
+							double c = 0, so = 0;
+							if (!div && GetNumber(e, "uCategory", c)) category = c;
+							if (GetNumber(e, "uSortIndex", so)) sort = std::max(sort, so);
+							const auto mainNames = SlotNames(e, "MainBinding", gp ? "aButtonName" : "aPCKeyName");
+							if (!div && mainNames.size() == 1 && !mainNames[0].empty()) {
+								if (gp) { if (const auto bit = bindlogic::GamePadBit(controlmap::PadFor(ctx.c_str(), ev.c_str()))) names.pads.emplace(bit, mainNames[0]); }
+								else if (const int vk = controlmap::KeyFor(ctx.c_str(), ev.c_str(), 0)) names.keys.emplace(vk, mainNames[0]);
+							}
+							// Evidence for the first test: what the game's dividers and first rows hold.
+							if (!g_set.ctlSampled && (div || i < 3)) {
+								double id = 0;
+								bool req = false, ro = false;
+								GetNumber(e, "uContextID", id);
+								GetBoolMember(e, "bRequired", req);
+								GetBoolMember(e, "bReadOnly", ro);
+								logger::Write("Controls page: native row %d: divider %d pad %d ctx '%s' (0x%X) event '%s' cat %.0f sort %.0f req %d ro %d main [%s|%s] alt [%s|%s]", i, div, gp,
+									ctx.c_str(), unsigned(id), ev.c_str(), c, so, req, ro, JoinNames(SlotNames(e, "MainBinding", "aPCKeyName")).c_str(),
+									JoinNames(SlotNames(e, "MainBinding", "aButtonName")).c_str(), JoinNames(SlotNames(e, "AltBinding", "aPCKeyName")).c_str(),
+									JoinNames(SlotNames(e, "AltBinding", "aButtonName")).c_str());
+							}
+							const Value push[] = { Arg(e) };
+							Invoke(all, "push", push, 1);
+						}
+					}
+					Release(e);
+				}
+				if (!g_set.ctlSampled) {
+					g_set.ctlSampled = true;
+					logger::Write("Controls page: %d native rows (keyboard %d, controller %d); learnt %zu key and %zu button names", int(count), anyKbm, anyPad, names.keys.size(), names.pads.size());
+				}
+				if (!haveOurs || g_set.ctlGeneration != bindings::Generation()) {
+					int k = 0;
+					for (const bool pad : { false, true }) {
+						if (pad ? !anyPad : !anyKbm) continue;
+						OurControlRow(movie, all, names, -1, pad, category, sort + ++k);
+						for (int a = 0; a < int(bindings::Action::Count); ++a) OurControlRow(movie, all, names, a, pad, category, sort + ++k);
+					}
+					double selection = 0;
+					GetNumber(list, "selectedIndex", selection);
+					const Value init[] = { Arg(all) };
+					Invoke(list, "InitializeEntries", init, 1);
+					SetMember(list, "selectedIndex", Num(std::max(0.0, selection)));
+					g_set.ctlGeneration = bindings::Generation();
+					if (!g_set.ctlLogged) { g_set.ctlLogged = true; logger::Write("Hover UI: settings: vehicle controls added to the Controls page under %s", controlspage::kContextName); }
+				}
+			}
+			Release(all); Release(list); Release(cp);
 		}
 
 		void SettingsWorkBody(uptr menu, uptr movie)
@@ -1071,73 +1291,81 @@ namespace hoverui
 			const Value& root = *reinterpret_cast<const Value*>(menu + 0x58);
 			if (!IsObject(root)) return;
 			Value panel, catPanel, catList, optPanel, optList;
-			bool visible = false;
-			if (!GetMember(root, "SettingsPanel_mc", &panel) || !IsObject(panel)) {
-				if (!g_set.noPanelLogged) { g_set.noPanelLogged = true; logger::Write("Hover UI: settings: no SettingsPanel_mc in this menu"); }
-				Release(panel);
-				return;
-			}
-			if (GetBoolMember(panel, "visible", visible) && visible && GetMember(panel, "CategoryPanel_mc", &catPanel) && IsObject(catPanel) &&
-				GetMember(catPanel, "CategoryList_mc", &catList) && IsObject(catList) && GetMember(panel, "OptionsPanel_mc", &optPanel) && IsObject(optPanel) &&
-				GetMember(optPanel, "OptionsList_mc", &optList) && IsObject(optList)) {
-				// 1. The category: added after the game's (the list is unfiltered, so its entries are all the categories).
-				double count = 0, lastId = -1;
-				if (GetNumber(catList, "entryCount", count) && count >= 1) {
-					Value last;
-					const Value at[1] = { Num(count - 1) };
-					if (InvokeR(catList, "GetDataForEntry", at, 1, &last) && IsObject(last)) GetNumber(last, "uID", lastId);
-					Release(last);
-					if (unsigned(lastId) != kCategoryId) {
-						Value cats, cat;
-						if (NewObject(movie, &cats, "Array") && NewObject(movie, &cat, "Object")) {
-							for (int i = 0; i < int(count); ++i) {
-								Value e;
-								const Value idx[1] = { Num(i) };
-								if (InvokeR(catList, "GetDataForEntry", idx, 1, &e) && IsObject(e)) {
-									const Value push[1] = { Arg(e) };
-									Invoke(cats, "push", push, 1);
-								}
-								Release(e);
-							}
-							SetMember(cat, "uID", Num(kCategoryId));
-							SetMember(cat, "sText", Str(kCategoryName));
-							SetMember(cat, "bDisabled", Bool(false));
-							SetMember(cat, "bShowSpinner", Bool(false));
-							const Value push[1] = { Arg(cat) };
-							Invoke(cats, "push", push, 1);
-							const Value init[1] = { Arg(cats) };
-							Invoke(catList, "InitializeEntries", init, 1);
-							if (!g_set.catLogged) { g_set.catLogged = true; logger::Write("Hover UI: settings: category \"%s\" added after %d of the game's", kCategoryName, int(count)); }
-						}
-						Release(cat); Release(cats);
+			bool visible = false, gameplayVisible = false;
+			if (!GetMember(root,"SettingsPanel_mc",&panel)||!IsObject(panel)) {Release(panel);bindings::CancelCapture();return;}
+			const bool ready=GetBoolMember(panel,"visible",visible)&&visible&&
+				GetMember(panel,"CategoryPanel_mc",&catPanel)&&IsObject(catPanel)&&
+				GetMember(catPanel,"CategoryList_mc",&catList)&&IsObject(catList)&&
+				GetMember(panel,"PEOPanel_mc",&optPanel)&&IsObject(optPanel)&&
+				GetMember(optPanel,"OptionsList_mc",&optList)&&IsObject(optList);
+			if(ready){
+				// Remove only our obsolete category; retain every game/other-mod entry.
+				if(!g_set.catLogged){
+				double count=0;GetNumber(catList,"entryCount",count);
+				bool oldCategory=false;Value categories;
+				if(NewObject(movie,&categories,"Array")){
+					for(int i=0;i<int(count);++i){
+						Value entry;const Value at[]={Num(i)};double id=-1;
+						if(InvokeR(catList,"GetDataForEntry",at,1,&entry)&&IsObject(entry)){
+							GetNumber(entry,"uID",id);
+							if(id==kOldCategoryId)oldCategory=true;
+							else {const Value push[]={Arg(entry)};Invoke(categories,"push",push,1);}
+						}Release(entry);
 					}
+					if(oldCategory){const Value init[]={Arg(categories)};Invoke(catList,"InitializeEntries",init,1);}
+				}Release(categories);g_set.catLogged=true;
 				}
-				// 2. Our options: while our category is the open one and they are missing (the panel filters the list by category).
-				Value sel;
-				double selId = -1, shown = 0;
-				if (GetMember(catList, "selectedEntry", &sel) && IsObject(sel)) GetNumber(sel, "uID", selId);
-				Release(sel);
-				GetNumber(optList, "entryCount", shown);
-				const bool dirty = g_setDirty.exchange(false);
-				if (unsigned(selId) == kCategoryId && (shown < 1 || dirty)) {
-					Value game, ours, all;
-					const bool haveGame = GameOptions(root, &game);
-					if (OurOptions(movie, &ours)) {
-						const Value with[1] = { Arg(ours) };
-						const bool joined = haveGame && InvokeR(game, "concat", with, 1, &all) && IsObject(all);
-						const Value init[1] = { Arg(joined ? all : ours) };
-						Invoke(optList, "InitializeEntries", init, 1);
-						double index = -1;
-						if (GetNumber(optList, "selectedIndex", index) && index < 0) SetMember(optList, "selectedIndex", Num(0));
-						if (!g_set.optLogged) {
-							g_set.optLogged = true;
-							logger::Write("Hover UI: settings: %d options shown (%s)", int(features::Id::Count), joined ? "with the game's own" : "the game's own list not found");
+				Value selected;double selectedId=-1;
+				if(GetMember(catList,"selectedEntry",&selected)&&IsObject(selected))GetNumber(selected,"uID",selectedId);
+				Release(selected);
+				GetBoolMember(optPanel,"visible",gameplayVisible);
+				gameplayVisible=gameplayVisible&&selectedId==kCategoryId;
+			}
+			if(!gameplayVisible)bindings::CancelCapture();
+			else {
+				bindings::CaptureTick();
+				bool capture=bindings::Capturing();
+				if(capture!=g_set.captureUI){SetMember(panel,"remappingControl",Bool(capture));g_set.captureUI=capture;}
+				double count=0;GetNumber(optList,"entryCount",count);
+				bool haveOurs=false;
+				for(int i=0;i<int(count);++i){Value entry;const Value at[]={Num(i)};double id=-1;
+					if(InvokeR(optList,"GetDataForEntry",at,1,&entry)&&IsObject(entry))GetNumber(entry,"uID",id);
+					haveOurs=haveOurs||id==kFeatureHeader;Release(entry);
+				}
+				const auto bindingGeneration=bindings::Generation(), featureGeneration=features::Generation();
+				const bool dirty=g_setDirty.exchange(false)||g_set.bindingGeneration!=bindingGeneration||g_set.featureGeneration!=featureGeneration;
+				if(!haveOurs||dirty){
+					Value all,ours;
+					if(NewObject(movie,&all,"Array")&&OurOptions(movie,&ours)){
+						// Copy the live list so entries injected by other mods survive.
+						for(int i=0;i<int(count);++i){Value entry;const Value at[]={Num(i)};double id=-1;
+							if(InvokeR(optList,"GetDataForEntry",at,1,&entry)&&IsObject(entry)){
+								GetNumber(entry,"uID",id);if(!OurSetting(id)){const Value push[]={Arg(entry)};Invoke(all,"push",push,1);}
+							}Release(entry);
 						}
-					}
-					Release(all); Release(ours); Release(game);
+						// If the native provider has not arrived yet, wait for it; never
+						// replace the gameplay screen with only the mod's options.
+						Value native;
+						bool haveNative=count>0;
+						if(!haveNative&&GameOptions(root,&native)){double nativeCount=0;haveNative=GetNumber(native,"length",nativeCount)&&nativeCount>0;}
+						if(haveNative){
+							const Value append[]={Arg(ours)};Value merged;
+							if(InvokeR(count==0&&IsObject(native)?native:all,"concat",append,1,&merged)&&IsObject(merged)){
+								double selection=0;GetNumber(optList,"selectedIndex",selection);
+								const Value init[]={Arg(merged)};Invoke(optList,"InitializeEntries",init,1);
+								SetMember(optList,"selectedIndex",Num(std::max(0.0,selection)));
+								g_set.bindingGeneration=bindings::Generation();g_set.featureGeneration=featureGeneration;
+								if(!g_set.optLogged){g_set.optLogged=true;logger::Write("Hover UI: settings: vehicle options added inside Gameplay Options; controls %s",g_controlsAvailable?"on":"off (link hook unavailable)");}
+							}Release(merged);
+						}Release(native);
+					}Release(ours);Release(all);
 				}
 			}
-			Release(optList); Release(optPanel); Release(catList); Release(catPanel); Release(panel);
+			if (visible) ControlsPageWork(movie, panel);
+			else g_set.ctlVisible = false;
+			// Release a capture modal even when Back / menu closure changed panels.
+			if(!gameplayVisible&&g_set.captureUI){SetMember(panel,"remappingControl",Bool(false));g_set.captureUI=false;}
+			Release(optList);Release(optPanel);Release(catList);Release(catPanel);Release(panel);
 		}
 
 		void SettingsWork(uptr menu, uptr movie)
@@ -1147,16 +1375,20 @@ namespace hoverui
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				g_set.failed = true;
+				bindings::CancelCapture();
 				logger::Write("Hover UI: exception 0x%08lX in the settings menu; the %s category is off until the menu opens again", GetExceptionCode(), kCategoryName);
 			}
 		}
 
+		// The dispatchers' argument is a BSGFxObject (vtable, then the event's GFx value at +8; FUN_142547820 reads it so),
+		// not a bare value: reading it as one found no "params" and every one of our settings events fell through (2026-10-23).
+		const Value& EventValue(Value* ev) { return *reinterpret_cast<const Value*>(reinterpret_cast<const char*>(ev) + 8); }
 		// The event's params.<name> as a number; false when it has none.
 		bool EventNumber(Value* ev, const char* name, double& out)
 		{
 			__try {
 				Value params;
-				const bool ok = ev && IsObject(*ev) && GetMember(*ev, "params", &params) && IsObject(params) && GetNumber(params, name, out);
+				const bool ok = ev && IsObject(EventValue(ev)) && GetMember(EventValue(ev), "params", &params) && IsObject(params) && GetNumber(params, name, out);
 				Release(params);
 				return ok;
 			}
@@ -1169,7 +1401,7 @@ namespace hoverui
 		{
 			__try {
 				Value params;
-				const bool ok = ev && IsObject(*ev) && GetMember(*ev, "params", &params) && IsObject(params) && GetBoolMember(params, name, out);
+				const bool ok = ev && IsObject(EventValue(ev)) && GetMember(EventValue(ev), "params", &params) && IsObject(params) && GetBoolMember(params, name, out);
 				Release(params);
 				return ok;
 			}
@@ -1185,8 +1417,8 @@ namespace hoverui
 			if (!seen.exchange(true)) logger::Write("Hover UI: settings: first checkbox event (setting %.0f)", EventNumber(ev, "uSettingID", id) ? id : -1.0);
 			if (EventNumber(ev, "uSettingID", id) && id >= kSettingBase && id < double(kSettingBase) + int(features::Id::Count)) {
 				bool checked = false;
-				EventBool(ev, "bChecked", checked);
-				features::Set(features::Id(int(id - kSettingBase)), checked);
+				if(EventBool(ev, "bChecked", checked))features::Set(features::Id(int(id - kSettingBase)), checked);
+				g_setDirty.store(true);
 				return;  // ours: the game never sees it
 			}
 			g_checkOriginal(self, ev);
@@ -1197,19 +1429,34 @@ namespace hoverui
 			static std::atomic<bool> seen{ false };
 			double id = -1;
 			if (!seen.exchange(true)) logger::Write("Hover UI: settings: first category event (category %.0f)", EventNumber(ev, "categoryID", id) ? id : -1.0);
-			if (EventNumber(ev, "categoryID", id) && unsigned(id) == kCategoryId) return;  // ours: nothing for the game to load
+			bindings::CancelCapture();g_setDirty.store(true);
+			if (EventNumber(ev, "categoryID", id) && id == kOldCategoryId) return;
 			g_openOriginal(self, ev);
 		}
 
 		void ResetDetour(void* self, Value* ev)
 		{
 			double id = -1;
-			if (EventNumber(ev, "categoryID", id) && unsigned(id) == kCategoryId) {
+			const bool known = EventNumber(ev, "categoryID", id);
+			logger::Write("Hover UI: settings: reset to defaults (category %.0f%s)", known ? id : -1.0, g_set.ctlVisible ? ", Controls page" : "");
+			if (g_set.ctlVisible) { bindings::ResetAll(); g_setDirty.store(true); }
+			else if (known && unsigned(id) == kCategoryId) {
 				features::ResetAll();
+				bindings::ResetAll();
 				g_setDirty.store(true);
-				return;
 			}
 			g_resetOriginal(self, ev);
+		}
+
+		void LinkDetour(void* self,Value* ev)
+		{
+			double id=-1;
+			if(EventNumber(ev,"uSettingID",id)&&id>=kControlBase&&id<=kRestoreControls){
+				if(id==kRestoreControls)bindings::ResetAll();
+				else bindings::BeginCapture(bindings::Action(int(id-kControlBase)));
+				g_setDirty.store(true);return;
+			}
+			g_linkOriginal(self,ev);
 		}
 
 		bool PatchSlot(std::uint32_t vtblRva, int slot, std::uint32_t expectRva, void* detour, void** original);
@@ -1226,13 +1473,16 @@ namespace hoverui
 			if (open) g_openOriginal = reinterpret_cast<Dispatch_t>(orig);
 			const bool reset = PatchSlot(kRvaResetDisp, kSlotDispatch, kRvaResetFn, reinterpret_cast<void*>(&ResetDetour), &orig);
 			if (reset) g_resetOriginal = reinterpret_cast<Dispatch_t>(orig);
+			controlspage::Install();
+			g_controlsAvailable=PatchSlot(kRvaLinkDisp,kSlotDispatch,kRvaLinkFn,reinterpret_cast<void*>(&LinkDetour),&orig);
+			if(g_controlsAvailable)g_linkOriginal=reinterpret_cast<Dispatch_t>(orig);
 			if (!check || !open) {
 				g_setMenu.store(0);
 				logger::Write("Hover UI: settings: the panel's event dispatchers do not match (checkbox %d, category %d); no %s category", check, open, kCategoryName);
 				g_set.failed = true;
 				return;
 			}
-			logger::Write("Hover UI: settings: %s category hooked (%d of 2 menus, reset %s)", kCategoryName, hooks, reset ? "on" : "off");
+			logger::Write("Hover UI: settings: %s inside Gameplay Options (%d of 2 menus, reset %s, control links %s)", kCategoryName, hooks, reset ? "on" : "off",g_controlsAvailable?"on":"off");
 		}
 
 		// One scanner element: a BasicButton whose key box shows `key`, with `label` under it (empty label: the key box
@@ -1364,6 +1614,154 @@ namespace hoverui
 			const std::string keys[]={visible?retryKey:"",visible?skipKey:"",visible?clearKey:""};
 			const char*labels[]={"Retry trip","Skip stop","T T: clear route"};int shown=0;
 			for(int i=0;i<3;++i)if(show(*actions[i],keys[i],labels[i]))PlaceButtonKey(actions[i]->button,x+44+140*shown++*rs/kBaseScale,y+24*rs/kBaseScale,false,rs);
+		}
+
+		// Physical VTOL instrument. Created through the same movie's CreateObject/Invoke interface as the buttons;
+		// all graphics and managed values stay on the HUD Advance thread. No external overlay or SWF replacement.
+		struct AttitudeView {
+			Value panel, horizon, aircraft;
+			MonoEl readout;
+			bool built=false, failed=false;
+		} g_attitudeView;
+
+		void DropAttitude(bool release)
+		{
+			auto& v=g_attitudeView;
+			if (release) {
+				// The readout is its own child of the HUD root (moved and sized apart from the instrument).
+				for (const Value* child : {&v.panel,&v.readout.button}) {
+					Value parent;
+					if (IsObject(*child) && GetMember(*child,"parent",&parent) && IsObject(parent)) {
+						const Value args[]={Arg(*child)}; Invoke(parent,"removeChild",args,1);
+					}
+					Release(parent);
+				}
+				Release(v.readout.data); Release(v.readout.button);
+				Release(v.aircraft); Release(v.horizon); Release(v.panel);
+			}
+			v=AttitudeView{};
+		}
+
+		bool AttitudeSprite(uptr movie, const Value& parent, Value& sprite)
+		{
+			if (!CreateObject(movie,&sprite,"flash.display.Sprite",nullptr,0)) return false;
+			SetMember(sprite,"mouseEnabled",Bool(false)); SetMember(sprite,"mouseChildren",Bool(false));
+			const Value args[]={Arg(sprite)};
+			return Invoke(parent,"addChild",args,1);
+		}
+		bool DrawAttitude(const Value& sprite, bool aircraft)
+		{
+			Value graphics;
+			if (!GetMember(sprite,"graphics",&graphics) || !IsObject(graphics)) { Release(graphics); return false; }
+			bool ok=true;
+			auto line=[&](double x1,double y1,double x2,double y2) {
+				const Value from[]={Num(x1),Num(y1)},to[]={Num(x2),Num(y2)};
+				ok=Invoke(graphics,"moveTo",from,2)&&ok; ok=Invoke(graphics,"lineTo",to,2)&&ok;
+			};
+			// Dark under-stroke keeps the instrument readable against ice, sky and bright terrain.
+			for (int pass=0;pass<2;++pass) {
+				const Value style[]={Num(pass?aircraft?4:2:aircraft?7:5),Num(pass?aircraft?0xFFFFFF:0x79D8FF:0x101C2C),Num(pass?0.95:0.8)};
+				ok=Invoke(graphics,"lineStyle",style,3)&&ok;
+				if (aircraft) {
+					line(-112,0,-18,0); line(18,0,112,0);
+					for (int side : {-1,1}) {
+						line(side*128.0,-7,side*148.0,-7); line(side*132.0,0,side*144.0,0); line(side*136.0,7,side*140.0,7);
+					}
+					const Value circle[]={Num(0),Num(0),Num(10)};
+					ok=Invoke(graphics,"drawCircle",circle,3)&&ok;
+				} else {
+					line(-160,0,160,0);
+					for (int degrees : {-30,-20,-10,10,20,30}) {
+						const double y=-degrees*2.0,w=degrees%20==0?44:28;
+						line(-w,y,-8,y); line(8,y,w,y);
+						// Tick direction identifies the horizon even while inverted.
+						line(-w,y,-w,y+(degrees>0?4:-4)); line(w,y,w,y+(degrees>0?4:-4));
+					}
+				}
+			}
+			Release(graphics); return ok;
+		}
+		bool BuildAttitude(uptr menu,uptr movie)
+		{
+			auto& v=g_attitudeView;
+			const auto& root=*reinterpret_cast<const Value*>(menu+0x58);
+			if (!IsObject(root) || !AttitudeSprite(movie,root,v.panel)) return false;
+			SetMember(v.panel,"visible",Bool(false)); SetMember(v.panel,"name",Str("SeamlessVtolAttitude"));
+			if (!AttitudeSprite(movie,v.panel,v.horizon) || !AttitudeSprite(movie,v.panel,v.aircraft) ||
+				!DrawAttitude(v.horizon,false) || !DrawAttitude(v.aircraft,true)) return false;
+			// Clip the moving ladder to the compact instrument window; aircraft marker is outside this clip.
+			Value rect;
+			const Value bounds[]={Num(-165),Num(-78),Num(330),Num(156)};
+			if (!CreateObject(movie,&rect,"flash.geom.Rectangle",bounds,4)) return false;
+			// A fixed parent supplies the mask; scrolling the horizon itself would move the viewport too.
+			Value viewport;
+			bool ok=CreateObject(movie,&viewport,"flash.display.Sprite",nullptr,0);
+			if (ok) {
+				SetMember(viewport,"scrollRect",Arg(rect)); SetMember(viewport,"mouseEnabled",Bool(false));
+				SetMember(viewport,"mouseChildren",Bool(false));
+				// scrollRect maps its top-left to the parent's origin; offset it back so (0,0) remains the centre.
+				SetMember(viewport,"x",Num(-165)); SetMember(viewport,"y",Num(-78));
+				const Value horizon[]={Arg(v.horizon)},child[]={Arg(viewport),Num(0)};
+				ok=Invoke(viewport,"addChild",horizon,1) && Invoke(v.panel,"addChildAt",child,2);
+			}
+			Release(viewport); Release(rect);
+			if (!ok || !CreateObject(movie,&v.readout.button,"BasicButton",nullptr,0)) return false;
+			const Value readout[]={Arg(v.readout.button)};
+			if (!Invoke(root,"addChild",readout,1) || !MonoSetData(movie,v.readout," ")) return false;
+			SetMember(v.readout.button,"mouseEnabled",Bool(false)); SetMember(v.readout.button,"mouseChildren",Bool(false));
+			SetMember(v.readout.button,"name",Str("SeamlessVtolAttitudeText"));
+			logger::Write("Physical VTOL HUD: native attitude indicator added; F7 selections 'VTOL attitude' and 'VTOL attitude text'");
+			return true;
+		}
+		void WorkAttitude(uptr menu,uptr movie)
+		{
+			auto& v=g_attitudeView;
+			vehiclecamera::Attitude attitude;
+			const bool active=vehiclecamera::ReadAttitude(attitude);
+			double x,y,scale,tx,ty,tscale; bool edit,picked,pickedText;
+			{ std::lock_guard lk(g_lay.lock); x=g_lay.attitudeX; y=g_lay.attitudeY; scale=g_lay.attitudeSize;
+				tx=g_lay.attitudeTextX; ty=g_lay.attitudeTextY; tscale=g_lay.attitudeTextSize;
+				edit=g_lay.edit; picked=g_lay.sel==kSelAttitude||g_lay.sel==kSelAll; pickedText=g_lay.sel==kSelAttitudeText||g_lay.sel==kSelAll; }
+			const bool preview=edit&&(picked||pickedText)&&g_inVehicle.load();
+			const bool visible=g_inVehicle.load()&&!ScannerOpen()&&(active||preview);
+			if (!visible || v.failed) {
+				if (IsObject(v.panel)) SetMember(v.panel,"visible",Bool(false));
+				MonoShow(v.readout,false); return;
+			}
+			if (!v.built) {
+				if (!BuildAttitude(menu,movie)) {
+					DropAttitude(true); v.failed=true;
+					logger::Write("Physical VTOL HUD: indicator creation failed; retry after next HUD load"); return;
+				}
+				v.built=true;
+			}
+			if (!active) { attitude.pitch=0; attitude.roll=0; }
+			const auto h=cameraroll::Indicator(attitude.pitch,attitude.roll);
+			SetMember(v.horizon,"rotation",Num(h.rotation));
+			SetMember(v.horizon,"x",Num(h.x)); SetMember(v.horizon,"y",Num(h.y));
+			char text[64]; std::snprintf(text,sizeof(text),"VTOL   P %+.0f   B %+.0f",attitude.pitch*180/cameraroll::kPi,attitude.roll*180/cameraroll::kPi);
+			MonoSetKey(v.readout,text); MonoShow(v.readout,true);
+			const auto& root=*reinterpret_cast<const Value*>(menu+0x58);
+			Value stage; double width=1920,height=1080;
+			if (GetMember(root,"stage",&stage)&&IsObject(stage)) {
+				GetNumber(stage,"stageWidth",width); GetNumber(stage,"stageHeight",height);
+			}
+			Release(stage);
+			SetMember(v.panel,"x",Num(width*0.5+x)); SetMember(v.panel,"y",Num(height*0.5+y));
+			SetMember(v.panel,"scaleX",Num(scale)); SetMember(v.panel,"scaleY",Num(scale));
+			const bool blink=edit&&(GetTickCount64()/300)%2==0;
+			SetMember(v.panel,"alpha",Num(blink&&picked?0.35:1));
+			SetMember(v.panel,"visible",Bool(true));
+			PlaceButtonKey(v.readout.button,width*0.5+tx,height*0.5+ty,false,kAttTextScale*tscale);
+			SetMember(v.readout.button,"alpha",Num(blink&&pickedText?0.35:1));
+		}
+		void RenderAttitude(uptr menu,uptr movie)
+		{
+			__try { WorkAttitude(menu,movie); }
+			__except(EXCEPTION_EXECUTE_HANDLER) {
+				g_attitudeView.failed=true;
+				logger::Write("Physical VTOL HUD: exception 0x%08lX; instrument disabled until HUD reload",GetExceptionCode());
+			}
 		}
 
 		// ---- The contextual HUD: on-foot panel and in-vehicle extras (in the HUD movie) ----
@@ -1516,8 +1914,8 @@ namespace hoverui
 			// Facing an occupied vehicle on foot: tap = the passenger seat, hold = eject the driver (half-size prompts).
 			g_ex.fPass.scale = g_ex.fEject.scale = OverlayScale();
 			const bool occShow = !inVehicle && (occupied || (ed && foot));
-			ElSet(g_ex.fPass, occShow, "Passenger", occKey);
-			ElSet(g_ex.fEject, occShow, "Double tap: eject", occKey);
+			ElSet(g_ex.fPass, occShow, "Ride as passenger", occKey);
+			ElSet(g_ex.fEject, occShow, "Hold: pull out driver", occKey);
 			// The Auto prompt (the trip itself is in the status card): "Auto", or "Auto off" (tinted) while it flies.
 			ElSet(g_ex.vLine, inVehicle && (ed || !autoKey.empty()), autoOn ? "Auto off" : "Auto", autoKey);
 			MonoTint(g_ex.movie, g_ex.vLine, autoOn);
@@ -1887,6 +2285,7 @@ namespace hoverui
 				g_hudMovie.store(0);
 			}
 			if (movie && movie == g_setMovie.load()) {
+				bindings::CancelCapture();g_set.captureUI=false;
 				g_setMenu.store(0);
 				g_setMovie.store(0);
 				g_set.movie = 0;
@@ -2111,6 +2510,8 @@ namespace hoverui
 			std::vector<int> o;
 			for (int i = 0; i <= kSelRows; ++i) if (i != kGearUp) o.push_back(i);  // (hidden: one Alt button now)
 			o.push_back(kSelRoute);
+			o.push_back(kSelAttitude);
+			o.push_back(kSelAttitudeText);
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) o.push_back(kSelNative + i);
 			for (int i : { int(kSelCluster), int(kSelColumn), int(kSelExtras), int(kSelAll) }) o.push_back(i);
 			return o;
@@ -2125,6 +2526,8 @@ namespace hoverui
 			}
 			const int s = g_lay.sel;
 			if(s==kSelRoute)return "Route";
+			if(s==kSelAttitude)return "VTOL attitude";
+			if(s==kSelAttitudeText)return "VTOL attitude text";
 			const char* names[kSelAll + 1] = { "W", "A", "S", "D", "Descend", "Gear", "Hover", "Gear box", "Trip status", "Target", "Vehicles", "WASD", "Column", "Extras",
 				"All" };
 			if (s >= 0 && s <= kSelAll) return names[s];
@@ -2204,6 +2607,8 @@ namespace hoverui
 				}
 				for (int i = 0; i < kCarEls; ++i) if (all || sel == kSelExtras || sel == kSelLine + i) picked.push_back(&g_lay.carSize[i]);
 				if (all || sel == kSelRoute) picked.push_back(&g_lay.routeSize);
+				if (all || sel == kSelAttitude) picked.push_back(&g_lay.attitudeSize);
+				if (all || sel == kSelAttitudeText) picked.push_back(&g_lay.attitudeTextSize);
 			}
 			if (picked.empty()) notify::Show("UI edit: %s keeps the game's own size", SelName(car).c_str());
 			else {
@@ -2243,6 +2648,14 @@ namespace hoverui
 			g_lay.sel = order[at];
 			notify::Show("UI edit: %s", SelName(true).c_str());
 		}
+		if(g_lay.sel==kSelAttitude){
+			if(dx!=0||dy!=0){g_lay.attitudeX+=dx;g_lay.attitudeY+=dy;SaveLayout();}
+			if(press[9]){g_lay.attitudeX=kDefAttX;g_lay.attitudeY=kDefAttY;g_lay.attitudeSize=1;SaveLayout();}return;
+		}
+		if(g_lay.sel==kSelAttitudeText){
+			if(dx!=0||dy!=0){g_lay.attitudeTextX+=dx;g_lay.attitudeTextY+=dy;SaveLayout();}
+			if(press[9]){g_lay.attitudeTextX=kDefAttTextX;g_lay.attitudeTextY=kDefAttTextY;g_lay.attitudeTextSize=1;SaveLayout();}return;
+		}
 		if(g_lay.sel==kSelRoute){
 			if(dx!=0||dy!=0){g_lay.routeX+=dx;g_lay.routeY+=dy;SaveLayout();}
 			if(press[9]){g_lay.routeX=kDefRouteX;g_lay.routeY=kDefRouteY;SaveLayout();}return;
@@ -2255,7 +2668,7 @@ namespace hoverui
 			if (all || sel == kSelColumn) { g_lay.colRight += dx; g_lay.colTop += dy; }
 			if (all || sel == kGear) { g_lay.gx += dx; g_lay.gy += dy; }
 			if (all || sel == kSelExtras) { g_lay.eox += dx; g_lay.eoy += dy; }
-			if(all){g_lay.routeX+=dx;g_lay.routeY+=dy;}
+			if(all){g_lay.routeX+=dx;g_lay.routeY+=dy;g_lay.attitudeX+=dx;g_lay.attitudeY+=dy;g_lay.attitudeTextX+=dx;g_lay.attitudeTextY+=dy;}
 			if (sel >= 0 && sel < kGear) { g_lay.off[sel][0] += dx; g_lay.off[sel][1] += dy; }
 			if (sel >= kSelLine && sel <= kSelRows) { g_lay.carOff[sel - kSelLine][0] += dx; g_lay.carOff[sel - kSelLine][1] += dy; }
 			for (int i = 0; i < int(g_lay.natNames.size()); ++i) {

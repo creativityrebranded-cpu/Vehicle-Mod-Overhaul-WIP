@@ -23,6 +23,8 @@ namespace controlmap
 	// The gamepad code the game binds to this event in this context (the game's own code space; bindings.cpp maps it to a
 	// controller button), 0 when none or unreadable. Also written to controlmap.txt as "gamepad" lines.
 	std::uint32_t PadFor(const char* context, const char* event);
+	// Contexts/events whose gamepad binding uses this game code (`only`: just that context), for the log.
+	std::string WhoUsesPad(std::uint32_t code, const char* only = nullptr);
 	// Key name for messages ("H", "F9").
 	std::string KeyName(int vk);
 	// ---- The one key table of the mod: every key we use is claimed here by (owner, action), so two of our modules never take the same key and the

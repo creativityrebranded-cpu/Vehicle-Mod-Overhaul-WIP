@@ -22,6 +22,13 @@
 #include "environment.h"
 #include "bodybinding.h"
 #include "hoverlogic.h"
+#include "freeroll.h"
+#include "physicsstep.h"
+#include "vtolphysics.h"
+#include "vtolai.h"
+#include "vtolassist.h"
+#include "vtolhooks.h"
+#include "vehiclecamera.h"
 #include "hulllogic.h"
 #include "integrationlogic.h"
 #include "boostlogic.h"
@@ -51,6 +58,8 @@
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
+#include <type_traits>
+#include <unordered_map>
 
 // Rover flight (0.57.0): a connected flight model that pushes the rover's own physics body instead of overwriting it.
 //  - On / off: double-tap the game's vertical boost (Space). Also off: settle onto the ground, hit something, or leave
@@ -63,7 +72,7 @@
 //    scaled by speed. Ahead clear: nothing. Ahead blocked but climbable in time: nose up and climb. Otherwise a clear
 //    side: turn that way (the A / D bank turn). Nothing clear: brake to a stop.
 //  - Yaw: the gap between where the camera looks and where the nose points, used like a variable turn input
-//    (bigger gap = faster turn, sin(gap / 2) shaped). The camera is never written: it stays the game's own camera.
+//    (bigger gap = faster turn, sin(gap / 2) shaped). Physical VTOL adds camera bank about its unchanged forward.
 //  - Rotation has momentum: inputs set wanted turn rates and the spin eases toward them; released axes level back.
 //    Couplings: banking curves the path (the hover lift tilts) and turns the nose into the curve; turning leans the
 //    rover into the turn; pitch trades speed and height; sideways speed leaks away and partly turns along the nose.
@@ -368,6 +377,19 @@ namespace vehicleflight
 			double vz = 0;                 // m/s
 			bool rollAimOn = false;
 			double rollAim = 0;            // rad
+			// Free roll (freeroll.h, the settings menu): the player's own hover turns about its body axes with no roll limit.
+			// The bank test (the , key with the detailed log on) uses the same body-axis turning for its held bank.
+			bool freeRoll = false, assist = true, bankTest = false;
+			bool physical = false;
+			bool physicalFault = false;
+			vtol::State physicalState{};
+			// Physical ownership of this pilot's chassis, read lock-free by the native assist hooks (PhysicalOwns).
+			// needsDriver: the player's manual hover is owned only while the player drives it; AI flights have no driver check.
+			std::atomic<bool> physOn{false}, physNeedsDriver{false};
+			std::atomic<std::uintptr_t> physInstance{0}, physChassis{0};
+			std::atomic<std::uint32_t> physBody{0};
+			std::atomic<unsigned> physSteps{0};
+			unsigned physWiped = 0;        // AI: consecutive steps where the game's own step wiped the speed we built
 			bool haveAim = false;
 			bool landing=false;
             bool holding = false;          // level, no lift keys: hold the height
@@ -385,6 +407,13 @@ namespace vehicleflight
 			double bodyHeading = 0;        // atan2(forward.x, forward.y) of the body: the same frame as the camera
 			double gap = 0, camYaw = 0;
 			int fixedVel = 0;              // steps where an absurd body velocity was replaced
+			// Attitude measurement (stage 0, notes/FLIGHT_MODEL_STUDY_20261023.md, pilot 0 only): what the game did to the spin we wrote
+			// one step earlier (its upright actions, contacts, air control). "Pull" = the part about the roll / pitch axis toward level.
+			float lastW[3] = {};
+			bool haveLastW = false;
+			unsigned measN = 0;
+			double measRollPull = 0, measPitchPull = 0, measMax = 0;
+			double measW[3] = {};          // the last spin written (world)
 			bool matched = false;
 			unsigned steps = 0;
 			// collision detection
@@ -401,7 +430,6 @@ namespace vehicleflight
 			std::atomic<ULONGLONG> impactAt{0};
             float collisionDelta = 0;
 			bool collisionUp = false;      // the contact pushed the vehicle up (something under it)
-			LARGE_INTEGER lastStep{};
 			// Every pilot, including the player and ground driving, owns one reference and its published body ID.
 			std::atomic<std::uintptr_t> vehicle{ 0 };
 			std::atomic<std::uint32_t> bodyId{ 0 };
@@ -489,7 +517,7 @@ namespace vehicleflight
 			const auto cam=Ptr(addr::kPlayerCameraPtr);
 			const auto state=cam?At<std::uintptr_t>(cam,0x10):0;
 			first=state && state==At<std::uintptr_t>(cam,0x188);
-			if(state && At<std::uintptr_t>(state,0)==game::Base()+0x04C28728)
+			if(state && At<std::uintptr_t>(state,0)==game::Base()+addr::kVehicleCameraStateVtbl)
 				first=At<std::uint8_t>(state,0x74)==1; // FUN_140FB4D80: first-person pitch/yaw limits
 			if(!first) return CameraPitch(pitch);
 			const auto root=cam?At<std::uintptr_t>(cam,0x08):0;
@@ -542,8 +570,10 @@ namespace vehicleflight
 			std::atomic<bool> boost{ false }, vert{ false };
 		} g_driveOut[kPilots];
 
-		using Step_t = std::uint64_t (*)(std::uintptr_t, std::uintptr_t);
+		using Step_t = physicsstep::Callback;
 		Step_t g_original = nullptr;
+		std::atomic<unsigned> g_nativeStepSamples{0}, g_nativeStepSkipped{0};
+		std::atomic<float> g_nativeStepSeconds{0};
 
 		// Booster visuals held while hovering. Paid forward boost uses the native fuel fraction (+0x238),
 		// recharge delay (+0x23C), and this vehicle configuration's burn/recharge timings.
@@ -562,6 +592,11 @@ namespace vehicleflight
 		// A seated ship pilot has no PlayerVehicle link. Count whether the last driven rover's physics
 		// callback keeps running after dismount; comparison only, never dereference a stale reference.
 		std::atomic<std::uintptr_t> g_driverVehicle{ 0 }, g_lastDrivenVehicle{ 0 };
+		std::atomic<unsigned> g_physicalSteps{0}, g_physicalFailures{0};
+		std::atomic<unsigned> g_physicalReject{0};
+		std::atomic<float> g_physicalCollective{0}, g_physicalMass{0};
+		std::atomic<float> g_physicalLinearError{0},g_physicalAngularError{0};
+		bool g_physicalHooksReady = false;
 		std::atomic<unsigned> g_occupiedSteps{ 0 }, g_unoccupiedSteps{ 0 };
 
 		std::atomic<bool> g_boostRequest{false},g_meterBoost{false};
@@ -617,7 +652,7 @@ namespace vehicleflight
 		// (linear velocity +0x60), or null for another vehicle.
 		struct Body
 		{
-			std::uintptr_t body = 0, motion = 0, write = 0;
+			std::uintptr_t body = 0, motion = 0, write = 0, read = 0;
 			std::uint32_t id = 0;
 		};
 
@@ -626,6 +661,7 @@ namespace vehicleflight
 			Body b;
 			const auto read = At<std::uintptr_t>(vehicle, 0x28);
 			b.write = At<std::uintptr_t>(vehicle, 0x30);
+			b.read = read;
 			if (!read || !b.write) {
 				return {};
 			}
@@ -637,6 +673,227 @@ namespace vehicleflight
 			(void)px;(void)py;(void)pz;(void)anyPosition; // full scene identity, independent of body/reference origin offsets
 			b.motion = VFn<std::uintptr_t (*)(std::uintptr_t, std::uint32_t)>(read, 0xD0)(read, At<std::uint32_t>(b.body, 0x80));
 			return b.motion ? b : Body{};
+		}
+
+		// Native impulse entry points are confirmed in both writer vtables in the pinned executable. Reject a
+		// different interface/body instead of invoking an unknown slot or falling back to a velocity overwrite.
+		bool ReadPhysicalMotion(const Body& b, vtol::Motion& motion)
+		{
+			__try {
+				if (!b.body || !b.motion || !b.read || !b.write) { g_physicalReject=1; return false; }
+				if (b.read-0x20!=b.write-0x18) { g_physicalReject=2; return false; }
+				if (At<std::uint32_t>(b.body,0x50)!=b.id || (At<std::uint32_t>(b.body,0x54)&7)!=2) { g_physicalReject=3; return false; }
+				if (reinterpret_cast<std::uintptr_t>(VFn<void*>(b.write,0xC0))!=game::Base()+0x03082320) { g_physicalReject=4; return false; }
+				if (reinterpret_cast<std::uintptr_t>(VFn<void*>(b.write,0xC8))!=game::Base()+0x03081D70) { g_physicalReject=5; return false; }
+				motion=vtol::Decode(At<std::uint64_t>(b.motion,0x40),reinterpret_cast<const float*>(b.motion));
+				const bool valid=vtol::Valid(motion); g_physicalReject=valid?0:6; return valid;
+			} __except(EXCEPTION_EXECUTE_HANDLER) { g_physicalReject=7; return false; }
+		}
+
+		bool PhysicalOwnsSlot(const Shared& s,std::uintptr_t instance)
+		{
+			if (!s.physOn.load(std::memory_order_acquire) || !instance ||
+				s.physInstance.load(std::memory_order_relaxed)!=instance) return false;
+			if (s.physNeedsDriver.load(std::memory_order_relaxed) &&
+				(!g_hoverVehicle.load() || g_hoverVehicle.load()!=g_driverVehicle.load())) return false;
+			__try {
+				const auto chassis=s.physChassis.load(std::memory_order_relaxed);
+				const auto id=s.physBody.load(std::memory_order_relaxed);
+				return chassis&&At<std::uint32_t>(instance,0x20)==id&&At<std::uint32_t>(chassis,0x50)==id&&(At<std::uint32_t>(chassis,0x54)&7)==2;
+			}
+			__except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		// Any pilot's physical chassis (the native assist hooks see every vehicle).
+		bool PhysicalOwns(std::uintptr_t instance)
+		{
+			if (!instance) return false;
+			for (const auto& s : g_shs) if (PhysicalOwnsSlot(s,instance)) return true;
+			return false;
+		}
+		void PhysicalRelease(Shared& s) { s.physInstance.store(0); }
+
+		using Level_t=void(*)(std::uintptr_t,std::uintptr_t);
+		using Damp_t=void(*)(std::uintptr_t,float);
+		using Clamp_t=void(*)(std::uintptr_t,std::uintptr_t,float);
+		Level_t g_physicalLevelOriginal=nullptr;
+		Damp_t g_physicalDampOriginal=nullptr;
+		Clamp_t g_physicalClampOriginal=nullptr;
+		struct UprightLease {
+			std::uintptr_t instance=0,action[2]={};
+			std::uint32_t body=0,form=0;
+			float strength[2]={},damping[2]={};
+		};
+		std::mutex g_uprightLock;
+		std::unordered_map<std::uintptr_t,UprightLease> g_uprightLeases;
+		bool CaptureUpright(std::uintptr_t component,UprightLease& lease)
+		{
+			__try {
+				lease.instance=At<std::uintptr_t>(component,0x10);
+				if (!PhysicalOwns(lease.instance)) return false;
+				lease.body=At<std::uint32_t>(lease.instance,0x20); lease.form=At<std::uint32_t>(component,0x0C);
+				for (int i=0;i<2;++i) {
+					lease.action[i]=At<std::uintptr_t>(component,i?0x540:0x538);
+					if (!lease.action[i]||At<std::uint32_t>(lease.action[i],0x20)!=lease.body) return false;
+					lease.strength[i]=At<float>(lease.action[i],0x50); lease.damping[i]=At<float>(lease.action[i],0x54);
+					if (!std::isfinite(lease.strength[i])||!std::isfinite(lease.damping[i])) return false;
+				}
+				return true;
+			} __except(EXCEPTION_EXECUTE_HANDLER) { g_physicalReject=7; return false; }
+		}
+		bool SetUpright(std::uintptr_t component,const UprightLease& lease,bool mute)
+		{
+			__try {
+				if (At<std::uintptr_t>(component,0x10)!=lease.instance||At<std::uint32_t>(component,0x0C)!=lease.form||
+					At<std::uint32_t>(lease.instance,0x20)!=lease.body) return false;
+				for (int i=0;i<2;++i)
+					if (At<std::uintptr_t>(component,i?0x540:0x538)!=lease.action[i]||At<std::uint32_t>(lease.action[i],0x20)!=lease.body) return false;
+				for (int i=0;i<2;++i) {
+					At<float>(lease.action[i],0x50)=mute?0.0f:lease.strength[i];
+					At<float>(lease.action[i],0x54)=mute?0.0f:lease.damping[i];
+				}
+				return true;
+			} __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		void PhysicalLevelDetour(std::uintptr_t component,std::uintptr_t config)
+		{
+			UprightLease previous; bool restore=false;
+			{ std::lock_guard lk(g_uprightLock); const auto it=g_uprightLeases.find(component);
+				if (it!=g_uprightLeases.end()) { previous=it->second; g_uprightLeases.erase(it); restore=true; } }
+			if (restore) SetUpright(component,previous,false);
+			g_physicalLevelOriginal(component,config);
+			UprightLease current;
+			if (CaptureUpright(component,current)) {
+				{ std::lock_guard lk(g_uprightLock); g_uprightLeases[component]=current; }
+				SetUpright(component,current,true);
+			}
+		}
+		void PhysicalDampDetour(std::uintptr_t instance,float seconds)
+		{
+			if (!PhysicalOwns(instance)) g_physicalDampOriginal(instance,seconds);
+		}
+		void PhysicalClampDetour(std::uintptr_t instance,std::uintptr_t world,float seconds)
+		{
+			if (!PhysicalOwns(instance)) g_physicalClampOriginal(instance,world,seconds);
+		}
+
+		void PreparePhysical(Shared& s,std::uintptr_t instance)
+		{
+			bool requested;
+			{ std::lock_guard lk(s.lock); requested=s.active&&s.physical&&!s.physicalFault; }
+			if (!requested) { PhysicalRelease(s); return; }
+			const auto b=FindBody(instance,0,0,0,true);
+			vtol::Motion motion;
+			const bool ready=ReadPhysicalMotion(b,motion);
+			std::lock_guard lk(s.lock);
+			if (ready&&s.active&&s.physical&&bodybinding::Matches(b.id,s.bodyId.load())) {
+				s.physChassis.store(b.body,std::memory_order_relaxed);
+				s.physBody.store(b.id,std::memory_order_relaxed);
+				s.physInstance.store(instance,std::memory_order_release);
+			} else { PhysicalRelease(s); g_physicalFailures.fetch_add(1,std::memory_order_relaxed); }
+		}
+
+		bool ApplyPhysical(const Body& b,const vtol::Output& output)
+		{
+			alignas(16) const float linear[4]={float(output.linear.x),float(output.linear.y),float(output.linear.z),0};
+			alignas(16) const float angular[4]={float(output.angular.x),float(output.angular.y),float(output.angular.z),0};
+			__try {
+				using Impulse=void(*)(std::uintptr_t,std::uint32_t,const float*,int);
+				VFn<Impulse>(b.write,0xC0)(b.write,b.id,linear,0);
+				VFn<Impulse>(b.write,0xC8)(b.write,b.id,angular,0);
+				return true;
+			} __except(EXCEPTION_EXECUTE_HANDLER) { g_physicalReject=9; return false; }
+		}
+
+		std::uint64_t StepPhysical(Shared& s,const Body& b,const float spin[4],double dt,std::uint64_t result,std::unique_lock<std::mutex>& lk)
+		{
+			if (s.physicalFault) return result;
+			vtol::Motion motion;
+			const bool player=&s==&g_shs[0]&&!s.autopilot;  // the global diagnostics stay the player's manual flight
+			if (!PhysicalOwnsSlot(s,s.instance.load())||!ReadPhysicalMotion(b,motion)) {
+				if (player) g_physicalFailures.fetch_add(1,std::memory_order_relaxed);
+				return result;
+			}
+			auto vec=[](const float* p) { return vtol::Vec{p[0],p[1],p[2]}; };
+			vtol::Body body{motion,vec(reinterpret_cast<const float*>(b.body)),vec(reinterpret_cast<const float*>(b.body+0x10)),
+				vec(reinterpret_cast<const float*>(b.body+0x20)),vec(reinterpret_cast<const float*>(b.motion+0x60)),vec(spin)};
+			const auto* R=reinterpret_cast<const float*>(b.body);
+			const auto* F=reinterpret_cast<const float*>(b.body+0x10);
+			const auto* U=reinterpret_cast<const float*>(b.body+0x20);
+			const float z=At<float>(b.body,0x38);
+			const double roll=hoverlogic::Roll(R[2],U[2]);
+			const double pitch=hoverlogic::Pitch(F[0],F[1],F[2]);
+			const double hSpeed=std::hypot(body.velocity.x,body.velocity.y);
+			if (s.autopilot&&s.haveLast) {
+				// The game's step brakes an unoccupied vehicle to rest (the "parked wipe" the stock model carries speed through).
+				// The speed clamp is bypassed for this chassis; if the speed still vanishes with nothing hit, this vehicle goes
+				// back to the stock model instead of fighting the game.
+				const double ourH=std::hypot(double(s.lastV[0]),double(s.lastV[1]));
+				const bool hit=GetTickCount64()-s.impactAt.load()<500;
+				s.physWiped=ourH>3&&hSpeed<0.15*ourH&&!hit?s.physWiped+1:0;
+				if (s.physWiped>=5) {
+					s.physicalFault=true; PhysicalRelease(s);
+					logger::Write("Physical VTOL AI: the game's step wiped the built speed %.1f -> %.1f m/s for 5 steps; this vehicle uses the standard model",ourH,hSpeed);
+					return result;
+				}
+			}
+			vtol::Vec rates;
+			if (s.autopilot) {
+				// AI pilots: the planner's yaw rate, a coordinated bank for it (or its roll aim), the nose level or aimed.
+				vtolai::Input in{vec(R),vec(F),vec(U),pitch,roll,hSpeed,s.yawWant,s.hull.YawAt(hSpeed),s.hull.pitch,s.hull.roll,
+					s.rollAimOn,s.rollAim,s.haveAim,s.pitchAim};
+				rates=vtolai::Rates(in);
+			} else if (s.assist&&!s.rollAimOn&&vtolassist::Applies(roll)) {
+				// Flight assist: coordinated turns (vtolassist.h, 2026-10-24). A camera turn banks as far as a level turn needs;
+				// the player's own roll wins and the nose follows its curve; near the ground and landing it levels.
+				vtolassist::Input in;
+				in.right=vec(R); in.forward=vec(F); in.up=vec(U); in.pitch=pitch; in.roll=roll; in.heading=std::atan2(double(F[0]),double(F[1]));
+				in.speed=hSpeed; in.haveView=s.haveView; in.view=s.view; in.haveAim=s.haveAim; in.pitchAim=s.pitchAim; in.rollIn=s.rollIn;
+				in.rollRate=freeroll::Rate(s.hull.roll); in.yawLimit=s.hull.YawAt(hSpeed); in.pitchLimit=s.hull.pitch;
+				in.camGain=kCamPitchGain; in.levelRate=kLevelRate; in.nearGround=s.groundOk&&z-s.groundUnder<freeroll::kGroundLevel; in.landing=s.landing;
+				rates=vtolassist::Solve(in).world;
+			} else {
+				const auto aim=s.haveView ? freeroll::AimDir(s.view,s.haveAim?s.pitchAim:0.0) : freeroll::Vec{F[0],F[1],F[2]};
+				const auto error=freeroll::AimError(R,F,U,aim);
+				const double pitchRate=std::clamp(kCamPitchGain*error.pitch,-s.hull.pitch,s.hull.pitch);
+				const double yawRate=std::clamp(kCamPitchGain*error.yaw,-s.hull.YawAt(hSpeed),s.hull.YawAt(hSpeed));
+				const bool nearGround=s.groundOk&&z-s.groundUnder<freeroll::kGroundLevel;
+				const double rate=freeroll::Rate(s.hull.roll);
+				const double rollRate=s.rollAimOn?freeroll::RollToward(roll,s.rollAim,kApRollGain,rate):
+					freeroll::RollWant(roll,s.rollIn,rate,kLevelRate,0,s.assist,nearGround,s.landing);
+				alignas(16) float composed[4]; freeroll::Compose(R,F,U,pitchRate,rollRate,yawRate,composed);
+				rates=vec(composed);
+			}
+			double vertical;
+			if (s.autopilot) vertical=s.vzOn?std::clamp(s.vz,-kLiftSpeed,kLiftSpeed):s.holding?std::clamp(kHoldGain*(s.refGround+s.hold-z),-kHoldMaxVz,kHoldMaxVz):0.0;
+			else vertical=s.landing?-1.0:s.holding?std::clamp(kHoldGain*(s.refGround+s.hold-z),-kHoldMaxVz,kHoldMaxVz):s.lift*kLiftSpeed;
+			if (s.groundOk&&!s.landing) {
+				const double floor=std::max(kMinClearance,std::fabs(R[2])*s.hull.width+std::fabs(F[2])*s.hull.length+std::fabs(U[2])*s.hull.height+1.5);
+				if (z-s.groundUnder<floor) vertical=std::max(vertical,std::min(kLiftSpeed,(floor-(z-s.groundUnder))*3+1));
+			}
+			// AI pilots always fly assisted (the planners expect a stable chassis), with stronger slip thrusters and strafe.
+			vtol::Command command{rates,s.thrustAcc*s.hull.acceleration,s.autopilot?0.0:s.lift,vertical,s.hull.brake,s.cap,
+				std::max({s.hull.width,s.hull.length,s.hull.height}),s.autopilot||s.assist,s.braking,
+				s.autopilot?s.strafe*kStrafeAcc:0.0,s.autopilot?vtolai::kSideAcceleration:3.0};
+			const auto output=vtol::Solve(body,command,s.physicalState,dt);
+			if (!output.valid) { g_physicalReject=8; if (player) g_physicalFailures.fetch_add(1,std::memory_order_relaxed); return result; }
+			lk.unlock();
+			const bool applied=ApplyPhysical(b,output);
+			alignas(16) float actualSpin[4]={};
+			if (applied) VFn<void(*)(std::uintptr_t,std::uint32_t,float*)>(b.read,0xA8)(b.read,b.id,actualSpin);
+			lk.lock();
+			if (!applied) { s.physicalFault=true; PhysicalRelease(s); g_physicalFailures.fetch_add(1,std::memory_order_relaxed); return result; }
+			if (!s.active||!s.physical||!bodybinding::Matches(b.id,s.bodyId.load())) return result;
+			const auto* velocity=reinterpret_cast<const float*>(b.motion+0x60);
+			for (int i=0;i<3;++i) { s.lastV[i]=s.v[i]=velocity[i]; s.lastW[i]=actualSpin[i]; s.measW[i]=actualSpin[i]; }
+			s.haveLast=true; s.haveLastW=false; s.bodyPitch=float(pitch); s.bodyRoll=float(roll); s.matched=true; ++s.steps;
+			s.physSteps.fetch_add(1,std::memory_order_relaxed);
+			if (!player) return result;
+			g_physicalLinearError.store(float(vtol::Length(vec(velocity)-(body.velocity+output.linear*motion.inverseMass))),std::memory_order_relaxed);
+			g_physicalAngularError.store(float(vtol::Length(vec(actualSpin)-(body.spin+vtol::AngularDelta(motion,output.angular)))),std::memory_order_relaxed);
+			g_physicalSteps.fetch_add(1,std::memory_order_relaxed);
+			g_physicalCollective.store(float(output.collective),std::memory_order_relaxed);
+			g_physicalMass.store(float(1/motion.inverseMass),std::memory_order_relaxed);
+			return result;
 		}
 
 		// Before the game's step: a sharp change from what we wrote = the solver resolved a contact (hover ends).
@@ -675,7 +932,7 @@ namespace vehicleflight
 		}
 
 		// ---- The flight model, once per physics step ---------------------------------------------------------------
-		std::uint64_t StepModel(Shared& g_sh, std::uintptr_t vehicle, std::uint64_t result);
+		std::uint64_t StepModel(Shared& g_sh, std::uintptr_t vehicle, std::uint64_t result, float seconds);
 
 		std::uint32_t PhysicsBodyId(std::uintptr_t vehicle)
 		{
@@ -716,8 +973,11 @@ namespace vehicleflight
 			return b;
 		}
 
-		std::uint64_t StepDetour(std::uintptr_t vehicle, std::uintptr_t world)
+		std::uint64_t StepDetour(std::uintptr_t vehicle, std::uintptr_t world, float seconds)
 		{
+			g_nativeStepSamples.fetch_add(1, std::memory_order_relaxed);
+			g_nativeStepSeconds.store(seconds, std::memory_order_relaxed);
+			if (physicsstep::ModelSeconds(seconds) == 0.0) g_nativeStepSkipped.fetch_add(1, std::memory_order_relaxed);
 			// This hook sees every vehicle. Unowned steps must never default to the player's controller.
 			vehiclediag::NoteStep(vehicle);
 			const auto body=PhysicsBodyId(vehicle);const auto now=GetTickCount64();
@@ -735,7 +995,9 @@ namespace vehicleflight
 					(s->instance.load()&&s->bodyId.load()!=body))s=nullptr;else{s->bodyId.store(body);s->instance.store(vehicle);}}
 				if(s)CheckCollision(*s,vehicle);
 			}
-			const auto result = g_original(vehicle, world);
+			if (s) PreparePhysical(*s,vehicle);
+			for (auto& o : g_shs) if (&o!=s && o.physInstance.load()==vehicle) PhysicalRelease(o);  // a chassis nobody owns now
+			const auto result = g_original(vehicle, world, seconds);
 			if(!s)return result;
 			const auto ref=s->vehicle.load();
 			if (ref && ref == g_lastDrivenVehicle.load(std::memory_order_relaxed)) {
@@ -750,11 +1012,14 @@ namespace vehicleflight
                     s->haveLast=std::isfinite(v[0])&&std::isfinite(v[1])&&std::isfinite(v[2]);
                 }
             }}
-            return StepModel(*s, vehicle, result);
+            return StepModel(*s, vehicle, result, seconds);
 		}
+		static_assert(std::is_same_v<decltype(&StepDetour), Step_t>);
 
-		std::uint64_t StepModel(Shared& g_sh, std::uintptr_t vehicle, std::uint64_t result)
+		std::uint64_t StepModel(Shared& g_sh, std::uintptr_t vehicle, std::uint64_t result, float seconds)
 		{
+			const double dt = physicsstep::ModelSeconds(seconds);
+			if (dt == 0.0) return result;
 			std::unique_lock lk(g_sh.lock);
 			if (!g_sh.active && g_sh.guardInstance && vehicle == g_sh.guardInstance) {
 				if (GetTickCount64() > g_sh.guardUntil || g_sh.guardVehicle == g_driverVehicle.load(std::memory_order_relaxed)) {
@@ -813,8 +1078,13 @@ namespace vehicleflight
 			// Never hold our lock across a call into the game (0.57.0-0.58.0 did, and the game froze 0.5 s after a
 			// re-centre while hovering: the physics step waited on the game while the frame task waited on our lock).
 			const float qx = g_sh.px, qy = g_sh.py, qz = g_sh.pz;
+			const bool physicalSpin = g_sh.physical;
 			lk.unlock();
 			const auto b = FindBody(vehicle, qx, qy, qz);
+			// Stage 0 (pilot 0): the body's spin now, after the game's step (world, read interface vt +0xA8, as FUN_1423CE0F0 reads it).
+			const bool measure = &g_sh == &g_shs[0] && b.body && b.read;
+			alignas(16) float wNow[4] = {};
+			if (measure || (physicalSpin && b.body && b.read)) VFn<void (*)(std::uintptr_t, std::uint32_t, float*)>(b.read, 0xA8)(b.read, b.id, wNow);
 			lk.lock();
 			if (!g_sh.active || !bodybinding::Matches(b.id,g_sh.bodyId.load())) {
 				return result;
@@ -823,12 +1093,9 @@ namespace vehicleflight
 			if (!b.body) {
 				return result;
 			}
-			LARGE_INTEGER now, freq;
-			QueryPerformanceCounter(&now);
-			QueryPerformanceFrequency(&freq);
-			const double dt = g_sh.lastStep.QuadPart ? std::clamp(double(now.QuadPart - g_sh.lastStep.QuadPart) / double(freq.QuadPart), 1.0 / 240.0, 1.0 / 20.0) : 1.0 / 60.0;
-			g_sh.lastStep = now;
-
+			// Physical flight (player manual or, with its own setting, AI pilots); a faulted chassis flies the stock model.
+			if (g_sh.physical&&!g_sh.physicalFault)
+				return StepPhysical(g_sh,b,wNow,dt,result,lk);
 			const float* R = reinterpret_cast<const float*>(b.body + 0x00);  // right
 			const float* F = reinterpret_cast<const float*>(b.body + 0x10);  // forward (nose)
 			const float* U = reinterpret_cast<const float*>(b.body + 0x20);  // up
@@ -919,38 +1186,74 @@ namespace vehicleflight
 				g_sh.camYaw = (g_sh.gap >= 0 ? 1.0 : -1.0) * kCamYawMax * std::sin(std::min(g2, 3.14159265358979) / 2.0);
 			}
 			const double yawLimit=g_sh.hull.YawAt(hSpeed);
-			const double yawWant = std::clamp(g_sh.yawWant + g_sh.camYaw + kBankYaw * std::sin(roll) * speedK,-yawLimit,yawLimit);  // banked: the nose follows the curve
-			// Axis signs come from the body basis; contacts must never recalibrate the controls.
-			// Pitch: the nose follows the camera aim (deadzone, then a rate toward it); without a camera it levels.
-			double pitchWant = -pitch * kLevelRate;
-			if (g_sh.haveAim) {
-				double e = g_sh.pitchAim - pitch;
-				e = e > 0 ? std::max(0.0, e - kCamPitchDeadzone) : std::min(0.0, e + kCamPitchDeadzone);
-				pitchWant = std::clamp(kCamPitchGain * e, -kPitchRate, kPitchRate);
+			// Stage 0: what happened to the spin we wrote last step (game upright actions, air control, contacts).
+			if (measure && g_sh.haveLastW && std::isfinite(wNow[0]) && std::isfinite(wNow[1]) && std::isfinite(wNow[2])) {
+				const float d[3] = { wNow[0] - g_sh.lastW[0], wNow[1] - g_sh.lastW[1], wNow[2] - g_sh.lastW[2] };
+				const double dF = d[0] * F[0] + d[1] * F[1] + d[2] * F[2], dR = d[0] * R[0] + d[1] * R[1] + d[2] * R[2];
+				g_sh.measRollPull += -dF * (roll >= 0.0 ? 1.0 : -1.0);     // + : toward level
+				g_sh.measPitchPull += -dR * (pitch >= 0.0 ? 1.0 : -1.0);
+				g_sh.measMax = std::max(g_sh.measMax, std::sqrt(double(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])));
+				++g_sh.measN;
 			}
-			if ((pitch > kPitchMax && pitchWant > 0) || (pitch < -kPitchMax && pitchWant < 0)) pitchWant = 0;
-			double rollWant = g_sh.rollIn * kRollRate;
-			if (g_sh.rollAimOn) {
-				rollWant = std::clamp(kApRollGain * Wrap(g_sh.rollAim - roll), -kRollRate, kRollRate);
+			// Free roll and the bank test turn about the body's own axes (freeroll.h); otherwise the stock model below.
+			const bool bodyAxes = g_sh.freeRoll || g_sh.bankTest;
+			double yawWant, pitchWant, rollWant;
+			if (bodyAxes) {
+				// The nose follows the camera aim measured in the body frame: elevation -> pitch, bearing -> yaw (no bank turn: a
+				// banked pull is the turn). No camera: the aim is level ahead.
+				const auto e = freeroll::AimError(R, F, U, freeroll::AimDir(g_sh.haveView ? g_sh.view : bodyHeading, g_sh.haveAim ? g_sh.pitchAim : 0.0));
+				g_sh.gap = e.yaw;
+				const double y2 = std::max(0.0, std::fabs(e.yaw) - kCamDeadzone);
+				g_sh.camYaw = g_sh.haveView ? (e.yaw >= 0 ? 1.0 : -1.0) * kCamYawMax * std::sin(std::min(y2, 3.14159265358979) / 2.0) : 0.0;
+				yawWant = std::clamp(g_sh.yawWant + g_sh.camYaw, -yawLimit, yawLimit);
+				const double ep = e.pitch > 0 ? std::max(0.0, e.pitch - kCamPitchDeadzone) : std::min(0.0, e.pitch + kCamPitchDeadzone);
+				pitchWant = std::clamp(kCamPitchGain * ep, -kPitchRate, kPitchRate);
+				const double rate = freeroll::Rate(g_sh.hull.roll);
+				const bool nearGround = g_sh.groundOk && P[2] - g_sh.groundUnder < freeroll::kGroundLevel;
+				const double leanTo = std::clamp(kLean * g_sh.wYaw * speedK, -0.35, 0.35);
+				rollWant = g_sh.rollAimOn ? freeroll::RollToward(roll, g_sh.rollAim, kApRollGain, rate)
+				                          : freeroll::RollWant(roll, g_sh.rollIn, rate, kLevelRate, leanTo, g_sh.assist, nearGround, g_sh.landing);
+				pitchWant = std::clamp(pitchWant, -g_sh.hull.pitch, g_sh.hull.pitch);
 			}
-			else if (g_sh.rollIn == 0.0) {
-				const double leanTo = std::clamp(kLean * g_sh.wYaw * speedK, -0.35, 0.35);  // lean into the turn
-				rollWant = std::clamp(Wrap(leanTo - roll) * kLevelRate, -kRollRate, kRollRate);
+			else {
+				yawWant = std::clamp(g_sh.yawWant + g_sh.camYaw + kBankYaw * std::sin(roll) * speedK,-yawLimit,yawLimit);  // banked: the nose follows the curve
+				// Axis signs come from the body basis; contacts must never recalibrate the controls.
+				// Pitch: the nose follows the camera aim (deadzone, then a rate toward it); without a camera it levels.
+				pitchWant = -pitch * kLevelRate;
+				if (g_sh.haveAim) {
+					double e = g_sh.pitchAim - pitch;
+					e = e > 0 ? std::max(0.0, e - kCamPitchDeadzone) : std::min(0.0, e + kCamPitchDeadzone);
+					pitchWant = std::clamp(kCamPitchGain * e, -kPitchRate, kPitchRate);
+				}
+				if ((pitch > kPitchMax && pitchWant > 0) || (pitch < -kPitchMax && pitchWant < 0)) pitchWant = 0;
+				rollWant = g_sh.rollIn * kRollRate;
+				if (g_sh.rollAimOn) {
+					rollWant = std::clamp(kApRollGain * Wrap(g_sh.rollAim - roll), -kRollRate, kRollRate);
+				}
+				else if (g_sh.rollIn == 0.0) {
+					const double leanTo = std::clamp(kLean * g_sh.wYaw * speedK, -0.35, 0.35);  // lean into the turn
+					rollWant = std::clamp(Wrap(leanTo - roll) * kLevelRate, -kRollRate, kRollRate);
+				}
+				if ((roll > kRollMax && rollWant > 0) || (roll < -kRollMax && rollWant < 0)) rollWant = 0;
+				pitchWant=std::clamp(pitchWant,-g_sh.hull.pitch,g_sh.hull.pitch);
+				rollWant=std::clamp(rollWant,-g_sh.hull.roll,g_sh.hull.roll);
 			}
-			if ((roll > kRollMax && rollWant > 0) || (roll < -kRollMax && rollWant < 0)) rollWant = 0;
-			pitchWant=std::clamp(pitchWant,-g_sh.hull.pitch,g_sh.hull.pitch);
-			rollWant=std::clamp(rollWant,-g_sh.hull.roll,g_sh.hull.roll);
 			g_sh.wYaw += (yawWant - g_sh.wYaw) * (1.0 - std::exp(-dt * kYawResp));
 			g_sh.wPitch += (pitchWant - g_sh.wPitch) * (1.0 - std::exp(-dt * kTiltResp));
 			g_sh.wRoll += (rollWant - g_sh.wRoll) * (1.0 - std::exp(-dt * kTiltResp));
 			// Body angular velocity: pitch about the right axis (nose up +), roll about the nose (right down +), yaw about
-			// world up (turn right = negative z).
+			// world up (stock) or the body's up (body axes); turn right = a negative turn about it.
 			const double wp = g_sh.wPitch, wr = g_sh.wRoll;
 			alignas(16) float w[4] = { float(R[0] * wp + F[0] * wr), float(R[1] * wp + F[1] * wr), float(R[2] * wp + F[2] * wr - g_sh.wYaw), 0.0f };
+			if (bodyAxes) freeroll::Compose(R, F, U, wp, wr, g_sh.wYaw, w);
 			lk.unlock();
 			VFn<void (*)(std::uintptr_t, std::uint32_t, const float*, int)>(b.write, 0xB0)(b.write, b.id, w, 0);
 			lk.lock();
 			if (!g_sh.active || !bodybinding::Matches(b.id,g_sh.bodyId.load())) return result;
+			if (measure) {
+				for (int i = 0; i < 3; ++i) { g_sh.lastW[i] = w[i]; g_sh.measW[i] = w[i]; }
+				g_sh.haveLastW = true;
+			}
 
 			// ---- Linear: pushes added to the body's own velocity ----
 			const double fh = std::hypot(F[0], F[1]);
@@ -1076,9 +1379,9 @@ namespace vehicleflight
 			ULONGLONG groundAt = 0;
 			unsigned rejected = 0;
 			int gear = 2;                  // 1-4 (shown on the HUD before hovering too)
-			bool wDown = false, sDown = false;
-			bool wHold = false;            // double-tapped W: accelerate stays on until W or S is pressed
-			ULONGLONG wLastPress = 0;
+			bool wDown = false, sDown = false, boostDown = false;
+			bool wHold = false;            // double-tapped boost (2026-10-24, was W): boost stays on until boost or brake is pressed
+			ULONGLONG wLastPress = 0;      // the last boost press (the double-tap window)
 			bool liftoff = false;          // climbing to kLiftoffHeight after switching on near the ground
 			ULONGLONG startedAt = 0;       // when the flight switched on (contacts are ignored for kContactGraceMs)
 			ULONGLONG contactGraceUntil = 0;  // after a push up, contacts until then are its aftermath, not a crash
@@ -1209,7 +1512,7 @@ namespace vehicleflight
 				const auto&v=g_vsnap.v[i];count=std::min(v.bodyCount,16u);std::copy(v.bodyIds,v.bodyIds+count,ids);
 				s.hull=hulllogic::For(v.half[0],v.half[1],v.half[2]);break;}
 			if(s.vehicle.load()!=ref||s.sceneCount!=count||!std::equal(ids,ids+count,s.sceneBodies)){
-				s.instance.store(0);s.bodyId.store(0);s.haveLast=false;s.matched=false;s.lastStep={};s.carryRun=0;
+				s.instance.store(0);s.bodyId.store(0);s.haveLast=false;s.matched=false;s.carryRun=0;s.physicalState={};s.physicalFault=false;
 				s.guardVehicle=0;s.guardInstance=0;s.sceneCount=count;std::copy(ids,ids+count,s.sceneBodies);
 				logger::Write("Hover body binding: ref %p -> %u owned bodies%s",reinterpret_cast<void*>(ref),count,count?"":" (waiting for scene identity)");
 			}
@@ -1617,6 +1920,7 @@ namespace vehicleflight
 			int call = 0;                  // N: summon / recall (on foot)
 			int follow = 0;                // U: cover on / off (on foot)
 			int stance = 0;                // Defend / Attack / Hold fire for your vehicle and your escorts (on foot and driving)
+			int bankTest = 0;              // , : the stage 0 bank test (only with the detailed log on)
 		} g_keys;
 
 		struct Tap
@@ -1670,7 +1974,7 @@ namespace vehicleflight
 				return;
 			}
 			auto freeHere = [](int vk) { return controlmap::KeyFreeIn(vk, "Vehicle"); };
-			// N and U are the user's summon / cover keys (2026-10-20): never the hover toggle (double-tap Space also toggles hover).
+			// N and U are the user's summon / cover keys (2026-10-20): never the hover toggle.
 			for (const int vk : std::initializer_list<int>{ 'J', 'K', 'Y', 'O', 'P', 'B' }) {
 				if (freeHere(vk) && controlmap::KeyFree(vk)) {
 					g_keys.toggle = vk;
@@ -1709,6 +2013,8 @@ namespace vehicleflight
 				if (vk != g_keys.toggle && vk != g_keys.up && vk != g_keys.down && controlmap::Claim("flight", "stance", vk)) { g_keys.stance = vk; break; }
 			}
 			logger::Write("Rover stance key: %s", g_keys.stance ? controlmap::KeyName(g_keys.stance).c_str() : "NONE FREE");
+			// The bank test is a test key (the user's rule: , . / ' only).
+			g_keys.bankTest = controlmap::Claim("flight", "bank test (detailed log)", VK_OEM_COMMA) ? VK_OEM_COMMA : 0;
 			logger::Write("Rover flight keys: toggle %s, roll %s / %s, up %s / down %s; mouse aims (yaw + pitch), W/S throttle, Shift boost; extra mouse buttons unused",
 				g_keys.toggle ? controlmap::KeyName(g_keys.toggle).c_str() : "NONE FREE", g_keys.rollLeft ? controlmap::KeyName(g_keys.rollLeft).c_str() : "none",
 				g_keys.rollRight ? controlmap::KeyName(g_keys.rollRight).c_str() : "none", g_keys.up ? controlmap::KeyName(g_keys.up).c_str() : "none",
@@ -1938,6 +2244,8 @@ namespace vehicleflight
 
 		void Stop(int idx, const char* why)
 		{
+			g_shs[idx].physOn.store(false); PhysicalRelease(g_shs[idx]);
+			if (!idx) vehiclecamera::Reset();
 			State& g = g_gs[idx];
 			Shared& g_sh = g_shs[idx];
 			const auto releasedVehicle = g_hoverVehicles[idx].load();
@@ -1952,6 +2260,7 @@ namespace vehicleflight
 			{
 				std::lock_guard lk(g_sh.lock);
 				g_sh.active = false;
+				g_sh.physical = false; g_sh.physicalState={};g_sh.physicalFault=false;
 				g_sh.groundOn = false;
 				g_sh.landing = false;
 				g_sh.haveLast = false;
@@ -2025,6 +2334,9 @@ namespace vehicleflight
 				std::lock_guard lk(g_sh.lock);
 				g_sh.px = pos.x; g_sh.py = pos.y; g_sh.pz = pos.z;
 				g_sh.wYaw = g_sh.wPitch = g_sh.wRoll = 0;
+				g_sh.physicalState={};
+				g_sh.physicalFault=false;
+				g_sh.haveLastW = false;
 				g_sh.instance.store(0);g_sh.matched=false;
 				g_sh.gEst = std::clamp(g_sh.gEst, 3.0, 20.0);  // a drained estimate would start a flight with no lift
 				g_sh.holding = false;
@@ -2043,8 +2355,10 @@ namespace vehicleflight
 				return;
 			}
 			logger::Write("Rover flight: on at (%.0f, %.0f, %.0f)", pos.x, pos.y, pos.z);
-			notify::Log("Hover on - [W] boost [S] brake [Alt tap] gear [LShift] boost  [%s]/[%s] up/down  [Alt hold] down  [%s]/[%s] turn  [Space x2] off", bindings::Label(bindings::Action::LiftUp, g_keys.up).c_str(),
-				bindings::Label(bindings::Action::LiftDown, g_keys.down).c_str(), bindings::Label(bindings::Action::TurnLeft, g_mk.left).c_str(), bindings::Label(bindings::Action::TurnRight, g_mk.right).c_str());
+			notify::Log("Hover on - [W] accelerate [S] brake [Alt tap] gear [%s] boost (double tap: stays on)  [%s]/[%s] up/down  [Alt hold] down  [%s]/[%s] turn  [%s] off",
+				bindings::Label(bindings::Action::Boost, VK_LSHIFT).c_str(), bindings::Label(bindings::Action::LiftUp, g_keys.up).c_str(),
+				bindings::Label(bindings::Action::LiftDown, g_keys.down).c_str(), bindings::Label(bindings::Action::TurnLeft, g_mk.left).c_str(), bindings::Label(bindings::Action::TurnRight, g_mk.right).c_str(),
+				bindings::Label(bindings::Action::HoverToggle, g_keys.toggle).c_str());
 			telemetry::Record("rover_flight_on", "\"pos\":[%.0f,%.0f,%.0f]", pos.x, pos.y, pos.z);
 		}
 		void Start(std::uintptr_t vehicle) { Start(0, vehicle); }
@@ -2583,6 +2897,10 @@ namespace vehicleflight
 	}
 
 	bool Active() { return g.active; }
+	bool PhysicalCameraActive(std::uintptr_t vehicle) {
+		return vehicle && g_sh.physOn.load(std::memory_order_acquire) && g_sh.physNeedsDriver.load() && g_sh.physInstance.load() &&
+			g_hoverVehicle.load()==vehicle && g_driverVehicle.load()==vehicle;
+	}
 
 	bool Install()
 	{
@@ -2594,6 +2912,16 @@ namespace vehicleflight
 		}
 		g_original = reinterpret_cast<Step_t>(original);
 		logger::Write("Rover flight: vehicle physics step hooked");
+		void* level=nullptr; void* damp=nullptr; void* clamp=nullptr;
+		const bool levelOk=hook::Install(game::Base()+vtolhooks::kLevel,vtolhooks::kLevelBytes,sizeof(vtolhooks::kLevelBytes),reinterpret_cast<void*>(&PhysicalLevelDetour),&level);
+		if (levelOk) g_physicalLevelOriginal=reinterpret_cast<Level_t>(level);
+		const bool dampOk=hook::Install(game::Base()+vtolhooks::kDamp,vtolhooks::kDampBytes,sizeof(vtolhooks::kDampBytes),reinterpret_cast<void*>(&PhysicalDampDetour),&damp);
+		if (dampOk) g_physicalDampOriginal=reinterpret_cast<Damp_t>(damp);
+		const bool clampOk=hook::Install(game::Base()+vtolhooks::kClamp,vtolhooks::kClampBytes,sizeof(vtolhooks::kClampBytes),reinterpret_cast<void*>(&PhysicalClampDetour),&clamp);
+		if (clampOk) g_physicalClampOriginal=reinterpret_cast<Clamp_t>(clamp);
+		g_physicalHooksReady=levelOk&&dampOk&&clampOk;
+		logger::Write("Physical VTOL: native assist hooks %s (opt-in, player only; native impulse writer checked per body)",g_physicalHooksReady?"ready":"unavailable; existing flight retained");
+		vehiclecamera::Install();
 		static const std::uint8_t kBoostPrologue[14] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55 };
 		void* boost = nullptr;
 		if (hook::Install(game::Base() + addr::kVehicleBoostUpdate, kBoostPrologue, sizeof(kBoostPrologue), reinterpret_cast<void*>(&BoostDetour), &boost)) {
@@ -2639,6 +2967,7 @@ namespace vehicleflight
 				g_sh.haveLast = false;
 				g_sh.collided = false;
 				g_sh.wYaw = g_sh.wPitch = g_sh.wRoll = 0;
+				g_sh.haveLastW = false;
 				g_sh.holding = false;
 			}
 			g.liftoff = true;
@@ -2692,6 +3021,102 @@ namespace vehicleflight
 					who, g.detourAng * 57.2958, c.freeDist, c.score, c.usable, c.blocked, c.unknown, oldSide < 0 ? "left" : "right");
 			}
 			return true;
+		}
+
+		// ---- Stage 0 attitude measurement (notes/FLIGHT_MODEL_STUDY_20261023.md, VEHICLE_CAMERA_ROLL_STUDY_20261023.md) ----
+		// Bank test: with the detailed log on, the , key steps the player's hover through a held bank of 0 -> 60 -> 120 -> 0 degrees
+		// (body-axis turning, freeroll.h). While a bank is held, or free roll is on with the detailed log, a line every 0.5 s
+		// logs the attitude, what the game did to our spin, the game's two upright actions and the camera's rows.
+		constexpr double kBankTestDeg[3] = { 0.0, 60.0, 120.0 };
+		constexpr ULONGLONG kAttitudeLogMs = 500;
+		struct BankTest { int step = 0; bool down = false; ULONGLONG logAt = 0, flight = 0; bool settingsLogged = false; } g_bankTest;
+
+		// A VehicleRuntimeComponent's two hknpReorientActions (+0x540 pitch axis, +0x538 roll axis; FUN_141317C90): strength +0x50,
+		// damping +0x54 (FUN_14131E290 sets them per frame, 0.1 / 0 when tipped past fVehicleLevelingMinUpAngle).
+		struct Reorient { bool ok = false; float pitchStrength = 0, pitchDamping = 0, rollStrength = 0, rollDamping = 0; };
+		Reorient ReadReorient(std::uintptr_t component)
+		{
+			Reorient r;
+			if (!component) return r;
+			__try {
+				const auto p = At<std::uintptr_t>(component, 0x540), q = At<std::uintptr_t>(component, 0x538);
+				if (p) { r.pitchStrength = At<float>(p, 0x50); r.pitchDamping = At<float>(p, 0x54); }
+				if (q) { r.rollStrength = At<float>(q, 0x50); r.rollDamping = At<float>(q, 0x54); }
+				r.ok = p || q;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				r.ok = false;
+			}
+			return r;
+		}
+
+		// The camera root's world rows (+0x80 right, +0x90 forward, +0xA0 up; the readings CameraHeadings uses).
+		bool CameraRows(float rows[9])
+		{
+			const auto cam = Ptr(addr::kPlayerCameraPtr);
+			const auto root = cam ? At<std::uintptr_t>(cam, 0x08) : 0;
+			if (!root) return false;
+			for (int r = 0; r < 3; ++r)
+				for (int k = 0; k < 3; ++k) rows[r * 3 + k] = At<float>(root, 0x80 + 0x10 * r + 4 * k);
+			return std::isfinite(rows[0]) && std::isfinite(rows[4]) && std::isfinite(rows[8]);
+		}
+
+		// The game settings that limit the attitude and the camera (values at setting object +8, degrees): FUN_14131E290 and
+		// FUN_140FB4D80 read them. Logged once.
+		void LogAttitudeSettings()
+		{
+			if (g_bankTest.settingsLogged) return;
+			g_bankTest.settingsLogged = true;
+			const float minUp = At<float>(game::Base(), 0x05F045A0);       // fVehicleLevelingMinUpAngle
+			const float camMin = At<float>(game::Base(), 0x05F074C0);      // fVehicleCameraPitchMin
+			const float camMax = At<float>(game::Base(), 0x05F074E0);      // fVehicleCameraPitchMax
+			logger::Write("Flight attitude: game settings fVehicleLevelingMinUpAngle %.1f, fVehicleCameraPitchMin %.1f, fVehicleCameraPitchMax %.1f (degrees)", minUp, camMin, camMax);
+		}
+
+		// The bank test key and the attitude line, pilot 0 hovering. Returns the bank target (rad) while one is held.
+		bool BankTestFrame(std::uintptr_t vehicle, ULONGLONG flightStart, bool keysOn, bool autopilot, double above, bool freeRoll, bool firstPerson, double& target)
+		{
+			auto& t = g_bankTest;
+			if (t.flight != flightStart) { t.flight = flightStart; t.step = 0; }  // every flight starts level
+			const bool held = keysOn && g_keys.bankTest && (GetAsyncKeyState(g_keys.bankTest) & 0x8000) != 0;
+			if (held && !t.down && logger::Verbose() && !autopilot) {
+				t.step = (t.step + 1) % 3;
+				notify::Show("Bank test: %.0f degrees", kBankTestDeg[t.step]);
+				logger::Write("Flight attitude: bank test -> %.0f degrees", kBankTestDeg[t.step]);
+			}
+			t.down = held;
+			if (t.step && (autopilot || above < freeroll::kGroundLevel || !logger::Verbose())) {
+				t.step = 0;
+				notify::Show("Bank test off");
+				logger::Write("Flight attitude: bank test off (%s)", autopilot ? "autopilot" : above < freeroll::kGroundLevel ? "too low" : "detailed log off");
+			}
+			const ULONGLONG now = GetTickCount64();
+			if ((t.step || (freeRoll && logger::Verbose())) && now - t.logAt >= kAttitudeLogMs) {
+				t.logAt = now;
+				LogAttitudeSettings();
+				double pitch, roll, rollPull, pitchPull, maxD, w[3];
+				unsigned n; bool physicalLog;
+				{
+					std::lock_guard lk(g_sh.lock);
+					pitch = g_sh.bodyPitch; roll = g_sh.bodyRoll;
+					physicalLog=g_sh.physical;
+					n = g_sh.measN; rollPull = g_sh.measRollPull; pitchPull = g_sh.measPitchPull; maxD = g_sh.measMax;
+					for (int i = 0; i < 3; ++i) w[i] = g_sh.measW[i];
+					g_sh.measN = 0; g_sh.measRollPull = g_sh.measPitchPull = g_sh.measMax = 0;
+				}
+				const auto ro = ReadReorient(vehiclediag::ComponentOf(At<std::uint32_t>(vehicle, off::kFormId)));
+				float cr[9] = {};
+				const bool camOk = CameraRows(cr);
+				const double camRoll = camOk ? std::atan2(-double(cr[2]), double(cr[8])) : 0.0;  // the camera's own roll (right side down +)
+				logger::Write("Flight attitude: bank %.0f, roll %.1f pitch %.1f deg; spin %s (%.2f, %.2f, %.2f) rad/s; game change per step over %u steps: "
+					"toward level roll %+.3f pitch %+.3f, largest %.3f rad/s; upright actions %s pitch %.2f / %.2f roll %.2f / %.2f (strength / damping); "
+					"camera %s %s roll %.1f deg rows R(%.2f %.2f %.2f) F(%.2f %.2f %.2f) U(%.2f %.2f %.2f)",
+					kBankTestDeg[t.step], roll * 57.2958, pitch * 57.2958, physicalLog?"after impulses":"written",w[0], w[1], w[2], n, n ? rollPull / n : 0.0, n ? pitchPull / n : 0.0, maxD,
+					ro.ok ? "read" : "NOT read", ro.pitchStrength, ro.pitchDamping, ro.rollStrength, ro.rollDamping,
+					firstPerson ? "1st person" : "3rd person", camOk ? "ok" : "MISSING", camRoll * 57.2958, cr[0], cr[1], cr[2], cr[3], cr[4], cr[5], cr[6], cr[7], cr[8]);
+			}
+			target = kBankTestDeg[t.step] / 57.2958;
+			return t.step != 0;
 		}
 
 		bool CoverFighting();
@@ -2902,18 +3327,20 @@ namespace vehicleflight
 			// Alt tap/hold is resolved once in PlayerTick, shared by driving and hover.
 			// W held: boost at the selected gear. S held: brake. Neither: coast.
 			const bool keysOn = focused && !g.autopilot;  // on autopilot the player's keys do not fly the rover
-			const bool paidBoost=keysOn && bindings::Held(bindings::Action::Boost, VK_LSHIFT) && g_meterBoost.load() && g_meterVehicle.load()==vehicle;
+			const bool boostHeld = keysOn && bindings::Held(bindings::Action::Boost, VK_LSHIFT);
 			const bool wHeld = keysOn && bindings::Held(bindings::Action::Accelerate, g_mk.accel), sHeld = keysOn && bindings::Held(bindings::Action::Brake, g_mk.brake);
-			const bool wWasDown = g.wDown, sWasDown = g.sDown;
+			const bool sWasDown = g.sDown, boostWasDown = g.boostDown;
 			{
 				g.wDown = wHeld;
 				g.sDown = sHeld;
+				g.boostDown = boostHeld;
 			}
-			// W: accelerate while held; double-tap W: accelerate stays on; the next W or S press releases it.
+			// Boost (Shift / RB): boost while held; double-tap it: boost stays on; the next boost or brake press releases it
+			// (2026-10-24, the user: the forward boost's own button, instead of double-tapping W).
 			{
-				const bool wPress = wHeld && !wWasDown;
+				const bool boostPress = boostHeld && !boostWasDown;
 				const bool sPress = sHeld && !sWasDown;
-				if (wPress) {
+				if (boostPress) {
 					const ULONGLONG nowMs = GetTickCount64();
 					if (g.wHold) {
 						g.wHold = false;
@@ -2922,7 +3349,7 @@ namespace vehicleflight
 					else if (g.wLastPress && nowMs - g.wLastPress <= kDoubleTapMs) {
 						g.wHold = true;
 						g.wLastPress = 0;
-						logger::Write("%s: accelerate held (double-tapped W)", wf);
+						logger::Write("%s: boost held (double-tapped boost)", wf);
 					}
 					else {
 						g.wLastPress = nowMs;
@@ -2932,7 +3359,10 @@ namespace vehicleflight
 					g.wHold = false;
 				}
 			}
-			bool boosting = wHeld || g.wHold || paidBoost;
+			const bool paidBoost = (boostHeld || g.wHold) && g_meterBoost.load() && g_meterVehicle.load()==vehicle;
+			// The player's throttle as an amount (2026-10-24: analog sticks; a key or the boost lock is all of it).
+			const double throttleIn = g.wHold || paidBoost ? 1.0 : keysOn ? bindings::Amount(bindings::Action::Accelerate, g_mk.accel) : 0.0;
+			bool boosting = wHeld || throttleIn > 0.0;
 			bool sBrake = sHeld;
 			// Autopilot: accelerate while the distance left exceeds the braking distance, then brake; arrive and stop.
 			double apBearing = 0;
@@ -3113,7 +3543,7 @@ namespace vehicleflight
 			}
 			const bool boost = boosting;  // booster visuals while accelerating
 			const double boostMultiplier=paidBoost?boostlogic::kMultiplier:1.0;
-			double thrustAcc = boosting ? boostMultiplier*kThrust * (g.aiGears ? kAiGearThrust[apGear] : kGearThrust[apGear]) * (g.autopilot ? g.throttle : 1.0) : 0.0;
+			double thrustAcc = boosting ? boostMultiplier*kThrust * (g.aiGears ? kAiGearThrust[apGear] : kGearThrust[apGear]) * (g.autopilot ? g.throttle : std::max(throttleIn, wHeld ? 1.0 : 0.0)) : 0.0;
 			bool thrust = thrustAcc > 0.0;
 			const double pitchIn = 0.0;
 			// The camera aim: its pitch above its resting pitch is the nose pitch wanted.
@@ -3124,8 +3554,9 @@ namespace vehicleflight
 				g_camRest.Observe(camPitch,firstPerson,false);
 				pitchAim = std::clamp(camPitch - g_camRest.pitch, -kPitchMax, kPitchMax);
 			}
-			double rollIn = (keysOn && bindings::Held(bindings::Action::TurnRight, g_mk.right) ? 1.0 : 0.0) -
-				(keysOn && bindings::Held(bindings::Action::TurnLeft, g_mk.left) ? 1.0 : 0.0);
+			// Analog (2026-10-24): half a stick rolls at half rate; A / D are all of it.
+			double rollIn = (keysOn ? bindings::Amount(bindings::Action::TurnRight, g_mk.right) : 0.0) -
+				(keysOn ? bindings::Amount(bindings::Action::TurnLeft, g_mk.left) : 0.0);
 			double lift = (keysOn && bindings::Held(bindings::Action::LiftUp, g_keys.up) ? 1.0 : 0.0) -
 				(keysOn && bindings::Held(bindings::Action::LiftDown, g_keys.down) ? 1.0 : 0.0);
 			if (!idx && keysOn && g_altDrop) lift = -1.0;
@@ -3715,7 +4146,21 @@ namespace vehicleflight
                 vzOn=true; vzCmd=0;
                 g.holding=true; g.hold=std::max(kMinClearance,pos.z-refGround);
             }
+			// Free roll (the settings menu) flies only your own hover, never the autopilot or NPC pilots; the bank test likewise.
+			const bool freeRoll = idx == 0 && !g.autopilot && features::On(features::Id::FreeRoll);
+			const bool flightAssist = features::On(features::Id::FlightAssist);
+			// Physical flight: the player's own hover (Physical VTOL), or any autopilot / NPC pilot (Physical VTOL for AI pilots).
+			const bool manualPhysical=idx==0&&!g.autopilot&&features::On(features::Id::PhysicalVtol);
+			const bool aiPhysical=g.autopilot&&features::On(features::Id::PhysicalAi);
+			const bool physical=g_physicalHooksReady&&(manualPhysical||aiPhysical);
+			g_sh.physNeedsDriver.store(manualPhysical,std::memory_order_relaxed);
+			g_sh.physOn.store(physical,std::memory_order_release);
+			double bankTarget = 0;
+			const bool bankTest = idx == 0 && BankTestFrame(vehicle, g.startedAt, keysOn, g.autopilot, above, freeRoll, firstPerson, bankTarget);
+			if (bankTest) { rollAimOn = true; rollAim = bankTarget; }
 			AskCorridors(idx, pos, (g.autopilot && apSteer && !g.apClimb) ? apBearing : (sp > 2.0 ? std::atan2(v[0], v[1]) : bodyHeading), std::max(sp, g.autopilot ? 10.0 : 0.0));
+			bool cameraActive=false;
+			double cameraPitch=0,cameraRoll=0;
 			{
 				std::lock_guard lk(g_sh.lock);
 				g_sh.px = pos.x; g_sh.py = pos.y; g_sh.pz = pos.z;
@@ -3724,6 +4169,7 @@ namespace vehicleflight
 				g_sh.haveAim = haveAim;
 				g_sh.thrusting = thrust;
 				g_sh.braking = braking;
+				const bool pilotChanged = g_sh.autopilot != g.autopilot;
 				g_sh.autopilot = g.autopilot;
 				g_sh.yawWant = yawWant;
 				g_sh.view = view;
@@ -3736,6 +4182,14 @@ namespace vehicleflight
 				g_sh.vz = vzCmd;
 				g_sh.rollAimOn = rollAimOn;
 				g_sh.rollAim = rollAim;
+				g_sh.freeRoll = freeRoll;
+				if (g_sh.physical!=physical||(physical&&pilotChanged)) {
+					g_sh.physicalState={}; g_sh.physicalFault=false; g_sh.haveLastW=false; g_sh.physWiped=0;
+					if (physical||g_sh.physical) logger::Write("%s: physical flight %s (%s)",Who(idx),physical?"on":"off",g.autopilot?"AI pilot":"manual");
+				}
+				g_sh.physical = physical;
+				g_sh.assist = flightAssist;
+				g_sh.bankTest = bankTest;
 				g_sh.holding = g.holding;
 				if (g.ceilValid) {
 					// Never up into a ceiling: the hold (metres over refGround) stays under it; the climb-outs give way to it too.
@@ -3756,6 +4210,12 @@ namespace vehicleflight
 				g_sh.groundOk = groundOk;
 				g_sh.airborne = groundOk && above > 1.5;
 				g_sh.cap = g.cap;
+				cameraActive=manualPhysical&&physical&&!g_sh.physicalFault;
+				cameraPitch=g_sh.bodyPitch; cameraRoll=g_sh.bodyRoll;
+			}
+			if (!idx) {
+				vehiclecamera::Publish(cameraActive?vehicle:0,cameraPitch,cameraRoll);
+				vehiclecamera::LogStatus();
 			}
 
 			if (g.autopilot) {
@@ -3997,7 +4457,7 @@ namespace vehicleflight
 		g.keyDown = h;
 		const auto driven = PlayerVehicle(player);
 		FirstPersonLookLimits(driven != 0);
-		g_boostRequest.store(driven && focused && !g.playerAuto && bindings::Held(bindings::Action::Boost, VK_LSHIFT));
+		g_boostRequest.store(driven && focused && !g.playerAuto && (bindings::Held(bindings::Action::Boost, VK_LSHIFT) || (g.active && g.wHold)));
 		if(!driven)g_meterBoost.store(false);
 		hoverui::SetState(driven != 0, g.active && (!g.autopilot || g.playerAuto), g.gear, g.wHold);
 		const auto priorDriven=g_driverVehicle.exchange(driven,std::memory_order_relaxed);
@@ -4472,17 +4932,38 @@ namespace vehicleflight
 		const ULONGLONG stepReportNow = GetTickCount64();
 		if (stepReportNow - lastStepReport >= 10000) {
 			lastStepReport = stepReportNow;
+			const unsigned samples = g_nativeStepSamples.exchange(0, std::memory_order_relaxed);
+			const unsigned skipped = g_nativeStepSkipped.exchange(0, std::memory_order_relaxed);
+			if (samples) logger::Write("Vehicle physics time: %u callbacks, last native dt %.6f s; %u invalid/long intervals skipped by custom control (native dt forwarded unchanged)",
+				samples, double(g_nativeStepSeconds.load(std::memory_order_relaxed)), skipped);
+			const unsigned physicalSteps=g_physicalSteps.exchange(0),physicalFailures=g_physicalFailures.exchange(0);
+			if (physicalSteps||physicalFailures) {
+				static const char* reasons[]={"none","missing body","world interfaces differ","body generation/type differs","linear writer differs","angular writer differs","mass/inertia/frame invalid","unreadable native data","invalid model input","native impulse fault"};
+				logger::Write("Physical VTOL: %u impulse steps, %u rejected; native mass %.1f, collective %.2f m/s^2; response error linear %.5f m/s angular %.5f rad/s; last reject %s; driver-only, no velocity overwrite",
+					physicalSteps,physicalFailures,double(g_physicalMass.load()),double(g_physicalCollective.load()),double(g_physicalLinearError.load()),double(g_physicalAngularError.load()),reasons[std::min(g_physicalReject.load(),9u)]);
+			}
+			{
+				char aiLine[256]; int n=0;
+				for (int i=0;i<kPilots;++i) {
+					const unsigned steps=g_shs[i].physSteps.exchange(0);
+					bool ai,fault; { std::lock_guard lk(g_shs[i].lock); ai=g_shs[i].autopilot; fault=g_shs[i].physicalFault&&g_shs[i].physical; }
+					if ((steps&&ai)||fault) n+=std::snprintf(aiLine+n,sizeof(aiLine)-n,"%s%s %u%s",n?", ":"",Who(i),ai?steps:0,fault?" (fell back)":"");
+					if (n>=int(sizeof(aiLine))-48) break;
+				}
+				if (n) logger::Write("Physical VTOL AI: impulse steps in 10 s: %s",aiLine);
+			}
 			const unsigned occupied = g_occupiedSteps.exchange(0, std::memory_order_relaxed);
 			const unsigned unoccupied = g_unoccupiedSteps.exchange(0, std::memory_order_relaxed);
 			if (occupied || unoccupied) {
 				if (logger::Verbose()) logger::Write("Ship vehicle physics probe: last rover stepped %u times while driven, %u times after leaving it (10 s)", occupied, unoccupied);
 			}
 		}
-		const bool boostTap = g_tapBoost.Update(focused && bindings::Held(bindings::Action::VerticalBoost, g_mk.vert));
+		// Hover on / off is the hover key only (2026-10-24, the user approved the no-chord map): double-tapping the vertical
+		// boost made the vehicle hop twice first, since the game boosts on each press.
 		static std::uintptr_t announced = 0;
 		if (vehicle && vehicle != announced && !g.active) {
 			announced = vehicle;
-			notify::Log("Rover: double-tap vertical boost (Space) to hover");
+			notify::Log("Rover: %s to hover", bindings::Label(bindings::Action::HoverToggle, g_keys.toggle).c_str());
 		}
 		if (!vehicle) {
 			announced = 0;
@@ -4499,14 +4980,6 @@ namespace vehicleflight
 		if (!g.active) {
 			double cp;bool first;
 			if(CameraAimReading(vehicle,cp,first))g_camRest.Observe(cp,first,true);
-		}
-		if (boostTap && driven) {  // on foot (autopilot) a double jump must not cancel the call
-			if (g.active) {
-				Stop("double-tapped vertical boost");
-				return;
-			}
-			Start(vehicle);
-			return;
 		}
 		if (pressed && driven) {
 			if (g.active) {
@@ -5149,6 +5622,8 @@ namespace vehicleflight
 
 	void LoadReset()
 	{
+		for (auto& s : g_shs) { s.physOn.store(false); PhysicalRelease(s); }
+		vehiclecamera::Reset();
 		FirstPersonLookLimits(false);
 		TrailClear();
 		// An in-game save load can keep the same player and rover addresses while

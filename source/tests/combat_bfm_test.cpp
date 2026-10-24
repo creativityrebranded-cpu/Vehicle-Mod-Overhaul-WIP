@@ -128,5 +128,13 @@ int main()
         Fighter slow = F(0, 0, 10, 0, 5); slow.boost = 0; Fighter fastIt = F(60, 0, 10, 0, 35);
         check(Desire(M::TurningFight, Measure(slow, fastIt), c) < 0.3, "low on energy: avoid the turning fight");
     }
+    {
+        Body ally;ally.pos={5,30,10};ally.radius=6;
+        check(AllyBodiesInLine({0,0,10},{0,60,10},&ally,1),"a wide allied hull blocks a shot even when its centre is outside the old fixed width");
+        ally.pos={0,30,20};ally.radius=2;
+        check(!AllyBodiesInLine({0,0,10},{0,60,10},&ally,1),"an ally well above the actual firing segment does not block it");
+        ally.pos={0,1,10};
+        check(AllyBodiesInLine({0,0,10},{0,60,10},&ally,1),"an ally overlapping the start of the shot still blocks fire");
+    }
     return failures ? 1 : 0;
 }

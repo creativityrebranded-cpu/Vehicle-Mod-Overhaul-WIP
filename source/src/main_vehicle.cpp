@@ -19,6 +19,7 @@
 #include "routeplan.h"
 #include "scantarget.h"
 #include "bindings.h"
+#include "inputgate.h"
 #include "vehiclediag.h"
 #include "mappoints.h"
 #include "vehicleworld.h"
@@ -137,6 +138,7 @@ namespace
 			return;
 		}
 		hoverui::Install();
+		inputgate::Install();
 		mappoints::Install();
 		npcvehicles::Install();
 		profiles::Install();
@@ -163,6 +165,7 @@ namespace
 		}
 		g_standalone = true;
 		hoverui::Install();
+		inputgate::Install();
 		mappoints::Install();
 		npcvehicles::Install();
 		profiles::Install();
@@ -225,7 +228,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	g_messaging = static_cast<SFSEMessagingInterface*>(sfse->QueryInterface(kInterface_Messaging));
 	g_tasks = static_cast<SFSETaskInterface*>(sfse->QueryInterface(kInterface_Task));
 	if (!g_messaging || !g_messaging->RegisterListener(g_handle, "SFSE", SfseMessage)) return false;
-	logger::Write("SeamlessVehicle 0.71.0 loaded; core optional");
+	logger::Write("SeamlessVehicle 0.72.0 loaded; core optional");
 	return true;
 }
 }

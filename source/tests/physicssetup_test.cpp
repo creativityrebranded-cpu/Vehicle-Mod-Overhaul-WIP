@@ -49,6 +49,22 @@ int main()
             !physicssetup::GuardOpen(until, 1000 + physicssetup::kLaunchGuardMs), "and closes after the guard time");
     }
     {
+        // 23:19 run: still clamping when the 10 s ran out. A clamp keeps it open 3 s more, never past 30 s from the first step.
+        const unsigned long long first = 1000;
+        unsigned long long until = 0;
+        physicssetup::GuardOpen(until, first);
+        physicssetup::GuardHit(first, until, first + 500);
+        check(until == first + physicssetup::kLaunchGuardMs, "an early clamp never shortens the first window");
+        physicssetup::GuardHit(first, until, first + 9000);
+        check(until == first + 9000 + physicssetup::kLaunchQuietMs, "a clamp near the end keeps the window open");
+        check(physicssetup::GuardOpen(until, first + 11000), "so it is still open after the old 10 s");
+        physicssetup::GuardHit(first, until, first + 29000);
+        check(until == first + physicssetup::kLaunchCapMs, "but never past the cap");
+        physicssetup::GuardHit(first, until, first + 40000);
+        check(until == first + physicssetup::kLaunchCapMs && !physicssetup::GuardOpen(until, first + 40000), "a late clamp does not reopen it");
+        check(!physicssetup::GuardGone(5000, 5999) && physicssetup::GuardGone(5000, 6000), "a vehicle missing under 1 s keeps its guard");
+    }
+    {
         // 22 vehicles pending at once: the game's 8-entry list would keep the last few; ours keeps them all.
         physicssetup::PendingSet set;
         for (std::uint32_t id = 0xFE008800; id < 0xFE008816; ++id) set.Add(id);

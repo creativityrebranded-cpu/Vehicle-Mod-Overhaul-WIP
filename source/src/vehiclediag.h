@@ -11,4 +11,5 @@ namespace vehiclediag
 	void Install();                          // hooks the vehicle component update (counting only)
 	void NoteStep(std::uintptr_t instance);  // from the physics step hook, every call (any owner)
 	void Tick();                             // main thread, once per frame
+	std::uintptr_t ComponentOf(std::uint32_t formId);  // the VehicleRuntimeComponent last updated for this vehicle form id, or 0
 }

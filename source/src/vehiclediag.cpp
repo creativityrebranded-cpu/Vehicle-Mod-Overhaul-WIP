@@ -5,6 +5,7 @@
 #include "hook.h"
 #include "log.h"
 #include "physicssetup.h"
+#include "vehicleflight.h"
 #include "vehiclehits.h"
 #include "vehicleworld.h"
 
@@ -334,9 +335,14 @@ namespace vehiclediag
 
 		// Launch guard slots (physicssetup::ClampLaunch). The main thread arms a slot for each new instance of a parked
 		// vehicle; the physics step (NoteStep, any thread) opens its window at the first step and clamps launches in it.
-		struct Guard { std::atomic<uptr> instance{0}; std::atomic<unsigned long long> until{0}; std::atomic<std::uint32_t> formId{0}; std::atomic<unsigned> hits{0}; };
+		// first / lastHit / maxSpeed / closed belong to the stepping thread once armed (the close line reports them).
+		struct Guard {
+			std::atomic<uptr> instance{0}; std::atomic<unsigned long long> until{0}; std::atomic<std::uint32_t> formId{0}; std::atomic<unsigned> hits{0};
+			std::atomic<unsigned long long> first{0}, lastHit{0}; std::atomic<float> maxSpeed{0}; std::atomic<bool> closed{false};
+		};
 		Guard g_guards[16];
-		std::unordered_map<uptr, std::uint32_t> g_guardSeen;  // main thread: instances already considered -> form id
+		struct Seen { std::uint32_t formId = 0; unsigned long long at = 0; };
+		std::unordered_map<uptr, Seen> g_guardSeen;  // main thread: instances already considered -> form id, last frame present
 
 		void ClampInstance(Guard& g, uptr instance)
 		{
@@ -344,10 +350,19 @@ namespace vehiclediag
 			const unsigned long long now = GetTickCount64();
 			const bool first = !until;
 			const bool open = physicssetup::GuardOpen(until, now);
-			if (first) g.until.store(until, std::memory_order_relaxed);
-			if (!open) return;
+			if (first) { g.first.store(now, std::memory_order_relaxed); g.until.store(until, std::memory_order_relaxed); }
+			if (!open) {
+				if (!g.closed.exchange(true, std::memory_order_relaxed)) {
+					const unsigned long long last = g.lastHit.load(std::memory_order_relaxed);
+					logger::Write("Vehicle physics repair: launch guard closed for %08X after %.1f s: %u clamps, last %s%.1f s ago, fastest %.1f m/s",
+						g.formId.load(std::memory_order_relaxed), double(now - g.first.load(std::memory_order_relaxed)) / 1000.0,
+						g.hits.load(std::memory_order_relaxed), last ? "" : "(none) ", last ? double(now - last) / 1000.0 : 0.0,
+						g.maxSpeed.load(std::memory_order_relaxed));
+				}
+				return;
+			}
 			float before[3] = {}, after[3] = {};
-			bool hit = false;
+			bool hit = false, spun = false;
 			__try {
 				// The vehicle instance's chassis, the way vehicleflight::FindBody reads it: read world +0x28, body id +0x20,
 				// body vt +0x70, its motion (read vt +0xD0 with the body's motion id +0x80), linear velocity at motion +0x60.
@@ -362,12 +377,34 @@ namespace vehiclediag
 				for (int k = 0; k < 3; ++k) before[k] = v[k];
 				hit = physicssetup::ClampLaunch(v);
 				for (int k = 0; k < 3; ++k) after[k] = v[k];
+				if (hit) {
+					// The push-out also spins it (FF0141B3 tipped to pitch 101 while its speed was held at 0): stop the spin too,
+					// through the body interfaces the step's own boost damper uses (FUN_1423CE0F0, called from FUN_1423CB260,
+					// the step this runs in): read world (+0x28) vt +0xA8 gets the angular velocity, write world (+0x30) vt +0xB0
+					// sets it.
+					const uptr write = At<uptr>(instance, 0x30);
+					if (write) {
+						alignas(16) float w[4] = {};
+						reinterpret_cast<void (*)(uptr, std::uint32_t, float*)>((*reinterpret_cast<void***>(read))[0xA8 / 8])(read, id, w);
+						if (std::isfinite(w[0]) && std::isfinite(w[1]) && std::isfinite(w[2]) && w[0] * w[0] + w[1] * w[1] + w[2] * w[2] > 0.0f) {
+							alignas(16) float zero[4] = {};
+							reinterpret_cast<void (*)(uptr, std::uint32_t, float*, std::uint64_t)>((*reinterpret_cast<void***>(write))[0xB0 / 8])(write, id, zero, 0);
+							spun = true;
+						}
+					}
+				}
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) { return; }
-			if (hit && g.hits.fetch_add(1, std::memory_order_relaxed) < 3)
-				logger::Write("Vehicle physics repair: launch guard caught %08X at %.1f m/s sideways, %.1f m/s up -> %.1f, %.1f (%.1f s left)",
+			if (!hit) return;
+			const float speed = std::sqrt(before[0] * before[0] + before[1] * before[1] + std::max(before[2], 0.0f) * std::max(before[2], 0.0f));
+			if (speed > g.maxSpeed.load(std::memory_order_relaxed)) g.maxSpeed.store(speed, std::memory_order_relaxed);
+			g.lastHit.store(now, std::memory_order_relaxed);
+			physicssetup::GuardHit(g.first.load(std::memory_order_relaxed), until, now);
+			g.until.store(until, std::memory_order_relaxed);
+			if (g.hits.fetch_add(1, std::memory_order_relaxed) < 3)
+				logger::Write("Vehicle physics repair: launch guard caught %08X at %.1f m/s sideways, %.1f m/s up -> %.1f, %.1f%s (%.1f s left)",
 					g.formId.load(std::memory_order_relaxed), std::hypot(before[0], before[1]), before[2], std::hypot(after[0], after[1]), after[2],
-					double(until - now) / 1000.0);
+					spun ? ", spin stopped" : "", double(until - now) / 1000.0);
 		}
 
 		// Wreck glide slots (physicssetup::Glide). Armed by GuardTick when a vehicle becomes wrecked; applied in the
@@ -425,35 +462,48 @@ namespace vehiclediag
 				comps.reserve(g_comps.size());
 				for (const auto& [id, c] : g_comps) if (c.component) comps.emplace_back(id, c.component);
 			}
-			std::unordered_map<uptr, std::uint32_t> present;
+			const unsigned long long now = GetTickCount64();
 			for (std::uint32_t i = 0; i < snap.count && i < 64; ++i) {
 				const auto& v = snap.v[i];
 				const auto it = std::find_if(comps.begin(), comps.end(), [&](const auto& c) { return c.first == v.formId; });
 				if (it == comps.end()) continue;
 				const Read r = ReadComponent(it->second);
 				if (!r.ok || !r.instance) continue;
-				present[r.instance] = v.formId;
 				if (vehiclehits::Wrecked(v.formId)) { if (g_wreckSeen.insert(v.formId).second) ArmGlide(v.formId, r.instance, v.vel[2]); }
 				else g_wreckSeen.erase(v.formId);
-				const bool parked = v.who == world::VehicleInfo::Who::Parked || v.who == world::VehicleInfo::Who::None;
+				// Our own autopilot flying the empty rover (summon, cover) is driving it too: the guard fought it for 30 s in the
+				// 23:38 run ("bumped", "cramped", no progress), since an undriven vehicle counts as parked.
+				const bool autopilot = v.formId == vehicleflight::OwnRoverId() && vehicleflight::Active();
+				const bool parked = (v.who == world::VehicleInfo::Who::Parked || v.who == world::VehicleInfo::Who::None) && !autopilot;
+				if (!parked || v.driverId || vehiclehits::Wrecked(v.formId))
+					for (auto& g : g_guards)
+						if (g.instance.load(std::memory_order_relaxed) == r.instance) g.instance.store(0);
+				auto [seen, fresh] = g_guardSeen.try_emplace(r.instance, Seen{ v.formId, now });
+				seen->second.at = now;
+				if (!fresh && seen->second.formId != v.formId) { seen->second.formId = v.formId; fresh = true; }  // the address now holds another vehicle's instance
+				if (!fresh || !parked || v.driverId || vehiclehits::Wrecked(v.formId)) continue;
 				for (auto& g : g_guards)
-					if (g.instance.load(std::memory_order_relaxed) == r.instance && !parked) g.instance.store(0);  // taken: drive freely
-				if (!g_guardSeen.emplace(r.instance, v.formId).second || !parked) continue;
+					if (g.instance.load(std::memory_order_relaxed) == r.instance) g.instance.store(0);  // NoteStep uses the first match: no stale slot for it
 				for (auto& g : g_guards) {
 					const uptr cur = g.instance.load(std::memory_order_relaxed);
 					const unsigned long long until = g.until.load(std::memory_order_relaxed);
-					if (cur && (!until || GetTickCount64() < until)) continue;
+					if (cur && (!until || now < until)) continue;
 					g.formId.store(v.formId, std::memory_order_relaxed);
 					g.hits.store(0, std::memory_order_relaxed);
+					g.first.store(0, std::memory_order_relaxed);
+					g.lastHit.store(0, std::memory_order_relaxed);
+					g.maxSpeed.store(0, std::memory_order_relaxed);
+					g.closed.store(false, std::memory_order_relaxed);
 					g.until.store(0, std::memory_order_relaxed);
 					g.instance.store(r.instance, std::memory_order_release);
 					break;
 				}
 			}
-			for (auto it = g_guardSeen.begin(); it != g_guardSeen.end();) it = present.count(it->first) ? std::next(it) : g_guardSeen.erase(it);
+			// A frame or two without the vehicle (a cell crossing) keeps its guard: only an instance missing kGuardMissMs is gone.
+			for (auto it = g_guardSeen.begin(); it != g_guardSeen.end();) it = physicssetup::GuardGone(it->second.at, now) ? g_guardSeen.erase(it) : std::next(it);
 			for (auto& g : g_guards) {
 				const uptr cur = g.instance.load(std::memory_order_relaxed);
-				if (cur && !present.count(cur)) g.instance.store(0);
+				if (cur && !g_guardSeen.count(cur)) g.instance.store(0);
 			}
 		}
 	}
@@ -502,6 +552,7 @@ namespace vehiclediag
 		void* motion = nullptr;
 		const bool mh = hook::Install(game::Base() + kSetMotion, kMotionPrologue, sizeof(kMotionPrologue), reinterpret_cast<void*>(&SetMotionDetour), &motion);
 		if (mh) g_setMotion = reinterpret_cast<SetMotion_t>(motion);
+		logger::Write("Vehicle launch guard: parked hold rollback active (velocity clamp only; no parked freeze)");
 		logger::Write("Vehicle probe: motion-type hook %s", mh ? "installed (static / keyframed counts per caller every 5 s; every nearby vehicle change with its caller)" : "FAILED (bytes differ)");
 	}
 
@@ -514,6 +565,13 @@ namespace vehiclediag
 			if (g.instance.load(std::memory_order_acquire) == instance) { GlideInstance(g, instance); break; }
 		std::lock_guard lk(g_lock);
 		++g_steps[instance];
+	}
+
+	std::uintptr_t ComponentOf(std::uint32_t formId)
+	{
+		std::lock_guard lk(g_lock);
+		const auto it = g_comps.find(formId);
+		return it == g_comps.end() ? 0 : it->second.component;
 	}
 
 	void Tick()

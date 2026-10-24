@@ -353,6 +353,18 @@ namespace controlmap
 		return out.empty() ? "nothing" : out;
 	}
 
+	std::string WhoUsesPad(std::uint32_t code, const char* only)
+	{
+		std::lock_guard lk(g_lock);
+		if (!Load()) return "control map unreadable";
+		std::string out;
+		for (const auto& b : g_pads) {
+			if (only && b.context != only) continue;
+			if (b.key == code || b.key2 == code) { if (!out.empty()) out += ", "; out += b.context + ":" + b.event; }
+		}
+		return out.empty() ? "nothing" : out;
+	}
+
 	std::string KeyName(int vk)
 	{
 		switch (vk) {

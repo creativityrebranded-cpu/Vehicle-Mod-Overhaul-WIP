@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(SeamlessVehicle VERSION 0.71.0 LANGUAGES CXX)
+project(SeamlessVehicle VERSION 0.72.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -26,8 +26,8 @@ sp_options(sp_common)
 
 add_library(SeamlessVehicle SHARED
     src/main_vehicle.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/crash.cpp
-    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
-    src/vehicleflight.cpp src/shipmodel.cpp src/shipvehicle.cpp
+    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
+    src/vehicleflight.cpp src/vehiclecamera.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(SeamlessVehicle)
 target_compile_definitions(SeamlessVehicle PRIVATE SP_FEATURE_VEHICLE)
@@ -85,3 +85,20 @@ sp_options(travelmode_test)
 
 add_executable(physicssetup_test tests/physicssetup_test.cpp)
 sp_options(physicssetup_test)
+
+add_executable(physicsstep_test tests/physicsstep_test.cpp)
+sp_options(physicsstep_test)
+add_executable(vtolphysics_test tests/vtolphysics_test.cpp)
+sp_options(vtolphysics_test)
+add_executable(vtolai_test tests/vtolai_test.cpp)
+sp_options(vtolai_test)
+add_executable(cameraroll_test tests/cameraroll_test.cpp)
+sp_options(cameraroll_test)
+add_executable(hook_call_test tests/hook_call_test.cpp src/hook.cpp)
+sp_options(hook_call_test)
+add_executable(vehiclecamera_test tests/vehiclecamera_test.cpp src/vehiclecamera.cpp)
+sp_options(vehiclecamera_test)
+add_executable(freeroll_test tests/freeroll_test.cpp)
+sp_options(freeroll_test)
+add_executable(vtolassist_test tests/vtolassist_test.cpp)
+sp_options(vtolassist_test)

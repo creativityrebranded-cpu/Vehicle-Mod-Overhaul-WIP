@@ -14,6 +14,8 @@
 // (Descend: hold Alt; Gear: tap Alt; Hover / Land: Space) and a key box reading "GEAR n". All Scaleform work runs inside the HUD movie's own per-frame Advance, never from the plugin task.
 namespace hoverui
 {
+	// Physical VTOL also shows a native Scaleform attitude instrument (fixed aircraft, pitch ladder, bank and
+	// pitch readout). Live physics snapshot only; hidden outside manual VTOL. F7: 'VTOL attitude' moves/resizes it.
 	bool Install();
 	// Main thread, every frame: what the buttons should show.
 	void SetState(bool inVehicle, bool hovering, int gear, bool accelHeld);

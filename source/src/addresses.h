@@ -158,6 +158,8 @@ namespace addr
 	inline constexpr std::uint32_t kCondIsInSpace = 0x00C05F70;       // (ref** subject, 0, 0, float* result) -> 1.0 in space
 	// PlayerCamera: current state +0x10, first-person state +0x188, third-person state +0x228.
 	inline constexpr std::uint32_t kPlayerCameraPtr = 0x061DD460;   // PlayerCamera*
+	// 141E8A9F0..141E8AA01: primary vptr at state+0 is 4C28740; 4C28728 is secondary at state+0x58.
+	inline constexpr std::uint32_t kVehicleCameraStateVtbl = 0x04C28740;
 	inline constexpr std::uint32_t kVehicleFirstPersonMinPitch = 0x05F07540; // degrees; registered by 140153F20, clamped in 140FB4D80
 	inline constexpr std::uint32_t kVehicleFirstPersonMaxPitch = 0x05F07560; // degrees; registered by 140153F50 (stock +15 downward)
 	inline constexpr std::uint32_t kForceThirdPerson = 0x01E8C840;  // (camera): Papyrus Game.ForceThirdPerson

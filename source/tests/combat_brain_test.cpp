@@ -143,5 +143,39 @@ int main()
         b.hasLeader = false;
         check(Tick(b, {}, false).action == Action::Wander, "nothing at all: wander");
     }
+    {
+        Squad s; s.count=4;
+        for(int i=0;i<4;++i){s.m[i].id=10+i;s.m[i].pos={double(i)*3,-60,6};}
+        Enemy e; e.id=90; e.pos={0,0,0}; e.inVehicle=false; e.vel={0,8,0};
+        Assign(s,&e,1,1000);
+        const double bearing=s.firingHeading;
+        Role roles[4];int engager=-1;bool unique=true;
+        for(int i=0;i<4;++i){roles[i]=s.m[i].role;if(roles[i]==Role::Engager)engager=i;for(int j=0;j<i;++j)unique=unique&&s.m[i].slot!=s.m[j].slot;}
+        check(s.tactic==SquadTactic::SuppressAndFlank&&unique,"running infantry: coordinated firing roles with distinct lane slots, no aircraft box-in");
+        if(engager>=0)s.m[engager].pos.y-=2;
+        Assign(s,&e,1,3000);bool stable=true;
+        for(int i=0;i<4;++i)stable=stable&&roles[i]==s.m[i].role;
+        check(stable&&s.firingHeading==bearing,"small distance changes retain roles and the common firing approach");
+        Blackboard b;b.haveTarget=true;b.targetVisible=true;b.targetInVehicle=false;
+        b.bfm[int(bfm::M::TurningFight)]=1;
+        check(Tick(b,{},false).action==Action::FirePosition,"on-foot enemy does not trigger a turning dogfight");
+        b.targetInVehicle=true;
+        check(Tick(b,{},false).action==Action::Bfm,"vehicle target retains aircraft manoeuvres");
+    }
+    {
+        Squad s;s.count=2;s.m[0].id=1;s.m[1].id=2;
+        Enemy e[2];e[0].id=10;e[0].pos={0,60,0};e[0].health=0.5;e[1].id=11;e[1].pos={20,60,0};e[1].health=0.55;
+        Assign(s,e,2,1000);e[1].health=0.48;Assign(s,e,2,6000);
+        check(s.focus==10,"small enemy health differences do not churn the squad's focus");
+        e[1].health=0.2;Assign(s,e,2,8000);
+        check(s.focus==11,"a materially weaker enemy can replace the held focus");
+        e[1].known=false;Assign(s,e,2,10000);
+        check(s.focus==10,"an unavailable focus is replaced without waiting for its hold timer");
+        Memory memory;
+        for(int i=1;i<=Memory::kMax;++i)memory.Sense(i,{double(i),0,0},{},true,false,1,10000+i);
+        check(memory.Find(1)&&memory.Find(12),"remembering more than eight contacts retains earlier sightings");
+        Memory stale;stale.Sense(1000,{},{},true,false,1,1000);memory.Merge(stale);
+        check(memory.Find(1)&&!memory.Find(1000),"stale shared memory cannot evict a newer contact from a full memory");
+    }
     return failures ? 1 : 0;
 }

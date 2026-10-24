@@ -65,7 +65,7 @@ struct Impulses
 struct Track { std::uint32_t id = 0; V3 pos, vel; std::uint64_t seenAt = 0, heardAt = 0; bool visible = false; double health = 1.0; };
 struct Memory
 {
-    static constexpr int kMax = 8;
+    static constexpr int kMax = 64; // match the vehicle snapshot; this is not a world population limit
     Track t[kMax];
     Track* Find(std::uint32_t id) { for (auto& x : t) if (x.id == id) return &x; return nullptr; }
     const Track* Find(std::uint32_t id) const { for (const auto& x : t) if (x.id == id) return &x; return nullptr; }
@@ -91,6 +91,12 @@ struct Memory
     {
         for (const auto& x : o.t) {
             if (!x.id) continue;
+            // A full memory must not discard fresh evidence for an older shared track.
+            if (!Find(x.id)) {
+                bool room = false; std::uint64_t oldest = UINT64_MAX;
+                for (const auto& existing : t) { room = room || !existing.id; oldest = std::min(oldest, std::max(existing.seenAt, existing.heardAt)); }
+                if (!room && std::max(x.seenAt, x.heardAt) <= oldest) continue;
+            }
             Track& k = Slot(x.id);
             if (std::max(x.seenAt,x.heardAt)>std::max(k.seenAt,k.heardAt)) { k.pos=x.pos; k.vel=x.vel; k.health=x.health; }
             k.seenAt=std::max(k.seenAt,x.seenAt);
@@ -163,7 +169,7 @@ inline const char* Name(SquadTactic t)
     return n[int(t)];
 }
 struct Member { std::uint32_t id = 0; V3 pos, vel; double health = 1.0, morale = 0.6; Role role = Role::Engager; int slot = 0; std::uint32_t coverFor = 0; };
-struct Enemy { std::uint32_t id = 0; V3 pos, vel; double health = 1.0; bool known = true; };
+struct Enemy { std::uint32_t id = 0; V3 pos, vel; double health = 1.0; bool known = true, inVehicle = true; };
 struct Squad
 {
     static constexpr int kMax = 8;
@@ -172,6 +178,8 @@ struct Squad
     SquadTactic tactic = SquadTactic::Solo;
     std::uint32_t focus = 0;     // the enemy everyone fires at (the weakest)
     std::uint64_t assignedAt = 0;
+    std::uint64_t focusAt = 0;
+    double firingHeading = 0;  // common, persistent target-to-squad approach for firing lanes
     Memory memory;               // the shared memory
     bool convoy = false;         // defending a convoy
 };
@@ -180,6 +188,7 @@ inline constexpr std::uint64_t kAssignMs = 1500;
 inline bool Assign(Squad& s, const Enemy* enemies, int enemyCount, std::uint64_t now, bool force = false)
 {
     if (!force && s.assignedAt && now - s.assignedAt < kAssignMs) return false;
+    const bool hadAssignment = s.assignedAt != 0;
     s.assignedAt = now;
     Member before[Squad::kMax];
     const auto oldFocus=s.focus; const auto oldTactic=s.tactic;
@@ -187,7 +196,19 @@ inline bool Assign(Squad& s, const Enemy* enemies, int enemyCount, std::uint64_t
     // Focus fire: the weakest known enemy.
     const Enemy* focus = nullptr;
     for (int i = 0; i < enemyCount; ++i) if (enemies[i].known && (!focus || enemies[i].health < focus->health)) focus = &enemies[i];
+    // Keep a viable focus through minor health fluctuations; explicit player orders
+    // are applied separately by the caller and do not wait on this preference.
+    for (int i = 0; i < enemyCount; ++i) if (enemies[i].known && enemies[i].id == oldFocus && focus) {
+        if ((s.focusAt && now - s.focusAt < 4000) || enemies[i].health <= focus->health + 0.1) focus = &enemies[i];
+        break;
+    }
     s.focus = focus ? focus->id : 0;
+    if (s.focus != oldFocus) s.focusAt = now;
+    if (focus && (!hadAssignment || oldFocus != s.focus)) {
+        V3 centre{};
+        for (int i = 0; i < s.count; ++i) centre = centre + s.m[i].pos;
+        if (s.count) s.firingHeading = steer::HeadingOf(centre * (1.0 / s.count) - focus->pos);
+    }
     double morale = 0;
     for (int i = 0; i < s.count; ++i) morale += s.m[i].morale;
     morale = s.count ? morale / s.count : 0.6;
@@ -209,6 +230,16 @@ inline bool Assign(Squad& s, const Enemy* enemies, int enemyCount, std::uint64_t
         int order[Squad::kMax];
         for (int i = 0; i < s.count; ++i) order[i] = i;
         std::sort(order, order + s.count, [&](int a, int b) { return steer::Len(s.m[a].pos - focus->pos) < steer::Len(s.m[b].pos - focus->pos); });
+        // Keep the firing roles through small distance changes as vehicles move.
+        // A replacement engager must be at least 20 m better placed.
+        if (oldFocus == s.focus && hadAssignment) {
+            for (int i = 0; i < s.count; ++i) if (before[i].role == Role::Engager &&
+                steer::Len(s.m[i].pos - focus->pos) <= steer::Len(s.m[order[0]].pos - focus->pos) + 20.0) {
+                for (int j = 0; j < s.count; ++j) if (order[j] == i) { std::rotate(order, order + j, order + j + 1); break; }
+                break;
+            }
+        }
+        std::sort(order + 1, order + s.count, [&](int a, int b) { return s.m[a].id < s.m[b].id; });
         // Bait: the enemy chases a member (its velocity points at it and it closes).
         int chased = -1;
         for (int i = 0; i < s.count; ++i) {
@@ -216,7 +247,7 @@ inline bool Assign(Squad& s, const Enemy* enemies, int enemyCount, std::uint64_t
             if (steer::Len2D(focus->vel) > 5.0 && std::fabs(steer::Wrap(steer::HeadingOf(focus->vel) - steer::HeadingOf(to))) < 0.4 && steer::Len(to) < 120.0) { chased = i; break; }
         }
         const bool fastTarget = steer::Len2D(focus->vel) > 5.0;
-        if (s.count >= 3 && chased >= 0) {
+        if (s.count >= 3 && focus->inVehicle && chased >= 0) {
             s.tactic = SquadTactic::BaitAndAmbush;
             int k = 0;
             for (int j = 0; j < s.count; ++j) {
@@ -225,19 +256,20 @@ inline bool Assign(Squad& s, const Enemy* enemies, int enemyCount, std::uint64_t
                 s.m[i].role = (k++ % 2 == 0) ? Role::Flanker : Role::Overwatch;
             }
         }
-        else if (s.count >= 3 && fastTarget) {
+        else if (s.count >= 3 && focus->inVehicle && fastTarget) {
             s.tactic = SquadTactic::BoxIn;
             for (int j = 0; j < s.count; ++j) { const int i = order[j]; s.m[i].role = j < 4 ? Role::BoxSlot : Role::Reserve; s.m[i].slot = j; }
         }
         else if (s.count >= 3) {
             s.tactic = SquadTactic::SuppressAndFlank;
             static const Role roles[] = { Role::Engager, Role::Flanker, Role::Suppressor, Role::Overwatch };
-            for (int j = 0; j < s.count; ++j) s.m[order[j]].role = j < 4 ? roles[j] : Role::Reserve;
+            for (int j = 0; j < s.count; ++j) { s.m[order[j]].role = j < 4 ? roles[j] : Role::Reserve; s.m[order[j]].slot = j; }
         }
         else {
             s.tactic = SquadTactic::Pincer;
             s.m[order[0]].role = Role::Engager;
             s.m[order[1]].role = Role::Flanker;
+            s.m[order[0]].slot = 0; s.m[order[1]].slot = 1;
         }
         // Cover a damaged ally: the nearest healthy member to an ally under 35 % with an enemy within 60 m of it.
         for (int i = 0; i < s.count; ++i) {
@@ -260,11 +292,11 @@ inline bool Assign(Squad& s, const Enemy* enemies, int enemyCount, std::uint64_t
 inline const Member* MemberOf(const Squad& s, std::uint32_t id) { for (int i = 0; i < s.count; ++i) if (s.m[i].id == id) return &s.m[i]; return nullptr; }
 
 // ---- The behaviour tree ----
-enum class Action : std::uint8_t { None, Flee, Retreat, Evade, Escape, Bfm, Tactic, Interpose, Suppress, Overwatch, Bait, Reserve, Cover, SearchLast, SearchPattern, FollowLeader, Wander };
+enum class Action : std::uint8_t { None, Flee, Retreat, Evade, Escape, Bfm, Tactic, Interpose, Suppress, Overwatch, Bait, Reserve, Cover, SearchLast, SearchPattern, FollowLeader, Wander, FirePosition };
 inline const char* Name(Action a)
 {
     static const char* const n[] = { "none", "flee", "retreat", "evade", "escape", "dogfight", "tactic", "interpose", "suppress", "overwatch", "bait", "reserve",
-        "cover ally", "search last known position", "search pattern", "follow leader", "wander" };
+        "cover ally", "search last known position", "search pattern", "follow leader", "wander", "firing position" };
     return n[int(a)];
 }
 // Everything a decision reads (filled by the caller each tick).
@@ -277,6 +309,7 @@ struct Blackboard
     bool wrecked = false;
     Impulses* impulses = nullptr;
     bool haveTarget = false, targetVisible = false;
+    bool targetInVehicle = true;
     double sinceSeen = 0;          // s since the target was seen (0 visible)
     bool searching = false;        // a search is under way
     bool reachedLast = false;      // the last known position was reached
@@ -352,6 +385,9 @@ inline bool ReactPlayer(const Blackboard& b, Decision& d) { if (!React(b, Impuls
 // The engage branch: the squad's order first, else the best of interpose / part D tactics / part B manoeuvres.
 inline bool Engage(const Blackboard& b, Decision& d)
 {
+    if (!b.targetInVehicle && (!b.squadsOn || b.role == Role::Engager || b.role == Role::Flanker || b.role == Role::BoxSlot)) {
+        d.action = Action::FirePosition; d.why = "on-foot target: hold a firing lane"; return true;
+    }
     if (b.squadsOn) {
         switch (b.role) {
         case Role::Suppressor: d.action = Action::Suppress; d.why = "squad: suppress"; return true;

@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
@@ -97,4 +98,24 @@ namespace physicssetup
         if (!until) until = now + kLaunchGuardMs;
         return now < until;
     }
+
+    // 2026-10-23 23:19 run: FF0141B3 was still being pushed out of the ground when the fixed 10 s window closed, and the
+    // next push threw it 260 m up. A clamp means it is still stuck, so each one keeps the window open kLaunchQuietMs more,
+    // never past kLaunchCapMs after the first step. first: the first step's time (the window's start).
+    constexpr unsigned long long kLaunchQuietMs = 3000;
+    constexpr unsigned long long kLaunchCapMs = 30000;
+
+    inline void GuardHit(unsigned long long first, unsigned long long& until, unsigned long long now)
+    {
+        const unsigned long long cap = first + kLaunchCapMs;
+        until = std::min(std::max(until, now + kLaunchQuietMs), std::max(cap, until));
+    }
+
+    // The same run: crossing a cell line dropped the vehicle from one frame's snapshot, which disarmed its guard and then
+    // armed a fresh one. An instance counts as gone only after it has been missing this long.
+    constexpr unsigned long long kGuardMissMs = 1000;
+
+    inline bool GuardGone(unsigned long long lastSeen, unsigned long long now) { return now - lastSeen >= kGuardMissMs; }
+
 }
+

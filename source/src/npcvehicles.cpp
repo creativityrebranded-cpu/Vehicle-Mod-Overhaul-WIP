@@ -4,6 +4,7 @@
 #include "profileclass.h"
 
 #include "addresses.h"
+#include "bindings.h"
 #include "controlmap.h"
 #include "crash.h"
 #include "game.h"
@@ -146,8 +147,9 @@ namespace npcvehicles
 			ULONGLONG cmdTryAt = 0;
 			bool driving = false;              // drive mode controls are being submitted
 			bool firing = false;               // the vehicle weapon's fire input is held
-			ULONGLONG fireAt = 0;              // when the current burst / gap started
 			unsigned bursts = 0;
+			coverfight::Burst weaponBurst;
+			ULONGLONG fireBlockedLogAt = 0;
 			double aimX = 0, aimY = 0, aimZ = 0, aimVx = 0, aimVy = 0, aimVz = 0;  // the player's last position and smoothed velocity (aim lead)
 			ULONGLONG aimAt = 0;
 			ULONGLONG tAt = 0;
@@ -237,7 +239,6 @@ namespace npcvehicles
 		constexpr std::uint32_t kVehicleSystem = 0x023FF640, kSubmitVehicleInput = 0x012C0550;
 		// 2026-10-21: longer bursts, shorter gaps (1.2 s / 1.5 s fired 44 % of the time, about 2 shots a burst). The cone stays 8 deg (the approved
 		// proposal); the nose is now held on the aim point while moving (manoeuvres), and the shots are also turned onto it at launch (vehicleaim).
-		constexpr ULONGLONG kBurstMs = coverfight::kBurstMs, kBurstGapMs = coverfight::kGapMs;
 		// The fire gate (2026-10-21, the user: "vehicles spend too much time nose pointing to shoot"): shots are re-aimed at the
 		// target at launch (vehicleaim), so the nose only needs to be roughly on it: 25 deg, widening up to 40 deg up close (a
 		// near target fills more of the view); pitch 1.5x. Never wider, so a gun never fires sideways or backwards.
@@ -1877,7 +1878,7 @@ namespace npcvehicles
 				if (!leaderIn) ss.leader = ids[0];
 				// The squad brain's input: members and the enemies they fight.
 				sq.count = 0;
-				brain::Enemy enemies[8];
+				brain::Enemy enemies[64];
 				int en = 0;
 				sq.convoy = false;
 				for (auto& j : g_jobs) {
@@ -1891,7 +1892,7 @@ namespace npcvehicles
 					sq.convoy = sq.convoy || j.lead != 0;
 					sq.memory.Merge(j.ai.mem);
 					const uptr foe = RefById(j.foe);
-					if (!foe || en >= 8) continue;
+					if (!foe || en >= 64) continue;
 					const uptr fv = InVehicle(foe);
 					const uptr aim = fv ? fv : foe;
 					const std::uint32_t aid = At<std::uint32_t>(aim, off::kFormId);
@@ -1899,13 +1900,13 @@ namespace npcvehicles
 					for (int e = 0; e < en; ++e) dup = dup || enemies[e].id == aid;
 					if (dup) continue;
 					const auto fp = At<game::Vec3>(aim, off::kRefPosition);
-					enemies[en].id = aid; enemies[en].pos = { fp.x, fp.y, fp.z }; enemies[en].vel = { j.manFvx, j.manFvy, 0 };
+					enemies[en].id = aid; enemies[en].pos = { fp.x, fp.y, fp.z }; enemies[en].vel = { j.manFvx, j.manFvy, 0 }; enemies[en].inVehicle = fv != 0;
 					float hn = 0, hm = 0;
 					enemies[en].health = fv ? vehiclehits::HealthShare(aid) : (vehiclehits::ActorHealth(foe, hn, hm) ? hn / hm : 1.0);
 					++en;
 				}
 				// Native hostile drivers in the world snapshot supplement the selected targets (not only g_jobs).
-				for (int k = 0; k < g_combatVehicleCount && en < 8; ++k) {
+				for (int k = 0; k < g_combatVehicleCount && en < 64; ++k) {
 					const auto& cv = g_combatVehicles[k]; const auto& v = cv.vehicle;
 					if (!cv.driver || vehiclehits::Wrecked(v.formId)) continue;
 					bool hostile = false, friendly = false, nearby = false;
@@ -2098,9 +2099,9 @@ namespace npcvehicles
 			s.foe.heard = brain::Hears(std::hypot(double(fp.x) - vp.x, double(fp.y) - vp.y), s.foe.firing, std::hypot(j.manFvx, j.manFvy));
 			// Nearby vehicles, the squad, the enemies.
 			if (haveSnap) {
-				for (std::uint32_t k = 0; k < snap.count && k < 64 && s.otherCount < 8; ++k) {
+				for (std::uint32_t k = 0; k < snap.count && k < 64 && s.otherCount < combatai::Situation::kOtherMax; ++k) {
 					const auto& v = snap.v[k];
-					if (v.formId == j.vehicle || std::hypot(double(v.pos[0]) - vp.x, double(v.pos[1]) - vp.y) > 40.0) continue;
+					if (v.formId == j.vehicle || v.formId == foeId) continue;
 					auto& b = s.others[s.otherCount++];
 					b.pos = { v.pos[0], v.pos[1], v.pos[2] }; b.vel = { v.vel[0], v.vel[1], v.vel[2] }; b.heading = v.heading; b.radius = std::max(1.5, std::hypot(double(v.half[0]), double(v.half[1])) * 0.8);
 				}
@@ -2113,16 +2114,16 @@ namespace npcvehicles
 				const auto op = At<game::Vec3>(ov, off::kRefPosition);
 				const auto relation = CombatRelationOf(npc, RefById(o.npc));
 				if (relation == CombatRelation::Ally) {
-					if (s.mateCount < 8) { auto& m = s.mates[s.mateCount++]; m.pos = { op.x, op.y, op.z }; m.vel = { o.manMvx, o.manMvy, 0 }; m.heading = At<game::Vec3>(ov, off::kRefRotation).z; }
+					if (s.mateCount < 8) { auto& m = s.mates[s.mateCount++]; m.pos = { op.x, op.y, op.z }; m.vel = { o.manMvx, o.manMvy, verticalOf(o.vehicle) }; m.heading = At<game::Vec3>(ov, off::kRefRotation).z; m.radius = radiusOf(o.vehicle); }
 					if (o.foe == j.foe) { ++s.alliesOnTarget; if (o.pilot < j.pilot) ++rank; }
 				}
 				else if (relation == CombatRelation::Enemy) {
-					if (o.vehicle != foeId && s.enemyCount < 8) { auto& e = s.enemies[s.enemyCount++]; e.body.pos = { op.x, op.y, op.z }; e.body.vel = { o.manMvx, o.manMvy, 0 }; e.health = vehiclehits::HealthShare(o.vehicle); }
+					if (o.vehicle != foeId && s.enemyCount < combatai::Situation::kOtherMax) { auto& e = s.enemies[s.enemyCount++]; e.body.pos = { op.x, op.y, op.z }; e.body.vel = { o.manMvx, o.manMvy, 0 }; e.health = vehiclehits::HealthShare(o.vehicle); }
 					if (o.foe == j.npc) ++s.enemiesOnMe;
 				}
 			}
 			// Non-job enemy vehicles count for threat, terrain tactics and squad odds too.
-			for (int k = 0; k < g_combatVehicleCount && s.enemyCount < 8; ++k) {
+			for (int k = 0; k < g_combatVehicleCount && s.enemyCount < combatai::Situation::kOtherMax; ++k) {
 				const auto& cv = g_combatVehicles[k]; const auto& v = cv.vehicle;
 				if (!cv.driver || v.formId == j.vehicle || v.formId == foeId || vehiclehits::Wrecked(v.formId)) continue;
 				bool job = false; for (const auto& o : g_jobs) job = job || (o.phase == Phase::Following && o.aiOn && o.vehicle == v.formId);
@@ -2149,6 +2150,8 @@ namespace npcvehicles
 			}
 			s.role = g_combatIni.sw.squads ? j.role : brain::Role::Engager;
 			s.roleSlot = j.roleSlot;
+			if (g_combatIni.sw.squads && SideOf(j) >= 0 && g_sides[SideOf(j)].squad.focus == foeId)
+				s.firingHeading = g_sides[SideOf(j)].squad.firingHeading;
 			if (j.coverFor) {
 				const uptr cv = RefById(j.coverFor);
 				if (cv) { const auto cp = At<game::Vec3>(cv, off::kRefPosition); s.haveCover = true; s.coverBody.pos = { cp.x, cp.y, cp.z }; }
@@ -2165,7 +2168,7 @@ namespace npcvehicles
 			s.allowRam = g_combatIni.ram && aggressive;
 			s.breakOff = g_combatIni.breakOff;
 			const auto ballistic=vehiclehits::BallisticsOf(j.vehicle);
-            s.weapon.range=ballistic.range;s.weapon.cone=kFireCone;s.weapon.shotSpeed=ballistic.observedSpeed?ballistic.speed:std::numeric_limits<double>::infinity();
+            s.weapon.range=ballistic.range;s.weapon.cone=FireCone(Dist3(vehicle,aimRef));s.weapon.shotSpeed=ballistic.observedSpeed?ballistic.speed:std::numeric_limits<double>::infinity();
 			s.civilian = s.me.person.temper == brain::Temper::Civilian;
 			(void)rank;
 			static NavWorld world;
@@ -2175,12 +2178,17 @@ namespace npcvehicles
 			if (out.changed) {
 				logger::Write("NPC vehicles: [%d] %s; enemy %08X %.0f m, health %.0f%% vs %.0f%%, morale %.2f (%s), %s", j.pilot, out.log, foeId,
 					std::hypot(double(fp.x) - vp.x, double(fp.y) - vp.y), s.me.unit.health * 100.0, s.foe.unit.health * 100.0, j.ai.morale.value, brain::Name(j.ai.mood),
-					out.useCommands ? "steering" : "planner (terrain ahead)");
+					out.useCommands ? (out.avoiding ? "steering (avoidance)" : "steering") : out.terrainBlocked ? "planner (terrain ahead)" : out.hold ? "planner (firing hold)" : "planner (steering disabled)");
 			}
 			if (out.moodChanged) logger::Write("NPC vehicles: [%d] morale %.2f: %s", j.pilot, j.ai.morale.value, brain::Name(j.ai.mood));
 			// The goal: the carrot (cruise; a held spot arrives); the planner keeps it safe.
 			g.x = out.carrot.x; g.y = out.carrot.y; g.z = out.carrot.z;
-			g.stop = 0.0; g.hold = false; g.cruise = true; g.cruiseSpeed = out.speed;
+			g.stop = out.hold ? 3.0 : 0.0; g.hold = out.hold; g.cruise = !out.hold; g.cruiseSpeed = out.speed;
+            if (out.hold) {
+                g.nav.passThrough=false;
+                const float cap=float(std::max(1.0,out.speed));
+                g.nav.speedLimit=g.nav.speedLimit>0?std::min(g.nav.speedLimit,cap):cap;
+            }
 			vehicleflight::Command c;
 			c.set = 0;
 			if (now < j.stunUntil) {
@@ -2197,8 +2205,14 @@ namespace npcvehicles
 				if (!mayAim && out.aim) {
 					// Weapons "never": no nose on the target; fly along the desired velocity instead.
 					const double want = std::atan2(out.carrot.x - vp.x, out.carrot.y - vp.y);
-					c.yawRate = std::clamp(2.5 * WrapAngle(want - vr.z), -1.6, 1.6);
+					c.yawRate = std::clamp(2.5 * WrapAngle(want - vr.z), -s.me.turnRate, s.me.turnRate);
 				}
+			}
+			else if (out.hold && out.aim && mayAim && std::hypot(out.carrot.x-vp.x,out.carrot.y-vp.y)<10.0) {
+				// At the firing position, let navigation hold still while the hull aims.
+				c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kPitch;
+				c.yawRate = std::clamp(2.5 * WrapAngle(std::atan2(out.aimPoint.x-vp.x,out.aimPoint.y-vp.y)-vr.z),-s.me.turnRate,s.me.turnRate);
+				c.pitch = std::clamp(std::atan2(out.aimPoint.z-vp.z,std::max(1.0,std::hypot(out.aimPoint.x-vp.x,out.aimPoint.y-vp.y))),-0.6,0.6);
 			}
 			c.holdMs=100; vehicleflight::PilotCommand(j.pilot,c);
 			j.aiFire = out.fire && mayAim;
@@ -3439,6 +3453,7 @@ namespace npcvehicles
 					}
 					const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 					const auto vr = At<game::Vec3>(vehicle, off::kRefRotation);
+					if (j.aiOn) { axp=j.aiAimX; ayp=j.aiAimY; azp=j.aiAimZ; }
 					if (!manActive && (defMode == 3 || pMode == 13 || mode == overrides::Mode::Guard) && profileclass::MayAim(weapons, false) && std::hypot(pg.x - vp.x, pg.y - vp.y) < 12.0) {
 						// Overwatch: in place, the nose on the enemy (yaw and pitch), the autopilot holds the spot.
 						vehicleflight::Command c;
@@ -3457,33 +3472,34 @@ namespace npcvehicles
 					const bool onTarget = aimErr < cone && pitchErr < std::min(cone * 1.5, 0.9);
 					const bool inRange = rules.fire && profileclass::MayFire(weapons, false) && (kProfiles[int(j.profile)].fire || defending || retaliating || attacking) &&
 						Dist3(vehicle, aimRef) < vehiclehits::BallisticsOf(j.vehicle).range;
-					if (j.aiOn) { axp=j.aiAimX; ayp=j.aiAimY; azp=j.aiAimZ; }
                     const float muzzle[]={vp.x+float(std::sin(vr.z)*4),vp.y+float(std::cos(vr.z)*4),vp.z+1.5f};
                     const float shot[]={float(axp),float(ayp),float(azp)};
                     const bool clearShot=environment::ClearShot(j.vehicle,At<std::uint32_t>(aimRef,off::kFormId),
                         aimRef==vehicle?0:At<std::uint32_t>(aimRef,off::kFormId),muzzle,shot);
-                    const bool canFire = inRange && clearShot && (j.aiOn ? j.aiFire : onTarget);
+                    const bool canFire = inRange && clearShot && onTarget && (!j.aiOn || j.aiFire);
 					// ClearShot and launch now use the same final AI aim point.
 					StoreAim(j.pilot - 1, AimSnap{ j.vehicle, j.npc, axp, ayp, azp, inRange && clearShot, now });
 					const int slot = j.pilot - 1;
-					if (j.firing) {
-						if (!canFire || now - j.fireAt >= kBurstMs) {
-							SubmitFire(slot, j.vehicle, false);
-							j.firing = false;
-							j.fireAt = now;
-						}
-						else {
-							SubmitFire(slot, j.vehicle, true);
+					const bool wasFiring = j.firing;
+					const bool wantFire = j.weaponBurst.Update(canFire, now);
+					if (wantFire) {
+						const bool ok = SubmitFire(slot, j.vehicle, true);
+						j.firing = ok || wasFiring;
+						if (!wasFiring && ok) {
+							if (j.bursts++ % 10 == 0) {
+								logger::Write("NPC vehicles: [%d] vehicle %08X weapon burst %u (%.0f m, aim off %.0f deg, pitch off %.0f deg) -> input sent", j.pilot, j.vehicle, j.bursts, toFoe, aimErr * 57.2958, pitchErr * 57.2958);
+							}
 						}
 					}
-					else if (canFire && now - j.fireAt >= kBurstGapMs) {
-						const bool ok = SubmitFire(slot, j.vehicle, true);
-						j.firing = true;
-						j.fireAt = now;
-						if (j.bursts++ % 10 == 0) {
-							logger::Write("NPC vehicles: [%d] vehicle %08X weapon burst %u (%.0f m, aim off %.0f deg, pitch off %.0f deg) -> %s", j.pilot, j.vehicle, j.bursts, toFoe, aimErr * 57.2958, pitchErr * 57.2958,
-								ok ? "input sent" : "input FAILED");
-						}
+					else if (wasFiring) { j.firing = !SubmitFire(slot, j.vehicle, false); }
+					if (!canFire && now-j.fireBlockedLogAt>=3000) {
+						j.fireBlockedLogAt=now;
+						logger::Write("NPC fire: [%d] %08X holding fire: %s (range %.0f m, yaw %.0f deg, pitch %.0f deg; role %s)",j.pilot,j.vehicle,
+							!inRange?"profile or range":!clearShot?"blocked shot":!onTarget?"turning to aim":"AI safety or ally in line",Dist3(vehicle,aimRef),aimErr*57.2958,pitchErr*57.2958,brain::Name(j.role));
+					}
+					else if (wantFire && !j.firing && now-j.fireBlockedLogAt>=3000) {
+						j.fireBlockedLogAt=now;
+						logger::Write("NPC fire: [%d] %08X native fire input FAILED",j.pilot,j.vehicle);
 					}
 				}
 				else if (have && vehicleflight::PilotActive(j.pilot)) {
@@ -3722,10 +3738,11 @@ namespace npcvehicles
 		// Papyrus natives' cores: Actor.SendAssaultAlarm FUN_141FC9770(_, _, victim), ObjectReference.SendStealAlarm
 		// FUN_14207F050(_, _, ref, thief).
 		constexpr std::uint32_t kEndInteraction = 0x01A9C530, kAssaultAlarm = 0x01FC9770, kStealAlarm = 0x0207F050;
-		constexpr ULONGLONG kDoubleMs = 400;       // a second Activate press this soon after the first (an occupied vehicle) = pull the occupant out
-		// (2026-10-18: a single tap on an occupied vehicle is the PASSENGER seat for anyone; a double tap pulls the occupant out. It was: tap = passenger, hold = pull out.)
+		constexpr ULONGLONG kPullHoldMs = 500;     // Activate held this long on an occupied vehicle = pull the occupant out
+		// (2026-10-24, the user approved the gesture review: tap = the PASSENGER seat at once, hold = pull the occupant out.
+		// 2026-10-18 to 10-24 it was tap after a double-tap window / double tap, which made the seat feel late.)
 		constexpr ULONGLONG kIntentMs = 2500;      // a player-seat call this soon after the press is the player's
-		constexpr double kReachRange = 5.0;        // m: the vehicle in front of the player
+		constexpr double kReachRange = 3.0;        // m: from the vehicle's side (its footprint), not its centre (2026-10-23)
 		constexpr double kReachCone = 0.8;         // rad
 
 		enum class Relation : std::uint8_t { None, Gang, Neutral, Hostile };
@@ -3740,8 +3757,6 @@ namespace npcvehicles
 			ULONGLONG seatAt = 0;                  // seat the player at this time (after the occupant is out)
 		} g_intent;
 		bool g_activateDown = false;
-		int g_activateKey = 0;
-		struct Tap { bool pending = false; ULONGLONG at = 0; std::uint32_t vehicle = 0, occupant = 0; Relation relation = Relation::None; } g_tap;  // a tap waiting out the double-tap window
 
 		bool IsFollower(uptr player, uptr actor);
 
@@ -3773,22 +3788,43 @@ namespace npcvehicles
 			return 0;
 		}
 
-		uptr FacingVehicle(uptr player)
+		// The vehicle's footprint radius (its larger half-extent from the shared vehicle list), 1.5 m when unknown.
+		double Footprint(std::uint32_t formId)
+		{
+			static ::world::Snapshot snap;
+			static ULONGLONG at = 0;
+			const ULONGLONG now = GetTickCount64();
+			if (now - at > 250) { at = now; if (!::world::Vehicles(snap)) snap.count = 0; }
+			for (std::uint32_t i = 0; i < snap.count && i < 64; ++i)
+				if (snap.v[i].formId == formId) return std::clamp(double(std::max(snap.v[i].half[0], snap.v[i].half[1])), 1.0, 8.0);
+			return 1.5;
+		}
+		double EdgeDistance(uptr player, uptr v) { return std::max(0.0, Dist(player, v) - Footprint(At<std::uint32_t>(v, off::kFormId))); }
+
+		// Why the nearest vehicle someone else drives is or is not the one in front of the player (the prompt log).
+		struct Reach { uptr vehicle = 0; double centre = 0, edge = 0, off = 0, cone = 0; };
+		// The vehicle in front of the player: within kReachRange of its side and facing it (the cone widens with its size;
+		// right beside it any direction counts).
+		uptr FacingVehicle(uptr player, Reach* nearestDriven = nullptr)
 		{
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
 			const double facing = At<game::Vec3>(player, off::kRefRotation).z;
 			uptr best = 0;
-			double bestD = 1e9;
+			double bestD = 1e9, nearD = 15.0;
 			for (const uptr r : modscene::LoadedRefs(200)) {
 				if (!IsVehicle(r) || Disabled(r)) continue;
 				const auto q = At<game::Vec3>(r, off::kRefPosition);
 				const double dx = double(q.x) - pp.x, dy = double(q.y) - pp.y, d = std::hypot(dx, dy);
-				if (d > kReachRange) continue;
+				if (d > 15.0) continue;
+				const double fp = Footprint(At<std::uint32_t>(r, off::kFormId)), edge = std::max(0.0, d - fp);
 				double off = std::atan2(dx, dy) - facing;
 				while (off > 3.14159265) off -= 6.28318531;
 				while (off < -3.14159265) off += 6.28318531;
-				if (d > 2.0 && std::fabs(off) > kReachCone) continue;
-				if (d < bestD) { bestD = d; best = r; }
+				const double cone = kReachCone + std::atan2(fp, std::max(d, 0.1));
+				if (nearestDriven && d < nearD && DriverOf(r, player)) { nearD = d; *nearestDriven = { r, d, edge, off, cone }; }
+				if (edge > kReachRange) continue;
+				if (edge > 1.5 && std::fabs(off) > cone) continue;
+				if (edge < bestD) { bestD = edge; best = r; }
 			}
 			return best;
 		}
@@ -4263,8 +4299,8 @@ namespace npcvehicles
 					logger::Write("NPC vehicles: seat rules: you get in %08X -> %s", g_intent.vehicle, InVehicle(player) == v ? "seated" : "not seated yet");
 				}
 			}
-			if (!g_activateKey || now % 5000 < 20) g_activateKey = controlmap::KeyFor("Gameplay", "Activate", 'E');
-			const bool down = Focused() && (GetAsyncKeyState(g_activateKey) & 0x8000) != 0;
+			// The game's own Activate, keyboard and controller (the context is "MainGameplay"; "Gameplay" never matched).
+			const bool down = Focused() && bindings::GameHeld("MainGameplay", "Activate", 'E');
 			const bool pressed = down && !g_activateDown;
 			const bool released = !down && g_activateDown;
 			g_activateDown = down;
@@ -4275,52 +4311,67 @@ namespace npcvehicles
 				if (now - lastHud >= 200) {
 					lastHud = now;
 					bool occupied = false;
+					Reach nearby;
+					uptr fv = 0;
 					if (!InVehicle(player)) {
-						const uptr fv = FacingVehicle(player);
+						fv = FacingVehicle(player, &nearby);
 						occupied = fv && DriverOf(fv, player);
 					}
-					if (occupied || shown) hoverui::SetOccupied(occupied, controlmap::KeyName(g_activateKey).c_str());
+					if (occupied || shown) hoverui::SetOccupied(occupied, bindings::GameLabel("MainGameplay", "Activate", 'E').c_str());
+					// Evidence: each time the nearest NPC-driven vehicle (15 m) changes or the prompt turns on / off, why.
+					static std::uint32_t loggedVehicle = 0;
+					static bool loggedShown = false;
+					const std::uint32_t nearId = nearby.vehicle ? At<std::uint32_t>(nearby.vehicle, off::kFormId) : 0;
+					if (nearId != loggedVehicle || occupied != loggedShown) {
+						if (nearId || occupied != loggedShown) {
+							const char* why = occupied ? "shown" : !nearby.vehicle ? "no driven vehicle nearby" : nearby.edge > kReachRange ? "too far from its side"
+								: "not facing it";
+							logger::Write("NPC vehicles: seat prompt: nearest driven vehicle %08X centre %.1f m, side %.1f m (reach %.1f), facing off %.2f rad (cone %.2f) -> %s",
+								nearId, nearby.centre, nearby.edge, kReachRange, nearby.off, nearby.cone, why);
+						}
+						loggedVehicle = nearId;
+						loggedShown = occupied;
+					}
 					shown = occupied;
 				}
 			}
-			if (InVehicle(player)) { g_tap.pending = false; return; }
-			// A single tap waits out the double-tap window, then takes the passenger seat.
-			if (g_tap.pending && now - g_tap.at >= kDoubleMs) {
-				g_tap.pending = false;
-				const uptr v = RefById(g_tap.vehicle);
-				if (v && Dist(player, v) <= kReachRange + 1.0) {
-					const bool ok = passenger::BoardVehicle(player, v);
-					logger::Write("NPC vehicles: seat rules: tap on occupied vehicle %08X (%s driver %08X) -> passenger seat %s", g_tap.vehicle, RelationName(g_tap.relation),
-						g_tap.occupant, ok ? "taken" : "NOT taken");
-				}
-			}
+			if (InVehicle(player)) return;
 			if (pressed) {
 				g_activatePressAt = now;
-				const Tap tap = g_tap;
 				g_intent = Intent{};
 				const uptr v = FacingVehicle(player);
-				if (!v) { g_tap.pending = false; return; }
+				if (!v) return;
 				const uptr occ = DriverOf(v, player);
 				g_intent.vehicle = At<std::uint32_t>(v, off::kFormId);
 				g_intent.pressAt = now;
-				if (!occ) { g_tap.pending = false; return; }  // empty: the game's own get-in (and its theft rules)
+				if (!occ) return;  // empty: the game's own get-in (and its theft rules)
 				g_intent.occupant = At<std::uint32_t>(occ, off::kFormId);
 				g_intent.relation = RelationOf(player, occ);
-				if (tap.pending && tap.vehicle == g_intent.vehicle && now - tap.at < kDoubleMs) {
-					// The second press: pull the occupant out (a gang member hands over the wheel).
-					g_tap.pending = false;
-					g_intent.acted = true;
-					if (Dist(player, v) > kReachRange + 1.0) return;
-					TakeSeat(player, v, occ, g_intent.relation == Relation::Gang ? "hand-over" : g_intent.relation == Relation::Hostile ? "hijack" : "pulled out");
-					if (g_intent.relation != Relation::Gang) CrimeAlarms(occ, v, player, g_intent.relation == Relation::Neutral);
-					if (g_intent.relation == Relation::Hostile) Aggro(occ, player);
-					logger::Write(g_intent.relation == Relation::Gang ? "They hand you the wheel" : g_intent.relation == Relation::Hostile ? "Hijacked" : "You pulled them out");
-				}
+				return;
+			}
+			if (down && g_intent.occupant && !g_intent.acted && now - g_intent.pressAt >= kPullHoldMs) {
+				// Held: pull the occupant out (a gang member hands over the wheel).
+				g_intent.acted = true;
+				const uptr v = RefById(g_intent.vehicle);
+				const uptr occ = v ? DriverOf(v, player) : 0;
+				if (!v || !occ || EdgeDistance(player, v) > kReachRange + 1.0) return;
+				TakeSeat(player, v, occ, g_intent.relation == Relation::Gang ? "hand-over" : g_intent.relation == Relation::Hostile ? "hijack" : "pulled out");
+				if (g_intent.relation != Relation::Gang) CrimeAlarms(occ, v, player, g_intent.relation == Relation::Neutral);
+				if (g_intent.relation == Relation::Hostile) Aggro(occ, player);
+				logger::Write(g_intent.relation == Relation::Gang ? "They hand you the wheel" : g_intent.relation == Relation::Hostile ? "Hijacked" : "You pulled them out");
 				return;
 			}
 			if (released && g_intent.occupant && !g_intent.acted) {
-				// The first tap is over: wait for a second one (the passenger seat is taken when the window closes, above).
-				g_tap = Tap{ true, now, g_intent.vehicle, g_intent.occupant, g_intent.relation };
+				// A tap: the passenger seat at once. `acted` stays false: the game's own seat call can come after the release and
+				// must still be refused (SeatPlayerDetour); clearing the occupant ends this press instead.
+				const std::uint32_t occupant = g_intent.occupant;
+				g_intent.occupant = 0;
+				const uptr v = RefById(g_intent.vehicle);
+				if (v && EdgeDistance(player, v) <= kReachRange + 1.0) {
+					const bool ok = passenger::BoardVehicle(player, v);
+					logger::Write("NPC vehicles: seat rules: tap on occupied vehicle %08X (%s driver %08X) -> passenger seat %s", g_intent.vehicle, RelationName(g_intent.relation),
+						occupant, ok ? "taken" : "NOT taken");
+				}
 			}
 		}
 

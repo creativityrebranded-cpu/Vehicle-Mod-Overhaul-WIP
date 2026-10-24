@@ -4,7 +4,7 @@
 
 // The mod's features as switches (2026-10-21, the user: "modular features to turn on and off in the mod menu"): each one
 // is a seamless.ini key (the ones that existed keep their section and key), shown as a checkbox in the game's settings
-// menu under "Flying Vehicle Overhaul" (hoverui) and read live by the code it gates. On() reads a cached value (any
+// menu inside Gameplay Options (hoverui) and read live by the code it gates. On() reads a cached value (any
 // thread); the main thread reloads the ini every 5 s (Tick), so a hand edit still works.
 namespace features
 {
@@ -19,6 +19,10 @@ namespace features
 		StatusCard,     // [hud] card: the vehicle status card
 		Witnesses,      // [witness] enabled: bystanders flee or cower near a crash
 		Placement,      // [placement] enabled: parked vehicles for Carfield / Vehicles.esm (after a save load)
+		FreeRoll,       // [flight] freeRoll: your hover rolls all the way round, turning about its own axes (freeroll.h)
+		FlightAssist,   // [flight] assist: with free roll, a released roll levels when near level (off: the roll holds)
+		PhysicalVtol,   // [flight] physicalVtol: experimental player-only native impulse flight
+		PhysicalAi,     // [flight] physicalAi: experimental native impulse flight for the autopilot and NPC pilots
 		DebugLog,       // [log] verbose
 		Count
 	};

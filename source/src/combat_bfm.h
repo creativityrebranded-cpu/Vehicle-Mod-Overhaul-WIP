@@ -317,4 +317,15 @@ inline bool FireSolution(const Fighter& me, const Geo& g, const V3* allies, int 
 {
     return g.inMyZone && !AllyInLine(me.body.pos, g.lead, allies, allyCount);
 }
+// Hull-sized allies along the actual shot segment, including the muzzle's start.
+inline bool AllyBodiesInLine(const V3& from, const V3& to, const Body* allies, int count)
+{
+    const V3 ab = to - from;
+    const double l2 = std::max(1e-9, steer::Dot(ab, ab));
+    for (int i = 0; i < count; ++i) {
+        const double t = std::clamp(steer::Dot(allies[i].pos - from, ab) / l2, 0.0, 1.0);
+        if (steer::Len(allies[i].pos - (from + ab * t)) < std::max(0.5, allies[i].radius) + 0.5) return true;
+    }
+    return false;
+}
 }

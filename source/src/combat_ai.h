@@ -1,5 +1,6 @@
 #pragma once
 #include "combat_brain.h"
+#include "coverfight.h"
 #include <cstdio>
 // Part E of the full vehicle combat AI (2026-10-21, notes/VEHICLE_COMBAT_AI_FULL_SPEC_20261021.md): one tick for one vehicle, all parts together.
 // Perception and memory -> impulses -> morale -> the geometry and the scored manoeuvres (B) and tactics (D) -> the behaviour tree (C) -> the
@@ -33,13 +34,15 @@ struct Situation
     Self me;
     bool haveFoe = false;
     Foe foe;
-    steer::Body others[8]; int otherCount = 0;   // vehicles near me (collision avoidance)
+    static constexpr int kOtherMax = 64;
+    steer::Body others[kOtherMax]; int otherCount = 0; // every vehicle in the bounded world snapshot
     steer::Body mates[8]; int mateCount = 0;     // my squad (flocking, line of fire)
-    tactics::Unit enemies[8]; int enemyCount = 0;
+    tactics::Unit enemies[kOtherMax]; int enemyCount = 0;
     V3 anchor; double zone = 150.0;              // the fight zone (containment)
     bool protect = false; steer::Body protectee; double protectThreat = 0;  // an escort's player
     bool hasLeader = false; steer::Body leader; V3 slot{ 0, -15, 0 };
     brain::Role role = brain::Role::Engager; int roleSlot = 0; bool haveCover = false; steer::Body coverBody;
+    double firingHeading = std::numeric_limits<double>::quiet_NaN();
     bool hitRecently = false, allyWrecked = false, allyDriverKilled = false, leaderKilled = false, playerOnFoot = false, reinforcements = false;
     int alliesOnTarget = 1, enemiesOnMe = 1;
     bool targetInConvoy = false, targetIsCargo = false, iDefendConvoy = false;
@@ -64,6 +67,11 @@ struct State
     // The world reads are the costly part (nav map lookups): the tactic facts every kFactsMs, a hiding spot every kHideMs.
     tactics::Facts facts; std::uint64_t factsAt = 0; std::uint32_t factsFoe = 0;
     bool hideFound = false; V3 hideSpot; std::uint64_t hideAt = 0;
+    std::uint32_t laneFoe = 0; double laneHeading = 0;
+    bool haveLane = false, reinforced = false;
+    V3 laneSpot, laneTarget;
+    brain::Role laneRole = brain::Role::Engager; int laneSlot = 0;
+    std::uint64_t laneCheckAt = 0, laneBlockedAt = 0;
 };
 inline constexpr std::uint64_t kFactsMs = 250, kHideMs = 500;
 struct Output
@@ -77,6 +85,7 @@ struct Output
     double strafe = std::numeric_limits<double>::quiet_NaN();
     bool changed = false; char log[240] = "";
     bool moodChanged = false;
+    bool terrainBlocked = false, avoiding = false;
     const char* leaf = "";
     std::uint32_t used = 0;             // the behaviours the combiner used (for the verbose log)
 };
@@ -114,7 +123,10 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
     // ---- Perception and memory ----
     if (s.haveFoe) {
         st.mem.Sense(s.foe.id, foeB.pos, foeB.vel, s.foe.visible, s.foe.heard || (s.foe.firing && steer::Len(foeB.pos - s.me.unit.body.pos) < brain::kHearGunfire), s.foe.unit.health, now);
-        if (st.lastFoe != s.foe.id) { st.imp.Raise(brain::Impulse::NewEnemy, now); st.ms.started=false; st.ts.started=false; st.factsAt=0; st.search.active=false; }
+        if (st.lastFoe != s.foe.id) {
+            st.imp.Raise(brain::Impulse::NewEnemy, now); st.ms.started=false; st.ts.started=false; st.factsAt=0; st.search.active=false;
+            st.aimErrAt=0; st.aimErr={}; st.haveLane=false;
+        }
         if (st.wasVisible && !s.foe.visible) st.imp.Raise(brain::Impulse::TargetLost, now);
         st.wasVisible = s.foe.visible;
         st.lastFoe = s.foe.id;
@@ -153,12 +165,13 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
         if (st.imp.at[int(brain::Impulse::AllyWrecked)] == now) st.morale.Apply(brain::MoraleEvent::AllyWrecked);
         if (st.imp.at[int(brain::Impulse::LeaderKilled)] == now) st.morale.Apply(brain::MoraleEvent::LeaderKilled);
         if (st.imp.at[int(brain::Impulse::Hit)] == now) st.morale.Apply(brain::MoraleEvent::Hit);
-        if (s.reinforcements) st.morale.Apply(brain::MoraleEvent::Reinforcements);
+        if (s.reinforcements && !st.reinforced) st.morale.Apply(brain::MoraleEvent::Reinforcements);
         const double odds = double(std::max(1, s.enemyCount)) / double(s.mateCount + 1);
         st.morale.Tick(s.dt, odds, s.me.unit.health - (s.haveFoe ? s.foe.unit.health : s.me.unit.health));
         st.mood = st.morale.Of(s.mateCount == 0, s.leaderKilled, s.me.unit.health);
     }
     else st.mood = brain::Mood::Steady;
+    st.reinforced = s.reinforcements;
     out.moodChanged = st.mood != moodBefore;
     // ---- Geometry, scored manoeuvres and tactics ----
     brain::Blackboard b;
@@ -166,6 +179,7 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
     b.impulses = &st.imp; b.haveTarget = s.haveFoe||remembered; b.targetVisible = s.foe.visible; b.sinceSeen = s.foe.visible ? 0.0 : s.haveFoe?sinceSeen:std::max(3.0,sinceSeen);
     b.searching = st.search.active; b.reachedLast = st.search.active && st.search.leg >= 0;
     b.role = s.role; b.hasLeader = s.hasLeader; b.protect = s.protect; b.protectThreat = s.protectThreat; b.civilian = s.civilian;
+    b.targetInVehicle = s.foe.inVehicle;
     b.bfmOn = true; b.tacticsOn = sw.tactics; b.squadsOn = sw.squads;
     const bfm::Fighter me = FighterOf(s.me.unit, s.me.turnRate, s.me.boost);
     const bfm::Fighter it = FighterOf(s.foe.unit, 1.6, 0.5);
@@ -207,12 +221,60 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
     if (st.dec.action == brain::Action::SearchLast && !st.search.active && track) brain::StartSearch(st.search, *track);
     if (st.dec.action != brain::Action::SearchLast && st.dec.action != brain::Action::SearchPattern) st.search.active = false;
     if (st.dec.action != brain::Action::Bait) st.baitTurned = false;
+    const bool firingLane = s.haveFoe &&
+        (st.dec.action == brain::Action::FirePosition || st.dec.action == brain::Action::Suppress || st.dec.action == brain::Action::Overwatch || st.dec.action == brain::Action::Reserve);
+    V3 lane{};
+    if (firingLane) {
+        if (st.laneFoe != s.foe.id) { st.laneFoe = s.foe.id; st.laneHeading = steer::HeadingOf(a.pos - foeB.pos); st.haveLane = false; }
+        const double bearing = std::isfinite(s.firingHeading) ? s.firingHeading : st.laneHeading;
+        const auto role = sw.squads ? s.role : brain::Role::Engager;
+        const double offset = role == brain::Role::Flanker ? (s.roleSlot % 2 ? 0.65 : -0.65) :
+            role == brain::Role::Suppressor ? -0.35 : role == brain::Role::Overwatch ? 0.35 :
+            role == brain::Role::Reserve ? (s.roleSlot % 2 ? 1.0 : -1.0) : 0.0;
+        const double distance = std::max(0.1, std::min(s.weapon.range * (role == brain::Role::Reserve ? 0.8 : 0.55), role == brain::Role::Reserve ? 75.0 : 55.0));
+        const V3 targetEye = foeB.pos + V3{0,0,s.foe.inVehicle ? 1.0 : 1.2};
+        const bool roleChanged = st.laneRole != role || st.laneSlot != s.roleSlot;
+        const bool moved = st.haveLane && (steer::Len(foeB.pos-st.laneTarget)>8.0 || steer::Len(st.laneSpot-targetEye)>s.weapon.range*0.9);
+        // Probe at a bounded cadence. Small target movements do not drag the hold
+        // point around; persistent blocked shots choose a nearby alternate lane.
+        if (!st.haveLane || roleChanged || !st.laneCheckAt || now-st.laneCheckAt>=500) {
+            st.laneCheckAt=now;
+            auto usable = [&](V3 p) {
+                return !w.Solid(p) && steer::Len(p-targetEye)<s.weapon.range*0.95 &&
+                    !w.Blocked(p+V3{0,0,1.5},targetEye) && !bfm::AllyBodiesInLine(p+V3{0,0,1.5},targetEye,s.mates,s.mateCount);
+            };
+            const bool clear = st.haveLane && usable(st.laneSpot);
+            if (clear) st.laneBlockedAt=0;
+            else if (!st.laneBlockedAt) st.laneBlockedAt=now;
+            if (!st.haveLane || roleChanged || moved || (st.laneBlockedAt && now-st.laneBlockedAt>=750)) {
+                double best=1e18; V3 pick{}; bool found=false;
+                for (double angle : {0.0, -0.35, 0.35, -0.7, 0.7, -1.05, 1.05}) {
+                    V3 p=foeB.pos+steer::Fwd(bearing+offset+angle)*distance;
+                    p.z=foeB.pos.z+std::min(distance*0.2,role==brain::Role::Overwatch?10.0:6.0);
+                    const double ground=w.Ground(p.x,p.y);
+                    if (std::isfinite(ground)) p.z=std::max(p.z,ground+a.clearance+0.5);
+                    if (!usable(p)) continue;
+                    const double score=std::fabs(angle)*30.0+steer::Len(p-a.pos)*0.1;
+                    if (score<best) {best=score;pick=p;found=true;}
+                }
+                // If no mapped firing lane exists, hold safely where we are and
+                // retry later rather than forcing a destination inside terrain.
+                if (found || !st.haveLane || roleChanged || moved) st.laneSpot=found?pick:a.pos;
+                st.haveLane=true; st.laneTarget=foeB.pos; st.laneRole=role; st.laneSlot=s.roleSlot;
+            }
+        }
+        lane=st.laneSpot;
+    }
+    else { st.haveLane=false; st.laneFoe=0; }
     // ---- The leaf's steering requests ----
     bfm::Recipe r;
     bool contact = false;
     double strafe = std::numeric_limits<double>::quiet_NaN();
     const V3 u = s.haveFoe ? steer::Norm(steer::Flat(foeB.pos - a.pos)) : steer::Fwd(a.heading);
     switch (st.dec.action) {
+    case brain::Action::FirePosition:
+        r.Add(bfm::Request::Kind::Arrive, lane); r.speed = std::min(18.0, a.maxSpeed); r.aim = true;
+        break;
     case brain::Action::Bfm:
         if (s.haveFoe) r = bfm::Plan(st.ms, me, it, g, now, s.dt);
         break;
@@ -274,6 +336,10 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
         r.speed = a.maxSpeed * 0.4;
         break;
     }
+    if (firingLane) {
+        r = bfm::Recipe{};
+        r.Add(bfm::Request::Kind::Arrive, lane); r.speed = std::min(18.0, a.maxSpeed); r.aim = true;
+    }
     if(r.done&&st.dec.action==brain::Action::Bfm) {
         st.completedM=st.dec.m; st.completedUntil=now+1000; st.completedLastTick=true; st.ms.started=false;
     }
@@ -283,40 +349,43 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
     c.Add(steer::WallAvoidance(a, w), 1.5);
     c.Add(steer::ObstacleAvoidance(a, w), 1.2);
     {
-        steer::Body others[9]; int n = 0;
-        for (int i = 0; i < s.otherCount && n < 8; ++i) if (!(contact && steer::Len(s.others[i].pos - foeB.pos) < 1.0)) others[n++] = s.others[i];
+        steer::Body others[Situation::kOtherMax+1]; int n = 0;
+        for (int i = 0; i < s.otherCount && n < Situation::kOtherMax; ++i) if (!(contact && steer::Len(s.others[i].pos - foeB.pos) < 1.0)) others[n++] = s.others[i];
         if (s.haveFoe && !contact && s.foe.inVehicle) others[n++] = foeB;
         c.Add(steer::CollisionAvoidance(a, others, n), 1.0);
         c.Add(steer::Separation(a, s.mates, s.mateCount, 15.0), 1.0);
     }
     c.Add(steer::Containment(a, s.anchor, s.zone), 1.0);
+    const bool safetyActive = steer::Len(c.total)>1.0;
     // The leaf's own behaviours.
     if (st.dec.action == brain::Action::Interpose) c.Add(steer::Interpose(a, s.protectee, foeB), 1.0);
     else if (st.dec.action == brain::Action::Cover && s.haveCover) c.Add(steer::Interpose(a, s.coverBody, foeB), 1.0);
     else if (st.dec.action == brain::Action::FollowLeader) c.Add(steer::LeaderFollowing(a, s.leader, s.slot, s.mates, s.mateCount), 1.0);
     else if (st.dec.action == brain::Action::Wander || st.dec.action == brain::Action::None) c.Add(steer::Wander(a, st.wander, st.rng, s.dt), 1.0);
     for (int i = 0; i < r.n; ++i) c.Add(Resolve(r.req[i], a, foeB), r.req[i].weight);
-    if (s.mateCount && st.dec.action != brain::Action::Bfm && st.dec.action != brain::Action::Tactic) {
+    if (!firingLane && s.mateCount && st.dec.action != brain::Action::Bfm && st.dec.action != brain::Action::Tactic) {
         c.Add(steer::Alignment(a, s.mates, s.mateCount), 0.3);
         c.Add(steer::Cohesion(a, s.mates, s.mateCount), 0.2);
     }
-    c.Add(steer::Wander(a, st.wander, st.rng, s.dt), 0.1);
+    if (!firingLane) c.Add(steer::Wander(a, st.wander, st.rng, s.dt), 0.1);
     out.used = c.used;
     V3 desired = steer::Integrate(a, c.total);
     if (!std::isnan(r.vertical)) desired.z = r.vertical;
     desired = st.smooth.Apply(desired, s.dt);
     // ---- Aim and fire ----
-    if (s.haveFoe && (r.aim || st.dec.action == brain::Action::Suppress || st.dec.action == brain::Action::Overwatch)) {
-        if (now - st.aimErrAt > 600) { st.aimErrAt = now; st.aimErr = brain::AimError(person, g.range, st.rng); }
+    const bool mayFire = st.dec.action != brain::Action::Flee && st.dec.action != brain::Action::Retreat && st.dec.action != brain::Action::Bait &&
+        s.haveFoe && s.foe.visible && !s.me.wrecked;
+    // Moving/repositioning does not disable tracking a visible hostile target.
+    if (s.haveFoe && (r.aim || mayFire)) {
+        if (!st.aimErrAt || now - st.aimErrAt > 600) { st.aimErrAt = now; st.aimErr = brain::AimError(person, g.range, st.rng); }
         out.aim = true;
         out.aimPoint = g.lead + st.aimErr + V3{ 0, 0, s.foe.inVehicle ? 1.0 : 1.2 };
     }
-    const bool mayFire = st.dec.action != brain::Action::Flee && st.dec.action != brain::Action::Retreat && st.dec.action != brain::Action::Bait &&
-        st.dec.action != brain::Action::Reserve && s.haveFoe && s.foe.visible && !s.me.wrecked;
-    out.fire = mayFire && bfm::FireSolution(me, g, nullptr, 0);
+    const V3 muzzle = a.pos + steer::Fwd(a.heading)*4.0 + V3{0,0,1.5};
+    const double shotYaw=std::fabs(steer::Wrap(steer::HeadingOf(out.aimPoint-a.pos)-a.heading));
+    out.fire = mayFire && out.aim && g.range<s.weapon.range && g.leadTime<s.weapon.maxLeadTime && shotYaw<s.weapon.cone;
     if (out.fire && s.mateCount) {
-        V3 lines[8]; for (int i = 0; i < s.mateCount; ++i) lines[i] = s.mates[i].pos;
-        out.fire = !bfm::AllyInLine(a.pos, g.lead, lines, s.mateCount);
+        out.fire = !bfm::AllyBodiesInLine(muzzle, out.aimPoint, s.mates, s.mateCount);
     }
     // ---- Commands, or the planner when the terrain check fails ----
     const double sp = steer::Len2D(desired);
@@ -325,8 +394,13 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
     out.carrot = a.pos + dir * len; out.carrot.z = a.pos.z + desired.z * 2.0;
     out.speed = std::max(sp, 4.0);
     out.contact = contact; out.strafe = strafe;
+    if (firingLane) {
+        out.carrot = lane; out.hold = true;
+        out.speed = std::min({18.0,steer::Len2D(lane-a.pos),std::sqrt(12.0*std::max(0.0,steer::Len2D(lane-a.pos)-3.0))});
+    }
     const bool safe = steer::SafeAhead(a, desired, w);
-    out.useCommands = sw.steering && safe;
+    out.terrainBlocked=!safe; out.avoiding=safetyActive;
+    out.useCommands = sw.steering && safe && !(firingLane && !safetyActive && steer::Len2D(lane - a.pos) < 10.0);
     if (out.useCommands) {
         out.cmd = steer::ToCommands(a, desired, out.aim ? &out.aimPoint : nullptr);
         if (!std::isnan(strafe)) out.cmd.strafe = strafe;

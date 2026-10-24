@@ -26,6 +26,10 @@ namespace features
 			{ Id::StatusCard, "Vehicle status card", "The card that shows what your vehicle is doing.", L"hud", L"card", true },
 			{ Id::Witnesses, "Crash witnesses", "Bystanders flee or cower near a vehicle crash.", L"witness", L"enabled", true },
 			{ Id::Placement, "Parked vehicles (Carfield / Vehicles.esm)", "Places those mods' vehicles at parking spots. Takes effect after loading a save.", L"placement", L"enabled", true },
+			{ Id::FreeRoll, "Free roll (hover)", "Your hovering vehicle can roll all the way round and turns about its own axes. Off: the roll stops at 46 degrees and levels by itself.", L"flight", L"freeRoll", false },
+			{ Id::FlightAssist, "Flight assist", "Free roll levels near upright. With Physical VTOL, bounded thrusters and torque stabilize drift and spin. Off: manual VTOL retains uncommanded momentum.", L"flight", L"assist", true },
+			{ Id::PhysicalVtol, "Physical VTOL (experimental)", "Player hover uses thruster forces and torque with native mass and inertia. Flight assist stabilizes it; off preserves uncommanded spin and drift. No wing aerodynamics yet.", L"flight", L"physicalVtol", false },
+			{ Id::PhysicalAi, "Physical VTOL for AI pilots (experimental)", "Autopilot trips, summons and NPC-driven vehicles fly with thruster forces and torque on native mass and inertia: turns bank, speed builds and coasts. A vehicle whose speed the game keeps wiping falls back to the standard flight.", L"flight", L"physicalAi", false },
 			{ Id::DebugLog, "Detailed log", "Writes much more to the mod's log, for bug reports.", L"log", L"verbose", false },
 		};
 

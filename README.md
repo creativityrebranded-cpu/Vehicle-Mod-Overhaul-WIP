@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current version: **0.71.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current version: **0.72.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -19,7 +19,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 
 | Feature | What you get | State |
 |---|---|---|
-| **Hover flight** | Double-tap Space to hover; gears, boost, climb and descend, terrain assist | Tested |
+| **Hover flight** | The hover key (L3 on a controller) to hover; gears, boost, climb and descend, terrain assist | Tested |
 | **Summon, Follow and Cover** | N brings your vehicle to you over anything it is doing; U makes it follow you (Cover in combat: it defends you) | Summon/follow tested; Cover untested |
 | **Guard point and ram** | Hold T on a place: your vehicle guards it. Hold T on a person or vehicle: rammed in a straight line, flat out | Untested |
 | **Stance** | One key cycles Defend / Attack / Hold fire for your vehicle and your escorts | Untested in game; offline checks pass |
@@ -144,8 +144,9 @@ the vehicle flies on without stopping. The final point keeps normal arrival brak
 
 | Key | Action |
 |---|---|
-| **Space ×2** | Hover on / off |
-| **W / S** | Accelerate / brake (double-tap W: keep accelerating) |
+| **Hover key** | Hover on / off: the first free of J, K, Y, O, P, B, shown on the hover button (Space double tap no longer toggles hover) |
+| **W / S** | Accelerate / brake |
+| **Left Shift** (double tap) | Throttle lock: keep accelerating until you boost or brake again |
 | **Left Shift** (hold) | 1.75x boost in the selected gear. Uses the game's boost meter and the vehicle's own burn/recharge timings; release to recover after depletion. |
 | **Alt** (tap) | Cycle gears: 1 → 2 → 3 → 4 → 1 |
 | **Alt** (hold) | Descend after 0.3 seconds; releasing a hold does not change gear |
@@ -169,7 +170,7 @@ The HUD shows what you can do now and one status card (0.62.0). Everything uses 
   On foot your vehicle's state (*SUMMONING 120 m*, *FOLLOW 42 m*, *COVER · DEFEND 42 m*, *GUARD POINT*, *HOLDING*…) and the escort count.
 - **Prompts:** in the vehicle **T Auto / Auto off** (beside the game's own E exit); on foot **N Summon** and **U Follow** (*Cover* in
   combat); facing an occupied vehicle **Passenger** and **eject**.
-- **Control hints** (W / A / S / D, Alt: tap gear, hold descend, Hover / Land: Space double tap) show on your first 3 rides and for
+- **Control hints** (W / A / S / D, Alt: tap gear, hold descend, Hover / Land: the hover key) show on your first 3 rides and for
   10 s after you get in, then hide. **J** shows every hint and panel (the gear box, each escort's row, the HUD route panel).
 - **The scanner** is where you plan: the target readout, the route with Retry / Skip / *T T: clear route*, and your escorts.
 - **F7** moves and resizes everything (+ / − on the pick). The card moves with *Status* on foot and *Vehicles* in the vehicle.
@@ -179,10 +180,38 @@ The HUD shows what you can do now and one status card (0.62.0). Everything uses 
 ## Controls and controllers
 
 Every control of the mod is set in `Documents/My Games/Starfield/SFSE/Logs/SeamlessVehicle/bindings.ini`, written on the first
-start. Each line lists alternatives: keys, mouse buttons, controller buttons (`Pad:A`, `Pad:RT`, `Pad:LStickLeft` ...) and
-controller chords (`Pad:LB+DUp`). `default` keeps the mod's own key, and for the game's vehicle controls also the game's
-controller button. Saved changes apply while the game runs. Any XInput controller works; hover flies on RT / LT / the left stick
-by default, and the file has a commented controller layout to start from.
+start, or in the mod's section of the game's Controls menu. Each line lists alternatives: keys, mouse buttons and controller buttons,
+optionally limited to a situation (`Pad:DUp@vehicle`) or a gesture (`Pad:DLeft:tap`, `Pad:DLeft:hold`). `default` keeps the mod's own
+key, and for the game's vehicle controls also the game's controller button. Saved changes apply while the game runs.
+
+Since 0.72.0 the controller map changes with the situation (on foot, driving, hovering, physical flight, the scanner, a passenger seat)
+and uses no button combinations. Where the mod uses a controller button, the game's own action on it is switched off there, so one
+press never does two things; RT (fire) and LT (aim) are never taken. The left stick is analog for roll and throttle. A bindings.ini from
+0.71.0 or earlier is upgraded once; lines you edited are kept.
+
+| Situation | Controller |
+|---|---|
+| Driving, hovering, physical flight | Left stick: throttle, brake, turn / roll (analog). RB boost (double tap: throttle lock). L3 hover on / off. A: tap gear, hold descend. D-pad Up summon, Down follow / cover, Right stance, Left tap Auto / hold profile. R3 tap: every hint |
+| Flying | Y climb, X descend |
+| Hand scanner (LB) | Y go there / pick, B summon, L3 follow / cover. D-pad Left: tap retry / hold profile. D-pad Right: tap skip stop / hold ride along. View: tap stance / hold every hint |
+| Passenger seat | A: get out |
+
+Ram (hold T) is keyboard-only for now.
+
+## What's new in 0.72.0
+
+Details: [docs/RELEASE_0.72.0.md](docs/RELEASE_0.72.0.md). None of it is tested in game yet.
+
+- **Physical flight (experimental, off by default)**: Physical VTOL flies your vehicle on thrust and torque with the game's own mass
+  and inertia; Flight assist keeps it stable and gives coordinated turns. **Physical VTOL for AI pilots** does the same for the
+  autopilot and NPC drivers. Free roll lets your hover roll all the way round. Physics runs on the game's own timestep.
+- **Camera roll and attitude instrument**: the camera banks with the vehicle in both views; a horizon with pitch ladder and a
+  pitch / bank readout (separate F7 elements).
+- **Controller support**: a situation-based map with no combinations, the game's action switched off on the mod's buttons, analog
+  sticks, prompts that no longer flicker, and the mod's section in the game's Controls menu.
+- **Changed controls**: hover has its own key (no Space double tap), throttle lock is double tap Boost, tap Activate on an occupied
+  vehicle = passenger seat, hold = pull the driver out.
+- **Fix**: first-person vehicle view was not recognised, which kept camera roll and the HUD off.
 
 ## What's new in 0.71.0
 

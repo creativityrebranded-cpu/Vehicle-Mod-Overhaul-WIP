@@ -79,7 +79,8 @@ inline V3 Arrive(const Agent& a, V3 target, double slowRadius = 15.0)
     const V3 to = target - a.pos;
     const double d = Len(to);
     if (d < 0.3) return a.vel * -1.0;
-    const double speed = std::min(a.maxSpeed, a.maxSpeed * d / std::max(1.0, slowRadius));
+    const double speed = std::min({ a.maxSpeed, a.maxSpeed * d / std::max(1.0, slowRadius),
+        std::sqrt(2.0 * std::max(0.1, a.maxForce) * std::max(0.0, d - 0.3)) });
     return to * (speed / d) - a.vel;
 }
 // The look-ahead for pursuit / evasion: distance over the speeds, shorter when closing fast.
@@ -371,10 +372,18 @@ inline Commands ToCommands(const Agent& a, V3 desired, const V3* aimPoint = null
 // The terrain safety check: false when flying `desired` for `seconds` meets a solid or the ground (the autopilot's planner then wins).
 inline bool SafeAhead(const Agent& a, V3 desired, const World& w, double seconds = 2.5, double* hitAt = nullptr)
 {
+    V3 pos = a.pos, velocity = a.vel;
     for (double t = 0.25; t <= seconds + 1e-9; t += 0.25) {
-        const V3 p = a.pos + desired * t;
-        const double g = w.Ground(p.x, p.y);
-        if (w.Solid(p) || (std::isfinite(g) && g > p.z - 0.5)) { if (hitAt) *hitAt = t; return false; }
+        // A new command cannot instantly remove the body's existing momentum.
+        const V3 nextVelocity = velocity + Trunc(desired - velocity, a.maxForce * 0.25);
+        const V3 p = pos + (velocity + nextVelocity) * 0.125;
+        const V3 side = Right(HeadingOf(nextVelocity)) * a.radius;
+        for (const V3 probe : { p, p + side, p - side }) {
+            const double g = w.Ground(probe.x, probe.y);
+            if (w.Solid(probe) || (std::isfinite(g) && g > probe.z - 0.5)) { if (hitAt) *hitAt = t; return false; }
+        }
+        if (w.Blocked(pos, p)) { if (hitAt) *hitAt = t; return false; }
+        pos = p; velocity = nextVelocity;
     }
     if (hitAt) *hitAt = -1;
     return true;

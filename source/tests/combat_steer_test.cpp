@@ -144,5 +144,15 @@ int main()
         check(!SafeAhead(a, { 20, 0, 0 }, tw, 2.5, &at) && at > 1.0, "the safety check sees terrain within 2.5 s");
         check(SafeAhead(a, { 0, 20, 0 }, tw), "a clear way is safe");
     }
+    {
+        Agent a=At(0,0,0,40); a.maxSpeed=100; a.maxForce=6;
+        const V3 wanted=a.vel+Arrive(a,{0,20,3},1);
+        check(Len(wanted)<=std::sqrt(2*6.0*20)+0.1,"arrival speed respects the stopping distance of a weakly braking vehicle");
+        FakeWorld tw;tw.plateauX=8;tw.plateauH=20;
+        a=At(0,0,40,0);a.maxForce=6;
+        check(!SafeAhead(a,{},tw),"a zero-speed request cannot hide momentum carrying the body into terrain");
+        a=At(0,0,0,10);a.radius=3;tw.plateauX=2;
+        check(!SafeAhead(a,{0,10,0},tw),"terrain safety checks hull width as well as the centre line");
+    }
     return failures ? 1 : 0;
 }

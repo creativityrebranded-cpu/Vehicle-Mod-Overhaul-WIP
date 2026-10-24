@@ -21,15 +21,16 @@ def write_zip(destination, files):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--version", required=True, help="e.g. 0.72.0")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    version = "0.63.1"
+    version = args.version
     binary = output / f"FlyingVehicleOverhaul-{version}.zip"
     source_zip = output / f"FlyingVehicleOverhaul-{version}-source.zip"
     files = [(root / "Data" / name, name) for name in (
-        "SeamlessPilots.esm", "SFSE/Plugins/SeamlessVehicle.dll")]
+        "SeamlessPilots.esm", "FlyingVehicleOverhaul - Placements.esm", "SFSE/Plugins/SeamlessVehicle.dll")]
     for source, _ in files:
         if not source.is_file():
             raise FileNotFoundError(source)
@@ -45,7 +46,7 @@ def main():
                 source_files.append((path, path.relative_to(source_root).as_posix()))
     write_zip(source_zip, source_files)
     with zipfile.ZipFile(binary) as archive:
-        if archive.read("SFSE/Plugins/SeamlessVehicle.dll") != files[1][0].read_bytes():
+        if archive.read("SFSE/Plugins/SeamlessVehicle.dll") != files[2][0].read_bytes():
             raise RuntimeError("Packaged plugin differs from repository plugin")
     sums = output / f"FlyingVehicleOverhaul-{version}-SHA256SUMS.txt"
     sums.write_text("".join(
