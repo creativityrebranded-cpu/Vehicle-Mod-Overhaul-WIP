@@ -18,6 +18,7 @@
 #include <ShlObj.h>
 
 #include "hook.h"
+#include "fvopaths.h"
 
 #include <algorithm>
 #include <atomic>
@@ -103,7 +104,7 @@ namespace vehiclehits
 			g_iniRead = true;
 			PWSTR docs = nullptr;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				const std::wstring ini = fvopaths::Settings();
 				CoTaskMemFree(docs);
 				g_hitDamage = float(GetPrivateProfileIntW(L"hits", L"damage", 20, ini.c_str()));
 				wchar_t scale[64]{};

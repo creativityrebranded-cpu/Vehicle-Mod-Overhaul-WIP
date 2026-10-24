@@ -64,18 +64,18 @@ inline std::uint32_t GamePadBit(std::uint32_t code)
 // hold come from the one situation the player is in now; an alternative without '@' counts everywhere.
 enum : std::uint8_t {
     kCtxFoot = 1, kCtxGround = 2, kCtxHover = 4, kCtxVtol = 8, kCtxScanner = 16, kCtxPassenger = 32,
-    kCtxFlying = kCtxHover | kCtxVtol, kCtxVehicle = kCtxGround | kCtxFlying, kCtxAll = 0xFF,
+    kCtxEditor = 64, kCtxFlying = kCtxHover | kCtxVtol, kCtxVehicle = kCtxGround | kCtxFlying, kCtxAll = 0xFF,
 };
 struct CtxName { const char* name; std::uint8_t ctx; };
 inline const std::vector<CtxName>& CtxNames()
 {
     static const std::vector<CtxName> t = { { "foot", kCtxFoot }, { "ground", kCtxGround }, { "hover", kCtxHover }, { "vtol", kCtxVtol },
-        { "scanner", kCtxScanner }, { "passenger", kCtxPassenger }, { "flying", kCtxFlying }, { "vehicle", kCtxVehicle } };
+        { "scanner", kCtxScanner }, { "passenger", kCtxPassenger }, { "editor", kCtxEditor }, { "flying", kCtxFlying }, { "vehicle", kCtxVehicle } };
     return t;
 }
 // "Pad:DLeft:tap" counts once, on a release before kGestureHoldMs; "Pad:DLeft:hold" from kGestureHoldMs on. Two actions
 // can share a button that way (tap one, hold the other) without either firing for the other's gesture.
-enum class Gesture : std::uint8_t { Raw, Tap, Hold };
+enum class Gesture : std::uint8_t { Raw, Tap, Hold, Double };
 inline constexpr std::uint64_t kGestureHoldMs = 500;
 
 struct Alt {
@@ -92,20 +92,35 @@ inline bool InCtx(const Alt& a, std::uint8_t ctx) { return !a.ctx || (a.ctx & ct
 // One tap / hold alternative's state (bindings.cpp keeps one per alternative and updates it once a frame).
 struct GestureState
 {
-    bool down = false, held = false;
-    std::uint64_t at = 0;
+    bool down = false, held = false, pending = false, consumed = false, blocked = false;
+    std::uint64_t at = 0, released = 0;
+    void Cancel(bool on) { down = held = pending = consumed = false; blocked = on; }
     // `on` = the button (and its chord modifier) held now. True for one update after a short press (Tap), or while held
     // past kGestureHoldMs (Hold).
-    bool Update(bool on, Gesture g, std::uint64_t now)
+    bool Update(bool on, Gesture g, std::uint64_t now, bool doubleBound = false)
     {
         bool out = false;
+        if (blocked) { blocked = on; return false; }
         if (on) {
-            if (!down) { down = true; held = false; at = now; }
+            if (!down) {
+                down = true; held = false; at = now; consumed = false;
+                if (pending && now - released < 300 && doubleBound) {
+                    pending = false; consumed = true;
+                    return g == Gesture::Double;
+                }
+                if (pending && g == Gesture::Tap) out = true;
+                pending = false;
+            }
+            if (consumed) return out;
             if (now - at >= kGestureHoldMs) held = true;
-            out = g == Gesture::Hold && held;
+            out = out || (g == Gesture::Hold && held);
         }
         else {
-            out = g == Gesture::Tap && down && !held;
+            if (down && !consumed && !held && now - at < kGestureHoldMs) {
+                if (doubleBound) { pending = true; released = now; }
+                else out = g == Gesture::Tap;
+            }
+            if (pending && now - released >= 300) { out = g == Gesture::Tap; pending = false; }
             down = held = false;
         }
         return out;
@@ -182,51 +197,50 @@ inline Binding Parse(std::string_view line, std::string* bad = nullptr)
         std::string_view w = Trim(line.substr(0, comma));
         line = comma == std::string_view::npos ? std::string_view{} : line.substr(comma + 1);
         if (w.empty() || Same(w, "none")) continue;
-        if (Same(w, "default")) { out.push_back({ 0, 0, 0, true }); continue; }
-        if (Same(w, "default-key")) { out.push_back({ 0, 0, 0, true, true, false }); continue; }
-        if (Same(w, "default-pad")) { out.push_back({ 0, 0, 0, true, false, true }); continue; }
-        if (w.size() > 4 && Same(w.substr(0, 4), "pad:")) {
-            std::string_view b = w.substr(4);
-            // "@vehicle|scanner": the situations; ":tap" / ":hold": the gesture.
-            std::uint8_t ctx = 0;
-            bool okCtx = true;
-            if (const auto at = b.find('@'); at != std::string_view::npos) {
-                std::string_view list = b.substr(at + 1);
-                b = Trim(b.substr(0, at));
-                while (!list.empty()) {
-                    const auto bar = list.find('|');
-                    const auto n = Trim(list.substr(0, bar));
-                    list = bar == std::string_view::npos ? std::string_view{} : list.substr(bar + 1);
-                    std::uint8_t c = 0;
-                    for (const auto& cn : CtxNames()) if (Same(n, cn.name)) c = cn.ctx;
-                    if (!c) okCtx = false;
-                    ctx |= c;
-                }
+        const std::string originalWord(w);
+        std::uint8_t ctx = 0;
+        bool ok = true;
+        if (const auto at = w.find('@'); at != std::string_view::npos) {
+            auto list = w.substr(at + 1); w = Trim(w.substr(0, at));
+            if (list.empty()) ok = false;
+            while (!list.empty()) {
+                const auto bar = list.find('|'); const auto name = Trim(list.substr(0, bar));
+                list = bar == std::string_view::npos ? std::string_view{} : list.substr(bar + 1);
+                std::uint8_t c = 0;
+                for (const auto& n : CtxNames()) if (Same(name,n.name)) c = n.ctx;
+                if (!c) ok = false;
+                ctx |= c;
             }
-            Gesture g = Gesture::Raw;
-            if (const auto colon = b.find(':'); colon != std::string_view::npos) {
-                const auto gw = Trim(b.substr(colon + 1));
-                b = Trim(b.substr(0, colon));
-                if (Same(gw, "tap")) g = Gesture::Tap;
-                else if (Same(gw, "hold")) g = Gesture::Hold;
-                else okCtx = false;
-            }
-            const auto plus = b.find('+');
-            const std::uint32_t mod = plus == std::string_view::npos ? 0 : PadCode(Trim(b.substr(0, plus)));
-            const std::uint32_t pad = PadCode(Trim(plus == std::string_view::npos ? b : b.substr(plus + 1)));
-            if (okCtx && pad && (plus == std::string_view::npos || mod)) { out.push_back({ 0, pad, mod, false, true, true, ctx, g }); continue; }
         }
-        else if (const int vk = KeyCode(w)) { out.push_back({ vk, 0, 0, false }); continue; }
-        if (bad) { if (!bad->empty()) *bad += ", "; *bad += std::string(w); }
+        Gesture gesture = Gesture::Raw;
+        const auto colon = w.find(':', w.size()>4 && Same(w.substr(0,4),"pad:") ? 4 : 0);
+        if (colon != std::string_view::npos) {
+            const auto name = Trim(w.substr(colon + 1)); w = Trim(w.substr(0, colon));
+            if (Same(name,"tap")) gesture = Gesture::Tap;
+            else if (Same(name,"hold")) gesture = Gesture::Hold;
+            else if (Same(name,"double")) gesture = Gesture::Double;
+            else ok = false;
+        }
+        Alt alt; alt.ctx=ctx; alt.gesture=gesture;
+        if (Same(w,"default") || Same(w,"default-key") || Same(w,"default-pad")) {
+            alt.useDefault=true; alt.defaultKeyboard=!Same(w,"default-pad"); alt.defaultController=!Same(w,"default-key");
+        } else if (w.size()>4 && Same(w.substr(0,4),"pad:")) {
+            const auto body=w.substr(4); const auto plus=body.find('+');
+            alt.mod=plus==std::string_view::npos?0:PadCode(Trim(body.substr(0,plus)));
+            alt.pad=PadCode(Trim(plus==std::string_view::npos?body:body.substr(plus+1)));
+            if (!alt.pad || (plus!=std::string_view::npos&&!alt.mod)) ok=false;
+        } else { alt.vk=KeyCode(w); if(!alt.vk)ok=false; }
+        if(ok){out.push_back(alt);continue;}
+        if (bad) { if (!bad->empty()) *bad += ", "; *bad += originalWord; }
     }
     return out;
 }
 
 // Every chord modifier of these bindings (a plain pad binding is quiet while one of them is held).
-inline std::uint32_t Modifiers(const std::vector<Binding>& all)
+inline std::uint32_t Modifiers(const std::vector<Binding>& all, std::uint8_t ctx = kCtxAll)
 {
     std::uint32_t m = 0;
-    for (const auto& b : all) for (const auto& a : b) m |= a.mod;
+    for (const auto& b : all) for (const auto& a : b) if(InCtx(a,ctx)) m |= a.mod;
     return m;
 }
 
@@ -248,6 +262,8 @@ bool Held(const Binding& b, int defaultVk, std::uint32_t pad, std::uint32_t modi
 {
     for (std::size_t i = 0; i < b.size(); ++i) {
         const auto& a = b[i];
+        if (!InCtx(a, ctx)) continue;
+        if (a.gesture != Gesture::Raw) { if (gestures && i < gestures->size() && (*gestures)[i]) return true; continue; }
         if (a.useDefault) {
             if (a.defaultKeyboard && defaultVk && keyHeld(defaultVk)) return true;
             if (a.defaultController && defaultPad && (pad & defaultPad) && !(pad & modifiers & ~defaultPad)) return true;
@@ -297,6 +313,8 @@ double Amount(const Binding& b, int defaultVk, std::uint32_t pad, std::uint32_t 
     double out = 0.0;
     for (std::size_t i = 0; i < b.size(); ++i) {
         const auto& a = b[i];
+        if (!InCtx(a, ctx)) continue;
+        if (a.gesture != Gesture::Raw) { if (gestures && i < gestures->size() && (*gestures)[i]) out=std::max(out,1.0); continue; }
         if (a.useDefault) {
             if (a.defaultKeyboard && defaultVk && keyHeld(defaultVk)) return 1.0;
             if (a.defaultController && defaultPad && !(pad & modifiers & ~defaultPad))
@@ -372,13 +390,14 @@ inline std::string Label(const Binding& b, int defaultVk, std::uint32_t defaultP
             s += t;
         };
         for (const auto& a : b) {
+            if (!InCtx(a,ctx)) continue;
             if (a.useDefault) {
                 if (!pad && a.defaultKeyboard && defaultVk) add(KeyLabel(defaultVk));
                 if (pad && a.defaultController && defaultPad) add(PadLabel(defaultPad, style));
             }
             else if (!pad && a.vk) add(KeyLabel(a.vk));
             else if (pad && a.pad && InCtx(a, ctx))
-                add((a.mod ? PadLabel(a.mod, style) + "+" + PadLabel(a.pad, style) : PadLabel(a.pad, style)) + (a.gesture == Gesture::Hold ? " (hold)" : ""));
+                add((a.mod ? PadLabel(a.mod, style) + "+" + PadLabel(a.pad, style) : PadLabel(a.pad, style)) + (a.gesture == Gesture::Hold ? " (hold)" : a.gesture == Gesture::Double ? " (double)" : ""));
         }
         return s;
     };
@@ -390,7 +409,7 @@ inline std::string Label(const Binding& b, int defaultVk, std::uint32_t defaultP
     }
     else {
         s = collect(show == Show::Pad);
-        if (s.empty()) s = collect(show != Show::Pad);
+
     }
     return s.empty() ? "unbound" : s;
 }
@@ -419,22 +438,22 @@ inline std::string Label(const Binding& b, int defaultVk, std::uint32_t defaultP
 inline std::string Spec(const Binding& binding)
 {
     std::string out;
-    for (const auto& a : binding) {
+    for(const auto& a:binding){
         std::string part;
-        if (a.useDefault) part=a.defaultKeyboard?(a.defaultController?"default":"default-key"):"default-pad";
-        else if (a.vk) part=KeyLabel(a.vk);
-        else if (a.pad) {
-            part="Pad:"+(a.mod?PadLabel(a.mod)+"+":"")+PadLabel(a.pad);
-            if (a.gesture==Gesture::Tap) part+=":tap"; else if (a.gesture==Gesture::Hold) part+=":hold";
-            if (a.ctx) {
-                // The widest names first, so "vehicle" is written instead of its three parts.
-                std::uint8_t left=a.ctx; std::string list;
-                for (const char* n : { "vehicle", "flying", "foot", "ground", "hover", "vtol", "scanner", "passenger" })
-                    for (const auto& cn : CtxNames()) if (std::string_view(n)==cn.name && (left & cn.ctx)==cn.ctx) { left&=std::uint8_t(~cn.ctx); list+=(list.empty()?"":"|")+std::string(n); }
-                part+="@"+list;
-            }
+        if(a.useDefault)part=a.defaultKeyboard?(a.defaultController?"default":"default-key"):"default-pad";
+        else if(a.vk)part=KeyLabel(a.vk);
+        else if(a.pad)part="Pad:"+(a.mod?PadLabel(a.mod)+"+":"")+PadLabel(a.pad);
+        if(part.empty())continue;
+        if(a.gesture==Gesture::Tap)part+=":tap";
+        else if(a.gesture==Gesture::Hold)part+=":hold";
+        else if(a.gesture==Gesture::Double)part+=":double";
+        if(a.ctx){
+            std::uint8_t left=a.ctx;std::string list;
+            for(const char* name:{"vehicle","flying","foot","ground","hover","vtol","scanner","passenger","editor"})
+                for(const auto& cn:CtxNames())if(std::string_view(name)==cn.name&&(left&cn.ctx)==cn.ctx){left&=std::uint8_t(~cn.ctx);list+=(list.empty()?"":"|")+std::string(name);}
+            part+="@"+list;
         }
-        if (!part.empty()) {if(!out.empty())out+=", ";out+=part;}
+        if(!out.empty())out+=", ";out+=part;
     }
     return out.empty()?"none":out;
 }
@@ -490,16 +509,17 @@ inline Binding SetSlot(const Binding& b, bool pad, int slot, Input in, int defau
     if (s.fromDefault) {
         auto& a = out[s.index];
         (pad ? a.defaultController : a.defaultKeyboard) = false;
+        Alt scoped = explicitAlt; scoped.ctx=a.ctx; scoped.gesture=a.gesture;
         const bool keep = a.defaultKeyboard || a.defaultController;
         if (!keep) out.erase(out.begin() + std::ptrdiff_t(s.index));
-        if (!in.Empty()) out.insert(out.begin() + std::ptrdiff_t(s.index), explicitAlt);
+        if (!in.Empty()) out.insert(out.begin() + std::ptrdiff_t(s.index), scoped);
         return out;
     }
     if (in.Empty()) out.erase(out.begin() + std::ptrdiff_t(s.index));
     else {
         // A new button keeps the slot's situations and gesture ("Pad:DLeft:hold@vehicle" rebound stays a vehicle hold).
         Alt next = explicitAlt;
-        if (next.pad && out[s.index].pad) { next.ctx = out[s.index].ctx; next.gesture = out[s.index].gesture; }
+        next.ctx = out[s.index].ctx; next.gesture = out[s.index].gesture;
         out[s.index] = next;
     }
     return out;

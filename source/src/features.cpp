@@ -1,6 +1,7 @@
 #include "features.h"
 
 #include "log.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -30,6 +31,7 @@ namespace features
 			{ Id::FlightAssist, "Flight assist", "Free roll levels near upright. With Physical VTOL, bounded thrusters and torque stabilize drift and spin. Off: manual VTOL retains uncommanded momentum.", L"flight", L"assist", true },
 			{ Id::PhysicalVtol, "Physical VTOL (experimental)", "Player hover uses thruster forces and torque with native mass and inertia. Flight assist stabilizes it; off preserves uncommanded spin and drift. No wing aerodynamics yet.", L"flight", L"physicalVtol", false },
 			{ Id::PhysicalAi, "Physical VTOL for AI pilots (experimental)", "Autopilot trips, summons and NPC-driven vehicles fly with thruster forces and torque on native mass and inertia: turns bank, speed builds and coasts. A vehicle whose speed the game keeps wiping falls back to the standard flight.", L"flight", L"physicalAi", false },
+			{ Id::PlacementMode, "Placement mode", "The scanner's action key edits vehicle spots instead of targeting. Tap: save a parking spot where you aim. Hold: delete the saved spot you aim at. Double tap: make it this area's summon point, where your vehicle appears when summoned from far away. Spots take effect after the placements are rebuilt.", L"placement", L"recording", false },
 			{ Id::DebugLog, "Detailed log", "Writes much more to the mod's log, for bug reports.", L"log", L"verbose", false },
 		};
 
@@ -45,7 +47,7 @@ namespace features
 			if (path.empty()) {
 				PWSTR docs = nullptr;
 				if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-					path = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+					path = fvopaths::Settings();
 					CoTaskMemFree(docs);
 				}
 			}
@@ -59,7 +61,7 @@ namespace features
 			for (const auto& f : kInfo) {
 				const bool v = ini.empty() ? f.defaultOn : GetPrivateProfileIntW(f.section, f.key, f.defaultOn ? 1 : 0, ini.c_str()) != 0;
 				if (!g_loaded || g_on[int(f.id)].load() != v) {
-					if (g_loaded) logger::Write("Features: %s -> %s (seamless.ini)", f.label, v ? "on" : "off");
+					if (g_loaded) logger::Write("Features: %s -> %s (settings.ini)", f.label, v ? "on" : "off");
 					g_on[int(f.id)].store(v);
 					g_gen.fetch_add(1);
 				}

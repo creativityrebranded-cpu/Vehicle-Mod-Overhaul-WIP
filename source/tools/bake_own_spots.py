@@ -36,16 +36,26 @@ def h64(text):
     return struct.unpack_from('<Q', hashlib.sha1(text.encode()).digest())[0]
 
 def load(paths):
-    spots = []
+    """Markers from the recordings. A placement-removed.tsv among them (placement mode's hold-to-delete of an already
+    baked spot, 2026-10-24) lists spots to leave out: by key, or within kMerge of the listed position in that world."""
+    spots, removed = [], []
     for path in paths:
         with open(path, encoding='utf-8') as f:
             head = f.readline().rstrip('\n').split('\t')
             for line in f:
                 if not line.strip(): continue
                 r = dict(zip(head, line.rstrip('\n').split('\t')))
+                if 'player_cell_runtime' not in head:
+                    removed.append(dict(key=int(r['key'], 16), world=r['world_editor_id'], x=float(r['x']), y=float(r['y']), z=float(r['z'])))
+                    continue
                 spots.append(dict(key=int(r['key'], 16), world=r['world_editor_id'], cell=int(r['player_cell_runtime'], 16),
                                   x=float(r['x']), y=float(r['y']), z=float(r['z']), h=float(r['yaw']), label=r.get('label', '')))
-    return spots
+    def gone(s):
+        return any(d['key'] == s['key'] or (d['world'] == s['world'] and
+                   math.dist((d['x'], d['y'], d['z']), (s['x'], s['y'], s['z'])) < kMerge) for d in removed)
+    kept = [s for s in spots if not gone(s)]
+    if removed: print(f"  {len(spots) - len(kept)} spot(s) left out by {len(removed)} removal(s)")
+    return kept
 
 def merge(spots):
     kept = []

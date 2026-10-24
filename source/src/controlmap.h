@@ -37,7 +37,7 @@ namespace controlmap
 	void Note(const char* owner, const char* action, int vk);
 	// Logs the table (owner, action, key), one line each.
 	void LogTable();
-	// Test / debug keys (board, exit, escort-pursuit, NPC profile cycle) exist only with Logs\SeamlessVehicle\seamless.ini [keys] debug=1. The context engine does their job.
+	// Test / debug keys (board, exit, escort-pursuit, NPC profile cycle) exist only with Logs\FlyingVehicleOverhaul\settings.ini [keys] debug=1. The context engine does their job.
 	bool DebugKeys();
 	// Writes every context's keyboard bindings to Logs\SeamlessPlanets\controlmap.txt (once per session).
 	void Dump();

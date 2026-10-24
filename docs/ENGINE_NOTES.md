@@ -17,7 +17,7 @@ Everything here was read from code or observed in a log; a note says when it is 
   seats (snap 1 = instant). `FUN_141952530(actor)` dismount (refused when `actor + 0x378` bit 1 is set, no seat interaction, or "getting on/off" bit 3 set).
   `FUN_141A9C530(actor)` ends the interaction (instant exit). `FUN_14219BE30(vehicle)` seats the PLAYER (the game's only vehicle seat path; hooked so NPC
   jobs' vehicles are refused).
-- The quest package route: `SeamlessPilots.esm`'s quest holds aliases; the plugin fills them (`ForceRefTo`) so the NPC runs a quest package (outranks its schedule).
+- The quest package route: `FVO_NPCPilots.esm`'s quest holds aliases; the plugin fills them (`ForceRefTo`) so the NPC runs a quest package (outranks its schedule).
   In combat the get-in package never runs, so the NPC is calmed first and set to force-run (`actor + 0xF8` bit 26, `FUN_140C3A040`).
 
 ## Physics queries (forward rays, hull sweeps)
@@ -50,4 +50,4 @@ Everything here was read from code or observed in a log; a note says when it is 
 - Loaded references: `modscene::LoadedRefs(limit)` walks the attached grid cells (`FUN_...` for each reference in a cell). A prefix of a larger scan equals a smaller scan; 2000 was too few to
   reach an NPC far down the list, so scans that look for NPCs use 8000.
 - Crash handler: `crash.cpp` prints the fault, registers, an unwound stack and the plugin's last 24 breadcrumbs (`crash::Crumb`).
-- `Vehicles - Real.esm`: runtime ids of the light-master vehicles are `FE001033` (REV-8), `FE004001` (Moon Jumper), `FE005005` (Deimog); vehicle keyword `FE001017`.
+- `FVO_ParkedVehiclesPatch.esm`: runtime ids of the light-master vehicles are `FE001033` (REV-8), `FE004001` (Moon Jumper), `FE005005` (Deimog); vehicle keyword `FE001017`.

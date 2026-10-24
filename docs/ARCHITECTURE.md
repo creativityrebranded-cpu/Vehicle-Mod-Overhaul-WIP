@@ -1,6 +1,6 @@
 # Architecture
 
-SeamlessVehicle is one SFSE plugin (`SeamlessVehicle.dll`, Starfield 1.16.244 only). It runs standalone; the optional
+Flying Vehicle Overhaul (FVO) is one SFSE plugin (`FlyingVehicleOverhaul.dll`, Starfield 1.16.244 only). It runs standalone; the optional
 SeamlessPlanets core DLL, when present, supplies the per-frame callback instead of the plugin's own task. Everything below runs
 on the game's main thread unless a section says otherwise.
 
@@ -41,7 +41,7 @@ passed through small locked structs or atomics (see `prefetch.h`).
 | `vehicleworld.*` | The shared vehicle list (`world::Vehicles`) |
 | `realvehicles.*` | Vehicle registry, Parked Vehicles integration, duplicate cleanup |
 | `passenger.*` | Passenger / taxi / take the wheel |
-| `pilotquest.*` | Drives the quest aliases of `SeamlessPilots.esm` (the walk-to-vehicle package) |
+| `pilotquest.*` | Drives the quest aliases of `FVO_NPCPilots.esm` (the walk-to-vehicle package) |
 | `vehicleaim.*` | Aims NPC vehicle shots at launch |
 | `hoverui.*` | The on-screen buttons (Scaleform), the F7 layout editor, the gang line and vehicles box |
 | `controlmap.*` | The game's key bindings, and the mod's one key table (`Claim` / `Note` / `LogTable`) |
@@ -54,7 +54,7 @@ passed through small locked structs or atomics (see `prefetch.h`).
 `Job` phases: `Idle -> Boarding -> Following -> Settling -> Leaving -> Idle`. At most 6 at once (pilots 1 to 6 of `vehicleflight`).
 
 1. **Boarding.** `BoardNpc(actor, vehicle, asDriver)` takes a free slot. The NPC is given the vehicle's seat keyword and walks (or runs in combat or when the
-   vehicle is over 40 m away) with a quest package from `SeamlessPilots.esm`. When it stands within about 3.5 m it is seated with the game's instant
+   vehicle is over 40 m away) with a quest package from `FVO_NPCPilots.esm`. When it stands within about 3.5 m it is seated with the game's instant
    seat (`kAnimatedEntry` is off). A passenger job (`seat >= 1`) frees its slot once seated and is kept in `g_riders`.
 2. **Following.** Each frame the Navigation profile gives the goal (`vcontract::GoalFor`; escort is a follower's default). A hostile pursuer has no
    navigation profile; its Combat profile `attack` gives the goal instead. When `PickFoe` finds an enemy and no Combat profile is set, one is chosen from
@@ -77,7 +77,7 @@ About every 0.5 s (the actor scan every 1 s, up to 8000 loaded references):
   Followers become escort, everyone else pursuit. A follower with no free vehicle near boards a vehicle an NPC drives as a passenger.
 - **Profile:** once a job is following, `SetVehicleProfile` switches escort / pursuit through `ApplyProfile`, which assigns the classes (pursuit: Combat `attack`, no escort navigation).
 - **Calm:** the player and the driver not in combat, and the vehicle under 2 m/s for 60 s: `UnloadVehicle` (everyone out).
-- Off switch: `seamless.ini [context] enabled=0`.
+- Off switch: `settings.ini [context] enabled=0`.
 
 ## Contract (`vcontract.h`)
 
@@ -97,13 +97,13 @@ do not meet. Known gap: the assist and the autopilot still react to each other f
 
 ## Files the mod reads and writes (`Documents\My Games\Starfield\SFSE\Logs\`)
 
-`SeamlessVehicle.log` (+ `.prev.log`), `SeamlessVehicle\seamless.ini` (`[log]`, `[context]`, `[keys]`, `[view]`), `SeamlessVehicle\nav.ini` (`[nav]`
-`sampler`, `shape`, `rays`), `SeamlessVehicle\hoverui.ini` (HUD layout), `SeamlessVehicle\vehicles.tsv` (registry).
+`FlyingVehicleOverhaul.log` (+ `.prev.log`), `FlyingVehicleOverhaul\settings.ini` (`[log]`, `[context]`, `[keys]`, `[view]`), `FlyingVehicleOverhaul\nav.ini` (`[nav]`
+`sampler`, `shape`, `rays`), `FlyingVehicleOverhaul\hoverui.ini` (HUD layout), `FlyingVehicleOverhaul\vehicles.tsv` (registry).
 
 ## Data plugins
 
-`Vehicles - Real.esm` (`tools/make_vehicles_real.py`): overrides Parked Vehicles so each prop becomes the real vehicle.
-`SeamlessPilots.esm` (`tools/make_pilots_esm.py`): one quest with 6 pilot aliases, 6 vehicle aliases and 6 "activate the vehicle alias" packages;
+`FVO_ParkedVehiclesPatch.esm` (`tools/make_vehicles_real.py`): overrides Parked Vehicles so each prop becomes the real vehicle.
+`FVO_NPCPilots.esm` (`tools/make_pilots_esm.py`): one quest with 6 pilot aliases, 6 vehicle aliases and 6 "activate the vehicle alias" packages;
 the plugin fills the aliases with the engine's own `ForceRefTo`.
 
 ## 0.61.0 integration

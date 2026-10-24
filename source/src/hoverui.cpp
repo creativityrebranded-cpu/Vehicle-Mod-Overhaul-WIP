@@ -10,7 +10,8 @@
 #include "controlspage.h"
 #include "scannercontext.h"
 #include "vehiclecamera.h"
-#include "cameraroll.h"
+#include "cameraroll.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -136,7 +137,7 @@ namespace hoverui
 		//  - Column: Descend, Gear, Hover top to bottom, right-aligned on their key boxes' right edge (colRight), key centres
 		//    colTop, colTop + colStep, colTop + 2 colStep.
 		//  - Gear box: a key box with the gear number only, by its centre (gx, gy).
-		// Saved to Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\hoverui.ini.
+		// Saved to Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul\hoverui.ini.
 		enum { kW, kA, kS, kD, kGearDown, kGearUp, kHover, kGear, kButtons };
 		// Editor selections: each element (W, A, S, D, Descend, Gear, Hover, Gear box, Trip status, Target), each of the
 		// rover widget's own clips (kSelNative + i, e.g. the Exit button), then the groups.
@@ -211,7 +212,7 @@ namespace hoverui
 			PWSTR docs = nullptr;
 			std::wstring path;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				path = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle";
+				path = fvopaths::Dir();
 				SHCreateDirectoryExW(nullptr, path.c_str(), nullptr);
 				path += L"\\hoverui.ini";
 			}
@@ -223,7 +224,7 @@ namespace hoverui
 		{
 			std::ofstream out(IniPath(), std::ios::trunc);
 			char line[160];
-			out << "; SeamlessVehicle hover buttons, in the rover widget's coordinates\n";
+			out << "; Flying Vehicle Overhaul (FVO) HUD layout, in the rover widget's coordinates\n";
 			std::snprintf(line, sizeof(line), "cluster = %.1f %.1f %.1f %d   ; S key centre x y, key distance, labels above (1) or under (0)\n", g_lay.cx, g_lay.cy,
 				g_lay.d, g_lay.labelsAbove ? 1 : 0);
 			out << line;
@@ -649,7 +650,7 @@ namespace hoverui
 			SetButton(kS, "Brake");
 			SetButton(kD, "Right");
 			// One Alt button (2026-10-21 UI review: "Descend (hold)" and "Gear (tap)" were two buttons with one key).
-			SetButton(kGearDown, "Tap: gear  Hold: descend");
+			SetButton(kGearDown, "Change gear");
 			// The hover key (2026-10-24: the hover toggle only; the vertical boost double tap is gone), shown in its key box.
 			SetButton(kHover, hovering ? "Land" : "Hover");
 			TintHover(hovering);
@@ -1113,7 +1114,7 @@ namespace hoverui
 					const auto help=std::string(bindings::ActionDescription(action))+"\nSelect, release the select input, then press a key or mouse button. For a controller chord, hold the first button and press the second; release a single button to bind it. Esc cancels. Backspace restores this action's defaults. Delete clears this action. Remapping one device preserves the other.";
 					TextOption(movie,*out,kControlBase+unsigned(i),4,label.c_str(),help.c_str());
 				}
-				TextOption(movie,*out,kRestoreControls,4,"Restore vehicle controls to defaults","Restores all vehicle controls to their default bindings.");
+				TextOption(movie,*out,kRestoreControls,4,"Restore vehicle controls to defaults","Restores defaults for the current input device; keeps the other device bindings.");
 			}
 			return true;
 		}
@@ -1686,7 +1687,7 @@ namespace hoverui
 			auto& v=g_attitudeView;
 			const auto& root=*reinterpret_cast<const Value*>(menu+0x58);
 			if (!IsObject(root) || !AttitudeSprite(movie,root,v.panel)) return false;
-			SetMember(v.panel,"visible",Bool(false)); SetMember(v.panel,"name",Str("SeamlessVtolAttitude"));
+			SetMember(v.panel,"visible",Bool(false)); SetMember(v.panel,"name",Str("FvoVtolAttitude"));
 			if (!AttitudeSprite(movie,v.panel,v.horizon) || !AttitudeSprite(movie,v.panel,v.aircraft) ||
 				!DrawAttitude(v.horizon,false) || !DrawAttitude(v.aircraft,true)) return false;
 			// Clip the moving ladder to the compact instrument window; aircraft marker is outside this clip.
@@ -1709,7 +1710,7 @@ namespace hoverui
 			const Value readout[]={Arg(v.readout.button)};
 			if (!Invoke(root,"addChild",readout,1) || !MonoSetData(movie,v.readout," ")) return false;
 			SetMember(v.readout.button,"mouseEnabled",Bool(false)); SetMember(v.readout.button,"mouseChildren",Bool(false));
-			SetMember(v.readout.button,"name",Str("SeamlessVtolAttitudeText"));
+			SetMember(v.readout.button,"name",Str("FvoVtolAttitudeText"));
 			logger::Write("Physical VTOL HUD: native attitude indicator added; F7 selections 'VTOL attitude' and 'VTOL attitude text'");
 			return true;
 		}
@@ -2368,6 +2369,7 @@ namespace hoverui
 	}
 
 	bool IsScannerOpen() { return ScannerOpen(); }
+    bool Editing(){return g_editOn.load();}
 	ScannerPick ScannerPickContext(){
 		std::lock_guard lk(g_scanLock);
 		return ScannerOpen()&&GetTickCount64()-g_placeAt<200?g_pick:ScannerPick{};
@@ -2494,6 +2496,7 @@ namespace hoverui
 	}
 
 	void Reset() {
+        {std::lock_guard lk(g_lay.lock);g_lay.edit=false;g_editOn=false;}
 		g_reset = true;
 		std::lock_guard lk(g_scanLock);
 		g_placeName.clear(); g_placeAt = 0;
@@ -2541,35 +2544,25 @@ namespace hoverui
 		static bool down[14] = {};
 		static ULONGLONG repeatAt[14] = {};
 		// 10..13: + / - on the main row and the number pad (the size, while editing).
-		const int keys[14] = { VK_F7, VK_PRIOR, VK_NEXT, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_HOME, VK_END, VK_DELETE, VK_OEM_PLUS, VK_ADD, VK_OEM_MINUS, VK_SUBTRACT };
-		const ULONGLONG now = GetTickCount64();
-		bool press[14] = {};
-		for (int i = 0; i < 14; ++i) {
-			const bool held = focused && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
-			if (held && !down[i]) {
-				press[i] = true;
-				repeatAt[i] = now + 350;  // arrows, Home, End and + / - repeat while held
-			}
-			else if (held && ((i >= 3 && i <= 8) || i >= 10) && now >= repeatAt[i]) {
-				press[i] = true;
-				repeatAt[i] = now + 40;
-			}
-			down[i] = held;
-		}
+        const bindings::Action commands[14]={bindings::Action::HudEdit,bindings::Action::HudPrevious,bindings::Action::HudNext,
+            bindings::Action::HudLeft,bindings::Action::HudRight,bindings::Action::HudUp,bindings::Action::HudDown,
+            bindings::Action::HudSpacingLess,bindings::Action::HudSpacingMore,bindings::Action::HudReset,
+            bindings::Action::HudGrow,bindings::Action::HudGrow,bindings::Action::HudShrink,bindings::Action::HudShrink};
+        const ULONGLONG now=GetTickCount64();bool press[14]{};
+        for(int i=0;i<14;++i){
+            const bool held=focused&&bindings::Held(commands[i],0);
+            press[i]=bindings::Triggered(commands[i]);
+            if(held&&!down[i])repeatAt[i]=now+350;
+            else if(held&&((i>=3&&i<=8)||i>=10)&&now>=repeatAt[i]){press[i]=true;repeatAt[i]=now+40;}
+            down[i]=held;
+        }
 		std::lock_guard lk(g_lay.lock);
 		{
 			// The hints key (J, else O / Y; the first free in play and in vehicles): every hint and panel on / off.
 			static bool hintsDown = false;
-			if (!g_hintsKey) {
-				for (const int vk : { 'J', 'O', 'Y' }) {
-					if (controlmap::KeyFreeIn(vk, "MainGameplay") && controlmap::KeyFreeIn(vk, "Vehicle") && controlmap::Claim("hud", "show all hints", vk)) { g_hintsKey = vk; break; }
-				}
-				if (!g_hintsKey) g_hintsKey = -1;
-				logger::Write("Hover UI: hints key %s (shows every hint and panel; on now: %d; rides %d)", g_hintsKey > 0 ? controlmap::KeyName(g_hintsKey).c_str() : "NONE FREE",
-					g_showAll ? 1 : 0, g_rides.load());
-			}
-			const bool hd = focused && bindings::Held(bindings::Action::ShowHints, g_hintsKey > 0 ? int(g_hintsKey) : 0);
-			if (hd && !hintsDown) {
+            g_hintsKey='J';
+			const bool hd=focused&&bindings::Triggered(bindings::Action::ShowHints);
+			if (hd) {
 				g_showAll = !g_showAll;
 				SaveLayout();
 				notify::Show(g_showAll ? "All hints shown" : "Hints: only what you need now");
@@ -2618,7 +2611,7 @@ namespace hoverui
 				logger::Write("Hover UI: %s size -> %.2f (%zu elements)", SelName(car).c_str(), *picked.front(), picked.size());
 			}
 		}
-		const double step = focused && (GetAsyncKeyState(VK_CONTROL) & 0x8000) ? 10.0 : 1.0;
+		const double step=focused&&bindings::Held(bindings::Action::HudFast,VK_CONTROL)?10.0:1.0;
 		const double dx = (press[4] ? step : 0.0) - (press[3] ? step : 0.0);
 		const double dy = (press[6] ? step : 0.0) - (press[5] ? step : 0.0);
 		const double dd = (press[8] ? step : 0.0) - (press[7] ? step : 0.0);

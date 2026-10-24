@@ -31,7 +31,8 @@
 #include "coverfight.h"
 #include "hulllogic.h"
 #include "navmap.h"
-#include "realvehicles.h"
+#include "realvehicles.h"
+#include "fvopaths.h"
 #include <ShlObj.h>
 #include <string>
 #include <unordered_map>
@@ -1501,7 +1502,7 @@ namespace npcvehicles
 		// ---- Vehicle combat AI (2026-10-21, the approved proposal notes/VEHICLE_COMBAT_AI_PROPOSAL_20261021.md, stages 1-4; manoeuvre.h). Replaces the
 		// orbit: steering (carrot, minimum combat speed, separation, zone), manoeuvres (attack run, lag pursuit, break turn, circle, scissors, extend and
 		// re-engage), roles (engage, pincer, overwatch), ram / sideswipe and hiding behind terrain on the way out.
-		// Seamless.ini [combat]: stage= 4 (1-4: the states of stages up to it), zoneEscort= 150, zonePursuit= 400 (m around the player), ram= 1,
+		// settings.ini [combat]: stage= 4 (1-4: the states of stages up to it), zoneEscort= 150, zonePursuit= 400 (m around the player), ram= 1,
 		// boost= 1, breakOff= 30 (percent health), hold= 1500 (ms).
 		// The full AI (notes/VEHICLE_COMBAT_AI_FULL_SPEC_20261021.md, part E): [combat] ai= 1 (0: the staged manoeuvres above), and a switch per part:
 		// steering= dogfight= tactics= squads= morale= personality= (1 on, 0 off).
@@ -1515,7 +1516,7 @@ namespace npcvehicles
 			gen = features::Generation();  // the settings menu changed a switch: read again
 			PWSTR docs = nullptr;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				const std::wstring ini = fvopaths::Settings();
 				CoTaskMemFree(docs);
 				g_combatIni.zoneEscort = GetPrivateProfileIntW(L"combat", L"zoneEscort", 150, ini.c_str());
 				g_combatIni.zonePursuit = GetPrivateProfileIntW(L"combat", L"zonePursuit", 400, ini.c_str());
@@ -3997,7 +3998,7 @@ namespace npcvehicles
 			}
 			const bool seat = CanMount(npc, vehicle);
 			// In combat: no calm up front any more (2026-10-21, the user: make the get-in the highest priority instead). The get-in
-			// packages carry Ignore Combat (SeamlessPilots.esm); the 1 s check in Boarding calms only if the package still did not take over.
+			// packages carry Ignore Combat (FVO_NPCPilots.esm); the 1 s check in Boarding calms only if the package still did not take over.
 			if(seat)slot.resumeFoe=BoardingEnemy(npc);
 			if (seat && InCombat(npc)) logger::Write("NPC vehicles: [%d] NPC %08X is in combat; get-in with Ignore Combat (no calm)", slot.pilot, npcId);
 			const int r = seat ? Mount(npc, vehicle) : 0;
@@ -4019,7 +4020,7 @@ namespace npcvehicles
 		bool StartWalkBoard(Job* slot, uptr npc, uptr vehicle, unsigned seat = 0)
 		{
 			// The Walk key: the game's own follower command. The job only watches (no instant seat); Enter and the seated check follow.
-			// Native, data-driven: SeamlessPilots.esm's quest package (any actor); else the follower command (followers only).
+			// Native, data-driven: FVO_NPCPilots.esm's quest package (any actor); else the follower command (followers only).
 			// Context: in combat the NPC RUNS to the vehicle, still hostile (the package's Ignore Combat outranks the fight; calm is the 1 s fallback); otherwise it walks at the package's own pace.
 			slot->resumeFoe=BoardingEnemy(npc);
 			if (InCombat(npc)) {
@@ -4047,7 +4048,7 @@ namespace npcvehicles
 			}
 			const bool viaQuest = combatReq || pilotquest::Assign(slot->pilot - 1, npc, vehicle);
 			if (!viaQuest) {
-				logger::Write("SeamlessPilots.esm is not loaded: NPCs cannot be sent to vehicles");
+				logger::Write("FVO_NPCPilots.esm is not loaded: NPCs cannot be sent to vehicles");
                 slot->npc=At<std::uint32_t>(npc,off::kFormId); ResumeCombat(*slot);
                 if(slot->forcedRun){SetForceRun(npc,false);slot->forcedRun=false;}
 				return false;
@@ -4299,10 +4300,11 @@ namespace npcvehicles
 					logger::Write("NPC vehicles: seat rules: you get in %08X -> %s", g_intent.vehicle, InVehicle(player) == v ? "seated" : "not seated yet");
 				}
 			}
+            if(hoverui::IsScannerOpen()){g_activateDown=false;g_intent=Intent{};return;}
 			// The game's own Activate, keyboard and controller (the context is "MainGameplay"; "Gameplay" never matched).
-			const bool down = Focused() && bindings::GameHeld("MainGameplay", "Activate", 'E');
-			const bool pressed = down && !g_activateDown;
-			const bool released = !down && g_activateDown;
+			const bool down=Focused()&&bindings::Allowed()&&!hoverui::IsScannerOpen()&&bindings::GameHeld("MainGameplay","Activate",'E');
+			const bool pressed=bindings::Started(bindings::Action::BoardPassenger)||bindings::Started(bindings::Action::PullDriver);
+			const bool released=bindings::Triggered(bindings::Action::BoardPassenger);
 			g_activateDown = down;
 			{
 				// The HUD prompts (Passenger / Hold: eject) while the player faces an occupied vehicle on foot.
@@ -4347,9 +4349,8 @@ namespace npcvehicles
 				if (!occ) return;  // empty: the game's own get-in (and its theft rules)
 				g_intent.occupant = At<std::uint32_t>(occ, off::kFormId);
 				g_intent.relation = RelationOf(player, occ);
-				return;
 			}
-			if (down && g_intent.occupant && !g_intent.acted && now - g_intent.pressAt >= kPullHoldMs) {
+			if (bindings::Triggered(bindings::Action::PullDriver) && g_intent.occupant && !g_intent.acted) {
 				// Held: pull the occupant out (a gang member hands over the wheel).
 				g_intent.acted = true;
 				const uptr v = RefById(g_intent.vehicle);
@@ -4752,10 +4753,27 @@ namespace npcvehicles
 					*reinterpret_cast<float*>(in + 0x14) = di.accel;
 					*reinterpret_cast<float*>(in + 0x18) = di.brake;
 					in[0x1C] = di.boost ? 1 : 0;
-					in[0x1E] = di.vert ? 1 : 0;
-				}
-			}
-			if (!ours || !component) {
+                    in[0x1E] = di.vert ? 1 : 0;
+                }else if(vehicleflight::PlayerDriving(At<std::uint32_t>(component,0xC))&&bindings::Allowed()){
+                    auto* in=reinterpret_cast<std::uint8_t*>(input);
+                    if(hoverui::Editing()||!hoverui::IsScannerOpen()){
+                        const bool edit=hoverui::Editing();
+                        const float right=edit?0:float(bindings::Amount(bindings::Action::TurnRight,'D'));
+                        const float left=edit?0:float(bindings::Amount(bindings::Action::TurnLeft,'A'));
+                        float accel=edit?0:float(bindings::Amount(bindings::Action::Accelerate,'W'));
+                        const float brake=edit?0:float(bindings::Amount(bindings::Action::Brake,'S'));
+                        const bool boost=!edit&&bindings::Held(bindings::Action::Boost,VK_LSHIFT);
+                        if(boost&&brake<=0)accel=1;
+                        *reinterpret_cast<float*>(in+0x10)=right-left;
+                        *reinterpret_cast<float*>(in+0x14)=accel;
+                        *reinterpret_cast<float*>(in+0x18)=brake;
+                        in[0x1C]=boost?1:0;
+                        in[0x1D]=0; // no native L3 toggle survives a mod hover toggle
+                        in[0x1E]=!edit&&bindings::Held(bindings::Action::VerticalBoost,VK_SPACE)?1:0;
+                    }
+                }
+            }
+            if (!ours || !component) {
 				g_applyOriginal(component, input);
 				return;
 			}

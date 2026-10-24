@@ -3,7 +3,7 @@
 #include <cstdint>
 
 // The mod's features as switches (2026-10-21, the user: "modular features to turn on and off in the mod menu"): each one
-// is a seamless.ini key (the ones that existed keep their section and key), shown as a checkbox in the game's settings
+// is a settings.ini key (the ones that existed keep their section and key), shown as a checkbox in the game's settings
 // menu inside Gameplay Options (hoverui) and read live by the code it gates. On() reads a cached value (any
 // thread); the main thread reloads the ini every 5 s (Tick), so a hand edit still works.
 namespace features
@@ -23,7 +23,8 @@ namespace features
 		FlightAssist,   // [flight] assist: with free roll, a released roll levels when near level (off: the roll holds)
 		PhysicalVtol,   // [flight] physicalVtol: experimental player-only native impulse flight
 		PhysicalAi,     // [flight] physicalAi: experimental native impulse flight for the autopilot and NPC pilots
-		DebugLog,       // [log] verbose
+		PlacementMode,  // [placement] recording: the scanner's T saves / deletes parking spots and sets summon points (placementedit.h)
+		DebugLog,      // [log] verbose
 		Count
 	};
 
@@ -39,7 +40,7 @@ namespace features
 
 	const Info& InfoOf(Id id);
 	bool On(Id id);
-	void Set(Id id, bool on);         // saves to seamless.ini at once
+	void Set(Id id, bool on);         // saves to settings.ini at once
 	void ResetAll();                  // every feature to its default
 	unsigned Generation();            // changes whenever any value does
 	void Tick();                      // main thread, every frame (reloads the ini every 5 s)

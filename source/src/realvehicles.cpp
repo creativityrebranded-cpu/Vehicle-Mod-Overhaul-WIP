@@ -9,7 +9,9 @@
 #include "placement_spots.h"
 #include "own_spots.h"
 #include "placementlogic.h"
+#include "placementedit.h"
 #include "notify.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -541,7 +543,7 @@ namespace realvehicles
 		{
 			PWSTR docs = nullptr;
 			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return;
-			std::wstring path = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle";
+			std::wstring path = fvopaths::Dir();
 			CoTaskMemFree(docs);
 			CreateDirectoryW(path.c_str(), nullptr);
 			path += L"\\vehicles.tsv";
@@ -650,7 +652,7 @@ namespace realvehicles
 		{
 			PWSTR docs = nullptr;
 			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return {};
-			std::wstring w = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+			std::wstring w = fvopaths::Settings();
 			CoTaskMemFree(docs);
 			return w;
 		}
@@ -934,7 +936,8 @@ namespace realvehicles
 		constexpr float kOwnOccupied = 3.0f;      // m: a vehicle this close to a spot is standing on it
 		constexpr float kOwnPlayerClear = 20.0f;  // m: not popped in right beside the player
 		constexpr ULONGLONG kOwnSpawnGap = 500;   // ms between spawns (each loads a model; the patch's spacing)
-		constexpr const char* kPlacementsPlugin = "FlyingVehicleOverhaul - Placements.esm";
+		constexpr const char* kPlacementsPlugin = "FVO_CityPlacements.esm";
+		constexpr const char* kPlacementsPluginOld = "FlyingVehicleOverhaul - Placements.esm";  // its name until 0.72.0
 
 		struct OwnSpot { std::uint32_t cell = 0; game::Vec3 p{}; float heading = 0; std::uint64_t key = 0, row = 0, location = 0; bool done = false, queued = false; };
 		struct Own
@@ -953,7 +956,7 @@ namespace realvehicles
 		{
 			PWSTR docs = nullptr;
 			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return {};
-			std::wstring w = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle";
+			std::wstring w = fvopaths::Dir();
 			CoTaskMemFree(docs);
 			SHCreateDirectoryExW(nullptr, w.c_str(), nullptr);
 			return w + L"\\placement-spawned.tsv";
@@ -993,10 +996,13 @@ namespace realvehicles
 				}
 				std::fclose(f);
 			}
-			// The placements now ship as plugin references (FlyingVehicleOverhaul - Placements.esm, scripts/make_placements_esm.py; Carfield's
+			// The placements now ship as plugin references (FVO_CityPlacements.esm, formerly "FlyingVehicleOverhaul - Placements.esm", scripts/make_placements_esm.py; Carfield's
 			// way). With it loaded nothing is spawned at run time any more (runtime-created vehicles live in the save, and on the
 			// 2026-10-21 runs every vehicle there loaded frozen), and the ones spawned before are retired.
-			if (LoadedFile(kPlacementsPlugin)) {
+			const bool newName = LoadedFile(kPlacementsPlugin), oldName = LoadedFile(kPlacementsPluginOld);
+			if (newName && oldName)
+				logger::Write("Own placements: BOTH %s and %s are loaded: every vehicle is placed twice; disable %s", kPlacementsPlugin, kPlacementsPluginOld, kPlacementsPluginOld);
+			if (newName || oldName) {
 				g_own.active = false;
 				g_own.retire = !g_own.spawned.empty();
 				g_own.plugin = g_patch.enabled && !g_own.spots.empty() && g_patch.pool.size() > 1;
@@ -1004,7 +1010,7 @@ namespace realvehicles
 				logger::Write("Own placements: plugin vehicles get a random type per row (%zu spots, %zu vehicle types)%s", g_own.spots.size(), g_patch.pool.size(),
 					g_own.plugin ? "" : ": OFF ([placement] enabled=0, or no vehicle types)");
 				logger::Write("Own placements: %s loaded: placed by the plugin, nothing spawned at run time; %zu earlier spawned vehicles to retire",
-					kPlacementsPlugin, g_own.spawned.size());
+					newName ? kPlacementsPlugin : kPlacementsPluginOld, g_own.spawned.size());
 				return;
 			}
 			// Runtime spawning stays off (2026-10-21: every runtime-created vehicle loaded frozen and never got its physics vehicle; the
@@ -1203,8 +1209,10 @@ namespace realvehicles
 		const auto now=GetTickCount64();if(checked&&now-checked<1000)return enabled;checked=now;
 		wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
 		std::wstring flag=exe;const auto slash=flag.find_last_of(L"\\/");if(slash==std::wstring::npos)return false;
-		flag.resize(slash+1);flag+=L"Data\\SFSE\\Plugins\\SeamlessVehicle.placement-recording";
-		const bool active=GetFileAttributesW(flag.c_str())!=INVALID_FILE_ATTRIBUTES;
+		flag.resize(slash+1);flag+=L"Data\\SFSE\\Plugins\\";
+		const bool flagged=GetFileAttributesW((flag+L"FlyingVehicleOverhaul.placement-recording").c_str())!=INVALID_FILE_ATTRIBUTES||
+			GetFileAttributesW((flag+L"SeamlessVehicle.placement-recording").c_str())!=INVALID_FILE_ATTRIBUTES;  // the pre-0.73.0 name still counts
+		const bool active=flagged||features::On(features::Id::PlacementMode);
 		if(!told||enabled!=active){enabled=active;told=true;logger::Write("Placement recorder: %s; scanner taps %s",enabled?"ON":"off",enabled?"save native vehicle parking positions":"use normal controls");}
 		return enabled;
 	}
@@ -1226,7 +1234,7 @@ namespace realvehicles
 		const auto key=placementlogic::Fnv(worldFile+"|"+worldName+"|"+std::to_string(local)+"|"+
 			std::to_string(std::llround(x*2))+"|"+std::to_string(std::llround(y*2))+"|"+std::to_string(std::llround(z*2)));
 		PWSTR docs=nullptr;if(FAILED(SHGetKnownFolderPath(FOLDERID_Documents,0,nullptr,&docs)))return false;
-		std::wstring path=std::wstring(docs)+L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle";CoTaskMemFree(docs);
+		std::wstring path=fvopaths::Dir();CoTaskMemFree(docs);
 		SHCreateDirectoryExW(nullptr,path.c_str(),nullptr);path+=L"\\placement-markers.tsv";
 		FILE* read=nullptr;bool existing=false;
 		if(_wfopen_s(&read,path.c_str(),L"r")==0&&read){
@@ -1242,6 +1250,118 @@ namespace realvehicles
 		logger::Write("Native vehicle placement: key %016llX world %s:%06X (%s), player cell %08X, position (%.6f, %.6f, %.6f), heading %.7f [%s]",
 			static_cast<unsigned long long>(key),worldFile.c_str(),local,worldName.c_str(),At<std::uint32_t>(cell,off::kFormId),x,y,z,yaw,name.c_str());
 		notify::Show("Vehicle placement saved");return true;
+	}
+
+	// ---- Placement mode (2026-10-24, the user): delete a spot, set an area's summon point (placementedit.h) ----
+	namespace
+	{
+		std::wstring PlacementFile(const wchar_t* name)
+		{
+			PWSTR docs=nullptr;if(FAILED(SHGetKnownFolderPath(FOLDERID_Documents,0,nullptr,&docs)))return {};
+			std::wstring path=fvopaths::Dir();CoTaskMemFree(docs);
+			SHCreateDirectoryExW(nullptr,path.c_str(),nullptr);return path+L"\\"+name;
+		}
+		// The player's exterior worldspace (0 indoors) and its editor id (stable between sessions, unlike a planet's FF id).
+		uptr PlayerWorld(std::string& name)
+		{
+			const auto player=Ptr(addr::kPlayerCharacterPtr),cell=player?At<uptr>(player,off::kRefParentCell):0;
+			const auto world=cell?At<uptr>(cell,off::kCellWorldspace):0;
+			name=world?EditorId(world):std::string();
+			return world;
+		}
+		std::vector<std::string> ReadLines(const std::wstring& path)
+		{
+			std::vector<std::string> out;FILE* f=nullptr;
+			if(path.empty()||_wfopen_s(&f,path.c_str(),L"r")!=0||!f)return out;
+			char line[2048];while(std::fgets(line,sizeof(line),f)){std::string s=line;while(!s.empty()&&(s.back()=='\n'||s.back()=='\r'))s.pop_back();out.push_back(s);}
+			std::fclose(f);return out;
+		}
+		bool WriteLines(const std::wstring& path,const std::vector<std::string>& lines)
+		{
+			FILE* f=nullptr;if(path.empty()||_wfopen_s(&f,path.c_str(),L"w")!=0||!f)return false;
+			bool ok=true;for(const auto& l:lines)ok=std::fprintf(f,"%s\n",l.c_str())>=0&&ok;
+			return std::fclose(f)==0&&ok;
+		}
+		std::vector<std::string> Fields(const std::string& line)
+		{
+			std::vector<std::string> out;std::size_t at=0;
+			for(;;){const auto tab=line.find('\t',at);out.push_back(line.substr(at,tab==std::string::npos?std::string::npos:tab-at));if(tab==std::string::npos)break;at=tab+1;}
+			return out;
+		}
+		std::vector<placementedit::SummonPoint> LoadSummonPoints()
+		{
+			std::vector<placementedit::SummonPoint> out;
+			for(const auto& l:ReadLines(PlacementFile(L"summon-points.tsv"))){placementedit::SummonPoint p;if(placementedit::Parse(l,p))out.push_back(p);}
+			return out;
+		}
+	}
+
+	bool DeletePlacement(double x,double y,double z)
+	{
+		std::string worldName;const uptr world=PlayerWorld(worldName);
+		if(!world){notify::Show("Placement mode: an exterior worldspace is required");return false;}
+		// Candidates: the recorded markers in this world, and the baked spots whose cell lies in it.
+		const auto markersPath=PlacementFile(L"placement-markers.tsv");
+		auto lines=ReadLines(markersPath);
+		std::vector<placementedit::Point> points;std::vector<int> source;  // >= 0: a marker line, < 0: -(baked index + 1)
+		for(std::size_t i=1;i<lines.size();++i){
+			const auto f=Fields(lines[i]);if(f.size()<10||f[4]!=worldName)continue;
+			points.push_back({std::atof(f[6].c_str()),std::atof(f[7].c_str()),std::atof(f[8].c_str())});source.push_back(int(i));
+		}
+		uptr files[std::size(ownspots::kFiles)]={};
+		for(std::size_t f=0;f<std::size(ownspots::kFiles);++f)files[f]=LoadedFile(ownspots::kFiles[f]);
+		for(std::size_t i=0;i<std::size(ownspots::kSpots);++i){
+			const auto& s=ownspots::kSpots[i];
+			const uptr file=s.file<std::size(files)?files[s.file]:0;
+			const uptr cell=file?Lookup(RuntimeId(file,s.cellLocal)):0;
+			if(!cell||At<uptr>(cell,off::kCellWorldspace)!=world)continue;
+			points.push_back({s.x,s.y,s.z});source.push_back(-int(i)-1);
+		}
+		const int pick=placementedit::Pick(points,{x,y,z});
+		if(pick<0){notify::Show("No saved spot there (aim within %.0f m of one)",placementedit::kPickRadius);return false;}
+		const int src=source[std::size_t(pick)];
+		const auto& p=points[std::size_t(pick)];
+		if(src>=0){
+			lines.erase(lines.begin()+src);
+			if(!WriteLines(markersPath,lines)){notify::Show("Placement could not be deleted");return false;}
+			logger::Write("Placement mode: deleted recorded spot at (%.2f, %.2f, %.2f) in %s",p.x,p.y,p.z,worldName.c_str());
+			notify::Show("Parking spot deleted");return true;
+		}
+		// A baked spot: listed for the next bake (scripts/bake_own_spots.py skips it).
+		const auto& s=ownspots::kSpots[std::size_t(-src-1)];
+		const auto removedPath=PlacementFile(L"placement-removed.tsv");
+		auto removed=ReadLines(removedPath);
+		char key[24];std::snprintf(key,sizeof(key),"%016llX",static_cast<unsigned long long>(s.key));
+		for(const auto& l:removed)if(l.rfind(key,0)==0){notify::Show("That spot is already removed (after the next rebuild)");return true;}
+		if(removed.empty())removed.push_back("key\tworld_editor_id\tx\ty\tz");
+		char line[256];std::snprintf(line,sizeof(line),"%s\t%s\t%.3f\t%.3f\t%.3f",key,worldName.c_str(),double(s.x),double(s.y),double(s.z));
+		removed.push_back(line);
+		if(!WriteLines(removedPath,removed)){notify::Show("Placement could not be deleted");return false;}
+		logger::Write("Placement mode: baked spot %s at (%.2f, %.2f, %.2f) listed in placement-removed.tsv",key,p.x,p.y,p.z);
+		notify::Show("Parking spot removed (after the next rebuild)");return true;
+	}
+
+	bool SetSummonPoint(double x,double y,double z,double yaw)
+	{
+		std::string worldName;
+		if(!PlayerWorld(worldName)||worldName.empty()){notify::Show("Placement mode: an exterior worldspace is required");return false;}
+		if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!std::isfinite(yaw)){notify::Show("Summon point not set: aim at a visible surface");return false;}
+		auto points=LoadSummonPoints();
+		const int replaced=placementedit::SetSummon(points,{worldName,x,y,z,yaw});
+		std::vector<std::string> lines;for(const auto& p:points)lines.push_back(placementedit::Line(p));
+		if(!WriteLines(PlacementFile(L"summon-points.tsv"),lines)){notify::Show("Summon point could not be saved");return false;}
+		logger::Write("Placement mode: summon point (%.2f, %.2f, %.2f) heading %.3f in %s%s",x,y,z,yaw,worldName.c_str(),replaced?" (replaced this area's old one)":"");
+		notify::Show(replaced?"Summon point moved here":"Summon point set");return true;
+	}
+
+	bool SummonPointNear(double px,double py,double& x,double& y,double& z,double& yaw)
+	{
+		std::string worldName;
+		if(!PlayerWorld(worldName)||worldName.empty())return false;
+		const auto points=LoadSummonPoints();
+		const int i=placementedit::SummonFor(points,worldName,px,py);
+		if(i<0)return false;
+		const auto& p=points[std::size_t(i)];x=p.x;y=p.y;z=p.z;yaw=p.yaw;return true;
 	}
 
 	std::uintptr_t PlaceOwner(std::uintptr_t ref)

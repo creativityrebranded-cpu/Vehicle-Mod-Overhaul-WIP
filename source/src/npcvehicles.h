@@ -5,7 +5,7 @@
 #include "vcontract.h"
 
 // NPCs getting into vehicles (notes/NPC_VEHICLE_ENTRY_RESEARCH_20261018.md, notes/MINTING_STATUS_20261018.md). The BOARD key (;) sends the
-// NPC the player faces to the nearest free vehicle: the SeamlessPilots.esm quest package walks it there (running in combat or when the vehicle
+// NPC the player faces to the nearest free vehicle: the FVO_NPCPilots.esm quest package walks it there (running in combat or when the vehicle
 // is over 40 m away), the seat keyword is given, and the instant seat puts it in (the animated entry is paused: kAnimatedEntry = false);
 // aboard it follows the player. The EXIT key (Insert) and RequestExit take NPCs out (the game's dismount, then the instant exit). The context
 // engine (context.cpp) can also board fighters by itself. The game's put-the-player-in call seats the NPC instead of the player for
@@ -100,7 +100,7 @@ namespace npcvehicles
 	Stance CycleStance();
 	Stance CurrentStance();
 	// Witness reactions (2026-10-20, notes/VEHICLE_BEHAVIOUR_RESEARCH_20261020.md): a crash at (x, y, z) -> calm bystanders within 10 m flee
-	// (ActionFleeStart), within 25 m cower (ActionCower). Never followers, quest NPCs, anyone fighting or in a vehicle. Seamless.ini [witness] enabled=0 off.
+	// (ActionFleeStart), within 25 m cower (ActionCower). Never followers, quest NPCs, anyone fighting or in a vehicle. settings.ini [witness] enabled=0 off.
 	// Friendship gate for every vehicle damage source: allied drivers/owners are protected, including the player's allies. Neutrals remain damageable.
 	// Main thread only.
 	bool VehicleFriendlyToShooter(std::uintptr_t vehicle, std::uint32_t shooterFormId);

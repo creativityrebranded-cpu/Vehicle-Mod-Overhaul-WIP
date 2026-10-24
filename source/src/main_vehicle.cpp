@@ -42,7 +42,7 @@
 
 namespace plugininfo
 {
-	const wchar_t* Name() { return L"SeamlessVehicle"; }
+	const wchar_t* Name() { return L"FlyingVehicleOverhaul"; }  // the log: FlyingVehicleOverhaul.log
 	const wchar_t* TelemetryPrefix() { return L"vehicle-"; }
 }
 
@@ -58,6 +58,7 @@ namespace
 
 	void Reset()
 	{
+		bindings::ResetRuntime();
 		vehicleflight::LoadReset();
 		shipvehicle::Reset();
 		shipmodel::Reset();
@@ -209,7 +210,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 63, "SeamlessVehicle", "seemless",
+	SFSEPluginVersionData::kVersion, 73, "FlyingVehicleOverhaul", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -228,7 +229,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	g_messaging = static_cast<SFSEMessagingInterface*>(sfse->QueryInterface(kInterface_Messaging));
 	g_tasks = static_cast<SFSETaskInterface*>(sfse->QueryInterface(kInterface_Task));
 	if (!g_messaging || !g_messaging->RegisterListener(g_handle, "SFSE", SfseMessage)) return false;
-	logger::Write("SeamlessVehicle 0.72.0 loaded; core optional");
+	logger::Write("Flying Vehicle Overhaul (FVO) 0.73.0 loaded; core optional");
 	return true;
 }
 }

@@ -19,6 +19,7 @@ namespace vehicleflight
 	void Tick();     // per frame, main thread (frame task)
 	void LoadReset(); // discard hover/body state before a different save replaces the rover
 	bool Active();
+    bool PlayerDriving(std::uint32_t vehicle);
 	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera and HUD
 
 	// NPC pilots 1..3 (the "pursuit" side; pilot 0 is the player's escort autopilot): the same flight model, terrain

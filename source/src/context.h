@@ -7,7 +7,7 @@
 //     A follower of the player boards as Escort, anyone else as Pursuit (hostile, fires the vehicle weapon).
 //     A follower with no free vehicle near but a vehicle an NPC drives within 40 m with a free seat -> boards it as a passenger.
 //   calm (the player and the driver not in combat) and the vehicle nearly still for 60 s -> everyone gets out (UnloadVehicle).
-// Master switch: Logs\SeamlessVehicle\seamless.ini [context] enabled=0 (re-read every 5 s).
+// Master switch: Logs\FlyingVehicleOverhaul\settings.ini [context] enabled=0 (re-read every 5 s).
 namespace context
 {
 	void Tick();

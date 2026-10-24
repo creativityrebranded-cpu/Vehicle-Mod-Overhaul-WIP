@@ -1,6 +1,6 @@
 # Testing
 
-Set `Logs\SeamlessVehicle\seamless.ini` `[log] verbose=1` for the chatty lines, and copy `SeamlessVehicle.log` BEFORE relaunching (only one `.prev.log` is kept).
+Set `Logs\FlyingVehicleOverhaul\settings.ini` `[log] verbose=1` for the chatty lines, and copy `FlyingVehicleOverhaul.log` BEFORE relaunching (only one `.prev.log` is kept).
 The log timestamps every line; a crash prints `CRASH?` with the stack and the plugin's breadcrumbs.
 
 ## Status as of this version (2026-10-18)

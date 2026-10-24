@@ -1,6 +1,6 @@
-# Flying Vehicle Overhaul 0.72.0: source
+# Flying Vehicle Overhaul 0.73.0: source
 
-The source of Flying Vehicle Overhaul for Starfield (SFSE plugin `SeamlessVehicle.dll`). It builds on its own: nothing else
+The source of Flying Vehicle Overhaul for Starfield (SFSE plugin `FlyingVehicleOverhaul.dll`). It builds on its own: nothing else
 from the author's project is needed, and the optional SeamlessPlanets core, Carfield and Parked Vehicles are not required.
 
 This version includes driving as the default travel mode, a wider firing gate, launch-line hit checks, shorter vehicle names,
@@ -14,9 +14,13 @@ and are no longer evicted by a fixed record limit. Accepted shots and rams alway
 does not depend on AI tactics. Vehicle first-person pitch extends to 80 degrees in either direction while driving and restores on exit.
 Air ejection waits for native seat cleanup and synchronizes the character controller once, then leaves falling to native physics.
 
+The 0.73.0 input resolver separates commands, contexts, gestures and device slots. The command matrix covers both devices, rebinding, modal UI policy and press/release ownership. Engine integration and UI behavior still require live testing.
+
+See [CONTROLS.md](CONTROLS.md) for the complete device maps and HUD editor controls.
+
 ## Build
 - Windows, Visual Studio 2022 Build Tools (MSVC, C++20) and CMake 3.24 or newer.
-- `powershell -ExecutionPolicy Bypass -File build.ps1` builds `build/Release/SeamlessVehicle.dll` and runs all 19 offline test suites.
+- `powershell -ExecutionPolicy Bypass -File build.ps1` builds `build/Release/FlyingVehicleOverhaul.dll` and runs all 31 offline test suites.
   Or: `cmake -S . -B build -A x64` then `cmake --build build --config Release`.
 
 The plugin targets Starfield 1.16.244 (Steam) only: engine addresses are fixed for that build and the plugin switches itself
@@ -35,11 +39,11 @@ off on any other.
 
 ## Placement recording
 
-For an authoring session, create `Data/SFSE/Plugins/SeamlessVehicle.placement-recording` (an empty file).
+For an authoring session, create `Data/SFSE/Plugins/FlyingVehicleOverhaul.placement-recording` (an empty file).
 On foot, open the scanner, aim at the intended parking surface and tap T. The scanner displays VEHICLE PLACEMENTS.
 A successful tap records the physical surface coordinates and heading, places the native map marker, and does not start a trip.
 Recording always uses the exact surface hit. Since 0.64.0, normal scanner destinations do too, wherever a real surface is hit.
-The append-only recording is `Documents/My Games/Starfield/SFSE/Logs/SeamlessVehicle/placement-markers.tsv`.
+The append-only recording is `Documents/My Games/Starfield/SFSE/Logs/FlyingVehicleOverhaul/placement-markers.tsv`.
 Estimated surfaces are refused; repeat taps at the same spot are ignored. Remove the flag to restore normal scanner controls.
 The authoring flag is not included in the release ZIP.
 

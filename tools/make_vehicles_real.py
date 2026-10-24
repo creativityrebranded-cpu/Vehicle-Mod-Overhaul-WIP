@@ -1,4 +1,4 @@
-"""Builds "Vehicles - Real.esm": a small override patch for Parked Vehicles (Vehicles.esm by SarthesArai) that turns
+"""Builds "FVO_ParkedVehiclesPatch.esm" (until 0.72.0 "Vehicles - Real.esm"): a small override patch for Parked Vehicles (Vehicles.esm by SarthesArai) that turns
 every pack-in's static vehicle prop into the real vehicle (REV-8 / Deimog / Moon Jumper furniture) and disables the
 separate wheel and turret statics the real vehicle already has. Vehicles.esm itself is not changed.
 
@@ -160,7 +160,7 @@ def main(src, dst):
         return n
 
     hedr = struct.pack("<fII", struct.unpack_from("<f", d, 24 + 6)[0], count(groups), 0x800)
-    items = [(b"HEDR", hedr), (b"CNAM", b"Seamless Vehicle (patch for Parked Vehicles by SarthesArai)\0")]
+    items = [(b"HEDR", hedr), (b"CNAM", b"Flying Vehicle Overhaul (FVO) (patch for Parked Vehicles by SarthesArai)\0")]
     items += [(b"MAST", m.encode() + b"\0") for m in MASTERS]
     items += [(b"ONAM", b"".join(struct.pack("<I", f) for f in sorted(set(overridden))))]
     items += [(b"BNAM", b"Main\0")]

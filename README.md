@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current version: **0.72.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current version: **0.73.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -48,7 +48,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Passenger, taxi, take the wheel** | Ride with an NPC driver, let them taxi you, or take over | Untested |
 | **Metered boost, view distance** | Hold Left Shift for a 1.75x boost in any gear using the native boost meter; vehicles stay visible farther away | Untested in game; offline checks pass |
 | **Full vehicle combat AI** | Steering, dogfight manoeuvres, Mad Max tactics, squads, morale and personalities; vehicle health with a wreck state | Untested in game; offline checks pass |
-| **Parked-vehicle patch (optional)** | With Carfield or Parked Vehicles (+ Vehicles - Real) installed, each kind of parked vehicle becomes a seeded pick from every vehicle in your load order, per location | Lightly tested |
+| **Parked-vehicle patch (optional)** | With Carfield or Parked Vehicles (+ FVO_ParkedVehiclesPatch) installed, each kind of parked vehicle becomes a seeded pick from every vehicle in your load order, per location | Lightly tested |
 | **Streamlined HUD** | One status card, only the prompts you can use now, control hints that hide after your first rides, J shows everything | Untested in game |
 | **Hover or drive** | NPC vehicles, and yours on autopilot, fly or drive on the ground depending on the terrain, the trip and the fight | Untested in game; offline checks pass |
 | **Enemy vehicle health bar** | Aim at an enemy vehicle: the game's own enemy bar shows its driver, with the vehicle's health in a second bar under it | Untested |
@@ -83,120 +83,56 @@ before installing or upgrading.
 ## Installation
 
 1. Install SFSE: copy `sfse_1_16_244.dll` and `sfse_loader.exe` into the Starfield folder (next to `Starfield.exe`).
-2. Copy this mod's **`Data`** folder into the Starfield folder (merge it). The plugin ends up at
-   `<Starfield>\Data\SFSE\Plugins\SeamlessVehicle.dll`.
+2. Extract the game archive into **`Starfield/Data`** (the archive contains Data's contents). From a repository checkout, merge its **`Data`** folder into Starfield instead. The plugin ends up at
+   `<Starfield>\Data\SFSE\Plugins\FlyingVehicleOverhaul.dll`.
 3. Enable the data plugins that came with it (below Parked Vehicles in your load order):
-   - **`SeamlessPilots.esm`** - lets NPCs walk to a vehicle and get in. **Without it, NPCs never use vehicles.**
-   - **`FlyingVehicleOverhaul - Placements.esm`** - the mod's own parked vehicles (35 in New Atlantis). Optional.
-   - **`Vehicles - Real.esm`** - turns the Parked Vehicles props into real, drivable vehicles (needs Parked Vehicles).
+   - **`FVO_NPCPilots.esm`** - lets NPCs walk to a vehicle and get in. **Without it, NPCs never use vehicles.**
+   - **`FVO_CityPlacements.esm`** - the mod's own parked vehicles (35 in New Atlantis). Optional.
+   - **`FVO_ParkedVehiclesPatch.esm`** - turns the Parked Vehicles props into real, drivable vehicles (needs Parked Vehicles).
 4. Start the game with **`sfse_loader.exe`** (Steam running).
-5. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` starts with `SeamlessVehicle ... loaded`.
+5. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log` starts with `Flying Vehicle Overhaul (FVO) ... loaded`.
 
-**Uninstall:** delete `Data\SFSE\Plugins\SeamlessVehicle.dll` (and the `.esm` files if you like). Vehicles in your save are kept.
+**Uninstall:** delete `Data\SFSE\Plugins\FlyingVehicleOverhaul.dll` (and the `.esm` files if you like). Vehicles in your save are kept.
 
 ---
 
 ## Controls
 
-Every key means one thing, and the same thing on foot and in the vehicle: no mode changes what a key does. **N, U and T are fixed**
-(your choice of keys: no fallback moves them). If the game also binds one of them, the log says so (`Rover keys: … is also bound by the
-game`). The **stance** key is the first free one of Y, O, P, B, K, J, G; it and the other free keys are written to the log at start-up
-(`Rover stance key: …`, `Rover flight keys: …`, `Passenger: key …`). Holds are all 1 second.
+Version 0.73.0 gives each command its own binding row. Rebinding a row preserves the other device and unrelated contexts. Real overlapping assignments are refused. Recognized defaults upgrade to layout 4; edited lines are retained and the previous file is backed up.
 
-| Key | Tap | Hold (1 s) |
+| Command | Keyboard default | Controller default |
 |---|---|---|
-| **T** | Go there (destination, or a queued stop) | On a person or vehicle: ram it. On a place: guard it (on foot) or fly there and hold (driving) |
-| **T T** | Clear the route | |
-| **N** | Summon / recall your vehicle | Your vehicle **and** every escort; also works while you drive (escorts only) |
-| **U** | Cover: your vehicle follows and defends you by itself | A free follower drives your vehicle to cover you |
-| **Stance** | Defend → Attack → Hold fire | |
-| **]** | On foot: your empty vehicle's profile (Scout / Return home / Hold). Driving: Stop / Orbit / Patrol / Cruise | |
+| Hover / land | V | L3 driving |
+| Accelerate / brake / turn | W / S / A / D | Left stick |
+| Climb / descend | Q / Z | Triangle / Square in flight |
+| Gear / descend | Alt tap / Alt hold | Cross tap / Cross hold in flight |
+| Boost / throttle lock | Shift / Shift double tap | R1 / R1 double tap in flight |
+| Flight assist | B in flight | D-pad Down in flight |
+| Summon / recall escorts | N tap / N hold | Scanner: Circle tap / hold; driving: D-pad Up recalls escorts |
+| Follow / follower drives | U tap / U hold | Scanner: L3 tap / hold |
+| Stance | K | D-pad Right driving; View/Create tap in scanner |
+| Destination / clear route / guard | T tap / double tap / hold in scanner | Triangle tap / double tap / hold in scanner |
+| Ram / focus / clear focus | R / H / O | Scanner: Circle double / L3 double / D-left double |
+| Auto / own profile | T tap outside scanner / ] | Driving: D-left tap / hold |
+| Retry / skip stop | Semicolon / [ | Scanner: D-left tap / D-right tap |
+| Passenger board / exit / take wheel | G tap nearby; G tap / hold as passenger | Scanner: D-right hold; Cross tap / hold as passenger |
+| Driver exit | E (native exit binding) | Circle; hover sets down first |
+| All hints | J | R3 tap driving; View/Create hold in scanner |
+| HUD editor | F7 | Scanner: View/Create double; Circle saves/closes |
 
-### On foot
+Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation names; Xbox Cross/Circle/Square/Triangle are A/B/X/Y. Native aim, fire and look remain on the game's controls. Physical flight is experimental.
 
-| Key | Action |
-|---|---|
-| **N** (tap) | **Summon / Recall your vehicle.** It comes to you whatever it is doing: covering, guarding, holding, ramming or fighting. Far away, it is moved in behind you, out of sight; closer, it flies to you. Pressing N again sends it again; it never cancels. With a follower driving, they bring it over without firing, park beside you and get out so you can drive. Your escorts are left in their fights. |
-| **N** (hold) | The same, and every escort drops its fight and falls back to you for 15 s. While driving, a hold recalls the escorts. |
-| **U** (tap) | **Cover** on / off: your vehicle follows and defends you by itself (see [Your vehicle defends you](#your-vehicle-defends-you)). While it guards a point, U makes it cover you again. If a follower already drives it, U toggles their cover; turning it off makes them get out. |
-| **U** (hold) | A free follower (within 60 m) gets in and drives your vehicle to cover you. No follower free: your vehicle covers you by itself. |
-| **E** (Activate) | **Get in** (shown within 6 m of your vehicle). At an occupied vehicle: tap = passenger seat, hold = take the wheel / pull the driver out. |
+The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
 
-The button names follow the context: N reads **Summon** when your vehicle is idle and **Recall** when it is busy; U reads **Cover** or
-**Stop cover**.
+## What's new in 0.73.0
 
-### T: tap, double tap, hold (aim with the hand scanner, on foot or driving)
+Independent command bindings, scoped conflict checks, fixed keyboard defaults, controller landing-before-exit, native ground-input remapping and controller HUD editing. Placement editing and area summon points from the post-0.72.0 build are included. See [release notes](docs/RELEASE_0.73.0.md).
 
-| T | Action |
-|---|---|
-| **Tap** | **Go there**, in every situation. The aimed place becomes the destination and starts navigation, up to ~1 km away (past the loaded area the distance is an estimate, shown with `~`). Driving, the autopilot starts at once. On foot, your vehicle is summoned and drives you there when you get in. **While a trip is on, a tap adds the point to a chain** (`+N queued`). A tap acts once the 0.3 s double-tap window has passed. |
-| **Double tap** | Clears the route and holds the vehicle where it is (it stays hovering). |
-| **Hold (1 s)** | **Acts on what you aimed at when you pressed.** A highlighted person or vehicle is **rammed** straight away by your driven vehicle, or by your own vehicle. A place: on foot, your vehicle **guards** it (it holds there even in a fight and defends from it; U makes it cover you again). Driving, you fly there and hold, replacing the route. Releasing a hold selects nothing. Outside the scanner a hold asks you to aim first. |
-
-**Ram:** a straight line, as fast as possible. The vehicle turns its nose onto where the target is heading and goes full throttle in
-top gear. There is no path planning, no detour and no slowing for traffic; only the minimum height above the ground is kept. It ends
-on impact, when the target is lost, or after 15 s, and any movement key takes your vehicle back.
-
-Chained markers swap automatically: about 4 s before your vehicle reaches the current marker, the next one takes its place and
-the vehicle flies on without stopping. The final point keeps normal arrival braking.
-
-### In the vehicle
-
-| Key | Action |
-|---|---|
-| **Hover key** | Hover on / off: the first free of J, K, Y, O, P, B, shown on the hover button (Space double tap no longer toggles hover) |
-| **W / S** | Accelerate / brake |
-| **Left Shift** (double tap) | Throttle lock: keep accelerating until you boost or brake again |
-| **Left Shift** (hold) | 1.75x boost in the selected gear. Uses the game's boost meter and the vehicle's own burn/recharge timings; release to recover after depletion. |
-| **Alt** (tap) | Cycle gears: 1 → 2 → 3 → 4 → 1 |
-| **Alt** (hold) | Descend after 0.3 seconds; releasing a hold does not change gear |
-| **A / D**, mouse | Turn / roll; the mouse aims |
-| **Q / Z** | Up / down |
-| **T** | See [T: tap, double tap, hold](#t-tap-double-tap-hold-aim-with-the-hand-scanner-on-foot-or-driving). Selecting a destination starts the autopilot; with the scanner closed a T tap switches Auto on or off. Any of W / A / S / D takes control back. |
-| **E** | Get out. While hovering, the vehicle sets down first, then you get out. |
-| **J** | Show / hide every hint and panel (the basic control hints hide after your first 3 rides). |
-| **]** (when free) | What the autopilot does at your destination: **Stop → Orbit → Patrol** (the route loops) **→ Cruise** (fly where you look at your gear's speed) |
-| **N** (hold) | Summon your escorts back into formation |
-| **Stance** | Defend / Attack / Hold fire for your escorts (your own seat never fires by itself) |
-| *Shooting* | Always yours. A vehicle you drive never fires or aims by itself. |
-| *Leave the vehicle* | The old destination and queued route are discarded. Set a fresh target for the next trip; an unattended Auto vehicle holds position. |
-| **F7** | Move any on-screen button (Page Up / Down pick, arrows move, Ctrl ×10, Delete resets, **+ / −** resize the pick). Saved to `hoverui.ini`. |
-
-### On-screen buttons
-
-The HUD shows what you can do now and one status card (0.62.0). Everything uses the game's native button style.
-
-- **Status card:** in the vehicle *GEAR 3 · HOVER · 2 ESCORTS*, the health bar when it matters, and the next stop or the Auto trip.
-  On foot your vehicle's state (*SUMMONING 120 m*, *FOLLOW 42 m*, *COVER · DEFEND 42 m*, *GUARD POINT*, *HOLDING*…) and the escort count.
-- **Prompts:** in the vehicle **T Auto / Auto off** (beside the game's own E exit); on foot **N Summon** and **U Follow** (*Cover* in
-  combat); facing an occupied vehicle **Passenger** and **eject**.
-- **Control hints** (W / A / S / D, Alt: tap gear, hold descend, Hover / Land: the hover key) show on your first 3 rides and for
-  10 s after you get in, then hide. **J** shows every hint and panel (the gear box, each escort's row, the HUD route panel).
-- **The scanner** is where you plan: the target readout, the route with Retry / Skip / *T T: clear route*, and your escorts.
-- **F7** moves and resizes everything (+ / − on the pick). The card moves with *Status* on foot and *Vehicles* in the vehicle.
-
----
-
-## Controls and controllers
-
-Every control of the mod is set in `Documents/My Games/Starfield/SFSE/Logs/SeamlessVehicle/bindings.ini`, written on the first
-start, or in the mod's section of the game's Controls menu. Each line lists alternatives: keys, mouse buttons and controller buttons,
-optionally limited to a situation (`Pad:DUp@vehicle`) or a gesture (`Pad:DLeft:tap`, `Pad:DLeft:hold`). `default` keeps the mod's own
-key, and for the game's vehicle controls also the game's controller button. Saved changes apply while the game runs.
-
-Since 0.72.0 the controller map changes with the situation (on foot, driving, hovering, physical flight, the scanner, a passenger seat)
-and uses no button combinations. Where the mod uses a controller button, the game's own action on it is switched off there, so one
-press never does two things; RT (fire) and LT (aim) are never taken. The left stick is analog for roll and throttle. A bindings.ini from
-0.71.0 or earlier is upgraded once; lines you edited are kept.
-
-| Situation | Controller |
-|---|---|
-| Driving, hovering, physical flight | Left stick: throttle, brake, turn / roll (analog). RB boost (double tap: throttle lock). L3 hover on / off. A: tap gear, hold descend. D-pad Up summon, Down follow / cover, Right stance, Left tap Auto / hold profile. R3 tap: every hint |
-| Flying | Y climb, X descend |
-| Hand scanner (LB) | Y go there / pick, B summon, L3 follow / cover. D-pad Left: tap retry / hold profile. D-pad Right: tap skip stop / hold ride along. View: tap stance / hold every hint |
-| Passenger seat | A: get out |
-
-Ram (hold T) is keyboard-only for now.
+**Every file is renamed to the mod's name, Flying Vehicle Overhaul (FVO):** `FlyingVehicleOverhaul.dll` (the core mod),
+`FVO_NPCPilots.esm` (NPC walking and boarding), `FVO_CityPlacements.esm` (optional parked vehicles),
+`FVO_ParkedVehiclesPatch.esm` (optional Parked Vehicles patch), the log `FlyingVehicleOverhaul.log` and the settings folder
+`Logs\FlyingVehicleOverhaul\` with `settings.ini`. The first start moves your old settings folder for you. Delete the old
+`SeamlessVehicle.dll`: with both DLLs installed the mod loads twice.
 
 ## What's new in 0.72.0
 
@@ -222,7 +158,7 @@ Details: [docs/RELEASE_0.71.0.md](docs/RELEASE_0.71.0.md).
   all 22 New Atlantis vehicles get physics at load, up from 6.
 - **Launch guard**: a parked vehicle whose physics starts partly in the ground or another vehicle is no longer thrown; for
   10 s after its physics starts, big sideways or upward pushes are removed. Verified in game.
-- **Own placements are plugin references** (`FlyingVehicleOverhaul - Placements.esm`, 35 REV-8s in New Atlantis), written
+- **Own placements are plugin references** (`FVO_CityPlacements.esm`, 35 REV-8s in New Atlantis), written
   like the Creation Kit writes them; nothing is created at run time any more.
 - **Controls toolkit** (`bindings.ini`, keys, mouse, controller buttons and chords), **combat boarding** through the game's
   combat movement, and **exit fixes** (no more flinging a stood-up player). Not tested in game yet.
@@ -289,7 +225,7 @@ None of this has been tested in game yet; the offline checks pass.
   with a second bar under it for the vehicle's name and health. This needs the driver to be fighting you. The status card
   shows your own vehicle's health at all times, and the enemy vehicle you aim at, last hit, or the nearest one within 400 m.
 - **Settings menu.** A *Flying Vehicle Overhaul* category in the game's Settings menu (pause menu and main menu), with a
-  toggle per feature (see [Settings](#settings)). Changes apply at once and are saved to `seamless.ini`.
+  toggle per feature (see [Settings](#settings)). Changes apply at once and are saved to `settings.ini`.
 - **Fixes:** vehicles getting stuck in towns (drive mode turning on 5-6 m above the ground, switching between drive and hover
   every 10 s); your vehicle's health not showing; you could get into a vehicle an NPC was using (the game had already sat you
   down, and now stands you back up with "That vehicle is taken").
@@ -310,9 +246,9 @@ All of this passes the offline checks; most of it has not been tested in game ye
 - **Auto on T:** a T tap with the scanner closed switches Auto on or off while you drive.
 - **Getting out while hovering:** E sets the vehicle down first; the game no longer reports the exit as obstructed.
 - **Streamlined HUD** (see [On-screen buttons](#on-screen-buttons)) and per-element sizes in F7.
-- **Optional parked-vehicle patch** for *Carfield* and *Parked Vehicles* (+ *Vehicles - Real*). Neither is required. Each kind of
+- **Optional parked-vehicle patch** for *Carfield* and *Parked Vehicles* (+ *FVO_ParkedVehiclesPatch*). Neither is required. Each kind of
   vehicle they park becomes one pick per location from every vehicle in your load order, using a fixed seed, so a place always
-  looks the same. Nothing is spawned: the parked vehicle itself changes type. `[placement] enabled=0` in `seamless.ini` turns it
+  looks the same. Nothing is spawned: the parked vehicle itself changes type. `[placement] enabled=0` in `settings.ini` turns it
   off. Overlapping duplicates left by older builds are cleared.
 - **Steadier enemy vehicles:** a chosen manoeuvre is kept for at least 1.5 s while it stays possible (they no longer switch
   moves every few milliseconds). Hits, rams and low health still interrupt at once.
@@ -511,32 +447,32 @@ never used for traffic.**
 **In game:** open **Settings** (pause menu or main menu) and pick **Flying Vehicle Overhaul**. Each feature has its own toggle,
 with a description: NPCs use vehicles, Full vehicle combat AI (off: simpler attack runs), Vehicle rams, Hover or drive, Vehicle
 damage and wrecks, Vehicle health bars, Vehicle status card, Crash witnesses, Parked vehicles (after loading a save) and
-Detailed log. *Reset to defaults* works for this category. Each toggle is the `seamless.ini` key in the table below, so editing
+Detailed log. *Reset to defaults* works for this category. Each toggle is the `settings.ini` key in the table below, so editing
 the file by hand still works (it is read again every 5 s).
 
-All optional, in `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle\`:
+All optional, in `Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul\`:
 
 | File | Section | Key | Default | What it does |
 |---|---|---|---|---|
-| `seamless.ini` | `[log]` | `verbose` | `0` | `1` = detailed log lines (needed for most bug reports) |
-| `seamless.ini` | `[context]` | `enabled` | `1` | `0` = NPCs never take vehicles on their own (fights and traffic) |
-| `seamless.ini` | `[hits]` | `health` | `300` | A vehicle's health |
-| `seamless.ini` | `[hits]` | `limit` | `0` | Any other number replaces `health` |
-| `seamless.ini` | `[hits]` | `driverShare` | `25` | Percent of each hit the driver takes |
-| `seamless.ini` | `[hits]` | `weaponScale` | `1` | Multiplies the weapons' damage to vehicles |
-| `seamless.ini` | `[hits]` | `damage` | `20` | Damage per shot, only when the weapon's own damage cannot be read |
-| `seamless.ini` | `[hits]` | `ramCap` | `35` | Percent of a vehicle's health one ram may take |
-| `seamless.ini` | `[hits]` | `shotCap` | `20` | Percent of a vehicle's health one shot may take |
-| `seamless.ini` | `[witness]` | `enabled` | `1` | `0` = bystanders do not react to crashes |
-| `seamless.ini` | `[combat]` | `ai`, `ram` | `1`, `1` | `0` = simpler attack runs / no rams |
-| `seamless.ini` | `[nav]` | `travel` | `1` | `0` = vehicles hover, and drive only to get out of tight spots |
-| `seamless.ini` | `[nav]` | `jump` | `4` | Metres a vertical boost clears on the ground (taller obstacles make vehicles hover) |
-| `seamless.ini` | `[hits]` | `enabled` | `1` | `0` = vehicles take no damage and never wreck |
-| `seamless.ini` | `[hud]` | `healthBars`, `card` | `1`, `1` | `0` = no vehicle health bars / no status card |
-| `seamless.ini` | `[placement]` | `enabled` | `1` | `0` = the optional parked-vehicle patch is off (after loading a save) |
-| `seamless.ini` | `[scanner]` | `key` | `84` (T) | The scanner marker key (Windows virtual-key code) |
-| `seamless.ini` | `[view]` | `objectFade`, `actorFade` | `3`, `1` | Fade distance multipliers (1 = the game's own, 0 = never fade) |
-| `seamless.ini` | `[keys]` | `debug` | `0` | `1` = manual test keys (listed in the log) |
+| `settings.ini` | `[log]` | `verbose` | `0` | `1` = detailed log lines (needed for most bug reports) |
+| `settings.ini` | `[context]` | `enabled` | `1` | `0` = NPCs never take vehicles on their own (fights and traffic) |
+| `settings.ini` | `[hits]` | `health` | `300` | A vehicle's health |
+| `settings.ini` | `[hits]` | `limit` | `0` | Any other number replaces `health` |
+| `settings.ini` | `[hits]` | `driverShare` | `25` | Percent of each hit the driver takes |
+| `settings.ini` | `[hits]` | `weaponScale` | `1` | Multiplies the weapons' damage to vehicles |
+| `settings.ini` | `[hits]` | `damage` | `20` | Damage per shot, only when the weapon's own damage cannot be read |
+| `settings.ini` | `[hits]` | `ramCap` | `35` | Percent of a vehicle's health one ram may take |
+| `settings.ini` | `[hits]` | `shotCap` | `20` | Percent of a vehicle's health one shot may take |
+| `settings.ini` | `[witness]` | `enabled` | `1` | `0` = bystanders do not react to crashes |
+| `settings.ini` | `[combat]` | `ai`, `ram` | `1`, `1` | `0` = simpler attack runs / no rams |
+| `settings.ini` | `[nav]` | `travel` | `1` | `0` = vehicles hover, and drive only to get out of tight spots |
+| `settings.ini` | `[nav]` | `jump` | `4` | Metres a vertical boost clears on the ground (taller obstacles make vehicles hover) |
+| `settings.ini` | `[hits]` | `enabled` | `1` | `0` = vehicles take no damage and never wreck |
+| `settings.ini` | `[hud]` | `healthBars`, `card` | `1`, `1` | `0` = no vehicle health bars / no status card |
+| `settings.ini` | `[placement]` | `enabled` | `1` | `0` = the optional parked-vehicle patch is off (after loading a save) |
+| `settings.ini` | `[scanner]` | `key` | `84` (T) | The scanner marker key (Windows virtual-key code) |
+| `settings.ini` | `[view]` | `objectFade`, `actorFade` | `3`, `1` | Fade distance multipliers (1 = the game's own, 0 = never fade) |
+| `settings.ini` | `[keys]` | `debug` | `0` | `1` = manual test keys (listed in the log) |
 | `nav.ini` | `[nav]` | `sampler`, `shape`, `rays` | `1` | `0` turns off the heading sampler, the hull sweeps, or all ray queries |
 | `hoverui.ini` | | | | On-screen layout, written by the F7 editor |
 
@@ -552,15 +488,15 @@ cd source
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-or `cmake -S . -B build -A x64` then `cmake --build build --config Release`. The plugin is `build/Release/SeamlessVehicle.dll`;
+or `cmake -S . -B build -A x64` then `cmake --build build --config Release`. The plugin is `build/Release/FlyingVehicleOverhaul.dll`;
 the `*_test.exe` files next to it are the offline checks (no game needed). The layout is in [source/README.md](source/README.md).
 The plugin targets Starfield 1.16.244 (Steam) only.
 
 ```
-Data/SFSE/Plugins/SeamlessVehicle.dll   the built plugin
-Data/SeamlessPilots.esm                 the walk-to-vehicle quest package
-Data/FlyingVehicleOverhaul - Placements.esm  the mod's own parked vehicles (New Atlantis)
-Data/Vehicles - Real.esm                Parked Vehicles props -> real vehicles
+Data/SFSE/Plugins/FlyingVehicleOverhaul.dll   the built plugin
+Data/FVO_NPCPilots.esm                 the walk-to-vehicle quest package
+Data/FVO_CityPlacements.esm  the mod's own parked vehicles (New Atlantis)
+Data/FVO_ParkedVehiclesPatch.esm                Parked Vehicles props -> real vehicles
 source/                                 the C++ source and its build (src/, tests/, third_party/sfse, tools/)
 tools/                                  integrate.sh (build + install), make_vehicles_real.py, make_pilots_esm.py
 docs/                                   ARCHITECTURE, ENGINE_NOTES, TESTING, KNOWN_ISSUES, research/
@@ -603,15 +539,15 @@ exits, drive mode, metered boost, view distance and the vehicle registry.
 
 ## Reporting a problem
 
-1. Turn on **Detailed log** in Settings > Flying Vehicle Overhaul (or set `[log] verbose=1` in `seamless.ini`).
+1. Turn on **Detailed log** in Settings > Flying Vehicle Overhaul (or set `[log] verbose=1` in `settings.ini`).
 2. Play until it goes wrong.
-3. Send `Documents\My Games\Starfield\SFSE\Logs\SeamlessVehicle.log` (and `SeamlessVehicle.prev.log` for the previous session). A crash
+3. Send `Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log` (and `FlyingVehicleOverhaul.prev.log` for the previous session). A crash
    report in the log lists the faulting address, the stack and what the plugin did in its last moments.
 
 **Common fixes**
 - **Nothing happens / no log:** the plugin only runs on Starfield **1.16.244** with SFSE for that build.
-- **NPCs never use vehicles:** `SeamlessPilots.esm` is not enabled, or there are no free parked vehicles near them.
-- **Parked props, not real vehicles:** `Vehicles - Real.esm` is not enabled, or Parked Vehicles is missing.
+- **NPCs never use vehicles:** `FVO_NPCPilots.esm` is not enabled, or there are no free parked vehicles near them.
+- **Parked props, not real vehicles:** `FVO_ParkedVehiclesPatch.esm` is not enabled, or Parked Vehicles is missing.
 - **Frame drops with many vehicles:** try `[nav] rays=0`, or a lower `[view] objectFade`.
 
 ---

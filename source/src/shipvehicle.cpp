@@ -2,6 +2,7 @@
 
 #include "addresses.h"
 #include "controlmap.h"
+#include "bindings.h"
 #include "game.h"
 #include "log.h"
 #include "notify.h"
@@ -79,7 +80,7 @@ namespace shipvehicle
 			g_vehicle = vehicle;
 		}
 		const bool down = vehicle && g_toggle && Focused() && (GetAsyncKeyState(g_toggle) & 0x8000);
-		if (down && !g_keyDown) {
+		if(vehicle&&bindings::Triggered(bindings::Action::ShipPreview)) {
 			g_want = !g_want;
 			notify::Log(g_want ? "Ship hull preview on vehicle (visual only)" : "Vehicle look restored");
 			logger::Write("Ship vehicle preview: %s", g_want ? "on" : "off");

@@ -1,6 +1,7 @@
 #include "vehicleflight.h"
 #include "vehiclediag.h"
 #include "bindings.h"
+#include "passenger.h"
 #include "features.h"
 #include "overrides.h"
 #include "profileclass.h"
@@ -44,7 +45,8 @@
 #include "vehicleworld.h"
 #include "vehiclehits.h"
 #include "realvehicles.h"
-#include "travelmode.h"
+#include "travelmode.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -591,7 +593,8 @@ namespace vehicleflight
 		std::atomic<bool>& g_forwardBoost = g_forwardBoosts[0];
 		// A seated ship pilot has no PlayerVehicle link. Count whether the last driven rover's physics
 		// callback keeps running after dismount; comparison only, never dereference a stale reference.
-		std::atomic<std::uintptr_t> g_driverVehicle{ 0 }, g_lastDrivenVehicle{ 0 };
+		std::atomic<std::uint32_t> g_manualDriverId{0};
+        std::atomic<std::uintptr_t> g_driverVehicle{ 0 }, g_lastDrivenVehicle{ 0 };
 		std::atomic<unsigned> g_physicalSteps{0}, g_physicalFailures{0};
 		std::atomic<unsigned> g_physicalReject{0};
 		std::atomic<float> g_physicalCollective{0}, g_physicalMass{0};
@@ -1973,26 +1976,7 @@ namespace vehicleflight
 			if (g_keys.chosen) {
 				return;
 			}
-			auto freeHere = [](int vk) { return controlmap::KeyFreeIn(vk, "Vehicle"); };
-			// N and U are the user's summon / cover keys (2026-10-20): never the hover toggle.
-			for (const int vk : std::initializer_list<int>{ 'J', 'K', 'Y', 'O', 'P', 'B' }) {
-				if (freeHere(vk) && controlmap::KeyFree(vk)) {
-					g_keys.toggle = vk;
-					break;
-				}
-			}
-			g_keys.rollLeft = 'A';
-			g_keys.rollRight = 'D';
-			const int lifts[][2] = { { 'Q', 'Z' }, { 'F', 'C' }, { 'X', 'C' }, { VK_OEM_4, VK_OEM_6 } };
-			for (const auto& pr : lifts) {
-				const auto used = [&](int vk) { return vk == g_keys.toggle || vk == g_keys.rollLeft || vk == g_keys.rollRight; };
-				if (!used(pr[0]) && !used(pr[1]) && freeHere(pr[0]) && freeHere(pr[1])) {
-					g_keys.up = pr[0];
-					g_keys.down = pr[1];
-					break;
-				}
-			}
-			// The user chose these exact keys: no fallback moves them elsewhere; a game binding on them is only logged.
+            g_keys.toggle='V';g_keys.rollLeft='A';g_keys.rollRight='D';g_keys.up='Q';g_keys.down='Z';
 			g_keys.call = 'N';
 			g_keys.follow = 'U';
 			for (const int vk : { g_keys.call, g_keys.follow })
@@ -2008,10 +1992,7 @@ namespace vehicleflight
 			controlmap::Note("flight", "call", g_keys.call);
 			controlmap::Note("flight", "follow", g_keys.follow);
 			// Stance: one free key besides the ones above, never a number key nor the test keys , . / ' (the user's rule).
-			g_keys.stance = 0;
-			for (const int vk : { 'Y', 'O', 'P', 'B', 'K', 'J', 'G' }) {
-				if (vk != g_keys.toggle && vk != g_keys.up && vk != g_keys.down && controlmap::Claim("flight", "stance", vk)) { g_keys.stance = vk; break; }
-			}
+            g_keys.stance='K';
 			logger::Write("Rover stance key: %s", g_keys.stance ? controlmap::KeyName(g_keys.stance).c_str() : "NONE FREE");
 			// The bank test is a test key (the user's rule: , . / ' only).
 			g_keys.bankTest = controlmap::Claim("flight", "bank test (detailed log)", VK_OEM_COMMA) ? VK_OEM_COMMA : 0;
@@ -2113,8 +2094,10 @@ namespace vehicleflight
 			bool pending = false;
 			double x = 0, y = 0, z = 0, yaw = 0;
 			ULONGLONG asked = 0;
+			bool summonPoint = false;  // to the area's summon point, not next to the player
 		} g_move;
 		ULONGLONG g_movedAt = 0;  // the last summon move (the HUD says "MOVED TO YOU" for a few seconds)
+		bool g_movedToPoint = false;  // ... or "AT SUMMON POINT"
 
 		std::uintptr_t RefById(std::uint32_t id);
 
@@ -2201,10 +2184,20 @@ namespace vehicleflight
 			return true;
 		}
 
-		void AskMove(std::uintptr_t player)
+		void AskMove(std::uintptr_t player, bool summonPoint = false)
 		{
 			if(vehiclehits::Wrecked(g_roverId)||IsDisabled(g_roverId))return;
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
+			// The area's summon point (placement mode, 2026-10-24, the user): a far or unloaded vehicle appears there instead.
+			// Only a summon uses it; follow keeps bringing the vehicle to the player.
+			double sx, sy, sz, syaw;
+			if (summonPoint && realvehicles::SummonPointNear(pp.x, pp.y, sx, sy, sz, syaw)) {
+				g_move = { true, sx, sy, sz, syaw, GetTickCount64(), true };
+				prefetch::RequestGround(prefetch::kSlotRescue0, float(sx), float(sy), float(sz) + 60.0f, 0.0f, 400.0f);
+				logger::Write("Rover call: moving it to this area's summon point (%.1f, %.1f, %.1f), %.0f m from the player", sx, sy, sz,
+					std::hypot(sx - pp.x, sy - pp.y));
+				return;
+			}
 			const double yaw = At<game::Vec3>(player, off::kRefRotation).z;
 			// 12 m behind the player and 3 m to the right (out of view), facing the way the player faces.
 			const double fx = std::sin(yaw), fy = std::cos(yaw), rx = std::cos(yaw), ry = -std::sin(yaw);
@@ -2234,7 +2227,10 @@ namespace vehicleflight
 			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
 			__try {
 				EngineFn<void (*)(std::uintptr_t, std::uint64_t*, std::uintptr_t, std::uintptr_t, float*, float*)>(addr::kMoveReference)(rover, &handle, cell, ws, pos, rot);
-				logger::Write("Rover call: moved to (%.1f, %.1f, %.1f) next to the player (ground %s)", pos[0], pos[1], pos[2], "validated footprint and boarding side");
+				logger::Write("Rover call: moved to (%.1f, %.1f, %.1f) %s (ground %s)", pos[0], pos[1], pos[2],
+					g_move.summonPoint ? "at the area's summon point" : "next to the player", "validated footprint and boarding side");
+				g_movedToPoint = g_move.summonPoint;
+				if (g_move.summonPoint) notify::Show("Your vehicle is at the summon point");
 				g_movedAt = GetTickCount64();
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2896,6 +2892,8 @@ namespace vehicleflight
 		}
 	}
 
+    bool PlayerDriving(std::uint32_t id){return id&&g_manualDriverId.load()==id;}
+
 	bool Active() { return g.active; }
 	bool PhysicalCameraActive(std::uintptr_t vehicle) {
 		return vehicle && g_sh.physOn.load(std::memory_order_acquire) && g_sh.physNeedsDriver.load() && g_sh.physInstance.load() &&
@@ -2936,7 +2934,7 @@ namespace vehicleflight
 
 	namespace
 	{
-		// The height a vertical boost clears on the ground ([nav] jump= in seamless.ini, default 4 m): an obstacle taller than this
+		// The height a vertical boost clears on the ground ([nav] jump= in settings.ini, default 4 m): an obstacle taller than this
 		// makes an NPC vehicle hover (travelmode).
 		double JumpHeight()
 		{
@@ -2945,7 +2943,7 @@ namespace vehicleflight
 				value = 4.0;
 				PWSTR docs = nullptr;
 				if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-					const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+					const std::wstring ini = fvopaths::Settings();
 					CoTaskMemFree(docs);
 					value = std::clamp(double(GetPrivateProfileIntW(L"nav", L"jump", 4, ini.c_str())), 1.0, 30.0);
 				}
@@ -3335,30 +3333,9 @@ namespace vehicleflight
 				g.sDown = sHeld;
 				g.boostDown = boostHeld;
 			}
-			// Boost (Shift / RB): boost while held; double-tap it: boost stays on; the next boost or brake press releases it
-			// (2026-10-24, the user: the forward boost's own button, instead of double-tapping W).
-			{
-				const bool boostPress = boostHeld && !boostWasDown;
-				const bool sPress = sHeld && !sWasDown;
-				if (boostPress) {
-					const ULONGLONG nowMs = GetTickCount64();
-					if (g.wHold) {
-						g.wHold = false;
-						g.wLastPress = 0;
-					}
-					else if (g.wLastPress && nowMs - g.wLastPress <= kDoubleTapMs) {
-						g.wHold = true;
-						g.wLastPress = 0;
-						logger::Write("%s: boost held (double-tapped boost)", wf);
-					}
-					else {
-						g.wLastPress = nowMs;
-					}
-				}
-				if (sPress && g.wHold) {
-					g.wHold = false;
-				}
-			}
+            if(keysOn&&bindings::Triggered(bindings::Action::ThrottleLock))g.wHold=!g.wHold;
+            else if((boostHeld&&!boostWasDown)||(sHeld&&!sWasDown))g.wHold=false;
+
 			const bool paidBoost = (boostHeld || g.wHold) && g_meterBoost.load() && g_meterVehicle.load()==vehicle;
 			// The player's throttle as an amount (2026-10-24: analog sticks; a key or the boost lock is all of it).
 			const double throttleIn = g.wHold || paidBoost ? 1.0 : keysOn ? bindings::Amount(bindings::Action::Accelerate, g_mk.accel) : 0.0;
@@ -4423,7 +4400,7 @@ namespace vehicleflight
 			FirstPersonLookLimits(false);
 			g_altInput = {}; g_altDrop = false;
 			hoverui::SetState(false, false, g.gear, false);
-			g_driverVehicle.store(0, std::memory_order_relaxed);
+			g_driverVehicle.store(0, std::memory_order_relaxed);g_manualDriverId.store(0);
 			return;
 		}
 		// The player died (aboard or not): the vehicle can no longer go on. Hover, Auto, follow and summon end and stay
@@ -4444,7 +4421,7 @@ namespace vehicleflight
 			hoverui::SetState(false, false, g.gear, false);
 			hoverui::SetTripStatus(false, "");
 			hoverui::SetFoot(false, false, "", "", "", "", "", "");
-			g_driverVehicle.store(0, std::memory_order_relaxed);
+			g_driverVehicle.store(0, std::memory_order_relaxed);g_manualDriverId.store(0);
 			return;
 		}
 		deadSaid = false;
@@ -4453,7 +4430,7 @@ namespace vehicleflight
 		ReadMoveKeys();
 		hoverui::EditTick(focused);
 		const bool h = focused && bindings::Held(bindings::Action::HoverToggle, g_keys.toggle);
-		const bool pressed = h && !g.keyDown;
+		const bool pressed = focused && bindings::Triggered(bindings::Action::HoverToggle);
 		g.keyDown = h;
 		const auto driven = PlayerVehicle(player);
 		FirstPersonLookLimits(driven != 0);
@@ -4461,6 +4438,7 @@ namespace vehicleflight
 		if(!driven)g_meterBoost.store(false);
 		hoverui::SetState(driven != 0, g.active && (!g.autopilot || g.playerAuto), g.gear, g.wHold);
 		const auto priorDriven=g_driverVehicle.exchange(driven,std::memory_order_relaxed);
+        g_manualDriverId.store(driven&&!passenger::RidingVehicle()?At<std::uint32_t>(driven,off::kFormId):0);
 		if (driven && priorDriven != driven) {
 			const auto id = At<std::uint32_t>(driven, off::kFormId);
 			logger::Write("Vehicle health: player boarded %08X with %.3f / %.0f health; existing chassis record retained", id,
@@ -4468,8 +4446,12 @@ namespace vehicleflight
 		}
 		if(priorDriven && priorDriven!=driven)EndTargetSession(priorDriven);
 		if (priorDriven != driven) g_altInput = {};
-		const auto alt = g_altInput.Update(bindings::Held(bindings::Action::Gear, VK_MENU), driven && focused && !hoverui::IsScannerOpen(), GetTickCount64());
-		g_altDrop = alt.drop;
+        const altcontrol::Action alt{bindings::Triggered(bindings::Action::Gear),false};
+        g_altDrop=false;
+        if(bindings::Triggered(bindings::Action::FlightAssist)){
+            const bool on=!features::On(features::Id::FlightAssist);features::Set(features::Id::FlightAssist,on);
+            notify::Show(on?"Flight assist on":"Flight assist off");
+        }
 		if (alt.cycle) {
 			const int before = g.gear;
 			g.gear = altcontrol::NextGear(g.gear);
@@ -4506,7 +4488,7 @@ namespace vehicleflight
 			static std::uintptr_t settleVehicle = 0;
 			static int exitKey = 0;
 			if (!exitKey) exitKey = controlmap::KeyFor("Vehicle", "VehicleExit", 'E');
-			const bool eDown = focused && driven && Held(exitKey);
+			const bool eDown = focused && driven && bindings::Held(bindings::Action::DriverExit,exitKey);
 			if (eDown && !exitDown && g.active && !settleSince) {
 				settleSince = GetTickCount64();
 				settleVehicle = driven;
@@ -4574,7 +4556,7 @@ namespace vehicleflight
 					notify::Log("Destination selected - navigating; W/A/S/D takes over");
 					logger::Write("Rover auto: on (%s)", wasHovering ? "already hovering" : "lifting off");
 			}
-			else if (g.playerAuto && focused && (alt.cycle || alt.drop || bindings::Held(bindings::Action::Accelerate, g_mk.accel) || bindings::Held(bindings::Action::Brake, g_mk.brake) || bindings::Held(bindings::Action::TurnLeft, g_mk.left) || bindings::Held(bindings::Action::TurnRight, g_mk.right))) {
+			else if (g.playerAuto && focused && (alt.cycle || alt.drop || bindings::Amount(bindings::Action::Accelerate, g_mk.accel) > 0.0 || bindings::Amount(bindings::Action::Brake, g_mk.brake) > 0.0 || bindings::Amount(bindings::Action::TurnLeft, g_mk.left) > 0.0 || bindings::Amount(bindings::Action::TurnRight, g_mk.right) > 0.0)) {
 				g.playerAuto = false;
 				g.autopilot = false;
 				g.routeHold=false; g.holdId=0;
@@ -4614,17 +4596,14 @@ namespace vehicleflight
 		{
 			// N tap: your vehicle only; N hold (1 s): every escort too, which also works while you drive. U tap: your vehicle covers you by itself;
 			// U hold: a free follower drives it to cover you. The stance key cycles Defend / Attack / Hold fire anywhere.
-			static keygesture::Input nKey, uKey;
-			static bool stanceDown = false;
-			const ULONGLONG keyNow = GetTickCount64();
-			const auto nAct = nKey.Update(bindings::Held(bindings::Action::Summon, g_keys.call), focused, keyNow);
-			const auto uAct = uKey.Update(bindings::Held(bindings::Action::Cover, g_keys.follow), focused && !driven, keyNow);
-			const bool stanceHeld = focused && bindings::Held(bindings::Action::Stance, g_keys.stance);
-			if (stanceHeld && !stanceDown) {
+
+            keygesture::Action nAct{bindings::Triggered(bindings::Action::Summon),bindings::Triggered(bindings::Action::RecallEscorts)};
+            keygesture::Action uAct{bindings::Triggered(bindings::Action::Cover),bindings::Triggered(bindings::Action::CrewDrive)};
+            const bool stanceHeld=bindings::Triggered(bindings::Action::Stance);
+			if (stanceHeld) {
 				const auto s = npcvehicles::CycleStance();
 				notify::Show("Stance: %s", s == npcvehicles::Stance::Attack ? "Attack" : s == npcvehicles::Stance::HoldFire ? "Hold fire" : "Defend");
 			}
-			stanceDown = stanceHeld;
 			const bool scanCall = g_scanCall.exchange(false);  // the scanner marker button counts as the call key
 			bool callPressed = (!driven && (nAct.tap || nAct.hold)) || scanCall;
 			const bool coverHand = uAct.hold;  // hand your vehicle to a follower
@@ -4719,9 +4698,9 @@ namespace vehicleflight
 					const bool sameWorld = Worldspace(rover) && Worldspace(rover) == Worldspace(player);
 					if (!has3D || !sameWorld || !std::isfinite(dist) || dist > kCallFar) {
 						if (g.autopilot) Stop("recall: moving it next to you");
-						logger::Write("Rover call: %08X %s; moving it next to the player", g_roverId,
+						logger::Write("Rover call: %08X %s; moving it next to the player (or the area's summon point)", g_roverId,
 							!sameWorld ? "in another worldspace" : !has3D ? "not loaded" : "far");
-						AskMove(player);
+						AskMove(player, true);
 					}
 					else if (dist <= kCallStop + 2.0) {
 						if (g.autopilot) Stop("recall: already beside you");
@@ -4897,7 +4876,7 @@ namespace vehicleflight
 				else if (g_remote && vcontract::AssignedTo(g_roverId))  // the empty vehicle runs its navigation profile: SCOUT, RETURN HOME
 					std::snprintf(status, sizeof(status), "%s", profileclass::Upper(vcontract::AssignedTo(g_roverId)->name).c_str());
 				else if (g.autopilot) std::snprintf(status, sizeof(status), "SUMMONING  %.0f m", std::min(toRover, 9999.0));
-				else if (g_move.pending || (g_movedAt && nowMs - g_movedAt < 4000)) std::snprintf(status, sizeof(status), "MOVED TO YOU");
+				else if (g_move.pending || (g_movedAt && nowMs - g_movedAt < 4000)) std::snprintf(status, sizeof(status), (g_move.pending ? g_move.summonPoint : g_movedToPoint) ? "AT SUMMON POINT" : "MOVED TO YOU");
 			}
 			const std::string callKey = bindings::Label(bindings::Action::Summon, g_keys.call);
 			const std::string followKey = bindings::Label(bindings::Action::Cover, g_keys.follow);
@@ -5653,7 +5632,7 @@ namespace vehicleflight
 			g_clearBoosts[i].store(0);
 			g_jobs[i] = PilotJob{};
 		}
-		g_driverVehicle.store(0);
+		g_driverVehicle.store(0);g_manualDriverId.store(0);
 		g_lastDrivenVehicle.store(0);
 		g_tapBoost = Tap{};
 		g_tapThrust = Tap{};

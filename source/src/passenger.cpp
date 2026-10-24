@@ -363,16 +363,10 @@ namespace passenger
 	{
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player) return;
-		if (!g_key) {
-			// The main-row / (VK_OEM_2) was this key; it is lent to the NPC probe selector for now (2026-10-18), so the passenger key is off unless one of the others is free.
-			g_key = controlmap::ClaimFirst("passenger", "ride along", { 'G', 'I', 'L', 'M', 'X', 'V' });
-			logger::Write("Passenger: key %s (near a vehicle an NPC flies: ride along; again: get out)", g_key ? controlmap::KeyName(g_key).c_str() : "NONE FREE");
-			if (!g_key) g_key = -1;
-		}
-		const bool down = Focused() && bindings::Held(bindings::Action::RideAlong, g_key > 0 ? g_key : 0);
-		const bool press = down && !g_keyDown;
-		const bool release = !down && g_keyDown;
-		g_keyDown = down;
+        g_key='G';
+        const bool press=bindings::Triggered(bindings::Action::RideAlong);
+        const bool exit=bindings::Triggered(bindings::Action::PassengerExit);
+        const bool wheel=bindings::Triggered(bindings::Action::TakeWheel);
 		const ULONGLONG now = GetTickCount64();
 		if (g_wheel.stage) {
 			WheelTick(player, now);
@@ -393,14 +387,8 @@ namespace passenger
 				GetOut(player, "arrived");
 				return;
 			}
-			if (press) { g_downAt = now; g_wheelAsked = false; }
-			if (down && g_downAt && !g_wheelAsked && now - g_downAt >= kWheelMs) {
-				g_wheelAsked = true;
-				StartWheel(player, vehicle);
-				return;
-			}
-			if (release && g_downAt && !g_wheelAsked) { g_downAt = 0; GetOut(player, "key"); return; }
-			if (release) g_downAt = 0;
+            if(wheel){StartWheel(player,vehicle);return;}
+            if(exit){GetOut(player,"passenger exit command");return;}
 			if (!npcvehicles::PilotFor(riding) && !npcvehicles::HasDriver(riding)) GetOut(player, "the driver left");
 			return;
 		}

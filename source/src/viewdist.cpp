@@ -1,6 +1,7 @@
 #include "viewdist.h"
 #include "game.h"
-#include "log.h"
+#include "log.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -19,7 +20,7 @@ namespace viewdist
 		constexpr std::uint32_t kObjectsValue = 0x05E86F70, kActorsValue = 0x05E86F30;
 		constexpr std::uint32_t kRebuild = 0x00573D40;      // FUN_140573d40
 
-		// On by default (2026-10-18, the user: "make the mod add this"): vehicles fade out at 3x the game's distance. seamless.ini [view] objectFade=1 restores the game's own.
+		// On by default (2026-10-18, the user: "make the mod add this"): vehicles fade out at 3x the game's distance. settings.ini [view] objectFade=1 restores the game's own.
 		constexpr float kDefaultObjects = 3.0f;
 		ULONGLONG g_readAt = 0, g_checkAt = 0;
 		float g_wantObjects = kDefaultObjects, g_wantActors = 1.0f;
@@ -61,11 +62,11 @@ namespace viewdist
 			g_readAt = now;
 			PWSTR docs = nullptr;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				const std::wstring ini = fvopaths::Settings();
 				CoTaskMemFree(docs);
 				const float o = ReadFloat(ini, L"objectFade", kDefaultObjects), a = ReadFloat(ini, L"actorFade", 1.0f);
 				if (o != g_wantObjects || a != g_wantActors) {
-					logger::Write("View distance: objects x%.2f, actors x%.2f (seamless.ini [view])", o, a);
+					logger::Write("View distance: objects x%.2f, actors x%.2f (settings.ini [view])", o, a);
 					g_wantObjects = o;
 					g_wantActors = a;
 					g_applied = false;

@@ -82,7 +82,7 @@ namespace crash
 					if (*p == '\\' || *p == '/') name = p + 1;
 				}
 				if (faulting && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && !t_unhandled &&
-					(_strnicmp(name, "Seamless", 8) == 0 || _strnicmp(name, "Gravspace", 9) == 0)) return EXCEPTION_CONTINUE_SEARCH;
+					(_strnicmp(name, "Seamless", 8) == 0 || _strnicmp(name, "FlyingVehicleOverhaul", 21) == 0 || _strnicmp(name, "Gravspace", 9) == 0)) return EXCEPTION_CONTINUE_SEARCH;
 				// Other mods' DLLs raise and catch their own exceptions as normal work (2026-10-21: CassiopeiaPapyrusExtender's
 				// first-chance faults were logged as "CRASH?"). Before anything handles it only the game's own code is watched;
 				// a real crash anywhere still reaches the unhandled filter and is reported in full.

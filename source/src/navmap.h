@@ -85,7 +85,7 @@ namespace navmap
 	bool HullEnabled();            // nav.ini [nav] shape=0 turns the hull-sized sweeps off (default on); a fault turns them off by itself
 	// For the log line: the straight way's thin ray and hull sweep verdicts side by side this frame.
 	void NoteHull(bool rayBlocked, bool hullBlocked);
-	bool SamplerEnabled();        // Logs\SeamlessVehicle\nav.ini [nav] sampler=0 turns it off (default on); re-read every 5 s
+	bool SamplerEnabled();        // Logs\FlyingVehicleOverhaul\nav.ini [nav] sampler=0 turns it off (default on); re-read every 5 s
 	void NoteSampler(bool used);  // for the log line: used the sampler's choice / fell back to the old rule
 
 	// ---- Housekeeping ----

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <array>
 
 // Switches the GAME's own action off on the controller buttons the mod uses in the situation now (2026-10-24, the user:
 // a mod button must never also do the game's thing). Every input event is resolved to the game's user event as it is
@@ -12,5 +13,7 @@ namespace inputgate
 {
 	bool Install();                          // startup only (an E8 call redirect)
 	void SetBlocked(std::uint32_t padBits);  // bindlogic controller bits; any thread
+    void SetBlockedKeys(const std::array<bool,256>& keys);
+    bool GameplayAllowed();
 	unsigned TakeBlockedCount();             // events blocked since the last call (for the log)
 }

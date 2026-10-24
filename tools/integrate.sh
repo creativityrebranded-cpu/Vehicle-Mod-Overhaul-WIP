@@ -11,14 +11,14 @@ cd "$ROOT/source" || exit 1
 EXTRA=()
 [ -n "${SFSE_ROOT:-}" ] && EXTRA+=("-DSFSE_ROOT=$SFSE_ROOT")
 cmake -S . -B build "${EXTRA[@]}" > /dev/null || { echo "cmake configure failed (Visual Studio 2022 Build Tools and CMake 3.24+ needed)"; exit 1; }
-cmake --build build --config Release --target SeamlessVehicle 2>&1 | grep -E "error|SeamlessVehicle.dll"
-DLL="build/Release/SeamlessVehicle.dll"
+cmake --build build --config Release --target FlyingVehicleOverhaul 2>&1 | grep -E "error|FlyingVehicleOverhaul.dll"
+DLL="build/Release/FlyingVehicleOverhaul.dll"
 [ -f "$DLL" ] || { echo "no DLL built"; exit 1; }
 if tasklist 2>/dev/null | grep -qi starfield.exe; then
   echo "BUILT, not installed: the game is running"; exit 0
 fi
 mkdir -p "$GAME_DATA/SFSE/Plugins"
 cp "$DLL" "$GAME_DATA/SFSE/Plugins/" && echo "installed $DLL ($NOTE)"
-for esm in "SeamlessPilots.esm" "Vehicles - Real.esm"; do
+for esm in "FVO_NPCPilots.esm" "FVO_ParkedVehiclesPatch.esm"; do
   [ -f "$ROOT/Data/$esm" ] && ! cmp -s "$ROOT/Data/$esm" "$GAME_DATA/$esm" && cp "$ROOT/Data/$esm" "$GAME_DATA/$esm" && echo "installed $esm"
 done

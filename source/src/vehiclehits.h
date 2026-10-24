@@ -7,7 +7,7 @@
 // Projectile::Launch hook reports its handle) is followed frame by frame; a projectile whose path passes through a vehicle's space (the world
 // list's vertical cylinder) counts as a hit for that vehicle, unless the shooter is that vehicle or sits in it. Damage per hit and the limit
 // use the native projectile weapon total and the game's player difficulty calculation, scaled by [hits] weaponScale=1 (float). [hits] damage=20
-// is used only when native data cannot be read. Health/limit come from Logs\SeamlessVehicle\seamless.ini [hits] (health=300, limit= overrides health,
+// is used only when native data cannot be read. Health/limit come from Logs\FlyingVehicleOverhaul\settings.ini [hits] (health=300, limit= overrides health,
 // driverShare=25 percent). At 0 health the
 // vehicle is wrecked (autopilot off, renewed until repaired over 25%); the counter heals after a quiet spell (a wreck later and slower).
 namespace vehiclehits

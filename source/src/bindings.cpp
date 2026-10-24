@@ -1,4 +1,5 @@
 #include "bindings.h"
+#include "commandinput.h"
 
 #include "addresses.h"
 #include "bindlogic.h"
@@ -9,7 +10,9 @@
 #include "log.h"
 #include "notify.h"
 #include "passenger.h"
-#include "vehicleflight.h"
+#include "realvehicles.h"
+#include "vehicleflight.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -27,47 +30,36 @@ namespace bindings
 {
 	namespace
 	{
-		struct Def
-		{
-			const wchar_t* key;        // the line in bindings.ini
-			const char* spec;          // what a new bindings.ini says
-			const char* what;          // its comment
-			const char* gameContext;   // the game binding "default" follows (its controller button too), or null
-			const char* gameEvent;
-		};
-		// In Action order.
-		// Layout 3 (2026-10-24, the user approved the situation-based map with no chords): a controller button belongs to
-		// the mod only in the situations named after '@' (bindlogic.h), and there the game's own action on it is switched
-		// off (inputgate). On foot the mod's controller actions live in the scanner (LB), where the game leaves buttons free.
-		constexpr Def kDefs[] = {
-			{ L"scanner", "default, Pad:DLeft:tap@vehicle, Pad:Y@scanner", "T: tap go / pick, double tap clear the route, hold 1 s ram; driving outside the scanner tap = Auto on / off", nullptr, nullptr },
-			{ L"summon", "default, Pad:DUp@vehicle, Pad:B@scanner", "N: summon your vehicle (tap), hold: with all escorts", nullptr, nullptr },
-			{ L"cover", "default, Pad:DDown@vehicle, Pad:LS@scanner", "U: follow (out of combat) / cover (in combat); hold: the follower drives", nullptr, nullptr },
-			{ L"stance", "default, Pad:DRight@vehicle, Pad:View:tap@scanner", "Defend / Attack / Hold fire for your vehicle and escorts", nullptr, nullptr },
-			{ L"hover_toggle", "default, Pad:LS@vehicle", "hover on / off", nullptr, nullptr },
-			{ L"lift_up", "default, Pad:Y@flying", "hover: climb", nullptr, nullptr },
-			{ L"lift_down", "default, Pad:X@flying", "hover: descend", nullptr, nullptr },
-			{ L"gear", "default, Pad:A@vehicle", "Alt: tap = next gear, hold = descend", nullptr, nullptr },
-			{ L"boost", "default-key, Pad:RB@vehicle", "LShift: boost; double tap in hover = boost stays on until boost or brake", "Vehicle", "VehicleBoost" },
-			{ L"accelerate", "default, Pad:LStickUp@flying|passenger", "the game's accelerate (W); also drives hover", "Vehicle", "VehicleAccel" },
-			{ L"brake", "default, Pad:LStickDown@flying|passenger", "the game's brake (S); also hover", "Vehicle", "VehicleBrake" },
-			{ L"turn_left", "default, Pad:LStickLeft", "the game's turn left (A); hover: roll left", "Vehicle", "VehicleTurnLeft" },
-			{ L"turn_right", "default, Pad:LStickRight", "the game's turn right (D); hover: roll right", "Vehicle", "VehicleTurnRight" },
-			{ L"vertical_boost", "default", "the game's vertical boost (Space)", "Vehicle", "VehicleVertBoost" },
-			{ L"ride_along", "default, Pad:DRight:hold@scanner, Pad:A@passenger", "next to a vehicle an NPC flies: ride along / get out", nullptr, nullptr },
-			{ L"retry_trip", "default, Pad:DLeft:tap@scanner", "route: retry the trip", nullptr, nullptr },
-			{ L"skip_stop", "default, Pad:DRight:tap@scanner", "route: skip the stop", nullptr, nullptr },
-			{ L"own_profile", "default, Pad:DLeft:hold@vehicle|scanner", "your vehicle's profile; driving: Stop / Orbit / Patrol / Cruise", nullptr, nullptr },
-			{ L"show_hints", "default, Pad:RS:tap@vehicle, Pad:View:hold@scanner", "J: show every hint and panel", nullptr, nullptr },
-		};
-		static_assert(std::size(kDefs) == std::size_t(Action::Count), "one bindings.ini line per action");
+
 		// Layout 2's lines (the LB chords), in Action order: a line still exactly at one of these, or at "default", takes
 		// layout 3 once. A line the player edited is kept.
 		constexpr const char* kLayout2[] = { "default, Pad:LB+A", "default, Pad:LB+DUp", "default, Pad:LB+DDown", "default, Pad:LB+DRight",
 			"default, Pad:LB+Y", "default, Pad:RB", "default, Pad:LB+RB", "default, Pad:LB+X", "default", "default, Pad:RT", "default, Pad:LT",
 			"default, Pad:LStickLeft", "default, Pad:LStickRight", "default", "default, Pad:LB+B", "default, Pad:LB+DLeft", "default, Pad:LB+RS",
 			"default", "default, Pad:LB+View" };
-		static_assert(std::size(kLayout2) == std::size(kDefs));
+
+
+        constexpr const char* kLayout3[] = {
+            "default, Pad:DLeft:tap@vehicle, Pad:Y@scanner",
+            "default, Pad:DUp@vehicle, Pad:B@scanner",
+            "default, Pad:DDown@vehicle, Pad:LS@scanner",
+            "default, Pad:DRight@vehicle, Pad:View:tap@scanner",
+            "default, Pad:LS@vehicle",
+            "default, Pad:Y@flying",
+            "default, Pad:X@flying",
+            "default, Pad:A@vehicle",
+            "default-key, Pad:RB@vehicle",
+            "default, Pad:LStickUp@flying|passenger",
+            "default, Pad:LStickDown@flying|passenger",
+            "default, Pad:LStickLeft",
+            "default, Pad:LStickRight",
+            "default",
+            "default, Pad:DRight:hold@scanner, Pad:A@passenger",
+            "default, Pad:DLeft:tap@scanner",
+            "default, Pad:DRight:tap@scanner",
+            "default, Pad:DLeft:hold@vehicle|scanner",
+            "default, Pad:RS:tap@vehicle, Pad:View:hold@scanner",
+        };
 
 		std::mutex g_lock;
 		std::array<bindlogic::Binding, std::size_t(Action::Count)> g_bind{};
@@ -79,8 +71,17 @@ namespace bindings
 		bindlogic::Capture g_capture;
 		ULONGLONG g_captureAt=0;
 		bool g_suppressInput=false;
-		constexpr const char* kNames[]={"Focus target / scanner destination","Summon vehicle","Follow / cover","Combat stance","Toggle hover","Climb","Descend","Change gear / descend","Boost","Accelerate","Brake","Turn left","Turn right","Vertical boost","Ride along / exit","Retry trip","Skip route stop","Vehicle profile","Show hints"};
-		static_assert(std::size(kNames)==std::size(kDefs));
+        const auto kNames = [] {std::array<const char*,std::size(kDefs)> n{};for(std::size_t i=0;i<n.size();++i)n[i]=kDefs[i].what;return n;}();
+        commandinput::Frame g_commands;
+        commandinput::Sample g_sample;
+
+        bool g_allowed=false, g_capturePad=false;
+        bool LayerOn(std::size_t i) {
+            const auto layer=kDefs[i].layer;
+            const bool recording=g_sample.placement;
+            return layer==Layer::Placement?recording:layer==Layer::Target?!recording:true;
+        }
+
 		std::uint32_t g_modifiers = 0;
 		bool g_loaded = false;
 		FILETIME g_stamp{};
@@ -97,7 +98,6 @@ namespace bindings
 		// The situation now (bindlogic kCtx*, Tick), the tap / hold results per action and alternative (Tick, under g_lock),
 		// and the controller buttons whose game action is off right now (inputgate).
 		std::atomic<std::uint8_t> g_ctx{ bindlogic::kCtxFoot };
-		std::array<std::vector<bindlogic::GestureState>, std::size_t(Action::Count)> g_gestureState{};
 		std::array<std::vector<bool>, std::size_t(Action::Count)> g_gestureOn{};
 		std::uint32_t g_blockedShown = 0;
 		int g_styleSetting = 0;                      // [display] pad_names: 0 auto, 1 xbox, 2 playstation
@@ -119,7 +119,7 @@ namespace bindings
 		{
 			PWSTR docs = nullptr;
 			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return {};
-			std::wstring dir = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle";
+			std::wstring dir = fvopaths::Dir();
 			CoTaskMemFree(docs);
 			SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
 			return dir + L"\\bindings.ini";
@@ -136,30 +136,17 @@ namespace bindings
 		{
 			FILE* f = nullptr;
 			if (_wfopen_s(&f, path.c_str(), L"w") != 0 || !f) return;
-			std::fprintf(f,
-				"; Flying Vehicle Overhaul - controls. Saved changes apply while the game runs.\n"
-				";\n"
-				"; Each line lists alternatives, separated by commas; any one of them counts:\n"
-				";   T, F7, LShift, Space, Mouse4 ...  a key or mouse button\n"
-				";   Pad:A                             a controller button: A B X Y LB RB LT RT LS RS Start View\n"
-				";                                     DUp DDown DLeft DRight, LStickUp/Down/Left/Right, RStickUp/Down/Left/Right\n"
-				";   Pad:DUp@vehicle                   a controller button only in these situations: foot, ground, hover,\n"
-				";                                     vtol, scanner, passenger, flying (hover|vtol), vehicle (all three);\n"
-				";                                     join with |. There the game's own action on that button is off.\n"
-				";   Pad:DLeft:tap / Pad:DLeft:hold    a short press / a press held 0.5 s, so two actions can share a button\n"
-				";   Pad:LB+DUp                        a chord: hold LB, press DUp. The game still acts on LB itself, so the\n"
-				";                                     defaults use none.\n"
-				";   default                           the mod's own key for it (the game's binding where it follows one,\n"
-				";                                     with the game's controller button)\n"
-				";   none                              nothing\n"
-				"; Example: summon = default, Pad:DUp@vehicle, Pad:B@scanner\n"
-				";\n"
-				"; Controller defaults: driving, DUp summon, DDown follow / cover, DRight stance, DLeft tap Auto (hold: Stop /\n"
-				"; Orbit / Patrol / Cruise), A gear (hold: descend), L3 hover, R3 hints, RB boost, hovering Y / X climb / descend.\n"
-				"; In the scanner (LB, also on foot): Y go there, B summon, L3 follow / cover, View stance (hold: hints), DLeft\n"
-				"; retry (hold: profile), DRight skip (hold: ride along). Prompts name the device you pressed a button on last;\n"
-				"; [display] pad_names = auto / xbox / playstation.\n"
-				"\n[bindings]\n");
+            std::fprintf(f,
+                "; Flying Vehicle Overhaul 0.73.0: independent commands, binding layout 4.\n"
+                "; Alternatives are comma separated. Each command has its own keyboard and controller slots.\n"
+                "; Examples: F6:tap@scanner, Pad:Y:tap@scanner, Pad:A:hold@passenger.\n"
+                "; Gestures: raw (held), :tap, :hold (0.5 s), :double (within 0.3 s).\n"
+                "; Contexts: foot, ground, hover, vtol, flying, vehicle, scanner, passenger, editor; join with |.\n"
+                "; default-key follows this command's keyboard default; default-pad follows its native pad default.\n"
+                "; Rebinding/clearing one device slot leaves the other device and other contexts alone.\n"
+                "; UI rebinding rejects real same-context/gesture conflicts. none unbinds this command.\n"
+                "; Open the scanner and double tap View/Create for the controller HUD editor; Circle/B saves and closes.\n"
+                "\n[bindings]\n");
 			for (const auto& d : kDefs) std::fprintf(f, "; %s\n%s = %s\n", d.what, Narrow(d.key).c_str(), d.spec);
 			std::fclose(f);
 			logger::Write("Bindings: wrote %s with the default controls", Narrow(path.c_str()).c_str());
@@ -176,8 +163,8 @@ namespace bindings
 			int problems = 0;
 			// Layout 3 (2026-10-24): the situation-based controller map. A line still at "default" or at its layout 2 line
 			// takes the new default once.
-			const bool upgrade = GetPrivateProfileIntW(L"meta", L"layout", 1, path.c_str()) < 3;
-			if (upgrade) WritePrivateProfileStringW(L"meta", L"layout", L"3", path.c_str());
+			const bool upgrade = GetPrivateProfileIntW(L"meta", L"layout", 1, path.c_str()) < 4;
+            if(upgrade) CopyFileW(path.c_str(),(path+L".before-layout4").c_str(),TRUE);
 			{
 				wchar_t w[32] = {};
 				if (GetPrivateProfileStringW(L"display", L"pad_names", L"", w, 32, path.c_str()) == 0) WritePrivateProfileStringW(L"display", L"pad_names", L"auto", path.c_str());
@@ -195,7 +182,7 @@ namespace bindings
 				}
 				else spec = Narrow(w);
 				const auto was = bindlogic::Trim(spec);
-				if (upgrade && (bindlogic::Same(was, "default") || bindlogic::Same(was, kLayout2[i])) && !bindlogic::Same(was, kDefs[i].spec)) {
+				if (upgrade && (bindlogic::Same(was, "default") || (i<std::size(kLayout2)&&bindlogic::Same(was,kLayout2[i])) || (i<std::size(kLayout3)&&bindlogic::Same(was,kLayout3[i]))) && !bindlogic::Same(was, kDefs[i].spec)) {
 					spec = kDefs[i].spec;
 					const std::wstring def(spec.begin(), spec.end());
 					WritePrivateProfileStringW(L"bindings", kDefs[i].key, def.c_str(), path.c_str());
@@ -203,7 +190,10 @@ namespace bindings
 				}
 				if (const auto semi = spec.find(';'); semi != std::string::npos && semi > 0 && spec[semi - 1] == ' ') spec.resize(semi);  // a trailing "; comment"
 				std::string bad;
-				g_bind[i] = bindlogic::Parse(spec, &bad);
+                g_bind[i] = bindlogic::Parse(spec, &bad);
+                if(!g_defaultSeen[i])g_defaultVk[i]=kDefs[i].defaultVk; g_defaultSeen[i]=true;
+                g_gestureOn[i].assign(g_bind[i].size(),false);
+
 				if (!bad.empty()) {
 					++problems;
 					logger::Write("Bindings: %s: not understood: %s (the rest of the line is used)", Narrow(kDefs[i].key).c_str(), bad.c_str());
@@ -211,6 +201,8 @@ namespace bindings
 				logger::Write("Bindings: %-14s = %s", Narrow(kDefs[i].key).c_str(), spec.c_str());
 			}
 			g_modifiers = bindlogic::Modifiers(std::vector<bindlogic::Binding>(g_bind.begin(), g_bind.end()));
+            if(upgrade)WritePrivateProfileStringW(L"meta",L"layout",L"4",path.c_str());
+            g_suppressInput=true;g_commands.Reset();
 			g_loaded = true;
 			g_generation.fetch_add(1);
 			if (reloaded) notify::Show(problems ? "Controls reloaded (%d line(s) partly not understood, see the log)" : "Controls reloaded from bindings.ini", problems);
@@ -223,6 +215,8 @@ namespace bindings
 			static bool told = false;
 			for (std::size_t i = 0; i < std::size(kDefs); ++i) {
 				if (!kDefs[i].gameContext) continue;
+                const int key=controlmap::KeyFor(kDefs[i].gameContext,kDefs[i].gameEvent,kDefs[i].defaultVk);
+                if(g_defaultVk[i]!=key){g_defaultVk[i]=key;g_generation.fetch_add(1);}
 				const std::uint32_t code = controlmap::PadFor(kDefs[i].gameContext, kDefs[i].gameEvent);
 				const auto mapped=bindlogic::GamePadBit(code);
 				if(g_gamePad[i]!=mapped){g_gamePad[i]=mapped;g_generation.fetch_add(1);}
@@ -321,6 +315,7 @@ namespace bindings
 		// vehicle being driven (physical VTOL, hover, wheels), else on foot.
 		std::uint8_t Situation()
 		{
+            if(hoverui::Editing())return bindlogic::kCtxEditor;
 			if (hoverui::IsScannerOpen()) return bindlogic::kCtxScanner;
 			if (passenger::RidingVehicle()) return bindlogic::kCtxPassenger;
 			const auto player = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kPlayerCharacterPtr);
@@ -385,31 +380,41 @@ namespace bindings
 		if (!g_connected.load()) g_device.device = bindlogic::Device::Keyboard;
 		else if (g_device.Update(keyPress, padPress)) logger::Write("Bindings: prompts now name the %s", g_device.device == bindlogic::Device::Pad ? "controller" : "keyboard and mouse");
 		g_padShown.store(g_device.device == bindlogic::Device::Pad, std::memory_order_relaxed);
-		{
-			// The situation, the tap / hold gestures, and the buttons whose game action is off (layout 3).
-			const std::uint8_t ctx = Situation();
-			if (g_ctx.exchange(ctx) != ctx) g_generation.fetch_add(1);
-			const std::uint32_t pad = g_pad.load(std::memory_order_relaxed);
-			std::uint32_t blocked = 0;
-			for (std::size_t i = 0; i < std::size(kDefs); ++i) {
-				const auto& b = g_bind[i];
-				auto& st = g_gestureState[i];
-				auto& on = g_gestureOn[i];
-				st.resize(b.size());
-				on.assign(b.size(), false);
-				for (std::size_t j = 0; j < b.size(); ++j)
-					if (b[j].gesture != bindlogic::Gesture::Raw)
-						on[j] = st[j].Update(bindlogic::InCtx(b[j], ctx) && bindlogic::PadOn(b[j], pad, g_modifiers), b[j].gesture, now);
-				// The game's own vehicle actions the mod follows (boost, accelerate ...) stay the game's.
-				if (!kDefs[i].gameContext) blocked |= bindlogic::GameBlockBits(b, ctx, pad);
-			}
-			if (!g_connected.load()) blocked = 0;
-			inputgate::SetBlocked(blocked);
-			if (blocked != g_blockedShown) {
-				g_blockedShown = blocked;
-				logger::Write("Bindings: situation %u, the game's controller actions off on: %s", unsigned(ctx), PadList(blocked).c_str());
-			}
-		}
+        {
+            const auto ctx=Situation();
+            const bool contextChanged=g_ctx.exchange(ctx)!=ctx;
+            if(contextChanged)g_generation.fetch_add(1);
+            const bool allowed=inputgate::GameplayAllowed();
+            g_allowed=allowed;
+            g_sample={};g_sample.context=ctx;g_sample.pad=g_pad.load();
+            {std::lock_guard axes(g_axesLock);g_sample.axes=g_axes;}
+            g_sample.allowed=allowed&&!g_suppressInput&&g_captureAction<0;
+            const auto player=*reinterpret_cast<std::uintptr_t*>(game::Base()+addr::kPlayerCharacterPtr);
+            const auto driven=player?reinterpret_cast<std::uintptr_t(*)(std::uintptr_t)>(game::Base()+addr::kPlayerVehicle)(player):0;
+            g_sample.driving=driven&&!passenger::RidingVehicle();
+            g_sample.placement=!g_sample.driving&&realvehicles::RecordingPlacements();
+            for(int key=1;key<256;++key)g_sample.keys[std::size_t(key)]=KeyDown(key);
+            g_commands.Update(g_bind,g_defaultVk,g_gamePad,g_sample,now);
+            g_modifiers=g_commands.modifiers;
+            std::uint32_t blocked=0;std::array<bool,256> keys{};
+            for(std::size_t i=0;i<std::size(kDefs);++i){
+                g_gestureOn[i]=g_commands.on[i];
+                if(!g_sample.allowed||!g_sample.Available(i))continue;
+                for(const auto& alt:g_bind[i])if(bindlogic::InCtx(alt,ctx)){
+                    const int vk=alt.useDefault?(alt.defaultKeyboard?g_defaultVk[i]:0):alt.vk;
+                    const auto pb=alt.useDefault?(alt.defaultController?g_gamePad[i]:0):alt.pad;
+                    bool nativeKey=kDefs[i].gameContext&&vk==g_defaultVk[i];
+                    bool nativePad=kDefs[i].gameContext&&(pb==g_gamePad[i]||(Action(i)==Action::Boost&&pb==bindlogic::kRB));
+                    if(Action(i)==Action::DriverExit&&vehicleflight::Active())nativeKey=nativePad=false;
+                    if(!nativeKey&&vk>0&&vk<256)keys[std::size_t(vk)]=true;
+                    if(!nativePad&&pb&&(!alt.mod||(g_sample.pad&alt.mod)))blocked|=pb&bindlogic::kPadPressBits;
+                }
+            }
+            inputgate::SetBlocked(g_connected?blocked:0);
+            inputgate::SetBlockedKeys(keys);
+            if(blocked!=g_blockedShown){g_blockedShown=blocked;logger::Write("Bindings: situation %u, owned controller buttons: %s",unsigned(ctx),PadList(blocked).c_str());}
+        }
+
 		const bool shownPad = PadInUse();
 		const auto style = Style();
 		if (shownPad != g_lastShownPad || style != g_lastStyle) { g_lastShownPad = shownPad; g_lastStyle = style; g_generation.fetch_add(1); }
@@ -423,10 +428,10 @@ namespace bindings
 		PollPad(GetTickCount64());
 		const std::uint32_t pad = g_pad.load(std::memory_order_relaxed);
 		std::lock_guard lk(g_lock);
-		if(!g_defaultSeen[i]||g_defaultVk[i]!=defaultVk){g_defaultVk[i]=defaultVk;g_defaultSeen[i]=true;g_generation.fetch_add(1);}
-		if(g_captureAction>=0||g_suppressInput)return false;
+		(void)defaultVk; defaultVk=g_defaultVk[i];
+		if(!g_allowed||!LayerOn(i)||g_captureAction>=0||g_suppressInput)return false;
 		if (!g_loaded) return KeyDown(defaultVk);  // before the first Tick: the module's own key
-		return bindlogic::Held(g_bind[i], defaultVk, pad, g_modifiers, KeyDown, g_gamePad[i], g_ctx.load(std::memory_order_relaxed), &g_gestureOn[i]);
+        (void)pad;for(bool value:g_gestureOn[i])if(value)return true;return false;
 	}
 
 	double Amount(Action a, int defaultVk)
@@ -435,13 +440,9 @@ namespace bindings
 		if (i >= std::size(kDefs)) return 0.0;
 		PollPad(GetTickCount64());
 		const std::uint32_t pad = g_pad.load(std::memory_order_relaxed);
-		bindlogic::Axes axes;
-		{ std::lock_guard al(g_axesLock); axes = g_axes; }
-		std::lock_guard lk(g_lock);
-		if(!g_defaultSeen[i]||g_defaultVk[i]!=defaultVk){g_defaultVk[i]=defaultVk;g_defaultSeen[i]=true;g_generation.fetch_add(1);}
-		if(g_captureAction>=0||g_suppressInput)return 0.0;
-		if (!g_loaded) return KeyDown(defaultVk) ? 1.0 : 0.0;
-		return bindlogic::Amount(g_bind[i], defaultVk, pad, g_modifiers, KeyDown, g_gamePad[i], g_ctx.load(std::memory_order_relaxed), &g_gestureOn[i], axes);
+        std::lock_guard lk(g_lock);(void)defaultVk;(void)pad;
+        if(!g_allowed||!LayerOn(i)||g_captureAction>=0||g_suppressInput)return 0;
+        return g_commands.Amount(i,g_bind,g_defaultVk,g_gamePad,g_sample);
 	}
 
 	std::string Label(Action a, int defaultVk)
@@ -449,10 +450,15 @@ namespace bindings
 		const std::size_t i = std::size_t(a);
 		if (i >= std::size(kDefs)) return "unbound";
 		std::lock_guard lk(g_lock);
-		if(!g_defaultSeen[i]||g_defaultVk[i]!=defaultVk){g_defaultVk[i]=defaultVk;g_defaultSeen[i]=true;g_generation.fetch_add(1);}
+		(void)defaultVk; defaultVk=g_defaultVk[i];
 		if (!g_loaded) return defaultVk ? bindlogic::KeyLabel(defaultVk) : "unbound";
-		return bindlogic::Label(g_bind[i], defaultVk, g_gamePad[i], PadInUse() ? bindlogic::Show::Pad : bindlogic::Show::Keyboard, Style(),
-			g_ctx.load(std::memory_order_relaxed));
+        const bool pad=PadInUse();const auto ctx=g_ctx.load();
+        const auto text=bindlogic::Label(g_bind[i],defaultVk,g_gamePad[i],pad?bindlogic::Show::Pad:bindlogic::Show::Keyboard,Style(),ctx);
+        if(pad&&ctx==bindlogic::kCtxFoot&&text=="unbound"){
+            const auto scan=bindlogic::Label(g_bind[i],defaultVk,g_gamePad[i],bindlogic::Show::Pad,Style(),bindlogic::kCtxScanner);
+            if(scan!="unbound")return "Scanner > "+scan;
+        }
+        return text;
 	}
 
 	std::string Label(Action a)
@@ -464,10 +470,15 @@ namespace bindings
 		return Label(a, vk);
 	}
 
+    void ResetRuntime(){std::lock_guard lk(g_lock);g_commands.Reset();g_allowed=false;g_suppressInput=true;g_captureAction=-1;}
+    bool Triggered(Action a){const auto i=std::size_t(a);std::lock_guard lk(g_lock);return i<g_commands.triggered.size()&&g_allowed&&g_commands.triggered[i];}
+    bool Started(Action a){const auto i=std::size_t(a);std::lock_guard lk(g_lock);return i<g_commands.started.size()&&g_allowed&&g_commands.started[i];}
+    bool Allowed(){std::lock_guard lk(g_lock);return g_allowed&&!g_suppressInput&&g_captureAction<0;}
 	bool PadConnected() { return g_connected.load(); }
 	bool UsingPad() { return PadInUse(); }
 	bool GameHeld(const char* context, const char* event, int fallbackVk)
 	{
+        if(!Allowed())return false;
 		PollPad(GetTickCount64());
 		if (KeyDown(controlmap::KeyFor(context, event, fallbackVk))) return true;
 		const auto bit = bindlogic::GamePadBit(controlmap::PadFor(context, event));
@@ -497,7 +508,7 @@ namespace bindings
 	{
 		if(std::size_t(a)>=std::size(kDefs))return;
 		std::lock_guard lk(g_lock);if(!g_loaded)Load(false);
-		g_captureAction=int(a);g_capture={};g_captureAt=GetTickCount64();g_suppressInput=true;g_generation.fetch_add(1);
+		g_capturePad=PadInUse();g_captureAction=int(a);g_capture={};g_captureAt=GetTickCount64();g_suppressInput=true;g_generation.fetch_add(1);
 	}
 	void CancelCapture()
 	{
@@ -508,26 +519,37 @@ namespace bindings
 		std::lock_guard lk(g_lock);if(g_captureAction<0)return false;
 		if(action)*action=Action(g_captureAction);return true;
 	}
-	void CaptureTick()
-	{
-		DWORD process=0;GetWindowThreadProcessId(GetForegroundWindow(),&process);
-		if(process!=GetCurrentProcessId()){CancelCapture();return;}
-		const auto now=GetTickCount64();PollPad(now);
-		std::lock_guard lk(g_lock);if(g_captureAction<0)return;
-		const auto result=g_capture.Update(CaptureKey(),g_pad.load());
-		if(result.kind==bindlogic::Capture::Kind::Wait&&now-g_captureAt<20000)return;
-		const auto i=std::size_t(g_captureAction);
-		if(result.kind==bindlogic::Capture::Kind::Key||result.kind==bindlogic::Capture::Kind::Pad)SaveLocked(i,bindlogic::RemapDevice(g_bind[i],result.alt));
-		else if(result.kind==bindlogic::Capture::Kind::Default)SaveLocked(i,bindlogic::Parse(kDefs[i].spec));
-		else if(result.kind==bindlogic::Capture::Kind::Clear)SaveLocked(i,{});
-		g_captureAction=-1;g_generation.fetch_add(1);
-	}
+    void CaptureTick()
+    {
+        DWORD process=0;GetWindowThreadProcessId(GetForegroundWindow(),&process);
+        if(process!=GetCurrentProcessId()){CancelCapture();return;}
+        const auto now=GetTickCount64();PollPad(now);
+        bindlogic::Capture::Result result;Action action;bool targetPad=false;
+        {
+            std::lock_guard lk(g_lock);if(g_captureAction<0)return;
+            result=g_capture.Update(CaptureKey(),g_pad.load());
+            if(result.kind==bindlogic::Capture::Kind::Wait&&now-g_captureAt<20000)return;
+            action=Action(g_captureAction);targetPad=g_capturePad;g_captureAction=-1;g_generation.fetch_add(1);
+        }
+        if(result.kind==bindlogic::Capture::Kind::Key||result.kind==bindlogic::Capture::Kind::Pad)
+            Assign(action,result.kind==bindlogic::Capture::Kind::Pad,0,{result.alt.vk,result.alt.pad,result.alt.mod});
+        else if(result.kind==bindlogic::Capture::Kind::Clear)ClearSlot(action,targetPad,0);
+        else if(result.kind==bindlogic::Capture::Kind::Default){
+            std::lock_guard lk(g_lock);const auto i=std::size_t(action);
+            const auto next=commandinput::RestoreDevice(g_bind[i],bindlogic::Parse(kDefs[i].spec),targetPad);
+            SaveLocked(i,next);
+        }
+    }
+
 	void ResetAll()
 	{
 		std::lock_guard lk(g_lock);if(!g_loaded)Load(false);
 		const auto path=IniPath();if(path.empty())return;
 		bool ok=true;
-		for(const auto& def:kDefs){const std::wstring spec(def.spec,def.spec+std::strlen(def.spec));ok=WritePrivateProfileStringW(L"bindings",def.key,spec.c_str(),path.c_str())&&ok;}
+		for(std::size_t i=0;i<std::size(kDefs);++i){
+            const bool pad=PadInUse();const auto next=commandinput::RestoreDevice(g_bind[i],bindlogic::Parse(kDefs[i].spec),pad);
+            const auto spec=bindlogic::Spec(next);const std::wstring wide(spec.begin(),spec.end());ok=WritePrivateProfileStringW(L"bindings",kDefs[i].key,wide.c_str(),path.c_str())&&ok;
+        }
 		g_captureAction=-1;g_suppressInput=true;Load(false);
 		logger::Write("Bindings: Gameplay Options restore defaults %s",ok?"saved":"incomplete (write failed)");
 	}
@@ -582,28 +604,32 @@ namespace bindings
 		for (const auto& s : bindlogic::DeviceSlots(g_bind[i], pad, g_defaultVk[i], g_gamePad[i])) out.push_back(s.in);
 		return out;
 	}
-	std::string Assign(Action a, bool pad, int slot, bindlogic::Input in)
+    bool CanAssign(Action action,bool pad,int slot,bindlogic::Input in){
+        const auto i=std::size_t(action);if(i>=std::size(kDefs)||in.Empty())return false;
+        std::lock_guard lk(g_lock);if(!g_loaded)Load(false);
+        const auto proposed=commandinput::ScopedSlot(g_bind[i],bindlogic::Parse(kDefs[i].spec),pad,slot,in,g_defaultVk[i],g_gamePad[i]);
+        return commandinput::FindConflict(i,proposed,g_bind,g_defaultVk,g_gamePad,pad)==commandinput::Count;
+    }
+
+	bool Assign(Action action, bool pad, int slot, bindlogic::Input in)
 	{
-		const auto i = std::size_t(a);
-		if (i >= std::size(kDefs) || in.Empty()) return {};
+		const auto i = std::size_t(action);
+		if (i >= std::size(kDefs) || in.Empty()) return false;
 		std::lock_guard lk(g_lock);
 		if (!g_loaded) Load(false);
 		auto next = g_bind;
 		std::string moved;
-		for (std::size_t j = 0; j < next.size(); ++j) {
-			if (j == i) continue;
-			next[j] = bindlogic::Without(next[j], in, g_defaultVk[j], g_gamePad[j]);
-			if (bindlogic::Spec(next[j]) != bindlogic::Spec(g_bind[j])) { if (!moved.empty()) moved += ", "; moved += kNames[j]; }
-		}
-		// Already in another slot of this action: it moves into this one.
-		const auto own = bindlogic::DeviceSlots(next[i], pad, g_defaultVk[i], g_gamePad[i]);
-		for (int s = 0; s < int(own.size()); ++s)
-			if (s != slot && own[std::size_t(s)].in == in) { next[i] = bindlogic::SetSlot(next[i], pad, s, {}, g_defaultVk[i], g_gamePad[i]); if (s < slot) --slot; break; }
-		next[i] = bindlogic::SetSlot(next[i], pad, slot, in, g_defaultVk[i], g_gamePad[i]);
+        const auto proposed=commandinput::ScopedSlot(next[i],bindlogic::Parse(kDefs[i].spec),pad,slot,in,g_defaultVk[i],g_gamePad[i]);
+        const auto conflict=commandinput::FindConflict(i,proposed,next,g_defaultVk,g_gamePad,pad);
+        if(conflict!=commandinput::Count){
+            notify::Show("Binding unchanged: conflicts with %s",kNames[conflict]);
+            logger::Write("Bindings: assignment refused: %s overlaps %s",kNames[i],kNames[conflict]);return false;
+        }
+        next[i]=proposed;
 		logger::Write("Bindings: Controls page: %s %s slot %d = %s%s%s", kNames[i], pad ? "controller" : "keyboard", slot, InputLabel(in).c_str(),
 			moved.empty() ? "" : ", moved from ", moved.c_str());
 		SaveLines(next);
-		return moved;
+		return true;
 	}
 	void ClearSlot(Action a, bool pad, int slot)
 	{

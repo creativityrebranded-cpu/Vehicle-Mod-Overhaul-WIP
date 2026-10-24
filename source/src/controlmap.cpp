@@ -1,7 +1,8 @@
 #include "controlmap.h"
 
 #include "game.h"
-#include "log.h"
+#include "log.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -319,7 +320,7 @@ namespace controlmap
 			lastRead = now;
 			PWSTR docs = nullptr;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				const std::wstring ini = fvopaths::Settings();
 				CoTaskMemFree(docs);
 				value = GetPrivateProfileIntW(L"keys", L"debug", 0, ini.c_str()) != 0;
 			}

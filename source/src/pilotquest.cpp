@@ -69,14 +69,14 @@ namespace pilotquest
 					g_index = int(i);
 					g_actQuest = Lookup((i << 24) | kActQuestLocal);
 					if (g_actQuest && TypeOf(g_actQuest) != qType) g_actQuest = 0;
-					logger::Write("Pilot quest: SeamlessPilots.esm found at load index %02X: quest %08X (%s), package %08X", i, (i << 24) | kQuestLocal,
+					logger::Write("Pilot quest: FVO_NPCPilots.esm found at load index %02X: quest %08X (%s), package %08X", i, (i << 24) | kQuestLocal,
 						(At<std::uint8_t>(q, 0x114) & 1) ? "running" : "NOT running", (i << 24) | kPackLocal);
 					return;
 				}
 			}
 			if (g_index == -1) {
 				g_index = -2;
-				logger::Write("Pilot quest: SeamlessPilots.esm is not loaded (enable it in Plugins.txt); NPCs cannot be sent to vehicles by quest package");
+				logger::Write("Pilot quest: FVO_NPCPilots.esm is not loaded (enable it in Plugins.txt); NPCs cannot be sent to vehicles by quest package");
 			}
 		}
 
@@ -128,7 +128,7 @@ namespace pilotquest
 	{
 		if (slot < 0 || slot >= kSlots || !npc || !vehicle) return false;
 		if (!Available()) {
-			logger::Write("Pilot quest: assign refused: %s", g_quest ? "the quest is not running" : "SeamlessPilots.esm is not loaded");
+			logger::Write("Pilot quest: assign refused: %s", g_quest ? "the quest is not running" : "FVO_NPCPilots.esm is not loaded");
 			return false;
 		}
 		Clear(slot);
@@ -223,7 +223,7 @@ namespace pilotquest
 	{
 		if (slot < 0 || slot >= kSlots || !npc || !vehicle) return false;
 		if (!g_actQuest || !(At<std::uint8_t>(g_actQuest, 0x114) & 1)) {
-			logger::Write("Pilot quest: the Activate quest %s", g_actQuest ? "is not running" : "is not in the plugin (regenerate SeamlessPilots.esm)");
+			logger::Write("Pilot quest: the Activate quest %s", g_actQuest ? "is not running" : "is not in the plugin (regenerate FVO_NPCPilots.esm)");
 			return false;
 		}
 		ClearIn(g_actQuest, slot);

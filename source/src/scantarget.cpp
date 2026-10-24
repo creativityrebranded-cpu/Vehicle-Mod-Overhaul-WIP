@@ -15,12 +15,14 @@
 #include "log.h"
 #include "notify.h"
 #include "prefetch.h"
-#include "vehicleflight.h"
+#include "vehicleflight.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -99,7 +101,7 @@ namespace scantarget
 			g_keyRead = true;
 			PWSTR docs = nullptr;
 			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\seamless.ini";
+				const std::wstring ini = fvopaths::Settings();
 				CoTaskMemFree(docs);
 				g_key = int(GetPrivateProfileIntW(L"scanner", L"key", 'T', ini.c_str()));
 			}
@@ -383,13 +385,12 @@ namespace scantarget
 				// An externally replaced marker must not continue the old route under an old name.
 				g_chain.clear(); g_haveCurrent=false; g_routeCleared=false;
 			}
-			if(g_retryKey<0) g_retryKey=controlmap::ClaimFirst("route","Retry trip",{VK_OEM_1,VK_F8,VK_F12});
-            if(g_skipKey<0) g_skipKey=controlmap::ClaimFirst("route","Skip stop",{VK_OEM_4,VK_F9,VK_F10,'K'});
-			const bool skip=Focused() && bindings::Held(bindings::Action::SkipStop, g_skipKey);
-			const bool retry=Focused() && bindings::Held(bindings::Action::RetryTrip, g_retryKey);
+            g_retryKey=VK_OEM_1;g_skipKey=VK_OEM_4;
+            const bool skip=bindings::Triggered(bindings::Action::SkipStop);
+            const bool retry=bindings::Triggered(bindings::Action::RetryTrip);
             const bool available=(marker || !g_chain.empty()) && !g_routeCleared;
-			if(retry && !g_retryDown && available) vehicleflight::RetryScannerTrip();
-			else if(skip && !g_skipDown && available) {
+			if(retry && available) vehicleflight::RetryScannerTrip();
+			else if(skip && available) {
 				if(g_chain.empty()) ClearRoute();
 				else if(AdvanceStop(true)) vehicleflight::RequestScannerTrip();
 			}
@@ -508,43 +509,48 @@ namespace scantarget
 		const bool scanner = hoverui::IsScannerOpen();
 		const bool driving = reinterpret_cast<uptr (*)(uptr)>(game::Base() + addr::kPlayerVehicle)(player) != 0;
 		const Target t = scanner ? Look(player, now, !driving && realvehicles::RecordingPlacements()) : Target{};
-		const bool held = bindings::Held(bindings::Action::Scanner, g_key);
-		const bool combatFocusMode = !driving && (npcvehicles::CombatOf(player).fighting || npcvehicles::CombatFocus());
-		const bool enabled = Focused() && (combatFocusMode || scanner || driving || g_haveCurrent || !g_chain.empty() ||
-			vehicleflight::Ramming(vehicleflight::OwnRoverId()));
-		// A tap captured in the scanner must not land after it closed (or a tap outside it inside the scanner).
-		if (scanner != g_lastScanner || driving != g_lastDriving) {
-			g_input.Cancel(held);g_lastScanner=scanner;g_lastDriving=driving;g_pressedCombat=false;
-		}
-		const auto action = g_input.Update(held, enabled, now);
-		if(action.tap && g_pressedPlacement && scanner && !driving && realvehicles::RecordingPlacements()) {
-			const auto& point=g_pressedTarget;
-			if(realvehicles::RecordPlacement(point.x,point.y,point.z,g_pressedHeading,!point.valid||point.estimated,point.name.c_str())) {
-				const float pos[]{point.x,point.y,point.z};readout::SetPlayerMarker(pos);
-			}
-		}
-		else if (action.tap && g_pressedCombat && !driving) {
-			notify::Show(g_pressedFocus && npcvehicles::SetCombatFocus(g_pressedFocus) ? "Focus fire set | double-tap T to clear" : "Aim at a hostile target to focus fire");
-		}
-		else if (action.tap && g_pressedInScanner) Select(player, now);
-		else if (action.tap && driving) vehicleflight::ToggleAuto();  // outside the scanner, driving: Auto on / off
-		if (action.capture) {
-			g_pressedTarget = t;
-			g_pressedInScanner = scanner;
-			g_pressedCombat = combatFocusMode;
-			g_pressedPlacement=scanner&&!driving&&realvehicles::RecordingPlacements();
-			g_pressedHeading=At<game::Vec3>(player,off::kRefRotation).z;vehicleflight::ViewHeading(g_pressedHeading);
-			const auto actor = scanner ? HighlightedActor() : 0;
-			g_pressedActor = actor ? At<std::uint32_t>(actor, off::kFormId) : 0;
-			g_pressedFocus=g_pressedActor;
-			if(!g_pressedFocus)g_pressedFocus=scanner?hoverui::ScannerPickContext().form:vehiclehits::CrosshairTarget();
-		}
-		if (action.doubleTap) {
-			if(scanner&&!driving&&realvehicles::RecordingPlacements())notify::Show("Placement recording: tap T to save a surface");
-			else if(!driving && (combatFocusMode||g_pressedCombat)) {npcvehicles::SetCombatFocus(0);notify::Show("Focus cleared | automatic targeting");}
-			else { logger::Write("Scanner key: double tap clears the route"); ClearRoute(); }
-		}
-		if (action.hold && !(scanner&&!driving&&realvehicles::RecordingPlacements())) Hold(driving, now);
+        struct Selection {Target target;std::uint32_t actor=0,focus=0;double heading=0;bool scanner=false;};
+        static std::array<Selection,std::size_t(bindings::Action::Count)> selections;
+        const bindings::Action commands[]={bindings::Action::Scanner,bindings::Action::GuardPoint,bindings::Action::Ram,
+            bindings::Action::FocusTarget,bindings::Action::SavePlacement,bindings::Action::DeletePlacement,bindings::Action::SetSummonPoint};
+        for(auto command:commands){
+            auto& saved=selections[std::size_t(command)];
+            if(bindings::Started(command)){
+                saved={};saved.target=t;saved.scanner=scanner;
+                saved.heading=At<game::Vec3>(player,off::kRefRotation).z;vehicleflight::ViewHeading(saved.heading);
+                const auto actor=scanner?HighlightedActor():0;
+                saved.actor=actor?At<std::uint32_t>(actor,off::kFormId):0;
+                saved.focus=saved.actor?saved.actor:scanner?hoverui::ScannerPickContext().form:vehiclehits::CrosshairTarget();
+            }
+            if(!bindings::Triggered(command))continue;
+            g_pressedTarget=saved.target;g_pressedInScanner=saved.scanner;g_pressedActor=saved.actor;
+            g_pressedFocus=saved.focus;g_pressedHeading=saved.heading;
+            if(command==bindings::Action::Scanner){if(scanner)Select(player,now);}
+            else if(command==bindings::Action::GuardPoint){
+                if(saved.actor)notify::Show("Guard point: aim at a location");else Hold(driving,now);
+            }else if(command==bindings::Action::Ram){
+                const auto actor=RefById(saved.actor);
+                notify::Show(actor&&vehicleflight::RequestRam(actor)?"Ram order set":"Ram: aim at a person or vehicle in the scanner");
+            }else if(command==bindings::Action::FocusTarget){
+                notify::Show(saved.focus&&npcvehicles::SetCombatFocus(saved.focus)?"Focus fire set":"Aim at a hostile target to focus fire");
+            }else if(!driving&&scanner&&realvehicles::RecordingPlacements()){
+                const auto& point=saved.target;
+                if(command==bindings::Action::SavePlacement){
+                    if(realvehicles::RecordPlacement(point.x,point.y,point.z,saved.heading,!point.valid||point.estimated,point.name.c_str())){
+                        const float pos[]{point.x,point.y,point.z};readout::SetPlayerMarker(pos);
+                    }
+                }else if(command==bindings::Action::DeletePlacement){
+                    if(point.valid)realvehicles::DeletePlacement(point.x,point.y,point.z);else notify::Show("Aim at a saved parking spot");
+                }else if(command==bindings::Action::SetSummonPoint){
+                    if(point.valid&&!point.estimated)realvehicles::SetSummonPoint(point.x,point.y,point.z,saved.heading);
+                    else notify::Show("Summon point: aim at a visible surface");
+                }
+            }
+        }
+        if(bindings::Triggered(bindings::Action::AutoToggle)&&driving)vehicleflight::ToggleAuto();
+        if(bindings::Triggered(bindings::Action::ClearRoute))ClearRoute();
+        if(bindings::Triggered(bindings::Action::ClearFocus)){npcvehicles::SetCombatFocus(0);notify::Show("Focus cleared | automatic targeting");}
+
 		if (!scanner) { hoverui::SetScan(""); return; }
 		char buf[256];
 		if (g_setAt && now - g_setAt < 3000) {
@@ -563,7 +569,11 @@ namespace scantarget
 			const size_t n = std::strlen(buf);
 			std::snprintf(buf + n, sizeof(buf) - n, "  +%zu queued", g_chain.size());
 		}
-		if(realvehicles::RecordingPlacements())std::snprintf(buf,sizeof(buf),"VEHICLE PLACEMENTS | %s | tap T to save",t.valid?(t.estimated?"aim closer: estimated surface":"surface ready"):"aim at a surface");
+		if(realvehicles::RecordingPlacements()){
+			const auto key=KeyName();
+			std::snprintf(buf,sizeof(buf),"PLACEMENT MODE | %s | %s: save  hold: delete  double: summon point",
+				t.valid?(t.estimated?"aim closer: estimated surface":"surface ready"):"aim at a surface",key.c_str());
+		}
 		hoverui::SetScan(buf);
 		static ULONGLONG lastLog = 0;
 		if (logger::Verbose() && now - lastLog > 2000) {

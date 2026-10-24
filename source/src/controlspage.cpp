@@ -72,7 +72,7 @@ namespace controlspage
 			const auto in = FromGame(device, codes);
 			logger::Write("Controls page: capture for %s: device %u slot %u codes 0x%X 0x%X context 0x%X -> %s", bindings::ActionName(a), device, slot,
 				std::uint32_t(codes[0]), std::uint32_t(codes[1]), context, in.Empty() ? "refused" : "free");
-			return in.Empty() ? 1 : 0;  // 1: the game's "button reserved" notice
+			return in.Empty() || !bindings::CanAssign(a,device==2,slot?1:0,in) ? 1 : 0;
 		}
 
 		std::uint8_t ApplyDetour(void* map, uptr* event, std::uint8_t device, std::int32_t* codes, std::uint8_t slot, std::uint8_t context)
@@ -81,9 +81,7 @@ namespace controlspage
 			if (!Ours(event, &a)) return g_apply(map, event, device, codes, slot, context);
 			const auto in = FromGame(device, codes);
 			if (in.Empty()) return 0;
-			const auto moved = bindings::Assign(a, device == 2, slot ? 1 : 0, in);
-			if (!moved.empty()) notify::Show("%s: moved here from %s", bindings::ActionName(a), moved.c_str());
-			return 1;
+            return bindings::Assign(a,device==2,slot?1:0,in)?1:0;
 		}
 
 		// "$FlyingVehicleOverhaul" -> the header; "$FlyingVehicleOverhaul_FVO_scanner[_KBM]" -> that action's name.

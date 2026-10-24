@@ -30,10 +30,13 @@ def main():
     binary = output / f"FlyingVehicleOverhaul-{version}.zip"
     source_zip = output / f"FlyingVehicleOverhaul-{version}-source.zip"
     files = [(root / "Data" / name, name) for name in (
-        "SeamlessPilots.esm", "FlyingVehicleOverhaul - Placements.esm", "SFSE/Plugins/SeamlessVehicle.dll")]
+        "FVO_NPCPilots.esm", "FVO_CityPlacements.esm", "SFSE/Plugins/FlyingVehicleOverhaul.dll")]
     for source, _ in files:
         if not source.is_file():
             raise FileNotFoundError(source)
+    guide = root / "docs" / f"NEXUS_DESCRIPTION_{version}.txt"
+    if guide.is_file():
+        files.append((guide, "Docs/FlyingVehicleOverhaul.txt"))
     write_zip(binary, files)
     source_root = root / "source"
     source_files = []
@@ -46,7 +49,7 @@ def main():
                 source_files.append((path, path.relative_to(source_root).as_posix()))
     write_zip(source_zip, source_files)
     with zipfile.ZipFile(binary) as archive:
-        if archive.read("SFSE/Plugins/SeamlessVehicle.dll") != files[2][0].read_bytes():
+        if archive.read("SFSE/Plugins/FlyingVehicleOverhaul.dll") != files[2][0].read_bytes():
             raise RuntimeError("Packaged plugin differs from repository plugin")
     sums = output / f"FlyingVehicleOverhaul-{version}-SHA256SUMS.txt"
     sums.write_text("".join(

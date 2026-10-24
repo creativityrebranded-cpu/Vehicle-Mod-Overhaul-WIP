@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
-project(SeamlessVehicle VERSION 0.72.0 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 0.73.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 if(NOT MSVC)
-    message(FATAL_ERROR "SeamlessVehicle builds with MSVC (Visual Studio 2022 Build Tools).")
+    message(FATAL_ERROR "FlyingVehicleOverhaul builds with MSVC (Visual Studio 2022 Build Tools).")
 endif()
 
 # Only sfse/PluginAPI.h is used (MIT, bundled in third_party/sfse with its notice).
@@ -24,14 +24,14 @@ sp_options(sp_common)
 # The rover flight DLL has its own main loop, ground probes and scene update
 # when SeamlessPlanets is not installed. With the core present it uses its API.
 
-add_library(SeamlessVehicle SHARED
+add_library(FlyingVehicleOverhaul SHARED
     src/main_vehicle.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/crash.cpp
     src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
     src/vehicleflight.cpp src/vehiclecamera.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
-sp_options(SeamlessVehicle)
-target_compile_definitions(SeamlessVehicle PRIVATE SP_FEATURE_VEHICLE)
-target_link_libraries(SeamlessVehicle PRIVATE sp_common Synchronization)
+sp_options(FlyingVehicleOverhaul)
+target_compile_definitions(FlyingVehicleOverhaul PRIVATE SP_FEATURE_VEHICLE)
+target_link_libraries(FlyingVehicleOverhaul PRIVATE sp_common Synchronization)
 
 add_executable(navfield_test tests/navfield_test.cpp src/navfield.cpp)
 sp_options(navfield_test)
@@ -102,3 +102,9 @@ add_executable(freeroll_test tests/freeroll_test.cpp)
 sp_options(freeroll_test)
 add_executable(vtolassist_test tests/vtolassist_test.cpp)
 sp_options(vtolassist_test)
+
+add_executable(placementedit_test tests/placementedit_test.cpp)
+sp_options(placementedit_test)
+
+add_executable(commandinput_test tests/commandinput_test.cpp)
+sp_options(commandinput_test)

@@ -1,7 +1,7 @@
-"""Builds "SeamlessPilots.esm": a small plugin with one quest ("SeamlessPilotsQuest", start-game-enabled) that holds
+"""Builds "FVO_NPCPilots.esm" (until 0.72.0 "SeamlessPilots.esm"): a small plugin with one quest ("FVO_NPCPilotsQuest", start-game-enabled) that holds
 6 pilot ref aliases and 6 vehicle ref aliases, and 6 packages, one per pilot alias: "activate the vehicle alias".
 
-The plugin (SeamlessVehicle.dll) fills the aliases at run time with the engine's own ForceRefTo, so the NPC runs a
+The plugin (FlyingVehicleOverhaul.dll) fills the aliases at run time with the engine's own ForceRefTo, so the NPC runs a
 QUEST package (which outranks the NPC's own schedule) that walks it to the vehicle and activates it (the game's get-in).
 Works for any actor, follower or not. Records are copied in shape from Starfield.esm:
   quest   <- SQ_Passengers (001D307E) / DialogueCFTheKey_RandomIdles_LastNova02 (000B2283) for the alias layout
@@ -72,7 +72,7 @@ def main(src, dst):
         out = []
         for t, v in pk:
             if t == b"EDID":
-                v = b"SeamlessPilotGetIn%d\x00" % k
+                v = b"FVO_PilotGetIn%d\x00" % k
             elif t == b"QNAM":
                 v = struct.pack("<I", 0x01000000 | QUEST_ID)
             elif t == b"PLDT":
@@ -81,7 +81,7 @@ def main(src, dst):
         packs += record(b"PACK", 0x01000000 | (PKG_BASE + k), b"".join(sub(t, v) for t, v in out), tail)
 
     # the quest: SQ_Passengers' header fields, then the aliases
-    body = sub(b"EDID", b"SeamlessPilotsQuest\0")
+    body = sub(b"EDID", b"FVO_NPCPilotsQuest\0")
     body += sub(b"DNAM", struct.pack("<III", 0x111, 0, 0))
     body += sub(b"NEXT", b"")
     body += sub(b"ANAM", struct.pack("<I", PILOTS * 2))
@@ -108,14 +108,14 @@ def main(src, dst):
         out = []
         for t, v in pa:
             if t == b"EDID":
-                v = b"SeamlessPilotActivate%d\x00" % k
+                v = b"FVO_PilotActivate%d\x00" % k
             if t == b"PKCU":
                 out.append((b"QNAM", struct.pack("<I", 0x01000000 | ACT_QUEST_ID)))
             if t == b"PTDA":
                 v = struct.pack("<III", 4, PILOTS + k, 0)
             out.append((t, v))
         packs2 += record(b"PACK", 0x01000000 | (ACT_PKG_BASE + k), b"".join(sub(t, v) for t, v in out), tail)
-    body2 = sub(b"EDID", b"SeamlessPilotsActivateQuest\x00")
+    body2 = sub(b"EDID", b"FVO_NPCPilotsActivateQuest\x00")
     body2 += sub(b"DNAM", struct.pack("<III", 0x111, 0, 0))
     body2 += sub(b"NEXT", b"")
     body2 += sub(b"ANAM", struct.pack("<I", PILOTS * 2))
@@ -138,7 +138,7 @@ def main(src, dst):
     nrec = 2 + PILOTS * 2 + 2  # 2 quests + 12 packages + 2 groups
     hedr_ver = struct.unpack_from("<f", d, 24 + 6)[0]
     items = [(b"HEDR", struct.pack("<fII", hedr_ver, nrec, 0x820)),
-             (b"CNAM", b"Seamless Vehicle\0"),
+             (b"CNAM", b"Flying Vehicle Overhaul (FVO)\0"),
              (b"MAST", b"Starfield.esm\0"), (b"DATA", struct.pack("<Q", 0))]
     tes4 = b"".join(sub(t, v) for t, v in items)
     header = b"TES4" + struct.pack("<II", len(tes4), F_ESM) + d[12:24]

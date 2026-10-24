@@ -1,0 +1,197 @@
+Short summary: Hover vehicles with gears, terrain following and an autopilot, plus experimental physical flight. Summon your vehicle, have it follow or cover you, and send it to scanner destinations. NPCs drive and fight in vehicles. Version 0.73.0 separates command bindings and adds controller HUD editing. Early WIP: many features still need in-game testing. Requires SFSE and Starfield 1.16.244 (Steam).
+
+Flying Vehicle Overhaul 0.73.0
+
+Hover vehicles, an autopilot, and NPCs who use vehicles.
+
+Early work in progress. The mod builds and passes offline checks, but much of its gameplay has not been tested in game. The 0.73.0 input changes need a fresh in-game test. Please send your log when something goes wrong.
+
+What it does
+
+- Hover flight: compatible native vehicles hover with four gears, boost, climb, descend and terrain following.
+- Physical flight (experimental, off by default): your hovering vehicle uses thrust and torque with the game's own mass and inertia. Speed builds and coasts, and banking needs more lift. Flight assist stabilizes it and provides coordinated turns. Camera roll and an attitude instrument show its bank and pitch. Autopilot and NPC pilots can optionally use physical flight too.
+- Autopilot: navigation plans ahead, checks walls, ceilings, people and other vehicles, and adjusts travel for weather and darkness.
+- Your vehicle: summon it, let it follow or cover you, set a guard point, or send it to a destination. A following vehicle can catch you from below.
+- Scanner routes: select destinations up to about 1 km away and chain stops into a route. Retry a held trip or skip a stop.
+- Followers: ask a follower to drive, ride as a passenger, or take the wheel. Vehicle escorts can defend, intercept, scout and rescue.
+- Vehicle combat: enemy and escort vehicles use manoeuvres, squad roles, morale, attacks, retreats and rams.
+- Vehicle health: shots and rams damage the chassis, share damage with its driver, and can wreck it. Health and wreck handling apply to empty vehicles too.
+- Faction reactions: ownership and allegiance govern vehicle use, combat responses and friendly-fire protection.
+- Traffic: outside fights, NPCs can travel by vehicle, share rides, patrol, make supply trips and return vehicles home.
+- Keyboard and controller commands: each gameplay command has its own binding row. The default map uses context, tap, hold and double tap; it needs no controller chords.
+- HUD: status cards, health information, contextual prompts, camera roll and an attitude instrument. The layout editor accepts keyboard and controller input.
+
+New in 0.73.0
+
+- Separate bindings for commands previously bundled together: gear and descend; summon and escort recall; follow and asking a follower to drive; destination, Auto, route clear, guard, ram and focus fire; passenger boarding, passenger exit and taking the wheel; boost and throttle lock.
+- Rebinding one command no longer removes the same button from other commands. Different contexts and gestures can share a button. A real overlapping assignment is refused instead of stealing another control.
+- Both settings interfaces use scoped device slots. Clearing or restoring one device's controls preserves the other device's bindings.
+- Fixed keyboard defaults replace the previous search for a free key, which could leave hover, stance, passenger commands, profiles and hints unbound.
+- Keyboard and controller both use the mod's landing-before-exit path while hovering. Ground-driving remaps now reach the native vehicle input path, including vertical boost.
+- Input ownership lasts until a button is released, including across scanner/editor changes. Native modal UI blocks mod gameplay commands. Occupied-vehicle Activate handling no longer also responds to scanner input.
+- Controller HUD editor: open the scanner and double tap View / Create. The editor's controls are listed below.
+- bindings.ini upgrades to layout 4, backing up the old file as bindings.ini.before-layout4. Recognized old defaults are upgraded; edited lines are retained. Review retained custom bindings against the new separate commands.
+- Placement mode and area summon points are included. Parking edits record authoring data; parking changes still need a rebuilt placements plugin.
+
+Requirements
+
+- Starfield 1.16.244, Steam version.
+- Starfield Script Extender (SFSE), the build for 1.16.244.
+
+The plugin refuses unsupported game versions. This SFSE build is not for Game Pass / Microsoft Store.
+
+Optional
+
+- Carfield and/or Parked Vehicles (with FVO_ParkedVehiclesPatch.esm for Parked Vehicles): parked types are selected from compatible vehicles in your load order with a fixed seed per location.
+- Additional compatible native vehicle mods join the vehicle pool automatically.
+- FVO_CityPlacements.esm adds the mod's own parked vehicles. Neither this nor another parked-vehicle mod is needed for player flight.
+
+Installation
+
+- Install SFSE and start the game through sfse_loader.exe.
+- Install the mod with your mod manager, or extract the game archive into Starfield\Data. The archive root contains the contents of Data.
+- Enable FVO_NPCPilots.esm. NPC drivers need its walking and boarding packages.
+- Optionally enable FVO_CityPlacements.esm for the mod's parked vehicles.
+- Updating from 0.72.0 or earlier: the files were renamed (see below). Delete the old ones and enable the new ones.
+- Restart the game after replacing the DLL.
+
+What the files do
+
+Every file name starts with the mod's name, Flying Vehicle Overhaul (FVO). The core mod is the DLL, not a plugin. None of the plugins depend on each other, so their order among themselves does not matter.
+
+- SFSE\Plugins\FlyingVehicleOverhaul.dll (required): the core mod. Flight, the autopilot, navigation, NPC driving and combat, vehicle damage, traffic, controls, settings and the HUD are all in it. SFSE loads it; it is not part of your load order.
+- FVO_NPCPilots.esm (required for NPC drivers): one quest and the AI packages NPCs use to walk to a vehicle and get in. It does not change flight, place vehicles, add items or edit game records. Without it you can still fly, but NPCs cannot be sent to vehicles.
+- FVO_CityPlacements.esm (optional): the mod's own parked vehicles, about 35 REV-8s in 8 city cells. It skips spots where Carfield or Parked Vehicles already park one. It is flagged light. Other mods that edit the same cells may conflict.
+- FVO_ParkedVehiclesPatch.esm (optional, separate download): a patch for Parked Vehicles (Vehicles.esm by SarthesArai) that turns its static vehicle props into real, drivable vehicles. It needs Vehicles.esm and must load after it.
+
+Who needs what: everyone needs the DLL; FVO_NPCPilots.esm if you want NPCs in vehicles; FVO_CityPlacements.esm only for extra parked vehicles in cities; FVO_ParkedVehiclesPatch.esm only if you use Parked Vehicles.
+
+Renamed in 0.73.0 (old name -> new name):
+- SeamlessVehicle.dll -> FlyingVehicleOverhaul.dll
+- SeamlessPilots.esm -> FVO_NPCPilots.esm
+- FlyingVehicleOverhaul - Placements.esm -> FVO_CityPlacements.esm
+- Vehicles - Real.esm -> FVO_ParkedVehiclesPatch.esm
+- The log SeamlessVehicle.log -> FlyingVehicleOverhaul.log
+- The settings folder Logs\SeamlessVehicle -> Logs\FlyingVehicleOverhaul, and seamless.ini in it -> settings.ini (moved for you, see below)
+Delete the old DLL from Data\SFSE\Plugins: if both DLLs are there, the mod loads twice. On its first start the new version moves your settings folder to Logs\FlyingVehicleOverhaul and renames seamless.ini to settings.ini, so your settings, HUD layout and bindings stay. If the folder is in use it keeps using the old one. A save that used the old placements plugin shows it as missing once; the new plugin places the same vehicles again.
+
+Settings and saved controls
+
+Open Settings > Gameplay Options and find the Flying Vehicle Overhaul section. Physical VTOL and Physical VTOL for AI pilots are experimental and off by default. Flight assist is on by default; Free roll is off by default.
+
+The mod's section in Settings > Controls exposes its command rows and device slots. Gameplay Options also provides control capture. To change native firing, aiming, scanner or other game controls, use the game's own control rows.
+
+Files in Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul:
+
+- settings.ini: feature switches and detailed logging.
+- bindings.ini: keyboard and controller command bindings. :tap, :hold and :double are part of a slot, as is its @context.
+- hoverui.ini: HUD position and size settings.
+- placement recording files: saved/removed parking spots and area summon points, when those tools are used.
+
+The main log, FlyingVehicleOverhaul.log, is one folder above these files. Deleting a configuration file restores its defaults at the next appropriate load; back up custom settings first.
+
+Controls: keyboard and mouse defaults
+
+Driving and flying
+
+- W / S: accelerate / brake. A / D: turn or roll. Mouse: look and aim.
+- V: hover / land.
+- Q / Z: climb / descend in flight.
+- Alt tap: next gear. Holding Alt for 0.5 s is a separate default descend binding in flight.
+- Left Shift: boost. Double tap Left Shift: throttle lock in flight. A fresh boost or brake press releases the lock.
+- T tap, scanner closed: Auto on / off. Movement takes control back.
+- E: driver exit; while hovering the mod sets the vehicle down first.
+- B in flight: Flight assist on / off.
+- K: cycle Defend / Attack / Hold fire.
+- ]: cycle your vehicle's navigation profile. While driving: Stop / Orbit / Patrol / Cruise.
+- J: show / hide all hints. F8: ship-hull visual preview while driving.
+
+On foot and orders
+
+- N tap: summon your vehicle. Hold N 0.5 s: recall escorts and your vehicle.
+- U tap: follow / cover on or off. Hold U 0.5 s: ask a follower to drive.
+- Facing an occupied vehicle, tap Activate (normally E): passenger seat. Hold Activate 0.5 s: pull out the driver / take their seat.
+- G tap near an NPC vehicle: board as a passenger. As passenger, G tap exits and G hold takes the wheel.
+- As passenger: look to steer and W / S to adjust speed, unless a map marker is supplying the taxi destination.
+- F9: cycle escort NPC navigation profiles.
+
+Scanner open
+
+- T tap: select a destination or append a route stop.
+- T double tap: clear the route.
+- T hold 0.5 s: guard the aimed location, or fly there and hold while driving.
+- R: ram the aimed person or vehicle.
+- H: focus fire on the aimed hostile. O: clear focus.
+- Semicolon: retry the trip. [: skip the stop.
+- In Placement mode, T tap records a spot, T hold deletes an aimed saved spot, and T double tap sets the area's summon point.
+
+Controls: controller defaults
+
+Xbox names are listed first, with PlayStation names where different. A = Cross, B = Circle, X = Square, Y = Triangle, LB = L1, RB = R1, LT = L2, RT = R2. Hold means 0.5 s. Double tap means two presses within 0.3 s. A tap sharing a double-tap button waits briefly for that window to finish.
+
+Driving, hovering and physical flight
+
+- Left stick: analog throttle, brake, turn and roll. Right stick: look.
+- RB / R1: boost. Double tap: throttle lock in flight.
+- L3: hover / land.
+- A / Cross tap: next gear. Hold in flight: descend.
+- Y / Triangle in flight: climb. X / Square in flight: descend.
+- D-pad Down in flight: Flight assist on / off.
+- D-pad Up: recall escorts. D-pad Right: stance.
+- D-pad Left tap: Auto on / off. Hold: your vehicle's navigation profile.
+- R3 tap: all hints. R3 hold: ship-hull visual preview.
+- B / Circle: driver exit, with landing first while hovering.
+- RT / R2 fires and LT / L2 aims through the game's own controls.
+
+On foot: open the hand scanner with LB / L1 for vehicle orders
+
+- B / Circle tap: summon your vehicle. Hold: recall escorts too. Double tap: ram the aimed person or vehicle.
+- L3 tap: follow / cover. Hold: ask a follower to drive. Double tap: focus fire on the aimed hostile.
+- Y / Triangle tap: destination / queued stop. Hold: guard a location. Double tap: clear route.
+- D-pad Left tap: retry trip. Hold: your vehicle's profile. Double tap: clear focus.
+- D-pad Right tap: skip stop. Hold: ride along. Double tap: cycle escort NPC profiles.
+- View / Create tap: stance. Hold: all hints. Double tap: HUD editor.
+- Placement mode changes Triangle's target commands to record / delete / set summon point.
+
+As passenger
+
+- A / Cross tap: exit passenger seat. Hold: take the wheel.
+- Right stick: look to steer. Left stick up/down: speed, unless a map marker is supplying the taxi destination.
+
+HUD editor
+
+- Keyboard: F7 opens/closes and saves. Page Up / Down select. Arrows move. Home / End change spacing. + / - resize. Delete resets the selected element. Ctrl increases movement steps.
+- Controller: with the scanner open, double tap View / Create to enter. LB / RB select the previous/next element. Left stick moves it. D-pad Left/Right changes spacing. RT / LT grows/shrinks it. X / Square resets it. L3 increases movement steps. B / Circle saves and closes.
+
+Status and known issues
+
+- Previously seen working in game: basic hover flight, summon/follow, driving/autopilot basics, initial parked-vehicle replacement, and basic controller response before the 0.73.0 rework.
+- The 0.73.0 command rework has offline validation; its menus, native input ownership, controller HUD editor and exit behavior still need a full live test on both input devices.
+- Physical flight, coordinated turns, camera roll/HUD, combat interactions, escort behavior, traffic and current placement behavior need further in-game verification.
+- Placed REV-8s can start about 0.5 m inside the ground. Parked small vehicles can hop.
+- Physical AI flight may turn wide or overshoot: route planning still needs momentum-aware tuning.
+- Atmospheric lift and stalls are not implemented.
+- A short stutter can occur after loading. Performance with many vehicles still needs profiling.
+- The native enemy vehicle health bar is implemented; the current build's behavior needs live verification.
+- Recorded parking edits require rebuilding the placements plugin. They do not instantly rebuild world placements in game.
+- Save/load persistence of transient vehicle jobs remains outside this build.
+
+Reporting a problem
+
+- Set verbose=1 under [log] in settings.ini, or turn on Detailed log in Gameplay Options.
+- Reproduce the problem. Include your input device, the command/button you used, whether the scanner was open, and whether you were driving, flying or a passenger.
+- Copy Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log before starting the game again. Only one previous log is retained.
+- Include bindings.ini if the problem involves custom controls.
+
+Compatibility
+
+- Works as a standalone vehicle plugin; the optional SeamlessPlanets core is not required.
+- Other mods changing vehicle physics, AI, the control map or the same HUD/settings hooks may conflict.
+- Game updates require a compatible rebuild for the new runtime.
+
+Credits
+
+- The SFSE team.
+- The authors of Carfield and Parked Vehicles (SarthesArai), whose parked-vehicle data the optional patch supports.
+
+Source: https://github.com/creativityrebranded-cpu/Vehicle-Mod-Overhaul-WIP

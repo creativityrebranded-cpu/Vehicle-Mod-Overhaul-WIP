@@ -120,7 +120,7 @@ int main()
         check(Label(summon, 'N', 0, Show::Keyboard, PadStyle::Xbox) == "N", "keyboard in use: only the key");
         check(Label(summon, 'N', 0, Show::Pad, PadStyle::Xbox) == "LB+DUp", "controller in use: only the chord");
         check(Label(summon, 'N', 0, Show::Pad, PadStyle::PlayStation) == "L1+DUp", "PlayStation names");
-        check(Label(Parse("default"), 'N', 0, Show::Pad, PadStyle::Xbox) == "N", "nothing on the controller: the key, never unbound");
+        check(Label(Parse("default"), 'N', 0, Show::Pad, PadStyle::Xbox) == "unbound", "missing controller input stays visibly unbound");
         check(Label(Parse("default, Pad:A"), 'E', kY, Show::Pad, PadStyle::PlayStation) == "Triangle / Cross", "the game's button and ours, PlayStation names");
         check(Label(summon, 'N', 0, Show::Both, PadStyle::Xbox) == "N / LB+DUp", "both devices for the settings list");
     }

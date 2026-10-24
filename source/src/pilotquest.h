@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-// Quest-package pilots (2026-10-17): the data-driven way to send ANY actor to a vehicle. SeamlessPilots.esm
+// Quest-package pilots (2026-10-17): the data-driven way to send ANY actor to a vehicle. FVO_NPCPilots.esm
 // (scripts/make_pilots_esm.py) holds one start-enabled quest with 6 pilot aliases and 6 vehicle aliases; each pilot alias
 // carries a quest package "activate the vehicle alias". Filling the aliases with the engine's own ForceRefTo
 // (Papyrus ReferenceAlias.ForceRefTo -> FUN_141ff7b80 -> FUN_140cfc990(quest, aliasId, ref, 6)) makes the actor run that package

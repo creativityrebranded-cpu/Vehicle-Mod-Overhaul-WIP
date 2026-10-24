@@ -57,10 +57,11 @@ namespace hoverui
 	// Exit button) or a group (WASD, Column, Extras, All); the pick is named in a notification and blinks. On foot they pick
 	// Summon, Follow, Get in, Status, Target or the whole panel. Arrows move (Ctrl: x10); Delete puts the pick back to its
 	// default; Home / End space the WASD keys or the column's rows. While editing every element shows (sample text where
-	// empty). Saved to SFSE\Logs\SeamlessVehicle\hoverui.ini.
+	// empty). Saved to SFSE\Logs\FlyingVehicleOverhaul\hoverui.ini.
 	void EditTick(bool focused);
 	// The scanner (MonocleMenu) is open right now (it counts as open for 300 ms after its last frame). Main thread.
 	bool IsScannerOpen();
+    bool Editing();
 	// Copied on the scanner movie thread. Empty unless the selected map-marker panel is active.
 	struct ScannerDestination { std::string name; double distance = 0; };
 	ScannerDestination ScannerDestinationContext();

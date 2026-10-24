@@ -1,6 +1,7 @@
 ﻿#include "navmap.h"
 
 #include "log.h"
+#include "fvopaths.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -329,7 +330,7 @@ namespace navmap
 			if (g_iniPath.empty()) {
 				PWSTR docs = nullptr;
 				if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-					g_iniPath = std::wstring(docs) + L"\\My Games\\Starfield\\SFSE\\Logs\\SeamlessVehicle\\nav.ini";
+					g_iniPath = fvopaths::File(L"nav.ini");
 					CoTaskMemFree(docs);
 				}
 				else {

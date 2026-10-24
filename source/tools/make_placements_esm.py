@@ -1,4 +1,4 @@
-"""Builds "FlyingVehicleOverhaul - Placements.esm": the mod's own vehicle placements as ordinary plugin references, the way
+"""Builds "FVO_CityPlacements.esm" (until 0.72.0 "FlyingVehicleOverhaul - Placements.esm"): the mod's own vehicle placements as ordinary plugin references, the way
 Carfield and Parked Vehicles place theirs (2026-10-21, the user: "do we use the same placement style as Carfield?" -> no: the DLL
 created them at run time into the save; this replaces that).
 
@@ -13,7 +13,7 @@ back into the city's own frame and into the cell that holds each position.
 
 Every spot gets the REV-8 (SFBGS004.esm, shipped with the game): the same vehicle in a row, parked in parallel.
 
-    python scripts/make_placements_esm.py [out.esm]      # default: plugin/build/FlyingVehicleOverhaul - Placements.esm
+    python scripts/make_placements_esm.py [out.esm]      # default: plugin/build/FVO_CityPlacements.esm
 """
 import glob, math, mmap, os, struct, sys, zlib, collections
 
@@ -23,7 +23,7 @@ import bake_own_spots as own            # merge, rows, align
 import bake_placement_spots as spots    # DATA path, subrecords, cell_grids
 
 STARFIELD = os.path.join(spots.DATA, "Starfield.esm")
-NAME = "FlyingVehicleOverhaul - Placements.esm"
+NAME = "FVO_CityPlacements.esm"  # "FlyingVehicleOverhaul - Placements.esm" until 0.72.0
 MASTERS = ["Starfield.esm", "SFBGS004.esm"]
 REV8 = 0xFE000033            # SFBGS004.esm Rev8 (a light master: FE + light-master index 0 + local id; as Vehicles - Real.esm writes it)
 CELL_SIZE = 100.0

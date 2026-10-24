@@ -319,8 +319,8 @@ namespace profiles
 		{
 			if (g_keysChosen) return;
 			g_keysChosen = true;
-			g_npcKey = controlmap::DebugKeys() && controlmap::Claim("profiles", "npc profile (debug)", VK_OEM_4) ? VK_OEM_4 : 0;
-			g_ownKey = controlmap::Claim("profiles", "own vehicle profile", VK_OEM_6) ? VK_OEM_6 : 0;
+			g_npcKey=VK_F9;
+			g_ownKey=VK_OEM_6;
 			logger::Write("Profiles: keys: NPC vehicles %s, your vehicle %s", g_npcKey ? controlmap::KeyName(g_npcKey).c_str() : "NONE FREE",
 				g_ownKey ? controlmap::KeyName(g_ownKey).c_str() : "NONE FREE");
 		}
@@ -407,8 +407,8 @@ namespace profiles
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player) return;
 		ChooseKeys();
-		if (Pressed(g_npcDown, g_npcKey && (GetAsyncKeyState(g_npcKey) & 0x8000) != 0)) CycleNpc();  // debug key: keyboard only
-		if (Pressed(g_ownDown, bindings::Held(bindings::Action::OwnProfile, g_ownKey))) CycleOwn(player);
+		if(bindings::Triggered(bindings::Action::NpcProfile))CycleNpc();
+		if(bindings::Triggered(bindings::Action::OwnProfile))CycleOwn(player);
 	}
 
 	void Reset()
