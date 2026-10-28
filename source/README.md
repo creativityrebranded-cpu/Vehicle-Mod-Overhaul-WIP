@@ -20,7 +20,7 @@ See [CONTROLS.md](CONTROLS.md) for the complete device maps and HUD editor contr
 
 ## Build
 - Windows, Visual Studio 2022 Build Tools (MSVC, C++20) and CMake 3.24 or newer.
-- `powershell -ExecutionPolicy Bypass -File build.ps1` builds `build/Release/FlyingVehicleOverhaul.dll` and runs all 31 offline test suites.
+- `powershell -ExecutionPolicy Bypass -File build.ps1` builds `build/Release/FlyingVehicleOverhaul.dll` and runs all 37 offline test suites.
   Or: `cmake -S . -B build -A x64` then `cmake --build build --config Release`.
 
 The plugin targets Starfield 1.16.244 (Steam) only: engine addresses are fixed for that build and the plugin switches itself
@@ -61,3 +61,5 @@ Chase acquisition is 700 m with 840 m retention; native weapon ranges remain ind
 On foot in combat, tap T at an enemy to focus allied vehicle fire; double-tap T returns to automatic targeting.
 Wreck recovery relocation is blocked, release preserves momentum, and ejection runs native on-foot furniture-state cleanup.
 These changes pass offline checks and need live verification.
+
+City builder: citybuild_test requires tests/fixtures/citytraffic-reference.esm; it never silently skips comparison. cityfiles_test executes the production startup transaction, including a locked-file failure. citybuild_dryrun <isolated settings folder> <existing plugin copy> runs the same startup code; copy recordings and a seed plugin to a disposable folder first.

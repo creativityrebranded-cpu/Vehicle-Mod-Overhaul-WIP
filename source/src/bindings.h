@@ -1,9 +1,11 @@
 #pragma once
 #include <cstdint>
+#include <array>
 #include <string>
 #include <vector>
 
 #include "bindingdefs.h"
+#include "inlinehints.h"
 
 // The controls toolkit (2026-10-21, the user: "set the buttons for each, that way it'll work for anything incl controllers").
 // Every action of the mod reads its input here. Each one is set in Logs\FlyingVehicleOverhaul\bindings.ini as a list of
@@ -15,7 +17,8 @@ namespace bindings
 {
 
 	// Once per frame (the vehicle task): bindings.ini changes, the controller's state.
-	void Tick();
+	void Tick(bool gameplay=true); // housekeeping samples; gameplay publishes queued events
+    void EndUpdate(); // end the shared gameplay-event batch
 	void ResetRuntime();
 	bool Triggered(Action a);
 	bool Started(Action a);
@@ -31,10 +34,12 @@ namespace bindings
 	std::string Label(Action a);
 	// A controller is connected (XInput).
 	bool PadConnected();
+	std::uint32_t PadState();  // the controller's raw button bits now (bindlogic::k*), 0 with none; for diagnostics
 	// One of the game's own actions (e.g. "MainGameplay", "Activate") as the game binds it: its keyboard key (fallbackVk
 	// when it binds none) or its controller button. GameLabel names the one for the device in use.
 	bool GameHeld(const char* context, const char* event, int fallbackVk);
 	std::string GameLabel(const char* context, const char* event, int fallbackVk);
+    std::string GameLabelFor(const char* context,const char* event,bool controller);
 	// The controller was used more recently than the keyboard / mouse (prompts name its buttons then).
 	bool UsingPad();
 	// A controller button's on-screen name: Xbox, or PlayStation with a Sony pad attached ([display] pad_names overrides).
@@ -44,6 +49,16 @@ namespace bindings
 	const char* ActionDescription(Action a);
 	std::string MenuLabel(Action a);
 	unsigned Generation();
+    struct HudState {
+        inlinehints::Inputs resolved;
+        std::array<std::string,std::size_t(Action::Count)> input,scannerInput;
+        std::array<bool,std::size_t(Action::Count)> available{},applicable{};
+        std::string editorClose;
+        std::uint8_t context=0;
+        bool allowed=false,driving=false,placement=false;
+    };
+    HudState HudSnapshot(bool controller,bool preview);
+    std::string PromptInput(Action action,bool controller,std::uint8_t context);
 	void BeginCapture(Action a);
 	void CancelCapture();
 	bool Capturing(Action* action = nullptr);

@@ -2,3 +2,6 @@ source/build/
 ref/
 *.pdb
 *.obj
+tools/__pycache__/
+Data/FVO_CityTraffic.esm
+Data/FVO_ScheduledTraffic.esm

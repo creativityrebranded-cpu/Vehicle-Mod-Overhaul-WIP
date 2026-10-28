@@ -143,20 +143,14 @@ int main()
     // ---- Stage 4 ----
     {
         Input in = Base(40); in.me.vy = 15; Mind m;
-        Settings r = s; r.allowRam = true;
-        check(Run(in, m, r) == State::Ram && Steer(in, m, r).ram, "a slow enemy straight ahead, ram allowed: ram");
-        in.ramming = true; in.now += 5000;
-        check(Run(in, m, r) == State::Ram, "the ram runs until its order ends");
-        in.ramming = false; in.now += 100;
-        check(Run(in, m, r) != State::Ram, "no second ram at once (cooldown)");
-        Mind m2; check(Run(in, m2, s) != State::Ram, "no ram unless allowed");
-        Settings r3 = r; r3.stage = 3; Mind m3; in.now += 60000;
-        check(Run(in, m3, r3) != State::Ram, "ram only from stage 4");
+        // Rams were removed (2026-10-25): a slow enemy straight ahead is fought, never rammed, at any stage.
+        check(Run(in, m, s) != State::Ram && !Steer(in, m, s).ram, "a slow enemy straight ahead: no ram (removed)");
+        for (int k = 0; k < 20; ++k) { in.now += 500; check(Run(in, m, s) != State::Ram, "no ram over time"); }
     }
     {
         Input in = Base(20, 3); in.foe.heading = 1.57; in.me.vy = 20; in.me.heading = 0.6;  // side-on, close, me faster, not straight at it
-        Mind m; Settings r = s; r.allowRam = true;
-        check(Run(in, m, r) == State::Sideswipe, "side-on at close range and faster: sideswipe");
+        Mind m;
+        check(Run(in, m, s) != State::Sideswipe, "side-on at close range and faster: no sideswipe (removed)");
     }
     {
         Mind m; m.ex = 0; m.ey = -1; double c[5][2];

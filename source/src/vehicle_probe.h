@@ -9,6 +9,11 @@
 namespace vehicle_probe
 {
 	bool Install();
+    // Completed native ship-system updates. Monotonic across save resets;
+    // the composition root uses this pulse instead of command-pump frequency.
+    std::uint64_t UpdateSerial();
+    void ReportUpdateCost(); // main thread, bounded ten-second telemetry
+
 	void Request(int slot, float x, float y, float z, float above, float length, std::uint32_t mask = 0);
 	bool Latest(int slot, float& height, unsigned& age);
 	void Reset();

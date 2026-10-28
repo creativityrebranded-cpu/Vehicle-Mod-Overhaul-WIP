@@ -11,6 +11,7 @@ namespace pilotquest
 {
 	// The plugin and its quest are loaded and running (probed every few seconds; logs once what it found).
 	bool Available();
+    void Reset(); // save/world load: discard cached forms and pending diagnostics
 	// Slot 0..5: the vehicle alias, then the pilot alias; then the actor re-evaluates its packages. Returns false with the reason logged.
 	bool Assign(int slot, std::uintptr_t npc, std::uintptr_t vehicle);
 	// Logs (after delayMs) what the pilot alias holds and which package the actor runs; call from the main thread each frame via Tick.
@@ -22,4 +23,7 @@ namespace pilotquest
 	bool AssignActivate(int slot, std::uintptr_t npc, std::uintptr_t vehicle);
 	// Empties both aliases of the slot (the actor goes back to its own packages).
 	void Release(int slot);
+    // Separate 18-slot quest: queue / walk-away targets never consume driver aliases.
+    bool RouteTraffic(int slot,std::uintptr_t npc,std::uintptr_t marker);
+    void ReleaseTraffic(int slot,std::uintptr_t npc=0);
 }

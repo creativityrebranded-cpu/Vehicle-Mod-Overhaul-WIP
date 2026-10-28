@@ -8,7 +8,6 @@
 #include "boostlogic.h"
 #include "altcontrol.h"
 #include "targetinput.h"
-#include "ramlogic.h"
 #include "overrides.h"
 #include "keygesture.h"
 #include <cstdio>
@@ -84,20 +83,6 @@ int main(){
  meter=boostlogic::Step(0,0,false,true,0.1,2,1,4);check(!meter.exhausted&&meter.charge==0,"release resets exhaustion but respects recharge delay");
  meter=boostlogic::Step(0,1,false,false,0.1,2,1,4);check(meter.charge>0&&!meter.active,"native meter recharges after delay");
  check(boostlogic::kMultiplier>1,"paid boost multiplies every selected gear");
- check(ramlogic::Owns(8,8,1000),"explicit ram retains its driver over ordinary parking/follow orders");
- check(!ramlogic::Owns(8,9,1000)&&!ramlogic::Owns(8,8,15000),"ram ownership excludes unrelated vehicles and expired orders");
- check(ramlogic::CanSelect(true,true,false),"a T hold on a highlighted living actor rams it");
- check(!ramlogic::CanSelect(false,true,false)&&!ramlogic::CanSelect(true,true,true),"ram selection excludes places and own occupants");
- check(ramlogic::Reject(true,false,false)!=nullptr&&ramlogic::Reject(false,true,false)!=nullptr,"refused rams carry a logged reason");
- check(ramlogic::Throttle(0.2)==1.0&&ramlogic::Throttle(-1.0)==1.0,"a ram runs flat out toward a target ahead");
- check(ramlogic::Throttle(2.5)<1.0,"a target behind is turned onto first, then the run is flat out");
- check(ramlogic::SteerRate(1.0,0.8)==0.8&&ramlogic::SteerRate(-1.0,0.8)==-0.8,"the ram turns as fast as the hull allows");
- check(std::fabs(ramlogic::SteerRate(0.1,0.8)-0.25)<1e-9,"near the line the ram steers gently onto it");
- check(ramlogic::Finished(true,15000,false,100,4),"ram order has a finite timeout");
- check(ramlogic::Finished(true,1000,true,3,4),"ram ends after nearby impact");
- check(!ramlogic::Finished(true,1000,true,50,4),"distant contact cannot falsely complete ram");
- check(ramlogic::Finished(false,100,false,50,4),"lost ram target cancels order");
- check(!ramlogic::Finished(true,1000,false,50,4),"an explicit ram is not cut short by the player's combat flag");
  altcontrol::Input alt;
  alt.Update(false,true,0);
  auto action=alt.Update(true,true,10);

@@ -140,6 +140,9 @@ namespace addr
 	inline constexpr std::uint32_t kHavokShiftWorld = 0x03060A50;       // hknpWorld::shiftWorld (vtbl[76] of the +0x18 interface)
 	inline constexpr std::uint32_t kOriginShiftEventSource = 0x00691580;  // returns BSTGlobalEvent::EventSource<BSWorldOriginShiftEvent>*
 	inline constexpr std::uint32_t kForEachRefInCell = 0x00B1E190;      // (cell, callback, flag) -> int
+	inline constexpr std::uint32_t kLookupFormById = 0x005DE3B0;
+	inline constexpr std::uint32_t kLookupPluginByName = 0x00598430;
+	inline constexpr std::uint32_t kPluginLocalToRuntime = 0x005B78C0;
 	inline constexpr std::uint32_t kEventNotify = 0x022C9300;           // (source, callback)
 	inline constexpr std::uint32_t kRWLockWrite = 0x022CC3D0;           // (lock)
 	inline constexpr std::uint32_t kRWLockWriteRelease = 0x002C45A0;    // (lock)
@@ -229,7 +232,7 @@ namespace addr
 	inline constexpr std::uint32_t kSaveLocationWriter = 0x018286F0;  // (saveBuffer{+8 data, +0x10 capacity, +0x14 offset}); hooked: rebase
 	inline constexpr std::uint32_t kAlignedOrigin = 0x0096EFB0;      // (grid, coord out, latlong): block-aligned landing origin
 	inline constexpr std::uint32_t kDisableReference = 0x00C10660;   // (ref, fade): what the console's disable calls
-	inline constexpr std::uint32_t kEnableReference = 0x00C10810;    // (ref): what the console's enable calls
+	inline constexpr std::uint32_t kEnableReference = 0x00C10810;    // (ref): cancels queued state changes; does NOT enable. Follow with kRefEnableTask for ordinary refs.
 	// Ship landing with its animation (what Papyrus SpaceshipReference.EnableWithLanding does, via FUN_141f16d20 kind 3):
 	// FUN_1421219b0(ship, marker) places the ship at the marker (position, rotation, the marker's cell) and, if the ship
 	// has no 3D (disabled), queues the landing sequence FUN_142121cc0; then the ship is enabled (EnableFunctor).

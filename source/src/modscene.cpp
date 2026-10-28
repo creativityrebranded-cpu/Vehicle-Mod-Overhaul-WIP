@@ -2,6 +2,8 @@
 
 #include "addresses.h"
 #include "game.h"
+#include "refcollect.h"
+#include "runtimecells.h"
 
 #include <Windows.h>
 
@@ -37,10 +39,7 @@ namespace modscene
 			static void Noop(RefCollector*) {}
 			static int Invoke(RefCollector* self, std::uintptr_t* refPtr)
 			{
-				if (refPtr && *refPtr && self->out->size() < self->limit) {
-					self->out->push_back(*refPtr);
-				}
-				return 1;
+                return refcollect::Append(*self->out,refPtr?*refPtr:0,self->limit);
 			}
 			inline static void* const kVtbl[4] = { reinterpret_cast<void*>(&Noop), reinterpret_cast<void*>(&Noop),
 				reinterpret_cast<void*>(&Invoke), reinterpret_cast<void*>(&Noop) };
@@ -107,6 +106,7 @@ namespace modscene
 		bool g_sharedValid = false;
 		ULONGLONG g_frameAt = 0;                // when NewFrame was last called (0: never)
 		constexpr ULONGLONG kFrameAliveMs = 250;
+		constexpr unsigned kSharedFloor = 8000;
 	}
 
 	void NewFrame()
@@ -118,16 +118,11 @@ namespace modscene
 	std::vector<std::uintptr_t> ScanRefs(unsigned limit)
 	{
 		std::vector<std::uintptr_t> out;
-		const auto tes = Ptr(addr::kTESPtr);
-		if (!tes) {
-			return out;
-		}
-		const auto entries = At<std::uintptr_t*>(tes, off::kTESGridCells);
-		const auto count = std::min<std::uint32_t>(At<std::uint32_t>(tes, off::kTESGridCount), 64);
-		for (std::uint32_t i = 0; entries && i < count; ++i) {
-			if (!entries[i]) continue;
-			const auto cell = At<std::uintptr_t>(entries[i], off::kGridEntryCell);
-			if (!cell || At<std::uint8_t>(cell, off::kCellState) != 10) continue;
+        out.reserve(std::min(limit,12000u));
+		const auto count=runtimecells::GridSize();
+		for (std::uint32_t i = 0; i < count && out.size()<limit; ++i) {
+			const auto cell=runtimecells::Cell(i,runtimecells::Policy::AttachedCell);
+			if (!cell) continue;
 			RefCollector cb{ RefCollector::kVtbl, &out, limit };
 			EngineFn<int (*)(std::uintptr_t, RefCollector*, char)>(addr::kForEachRefInCell)(cell, &cb, 0);
 		}
@@ -141,8 +136,11 @@ namespace modscene
 		if (!g_frameAt || now - g_frameAt > kFrameAliveMs) return ScanRefs(limit);  // nobody calls NewFrame: no sharing
 		const bool truncated = g_sharedValid && g_shared.size() >= g_sharedLimit;
 		if (!g_sharedValid || (truncated && limit > g_sharedLimit)) {
-			g_shared = ScanRefs(limit);
-			g_sharedLimit = limit;
+			// The frame's first scan takes at least kSharedFloor, so later callers in the same frame (8000 is common) reuse it
+			// rather than scanning the whole scene again.
+			const unsigned take = std::max(limit, kSharedFloor);
+			g_shared = ScanRefs(take);
+			g_sharedLimit = take;
 			g_sharedValid = true;
 		}
 		if (g_shared.size() <= limit) return g_shared;

@@ -242,6 +242,7 @@ namespace navmap
 			s.haveGround = true;
 		}
 		s.blocked = Valid(c->blockedZ) && now - c->blockedAt < kBlockedLifeMs && std::fabs(z - c->blockedZ) <= kBlockedBand;
+		if (s.blocked) s.blockedZ = c->blockedZ;
 		s.free = Valid(c->freeLo) && now - c->freeAt < kCellLifeMs && z >= c->freeLo - 2.0 && z <= c->freeHi + 2.0;
 		if (now - c->contactAt < kContactLifeMs) s.contacts = c->contacts;
 		for (int b = 0; b < 2; ++b) {  // a solid object's band where the vehicle would be
@@ -321,7 +322,7 @@ namespace navmap
 
 	namespace
 	{
-		bool g_samplerOn = true, g_hullOn = true, g_raysOn = true;
+		bool g_samplerOn = true, g_hullOn = true, g_raysOn = true, g_newPilot = true;
 		ULONGLONG g_samplerRead = 0;
 		std::wstring g_iniPath;
 
@@ -347,6 +348,9 @@ namespace navmap
 			const bool rays = GetPrivateProfileIntW(L"nav", L"rays", 1, g_iniPath.c_str()) != 0;
 			if (rays != g_raysOn) logger::Write("Nav map: engine ray and sweep queries %s (nav.ini)", rays ? "ON" : "OFF");
 			g_raysOn = rays;
+			const bool pilot = GetPrivateProfileIntW(L"nav", L"autopilot", 1, g_iniPath.c_str()) != 0;
+			if (pilot != g_newPilot) logger::Write("Nav map: autopilot %s (nav.ini)", pilot ? "NEW (autodrive)" : "OLD (0.8 rules)");
+			g_newPilot = pilot;
 		}
 	}
 
@@ -364,6 +368,12 @@ namespace navmap
 	{
 		SamplerEnabled();
 		return g_raysOn;
+	}
+
+	bool NewAutopilot()
+	{
+		SamplerEnabled();  // (re-reads nav.ini every 5 s)
+		return g_newPilot;
 	}
 
 	bool HullEnabled()

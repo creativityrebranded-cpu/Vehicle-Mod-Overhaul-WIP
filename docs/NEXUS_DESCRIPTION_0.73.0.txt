@@ -31,7 +31,7 @@ New in 0.73.0
 - Input ownership lasts until a button is released, including across scanner/editor changes. Native modal UI blocks mod gameplay commands. Occupied-vehicle Activate handling no longer also responds to scanner input.
 - Controller HUD editor: open the scanner and double tap View / Create. The editor's controls are listed below.
 - bindings.ini upgrades to layout 4, backing up the old file as bindings.ini.before-layout4. Recognized old defaults are upgraded; edited lines are retained. Review retained custom bindings against the new separate commands.
-- Placement mode and area summon points are included. Parking edits record authoring data; parking changes still need a rebuilt placements plugin.
+- Placement mode and area summon points are included. New Atlantis parking edits are served immediately by the spare pool and baked into FVO_CityTraffic.esm at the next game start.
 
 Requirements
 
@@ -44,14 +44,14 @@ Optional
 
 - Carfield and/or Parked Vehicles (with FVO_ParkedVehiclesPatch.esm for Parked Vehicles): parked types are selected from compatible vehicles in your load order with a fixed seed per location.
 - Additional compatible native vehicle mods join the vehicle pool automatically.
-- FVO_CityPlacements.esm adds the mod's own parked vehicles. Neither this nor another parked-vehicle mod is needed for player flight.
+- FVO_CityTraffic.esm adds New Atlantis traffic and parked vehicles, with automatic city recording rebuilds. It replaces FVO_CityPlacements.esm. Neither city plugin is needed for player flight.
 
 Installation
 
 - Install SFSE and start the game through sfse_loader.exe.
 - Install the mod with your mod manager, or extract the game archive into Starfield\Data. The archive root contains the contents of Data.
 - Enable FVO_NPCPilots.esm. NPC drivers need its walking and boarding packages.
-- Optionally enable FVO_CityPlacements.esm for the mod's parked vehicles.
+- Optionally enable FVO_CityTraffic.esm for New Atlantis traffic and parked vehicles. Disable the old FVO_CityPlacements.esm when using it.
 - Updating from 0.72.0 or earlier: the files were renamed (see below). Delete the old ones and enable the new ones.
 - Restart the game after replacing the DLL.
 
@@ -61,10 +61,10 @@ Every file name starts with the mod's name, Flying Vehicle Overhaul (FVO). The c
 
 - SFSE\Plugins\FlyingVehicleOverhaul.dll (required): the core mod. Flight, the autopilot, navigation, NPC driving and combat, vehicle damage, traffic, controls, settings and the HUD are all in it. SFSE loads it; it is not part of your load order.
 - FVO_NPCPilots.esm (required for NPC drivers): one quest and the AI packages NPCs use to walk to a vehicle and get in. It does not change flight, place vehicles, add items or edit game records. Without it you can still fly, but NPCs cannot be sent to vehicles.
-- FVO_CityPlacements.esm (optional): the mod's own parked vehicles, about 35 REV-8s in 8 city cells. It skips spots where Carfield or Parked Vehicles already park one. It is flagged light. Other mods that edit the same cells may conflict.
+- FVO_CityTraffic.esm (optional): persistent New Atlantis vehicles and pilots, ordinary parked spots, and the spare placement pool. Rebuilt from city recordings at startup; replaces the older FVO_CityPlacements.esm.
 - FVO_ParkedVehiclesPatch.esm (optional, separate download): a patch for Parked Vehicles (Vehicles.esm by SarthesArai) that turns its static vehicle props into real, drivable vehicles. It needs Vehicles.esm and must load after it.
 
-Who needs what: everyone needs the DLL; FVO_NPCPilots.esm if you want NPCs in vehicles; FVO_CityPlacements.esm only for extra parked vehicles in cities; FVO_ParkedVehiclesPatch.esm only if you use Parked Vehicles.
+Who needs what: everyone needs the DLL; FVO_NPCPilots.esm if you want NPCs in vehicles; FVO_CityTraffic.esm for New Atlantis traffic and automatic city placements; FVO_ParkedVehiclesPatch.esm only if you use Parked Vehicles.
 
 Renamed in 0.73.0 (old name -> new name):
 - SeamlessVehicle.dll -> FlyingVehicleOverhaul.dll
@@ -163,6 +163,28 @@ HUD editor
 - Keyboard: F7 opens/closes and saves. Page Up / Down select. Arrows move. Home / End change spacing. + / - resize. Delete resets the selected element. Ctrl increases movement steps.
 - Controller: with the scanner open, double tap View / Create to enter. LB / RB select the previous/next element. Left stick moves it. D-pad Left/Right changes spacing. RT / LT grows/shrinks it. X / Square resets it. L3 increases movement steps. B / Circle saves and closes.
 
+
+
+Contextual HUD help
+
+- Help adds short gesture explanations beside the original mod Summon, Follow, Hover/Land, Gear, Auto, Target and Route elements. It opens no separate help panel or controls browser.
+- Native game movement, look, fire, aim, health, boost, exit and scanner UI gain no duplicate help prompts.
+- Shared inputs have one visible owner per context. For example, eligible scanner ram/focus gestures join Summon/Follow when they share those buttons. Remapped keyboard/controller inputs regroup from their actual bindings.
+- Target stays a named information readout without a required button or UNBOUND warning. Placement replaces its destination gestures; deletion appears only near a saved spot and summon points require a real surface.
+- Toggle the existing Show hints action: J on keyboard, R3 tap while driving, or View/Create hold in the scanner. Default bindings and gameplay input handling are unchanged.
+- Existing HUD anchors and layout settings are preserved. The editor keeps readable names and previews only the selected hidden element; the former 44-row command guide and its editor choices are retired.
+- Context, grouping, rebinding and information labels have offline checks. Appearance and overlap still need an in-game test.
+
+
+City recordings and startup rebuild
+
+- FVO_CityTraffic.esm supplies New Atlantis traffic, ordinary parked spots and 64 disabled spare vehicles. Enable it instead of FVO_CityPlacements.esm; enabling both creates overlapping vehicles.
+- On game startup, the DLL merges the baked city spots with your New Atlantis placement-markers.tsv, applies placement-removed.tsv and rebuilds the plugin if needed. Ordinary parked placements keep stable local IDs; removed identities remain disabled tombstones and are never assigned to different spots. The plugin embeds spot keys so the sidecar registry can be recovered.
+- During play, new city spots use up to 64 spare vehicles. Assignments stay stable as more spots are added. Removed ordinary spots hide their free vehicles; owned or occupied vehicles are left alone. Free pool vehicles reconcile on load or assignment, rather than being pulled back every two seconds.
+- The original 32 dedicated traffic homes remain reserved for traffic. The immediate pool covers ordinary parked placements. Extra pending spots beyond the free pool wait for a game restart; the persistent parked/retired ID range has 1,536 slots.
+- A verified backup is required before plugin replacement; ID reservations commit first. Unreadable/malformed data or replacement failure leaves the original plugin usable. The log reports rebuild status and deferred pool work.
+- Keep citybuild-ids.tsv and citypool-ids.tsv in the settings folder. An isolated dry-run tool and mandatory reference fixture are included with the standalone source. Live pool placement, physics and save-load behavior still require in-game verification.
+
 Status and known issues
 
 - Previously seen working in game: basic hover flight, summon/follow, driving/autopilot basics, initial parked-vehicle replacement, and basic controller response before the 0.73.0 rework.
@@ -195,3 +217,15 @@ Credits
 - The authors of Carfield and Parked Vehicles (SarthesArai), whose parked-vehicle data the optional patch supports.
 
 Source: https://github.com/creativityrebranded-cpu/Vehicle-Mod-Overhaul-WIP
+
+City vehicle startup fix: prepare the validated native vehicle listener before persistent city references register, and capture the pending-vehicle list from the start of data loading. This addresses the startup null-listener access violation recorded on 2026-10-24. Executable signatures and offline tests are checked; a fresh in-game launch and gameplay/save-load checks remain pending.
+
+Stutter mitigation: vehicle discovery now resumes within dense cells with a 256-reference limit and a soft 0.5 ms budget, including the first sweep. Ring-editor beacon work is spread across frames; unchanged rings no longer reposition every beacon on routine refresh. Failed city-pilot seating attempts are limited and back off between retries. These changes preserve enabled mods and settings. Offline checks pass; the reduction in live stuttering still needs an in-game measurement.
+
+Performance follow-up: navigation captures stable form IDs once per pass and resolves bounded slices without retaining raw references across frames. Registry maintenance visits one attached cell per frame. Native reference visitors stop at the requested limit. Native binding lookup is indexed and unchanged maps are retained; unchanged feature settings skip repeat INI reads. Gameplay log flushes are batched for up to 250 ms or 32 KiB, while startup and fault output remain immediate. Offline checks pass; live frame-time improvement remains unmeasured. Enabled mods, settings and texture quality are preserved.
+
+Connection refactor: plugin records remain tied to their originating files through named local-form references, including light plugins. Pilot and parked-vehicle connections no longer guess load-order slots. Save/world reset drops cached pilot quests and diagnostics. Shared reference/cell access, explicit vehicle-service connections and city content definitions replace repeated setup and city-specific branches. Current plugin records, capacities, saved formats and settings are preserved. Offline checks pass; live gameplay remains to be verified.
+
+Live-sampling performance follow-up: removed the synchronous main-thread reference mass visitor. Combat mass now uses a recent native chassis observation from a matching full-generation scene body, with the existing bounds estimate when no fresh observation exists. Load epochs reject prior-world samples. Physics step diagnostics use bounded counters without allocation or a registry mutex. The detailed log separates scene/occupant work, callback spacing, mod physics-hook time and native physics-step time. All active mods, visual settings and content are preserved. Live stutter reduction has not yet been measured.
+
+Scheduling optimization: completed native updates admit full vehicle work, plus one startup/load bootstrap. If native pulses stop for 100 ms, a bounded 60 Hz clock fallback keeps on-foot gameplay active. Full work has a 240 Hz ceiling, and missed native updates coalesce without a catch-up queue. UI input samples retain one-shot events such as V until the next gameplay update consumes them. Recursive callbacks skip re-entry. Read-only RAM, process-I/O and GPU-budget diagnostics supplement callback timings. Offline checks pass; live V behavior and stutter reduction still require an in-game check.

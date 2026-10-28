@@ -1,9 +1,12 @@
 #include "vehiclediag.h"
+#include "airtraffic.h"
+#include "hookcost.h"
 
 #include "addresses.h"
 #include "game.h"
 #include "hook.h"
 #include "log.h"
+#include "listenerboot.h"
 #include "physicssetup.h"
 #include "vehicleflight.h"
 #include "vehiclehits.h"
@@ -37,7 +40,7 @@ namespace vehiclediag
 		struct Comp { uptr component = 0; unsigned updates = 0; };
 		std::mutex g_lock;
 		std::unordered_map<std::uint32_t, Comp> g_comps;          // vehicle form id -> its component and update count
-		std::unordered_map<uptr, unsigned> g_steps;               // vehicle instance -> physics steps
+		hookcost::KeyedCounter<> g_steps;               // vehicle instance -> physics steps
 		std::unordered_map<std::uint32_t, game::Vec3> g_lastPos;  // form id -> position at the last report
 		ULONGLONG g_at = 0;
 		bool g_hooked = false;
@@ -170,6 +173,42 @@ namespace vehiclediag
 
 		// FUN_14131B730(component): the native physics-vehicle builder, called once by the attach. Logged per call with
 		// how it ended, so a vehicle left without an instance names the step that stopped it.
+        bool ReadBootMemory(uptr address, void* out, std::size_t size) {
+            __try { std::memcpy(out,reinterpret_cast<const void*>(address),size); return true; }
+            __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        uptr PublishListener(uptr address, uptr desired) {
+            return reinterpret_cast<uptr>(InterlockedCompareExchangePointer(
+                reinterpret_cast<void* volatile*>(address),reinterpret_cast<void*>(desired),nullptr));
+        }
+        bool InstallPendingHooks() {
+            static bool attempted=false, installed=false;
+            if (attempted) return installed;
+            attempted=true;
+		static const std::uint8_t kAddPrologue[19] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x4C, 0x89, 0x4C, 0x24, 0x20, 0x56, 0x57, 0x41, 0x56 };
+		static const std::uint8_t kRemovePrologue[15] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20 };
+		static const std::uint8_t kHasPrologue[15] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20 };
+		if (std::memcmp(reinterpret_cast<const void*>(game::Base()+kPendingAdd),kAddPrologue,sizeof(kAddPrologue)) ||
+            std::memcmp(reinterpret_cast<const void*>(game::Base()+kPendingRemove),kRemovePrologue,sizeof(kRemovePrologue)) ||
+            std::memcmp(reinterpret_cast<const void*>(game::Base()+kPendingHas),kHasPrologue,sizeof(kHasPrologue))) {
+            logger::Write("Vehicle pending list: OFF (one or more signatures differ; nothing patched)");
+            return false;
+        }
+		void* add = nullptr; void* remove = nullptr; void* has = nullptr;
+		// Signature mismatch changes no code. If a later allocation fails, retain this
+		// DLL: an installed query/remover without the adder still gives native answers.
+		const bool ok = hook::Install(game::Base() + kPendingHas, kHasPrologue, sizeof(kHasPrologue), reinterpret_cast<void*>(&PendingHasDetour), &has);
+		if (ok) g_pendingHas = reinterpret_cast<PendingHas_t>(has);
+		const bool okRemove = ok && hook::Install(game::Base() + kPendingRemove, kRemovePrologue, sizeof(kRemovePrologue), reinterpret_cast<void*>(&PendingRemoveDetour), &remove);
+		if (okRemove) g_pendingRemove = reinterpret_cast<PendingRemove_t>(remove);
+		const bool okAdd = okRemove && hook::Install(game::Base() + kPendingAdd, kAddPrologue, sizeof(kAddPrologue), reinterpret_cast<void*>(&PendingAddDetour), &add);
+		if (okAdd) g_pendingAdd = reinterpret_cast<PendingAdd_t>(add);
+		logger::Write("Vehicle pending list: %s", okAdd ? "unbounded (the game's 8-entry list is shadowed; every loading vehicle gets its attach)"
+			: ok ? "PARTIAL (hook allocation/protection failed): DLL retained; native pending-list answers preserved" : "OFF (hook allocation/protection failed)");
+		installed = okAdd;
+		return installed || ok;
+        }
+
 		constexpr std::uint32_t kBuilder = 0x0131B730;
 		using Builder_t = void (*)(uptr);
 		Builder_t g_builder = nullptr;
@@ -473,7 +512,7 @@ namespace vehiclediag
 				else g_wreckSeen.erase(v.formId);
 				// Our own autopilot flying the empty rover (summon, cover) is driving it too: the guard fought it for 30 s in the
 				// 23:38 run ("bumped", "cramped", no progress), since an undriven vehicle counts as parked.
-				const bool autopilot = v.formId == vehicleflight::OwnRoverId() && vehicleflight::Active();
+				const bool autopilot = (v.formId == vehicleflight::OwnRoverId() && vehicleflight::Active()) || airtraffic::IsVehicle(v.formId);
 				const bool parked = (v.who == world::VehicleInfo::Who::Parked || v.who == world::VehicleInfo::Who::None) && !autopilot;
 				if (!parked || v.driverId || vehiclehits::Wrecked(v.formId))
 					for (auto& g : g_guards)
@@ -508,6 +547,14 @@ namespace vehiclediag
 		}
 	}
 
+    bool PrepareForDataLoad() {
+        const auto result=listenerboot::Prepare(game::Base(),ReadBootMemory,PublishListener);
+        logger::Write("Vehicle listener before data load: %s", result==listenerboot::Result::Published
+            ? "published the native static object (normal event initialization retained)"
+            : result==listenerboot::Result::Existing ? "already present, preserved" : "REFUSED (native initialization signatures differ)");
+        return result!=listenerboot::Result::Invalid && InstallPendingHooks();
+    }
+
 	void Install()
 	{
 		// Validate both the predicate entry and its exact vehicle-builder call site.
@@ -520,21 +567,7 @@ namespace vehiclediag
 			g_setupHooked = hook::Install(game::Base() + 0x023795E0, kStaticPrologue, sizeof(kStaticPrologue), reinterpret_cast<void*>(&IsStaticDetour), &predicate);
 			if (g_setupHooked) g_isStatic = reinterpret_cast<IsStatic_t>(predicate);
 		}
-		{
-			static const std::uint8_t kAddPrologue[19] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x4C, 0x89, 0x4C, 0x24, 0x20, 0x56, 0x57, 0x41, 0x56 };
-			static const std::uint8_t kRemovePrologue[15] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20 };
-			static const std::uint8_t kHasPrologue[15] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20 };
-			void* add = nullptr; void* remove = nullptr; void* has = nullptr;
-			// All three or none: a set kept by only some of them would drift from the game's.
-			const bool ok = hook::Install(game::Base() + kPendingHas, kHasPrologue, sizeof(kHasPrologue), reinterpret_cast<void*>(&PendingHasDetour), &has);
-			if (ok) g_pendingHas = reinterpret_cast<PendingHas_t>(has);
-			const bool okRemove = ok && hook::Install(game::Base() + kPendingRemove, kRemovePrologue, sizeof(kRemovePrologue), reinterpret_cast<void*>(&PendingRemoveDetour), &remove);
-			if (okRemove) g_pendingRemove = reinterpret_cast<PendingRemove_t>(remove);
-			const bool okAdd = okRemove && hook::Install(game::Base() + kPendingAdd, kAddPrologue, sizeof(kAddPrologue), reinterpret_cast<void*>(&PendingAddDetour), &add);
-			if (okAdd) g_pendingAdd = reinterpret_cast<PendingAdd_t>(add);
-			logger::Write("Vehicle pending list: %s", okAdd ? "unbounded (the game's 8-entry list is shadowed; every loading vehicle gets its attach)"
-				: ok ? "PARTIAL (remover/adder bytes differ): the shadow set only answers, it is never filled" : "OFF (bytes differ)");
-		}
+		InstallPendingHooks();
 		static const std::uint8_t kBuilderPrologue[17] = { 0x48, 0x89, 0x4C, 0x24, 0x08, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57 };
 		void* builder = nullptr;
 		const bool bh = hook::Install(game::Base() + kBuilder, kBuilderPrologue, sizeof(kBuilderPrologue), reinterpret_cast<void*>(&BuilderDetour), &builder);
@@ -563,8 +596,8 @@ namespace vehiclediag
 			if (g.instance.load(std::memory_order_acquire) == instance) { ClampInstance(g, instance); break; }
 		for (auto& g : g_glides)
 			if (g.instance.load(std::memory_order_acquire) == instance) { GlideInstance(g, instance); break; }
-		std::lock_guard lk(g_lock);
-		++g_steps[instance];
+        // No shared registry mutex and no allocation in the physics counter.
+        g_steps.Note(instance);
 	}
 
 	std::uintptr_t ComponentOf(std::uint32_t formId)
@@ -600,11 +633,13 @@ namespace vehiclediag
 		{
 			std::lock_guard lk(g_lock);
 			comps.swap(g_comps);
-			steps.swap(g_steps);
 			for (const auto& [id, c] : comps) g_comps[id] = Comp{ c.component, 0 };  // keep the component, restart the count
 		}
+        const auto skippedSteps=g_steps.Drain([&](uptr instance,unsigned count){steps[instance]=count;});
 		logger::Write("Vehicle probe: %zu vehicles within %.0f m; component updates hook %s; freeze on exit %u; %zu components updated, %zu instances stepped in %.0f s",
 			nearby.size(), kNear, g_hooked ? "on" : "OFF", freeze, comps.size(), steps.size(), kEveryMs / 1000.0);
+        if(skippedSteps)
+            logger::Write("Vehicle probe: %u step-count samples skipped (bounded diagnostics table full)",skippedSteps);
 		if (g_pendingAdd)
 			logger::Write("Vehicle pending list:   %zu waiting for their 3D; %u kept that the game's list had lost, %u wipes of the game's list so far",
 				g_pending.Size(), g_rescues.load(std::memory_order_relaxed), g_wipes.load(std::memory_order_relaxed));

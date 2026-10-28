@@ -5,6 +5,9 @@ namespace logger
 	// Opens Documents\My Games\Starfield\SFSE\Logs\SeamlessPlanets.log ; the previous one is kept as SeamlessPlanets.prev.log.
 	void Init();
 	void Write(const char* fmt, ...);
+	// Main-thread service: bounded flushes during gameplay; startup and crash output
+	// remain immediate. No worker thread, dropped lines or changed verbosity.
+	void Service();
 
 	// Chatty lines (per-second NPC state, the 2 s pilot position line, HUD notices, traffic per-NPC lines) only when
 	// Logs\FlyingVehicleOverhaul\settings.ini has [log] verbose=1 (re-read every 5 s). Decisions and faults are always logged.

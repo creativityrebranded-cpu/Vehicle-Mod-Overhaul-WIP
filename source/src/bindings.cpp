@@ -1,5 +1,7 @@
 #include "bindings.h"
 #include "commandinput.h"
+#include "inputevents.h"
+#include "hudprompts.h"
 
 #include "addresses.h"
 #include "bindlogic.h"
@@ -11,7 +13,7 @@
 #include "notify.h"
 #include "passenger.h"
 #include "realvehicles.h"
-#include "vehicleflight.h"
+#include "vehicleflight.h"
 #include "fvopaths.h"
 
 #include <Windows.h>
@@ -73,7 +75,9 @@ namespace bindings
 		bool g_suppressInput=false;
         const auto kNames = [] {std::array<const char*,std::size(kDefs)> n{};for(std::size_t i=0;i<n.size();++i)n[i]=kDefs[i].what;return n;}();
         commandinput::Frame g_commands;
+        inputevents::Buffer<commandinput::Count> g_triggerEvents,g_startEvents;
         commandinput::Sample g_sample;
+        std::array<std::uint8_t,std::size_t(Action::Count)> g_promptScopes{};
 
         bool g_allowed=false, g_capturePad=false;
         bool LayerOn(std::size_t i) {
@@ -191,6 +195,7 @@ namespace bindings
 				if (const auto semi = spec.find(';'); semi != std::string::npos && semi > 0 && spec[semi - 1] == ' ') spec.resize(semi);  // a trailing "; comment"
 				std::string bad;
                 g_bind[i] = bindlogic::Parse(spec, &bad);
+                g_promptScopes[i]=hudprompts::Contexts(bindlogic::Parse(kDefs[i].spec));
                 if(!g_defaultSeen[i])g_defaultVk[i]=kDefs[i].defaultVk; g_defaultSeen[i]=true;
                 g_gestureOn[i].assign(g_bind[i].size(),false);
 
@@ -202,7 +207,7 @@ namespace bindings
 			}
 			g_modifiers = bindlogic::Modifiers(std::vector<bindlogic::Binding>(g_bind.begin(), g_bind.end()));
             if(upgrade)WritePrivateProfileStringW(L"meta",L"layout",L"4",path.c_str());
-            g_suppressInput=true;g_commands.Reset();
+            g_suppressInput=true;g_commands.Reset();g_triggerEvents.Reset();g_startEvents.Reset();
 			g_loaded = true;
 			g_generation.fetch_add(1);
 			if (reloaded) notify::Show(problems ? "Controls reloaded (%d line(s) partly not understood, see the log)" : "Controls reloaded from bindings.ini", problems);
@@ -310,7 +315,7 @@ namespace bindings
 			const int s = g_styleSetting ? g_styleSetting : g_detected.load();
 			return s == 2 ? bindlogic::PadStyle::PlayStation : bindlogic::PadStyle::Xbox;
 		}
-		bool PadInUse() { return g_connected.load() && g_padShown.load(std::memory_order_relaxed); }
+		bool PadInUse() { return g_padShown.load(std::memory_order_relaxed); }
 		// The one situation the player is in (main thread): the scanner wins, then riding as a passenger, then the
 		// vehicle being driven (physical VTOL, hover, wheels), else on foot.
 		std::uint8_t Situation()
@@ -338,7 +343,7 @@ namespace bindings
 			const bool focused = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
 			bool fresh = false;
 			for (int vk = 1; vk < 256; ++vk) {
-				const bool down = focused && KeyDown(vk);
+				const bool down = focused && bindlogic::KeyboardMouseKey(unsigned(vk)) && KeyDown(vk);
 				if (down && !g_keyWasDown[vk]) fresh = true;
 				g_keyWasDown[vk] = down;
 			}
@@ -363,7 +368,7 @@ namespace bindings
 		}
 	}
 
-	void Tick()
+	void Tick(bool gameplay)
 	{
 		const ULONGLONG now = GetTickCount64();
 		PollPad(now);
@@ -377,8 +382,9 @@ namespace bindings
 		GamePads(now);
 		if (g_connected.load()) DetectStyle(now);
 		const bool keyPress = FreshKeyPress(), padPress = g_padPressed.exchange(false, std::memory_order_relaxed);
-		if (!g_connected.load()) g_device.device = bindlogic::Device::Keyboard;
-		else if (g_device.Update(keyPress, padPress)) logger::Write("Bindings: prompts now name the %s", g_device.device == bindlogic::Device::Pad ? "controller" : "keyboard and mouse");
+        DWORD focusPid=0;GetWindowThreadProcessId(GetForegroundWindow(),&focusPid);
+        if(g_device.Observe(inputgate::LastDevicePress(),keyPress,padPress&&focusPid==GetCurrentProcessId()))
+            logger::Write("Bindings: prompts now name the %s",g_device.device==bindlogic::Device::Pad?"controller":"keyboard and mouse");
 		g_padShown.store(g_device.device == bindlogic::Device::Pad, std::memory_order_relaxed);
         {
             const auto ctx=Situation();
@@ -395,6 +401,9 @@ namespace bindings
             g_sample.placement=!g_sample.driving&&realvehicles::RecordingPlacements();
             for(int key=1;key<256;++key)g_sample.keys[std::size_t(key)]=KeyDown(key);
             g_commands.Update(g_bind,g_defaultVk,g_gamePad,g_sample,now);
+            g_triggerEvents.Sample(g_commands.triggered,g_commands.enabled,ctx,g_sample.allowed);
+            g_startEvents.Sample(g_commands.started,g_commands.enabled,ctx,g_sample.allowed);
+            if(gameplay){g_triggerEvents.Publish();g_startEvents.Publish();}
             g_modifiers=g_commands.modifiers;
             std::uint32_t blocked=0;std::array<bool,256> keys{};
             for(std::size_t i=0;i<std::size(kDefs);++i){
@@ -410,6 +419,9 @@ namespace bindings
                     if(!nativePad&&pb&&(!alt.mod||(g_sample.pad&alt.mod)))blocked|=pb&bindlogic::kPadPressBits;
                 }
             }
+            // 2026-10-28 (the user: "restrict input from wasd" in the passenger seat): the driver's own job flies it; the game
+            // never gets the passenger's movement, boost or jump keys.
+            if(ctx==bindlogic::kCtxPassenger)for(const int vk:{int('W'),int('A'),int('S'),int('D'),VK_SPACE,VK_LSHIFT,VK_SHIFT})keys[std::size_t(vk)]=true;
             inputgate::SetBlocked(g_connected?blocked:0);
             inputgate::SetBlockedKeys(keys);
             if(blocked!=g_blockedShown){g_blockedShown=blocked;logger::Write("Bindings: situation %u, owned controller buttons: %s",unsigned(ctx),PadList(blocked).c_str());}
@@ -470,11 +482,13 @@ namespace bindings
 		return Label(a, vk);
 	}
 
-    void ResetRuntime(){std::lock_guard lk(g_lock);g_commands.Reset();g_allowed=false;g_suppressInput=true;g_captureAction=-1;}
-    bool Triggered(Action a){const auto i=std::size_t(a);std::lock_guard lk(g_lock);return i<g_commands.triggered.size()&&g_allowed&&g_commands.triggered[i];}
-    bool Started(Action a){const auto i=std::size_t(a);std::lock_guard lk(g_lock);return i<g_commands.started.size()&&g_allowed&&g_commands.started[i];}
+    void ResetRuntime(){std::lock_guard lk(g_lock);g_commands.Reset();g_triggerEvents.Reset();g_startEvents.Reset();g_allowed=false;g_suppressInput=true;g_captureAction=-1;}
+    void EndUpdate(){std::lock_guard lk(g_lock);g_triggerEvents.End();g_startEvents.End();}
+    bool Triggered(Action a){const auto i=std::size_t(a);std::lock_guard lk(g_lock);return g_allowed&&g_triggerEvents.Active(i);}
+    bool Started(Action a){const auto i=std::size_t(a);std::lock_guard lk(g_lock);return g_allowed&&g_startEvents.Active(i);}
     bool Allowed(){std::lock_guard lk(g_lock);return g_allowed&&!g_suppressInput&&g_captureAction<0;}
 	bool PadConnected() { return g_connected.load(); }
+	std::uint32_t PadState() { PollPad(GetTickCount64()); return g_pad.load(std::memory_order_relaxed); }
 	bool UsingPad() { return PadInUse(); }
 	bool GameHeld(const char* context, const char* event, int fallbackVk)
 	{
@@ -492,9 +506,38 @@ namespace bindings
 		return vk ? bindlogic::KeyLabel(vk) : "unbound";
 	}
 	std::string PadName(std::uint32_t bit) { return bindlogic::PadLabel(bit, Style()); }
+    std::string GameLabelFor(const char* context,const char* event,bool controller){
+        if(controller){
+            const auto code=controlmap::PadFor(context,event);if(code==0xB)return "Left stick";if(code==0xC)return "Right stick";
+            const auto bit=bindlogic::GamePadBit(code);return bit?bindlogic::PadLabel(bit,Style()):"";
+        }
+        return controlmap::KeyboardMouseLabel(context,event);
+    }
 	const char* ActionName(Action a){const auto i=std::size_t(a);return i<std::size(kNames)?kNames[i]:"Control";}
 	const char* ActionDescription(Action a){const auto i=std::size_t(a);return i<std::size(kDefs)?kDefs[i].what:"";}
 	unsigned Generation(){return g_generation.load();}
+    HudState HudSnapshot(bool controller,bool preview){
+        std::lock_guard lk(g_lock);HudState state;if(!g_loaded)return state;
+        state.context=g_sample.context;state.allowed=g_allowed&&!g_suppressInput&&g_captureAction<0;
+        state.driving=g_sample.driving;state.placement=g_sample.placement;
+        for(std::size_t i=0;i<std::size(kDefs);++i){
+            const auto context=preview?bindlogic::kCtxAll:state.context;
+            if(preview||g_sample.Available(i))state.resolved[i]=inlinehints::Resolve(g_bind[i],g_defaultVk[i],g_gamePad[i],controller,Style(),std::uint8_t(context));
+            state.input[i]=hudprompts::Input(g_bind[i],g_defaultVk[i],g_gamePad[i],controller,Style(),std::uint8_t(context));
+            state.available[i]=(preview||g_sample.Available(i))&&!state.input[i].empty();
+            const auto scopes=g_bind[i].empty()?g_promptScopes[i]:hudprompts::Contexts(g_bind[i]);
+            state.applicable[i]=preview||(g_sample.Available(i)&&(scopes&state.context));
+            if(controller&&!preview&&state.context==bindlogic::kCtxFoot)
+                state.scannerInput[i]=hudprompts::Input(g_bind[i],g_defaultVk[i],g_gamePad[i],true,Style(),bindlogic::kCtxScanner);
+        }
+        const auto edit=std::size_t(Action::HudEdit);
+        state.editorClose=hudprompts::Input(g_bind[edit],g_defaultVk[edit],g_gamePad[edit],controller,Style(),bindlogic::kCtxEditor);
+        return state;
+    }
+    std::string PromptInput(Action action,bool controller,std::uint8_t context){
+        const auto i=std::size_t(action);std::lock_guard lk(g_lock);if(!g_loaded||i>=std::size(kDefs))return "";
+        return hudprompts::Input(g_bind[i],g_defaultVk[i],g_gamePad[i],controller,Style(),context);
+    }
 	std::string MenuLabel(Action a)
 	{
 		const auto i=std::size_t(a);if(i>=std::size(kDefs))return {};

@@ -1,0 +1,103 @@
+Update/Installation Notice:
+If you're using an older version and updating, delete all the older files and replace with the newer files. FVO is also now compatible with mod managers.
+
+Flying Vehicle Overhaul 0.8.5 — Early WIP
+Hover vehicles with gears, terrain following and autopilot. Summon your vehicle, have it follow or cover you, send it along scanner routes, ride with NPC drivers, or let city traffic fly routes you write in simple text files. NPCs can use compatible vehicles for travel and combat.
+What it does
+
+* Hover flight: four gears, boost, climb, descend and terrain following. Standard hover works with Physical VTOL switched off.
+* Physical flight — experimental: thrust, torque, native mass and inertia produce momentum and banking. Flight assist stabilizes drift and rotation; camera roll and an attitude instrument show pitch and bank. Separate player and AI settings, both off by default.
+* Autopilot and routes: summon, follow, cover, guard and scanner destinations. Chain stops, retry a held trip or skip a stop. Navigation considers terrain, walls, ceilings, people, vehicles, weather and darkness.
+* Seats and passengers: get into a vehicle someone is driving and you ride as a passenger while their autopilot drives. Hold to pull the driver out and take the wheel. Followers take the passenger seats when you drive.
+* Combat and faction reactions: vehicle manoeuvres, squad roles, morale, attacks and retreats. Set Defend / Attack / Hold fire, or focus a hostile person or hostile-driven vehicle. Ownership and allegiance govern vehicle use and friendly-fire protection.
+* Damage and wrecks: shots and collisions damage occupied and empty vehicles, can injure occupants and can leave wrecks. Vehicle health stays with the chassis through driver changes.
+* Traffic and routes: calm NPCs take parked vehicles on trips. With city traffic installed they climb onto routes defined in text files, follow them to the exit nearest their destination and land, or lap and return home.
+* Ground navigation — experimental: optional ground-first route planning around terrain hazards and buildings, with native driving for occupied vehicles. Off by default.
+* Controls and HUD: separate keyboard/controller bindings with context, tap, hold and double tap. One vehicle prompt changes with context. Move and resize HUD groups, status-card elements, route text, escort rows and action slots.
+
+New in 0.8.5
+
+* AI navigation: a new autopilot steers by scoring headings round the vehicle and plans short routes round obstacles. It recovers from stuck spots by trying the most open direction, including up when flying is allowed. Combat prefers flight, traffic prefers the ground; climbs to high lanes work.
+* Entering and exiting: you are no longer seated over an NPC driver. Holding to pull a driver out now uses the game's own get-up, so they step out instead of hanging in a sitting pose. Exiting high up drops you beside the vehicle. Fixed a save-load crash.
+* Passenger system: entering a vehicle someone drives seats you as a passenger. You have no steering there; the NPC's autopilot drives and your movement keys are blocked. G taps out and holds to take the wheel.
+* Route making: traffic routes are plain .ini files in Data\SFSE\Plugins\FVO_Traffic. Draw rings or open/looping paths, add exits and landing places and set per-world rules. "Show traffic routes" places probes along them. A step-by-step guide is included (see Making your own routes).
+* Installer: the Extra Vehicles addon now has separate toggles for New Atlantis placements and city traffic; a new Traffic page holds its settings.
+
+Making your own routes
+
+* Copy NewAtlantis.ini in Data\SFSE\Plugins\FVO_Traffic and rename it. FVO reads every .ini there and re-reads them every 10 seconds, so changes show while you play.
+* [world.NAME] id = the worldspace name from the log. [route.NAME] type = ring (centre, height, radius, aspect, rotation, lanes, lane_gap) or path (points x y z, ..., closed = 1 for a loop, width).
+* [exit.NAME] route and "at" (degrees on a ring, point number on a path). [place.NAME] point x y z, radius and the exit to use. [traffic.NAME] max, gap, vehicles, trips = laps / places / mixed.
+* HOW-TO-MAKE-ROUTES.txt in the same folder explains each line with examples. Bad lines are skipped and named in the log.
+
+Requirements
+
+* Steam Starfield 1.16.244 and its matching Starfield Script Extender (SFSE). Launch through sfse_loader.exe. Game Pass and Microsoft Store are not supported.
+* Core-game vehicle content is sufficient for the main mod and Extra Vehicles addon. Carfield and Parked Vehicles are optional; only the Parked Vehicles conversion patch requires Parked Vehicles and its listed vehicle-content masters.
+
+Downloads and included files
+
+* FlyingVehicleOverhaul-0.8.5.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
+* FlyingVehicleOverhaul-0.8.5-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds New Atlantis parked vehicles; FVO_CityPlacements.dll with FVO_Traffic\NewAtlantis.ini and the route guide adds city traffic. Use either or both. Includes its guide.
+* FlyingVehicleOverhaul-0.8.5-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
+* FlyingVehicleOverhaul-0.8.5-FOMOD.zip — all-in-one alternative: the main files, both Extra Vehicles toggles and the patch, with dependency checks and grouped feature setup for Vortex/MO2. Addons start unchecked. Use this instead of the separate ZIPs.
+
+Installation and updating
+
+* Mod manager: install the FOMOD, or install the main ZIP plus whichever optional addon ZIPs you want.
+* Manual: extract the main ZIP and wanted addon ZIPs into Starfield\Data. DLLs belong in Data\SFSE\Plugins. Do not extract the entire FOMOD archive into Data.
+* Enable plugins: FVO_NPCPilots.esm and whichever optional ESMs you installed. City traffic needs no ESM. Launch through SFSE; restart after replacing a DLL.
+* Updating: replace the previous FVO installation. Remove SeamlessVehicle.dll and FVO_CityTraffic.esm if present; two core DLLs load both copies. An unchecked addon does not remove a copy installed elsewhere.
+
+Settings and defaults
+
+* Feature settings: Settings > Gameplay Options > Flying Vehicle Overhaul. Bindings: Settings > Controls.
+* On by default: NPC vehicle use, full combat AI, hover-or-drive behavior, damage and wrecks, health bars, status card, crash witnesses, everyday traffic and flight assist.
+* Off by default: free roll, player Physical VTOL, AI Physical VTOL, ground planning/native driving and Show traffic routes. Placement recording and detailed logging also default off. Saved settings can override defaults.
+
+Configuration folder: Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul
+
+* settings.ini: feature settings. bindings.ini: keyboard/controller bindings. hoverui.ini: HUD positions and sizes. FlyingVehicleOverhaul.log is one folder above. Route files live in Data\SFSE\Plugins\FVO_Traffic.
+
+Keyboard and mouse defaults
+
+* Driving: W/S accelerate/brake; A/D turn or roll; mouse looks/aims. V hover/land; hold Space climb, hold C descend; Alt tap next gear. Shift boosts; double tap locks throttle in flight. Fresh boost or brake releases the lock.
+* Vehicle commands: T with scanner closed toggles Auto; movement takes control back. E exits, landing first while hovering. B toggles flight assist; K cycles stance; right bracket cycles your vehicle's navigation profile; J shows all hints.
+* On foot: N tap summon, hold recall vehicle and escorts. U tap follow/cover, hold request a follower driver. At a vehicle someone drives, E boards as passenger; hold E pulls the driver out and takes the wheel.
+* Passenger: no steering; the driver's autopilot flies. G tap exits (high up you drop beside the vehicle), hold takes the wheel when stopped at a safe spot. F9 cycles escort navigation profiles.
+* Scanner: T tap destination/queued stop, double tap clear route, hold guard/focus an aimed hostile. H focus fire; O clear focus; semicolon retry; left bracket skip stop.
+
+Controller defaults
+
+Xbox / PlayStation names. Hold: 0.5 seconds; double tap: within 0.3 seconds. Custom bindings override these defaults.
+
+* Driving: left stick throttle/brake/turn/roll; right stick look. L3 hover/land; A/Cross tap gear, hold descend; Y/Triangle climb; X/Square descend. RB/R1 boost, double tap throttle lock. B/Circle exits with landing first. RT/R2 fires; LT/L2 aims.
+* Vehicle commands: D-pad Left tap Auto, hold navigation profile; Up recalls escorts; Right cycles stance; Down toggles flight assist in flight. R3 tap shows all hints.
+* Scanner orders: B/Circle tap summon, hold recall escorts too. L3 tap follow/cover, hold follower driver, double tap focus fire. Y/Triangle tap destination/stop, hold guard/focus, double tap clear route.
+* Scanner route actions: D-pad Left tap retry, hold navigation profile, double tap clear focus. Right tap skip, hold ride along, double tap escort profiles. View/Create tap stance, hold all hints, double tap HUD editor.
+* Passenger: A/Cross tap exit, hold take the wheel. Movement does not steer; the driver's autopilot flies.
+
+HUD editor
+
+* Keyboard: F7 opens/saves/closes; Page Up/Down selects; arrows move; Home/End adjust supported spacing; +/− resize; Delete resets the selection; Ctrl increases movement steps.
+* Controller: scanner View/Create double tap opens; LB/RB selects; left stick moves; D-pad Left/Right adjusts spacing; RT/LT resizes; X/Square resets; L3 increases movement steps; B/Circle saves/closes.
+* Groups and elements: moving a panel carries its arrangement; children keep their own offsets and sizes. Foot and vehicle cards have separate layouts; text pushes apart instead of overlapping. The vehicle prompt slot is movable.
+
+Status and known issues
+
+* Early WIP: hover flight, summon/follow, passenger seats, pulling a driver out and route trips have been seen working in game. Parking descent, route probes and follower seating still need gameplay testing.
+* Traffic: some NPCs give up walking to their vehicle; a few trips run at once; vehicles do not yet start already on a route. Pulling out a neutral driver counts as theft and can turn nearby NPCs hostile.
+* Performance: Jemison CPU/FPS drops were reported with 0.73.0; the cause remains unisolated. Extra live vehicles can increase CPU/physics load. Compare with optional addons disabled when reporting performance.
+
+Reporting and compatibility
+
+* Include your game/mod version, input device, location, optional plugins, command used and scanner/driving/passenger state. Copy Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log before restarting; include bindings.ini or your traffic file for control or route problems.
+* Mods changing the same vehicle physics, AI, controls, HUD hooks or placement areas may conflict. Game updates require a compatible build.
+
+Credits and source
+
+* The SFSE team.
+* The authors of Carfield and Parked Vehicles (SarthesArai), whose parked-vehicle data the optional patch supports.
+
+Source code can be found here:
+https://github.com/creativityrebranded-cpu/Vehicle-Mod-Overhaul-WIP

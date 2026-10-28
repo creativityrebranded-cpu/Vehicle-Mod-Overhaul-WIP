@@ -76,7 +76,7 @@ int main()
         const Unit it = U(0, 0, 0, 2, 0.0), me = U(-25, 0, 10, 0);
         const Facts f = Read(w, me, it, nullptr, 0);
         check(f.pinSurface && f.pinDir.x > 0.8 && f.pinDist < 12, "a wall next to it is a pin surface");
-        check(Pick(me, it, G(me, it), f, c) == T::Pin || Desire(T::Pin, me, it, G(me, it), f, c) > 0.7, "a slow target by a wall: pin");
+        check(Pick(me, it, G(me, it), f, c) != T::Pin && Desire(T::Pin, me, it, G(me, it), f, c) == 0, "a slow target by a wall: no pin (contact moves removed)");
         TState s; Enter(s, T::Pin, me, it, f, 0);
         Plan p = Steer(s, me, it, G(me, it), f, 100);
         check(p.contact && p.r.req[0].point.x < 0, "pin: first round to the far side of it from the wall");
@@ -97,17 +97,17 @@ int main()
     }
     {
         const Unit it = U(0, 0, 0, 10, 0.0), me = U(-20, 0, 18, 0);
-        check(Desire(T::Sideswipe, me, it, G(me, it), Facts{}, c) >= 0.7, "side-on, close, faster: sideswipe is wanted");
-        Ctx noRam = c; noRam.allowRam = false;
+        // Rams and contact moves were removed (2026-10-25): never wanted, whatever the geometry.
+        check(Desire(T::Sideswipe, me, it, G(me, it), Facts{}, c) == 0, "side-on, close, faster: no sideswipe (removed)");
         const Unit tb = U(-40, 0, 25, 0);
-        check(Desire(T::TBone, tb, it, G(tb, it), Facts{}, c) > 0.7 && Desire(T::TBone, tb, it, G(tb, it), Facts{}, noRam) == 0, "T-bone wanted from its side, only with rams allowed");
+        check(Desire(T::TBone, tb, it, G(tb, it), Facts{}, c) == 0, "T-bone geometry: no ram (removed)");
         const Unit pit = U(-6, -12, 3, 11);
-        check(Desire(T::PIT, pit, it, G(pit, it), Facts{}, c) > 0.7, "behind its quarter at a similar speed: PIT");
+        check(Desire(T::PIT, pit, it, G(pit, it), Facts{}, c) == 0, "behind its quarter: no PIT (removed)");
         TState s; Enter(s, T::PIT, pit, it, Facts{}, 0);
         const Plan p = Steer(s, pit, it, G(pit, it), Facts{}, 50);
         check(p.r.req[0].point.y < it.body.pos.y + it.body.vel.y * 0.3 && p.r.req[0].point.x < 0, "PIT aims at its rear quarter (on my side)");
         Unit weak = it; weak.health = 0.3; const Unit ho = U(0, 50, 0, -20);
-        check(Desire(T::HeadOnRam, ho, weak, G(ho, weak), Facts{}, c) > 0.6 && Desire(T::HeadOnRam, ho, it, G(ho, it), Facts{}, c) == 0, "head-on ram only when much stronger");
+        check(Desire(T::HeadOnRam, ho, weak, G(ho, weak), Facts{}, c) == 0 && Desire(T::HeadOnRam, ho, it, G(ho, it), Facts{}, c) == 0, "no head-on ram, even when much stronger (removed)");
     }
     {
         FakeWorld w; w.boxes[0] = { { -20, 55, -5 }, { -6, 65, 20 } }; w.boxes[1] = { { 6, 55, -5 }, { 20, 65, 20 } }; w.n = 2;  // a gap at y 60
@@ -157,7 +157,7 @@ int main()
     }
     {
         Unit me = U(0, 0, 0, 0); me.body.pos.z = 6; const Unit it = U(2, 0, 0, 0);
-        check(Desire(T::PushDown, me, it, G(me, it), Facts{}, c) >= 0.8, "a hover just above it: push it down");
+        check(Desire(T::PushDown, me, it, G(me, it), Facts{}, c) == 0, "a hover just above it: no push-down (contact moves removed)");
         TState s; Enter(s, T::PushDown, me, it, Facts{}, 0);
         check(Steer(s, me, it, G(me, it), Facts{}, 10).r.vertical < 0, "push-down goes down onto it");
     }

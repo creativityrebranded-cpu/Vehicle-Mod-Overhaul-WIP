@@ -66,6 +66,21 @@ int main()
     Hold f; Step(f, { Mode::Drive, false, "" }, 0);
     for (std::uint64_t t = 100; t < 20000; t += 100) Step(f, { (t / 100) % 2 ? Mode::Hover : Mode::Drive, false, "" }, t);
     check(f.mode == Mode::Drive, "a flickering reason never switches");
+    // The ground planner's route (2026-10-25).
+    in = base; in.planned = true; in.waterAhead = true; in.roughAhead = true; in.profile = Default::Hover; in.tripDist = 900;
+    check(Decide(in).mode == Mode::Drive && Decide(in).route, "route on the ground: drives, the straight-line water/rough checks are the route's job");
+    in.planAir = true;
+    check(Decide(in).mode == Mode::Hover && Decide(in).route, "route air leg: hovers");
+    in = base; in.planned = true; in.fighting = true;
+    check(Decide(in).mode == Mode::Hover, "route: a fight still flies");
+    in = base; in.planned = true; in.damaged = true; in.planAir = true;
+    check(Decide(in).mode == Mode::Drive, "route: a failing hover still drives");
+    in = base; in.planned = true; in.goalAbove = 120; in.planGroundToGoal = true;
+    check(Decide(in).mode == Mode::Drive, "route: a high goal the route reaches by road is driven to");
+    Hold r; Step(r, { Mode::Hover, true, "water ahead" }, 0);
+    check(Step(r, { Mode::Drive, false, "", true }, 2000) && r.mode == Mode::Drive, "a route decision ends an earlier blocking hold at once");
+    check(!Step(r, { Mode::Hover, false, "", true }, 2500) && r.mode == Mode::Drive, "route changes are guarded against flapping");
+    check(Step(r, { Mode::Hover, false, "", true }, 3600) && r.mode == Mode::Hover, "then the route's next leg switches without settling");
     std::printf("%d failures\n", failures);
     return failures ? 1 : 0;
 }

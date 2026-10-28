@@ -1,0 +1,107 @@
+FVO traffic files - how to make your own routes
+================================================
+
+Every *.ini file in this folder (Data\SFSE\Plugins\FVO_Traffic) is a traffic file.
+FVO reads them all, and re-reads them every 10 seconds while you play, so you can
+edit a file and watch the change. NewAtlantis.ini is a working example: copy it,
+rename it (for example MyCity.ini) and change it.
+
+Traffic uses vehicles that are already parked in the world (vanilla, Carfield,
+Parked Vehicles, the Extra Vehicles placements) and calm NPCs near them. A file
+does not create vehicles or NPCs.
+
+Lines starting with ; are comments. A bad line is skipped and named in
+Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log ("FVO traffic: skipped ...").
+
+
+1. Find your coordinates
+------------------------
+Positions are world coordinates (x y z), the same numbers FVO's log prints, for
+example "Vehicle registry: ... stored at (-871, 1590, -161)". In game the console
+command  player.getpos x  /  y  /  z  gives your own position. z is height; pick a
+route height clear of buildings (New Atlantis rooftops are about 100-150 m above
+its streets).
+
+
+2. Name the world
+-----------------
+[world.mycity]
+id = JemisonPlanetWorld157133511011091040
+
+The id is the worldspace's editor name. FVO writes it in the log
+("Route markers: ... probes for <id>"); New Atlantis is the id above. The name after
+"world." is yours and is used by the sections below.
+
+
+3. Draw a route
+---------------
+A ring (an ellipse round a centre):
+
+[route.ring]
+world    = mycity
+type     = ring
+centre   = -858.7 1567.4      ; x y
+height   = 143.5              ; z of lane 0
+radius   = 600                ; m, north-south
+aspect   = 1.0                ; east-west = radius x aspect
+rotation = 0                  ; degrees, clockwise
+lanes    = 2                  ; lane 0 clockwise, lane 1 counter-clockwise
+lane_gap = 40                 ; m lane 1 sits above lane 0
+speed    = 25                 ; m/s along the route
+
+A path (points in order, each "x y z", separated by commas):
+
+[route.canyon]
+world  = mycity
+type   = path
+points = -1450 1580 120, -1300 1600 130, -1150 1620 135, -1000 1700 140
+closed = 0                    ; 1 = the last point joins the first (a loop: oval, figure eight)
+lanes  = 2                    ; one each way, side by side
+width  = 20                   ; m between the two lanes
+speed  = 20
+
+Use at least 2 points; more points make smoother curves (one every 50-150 m).
+
+
+4. Exits and landing places
+---------------------------
+An exit is where trips leave a route. On a ring "at" is degrees round from north
+(0 north, 90 east); on a path it is a point number (the first point is 0).
+
+[exit.east]
+route = ring
+at    = 90
+
+A place is where a trip lands and parks. "near" names the exit to leave by;
+leave it out to use the nearest one.
+
+[place.east_row]
+world  = mycity
+point  = -713 1672 -160
+radius = 30
+near   = east
+
+
+5. Traffic rules
+----------------
+[traffic.mycity]
+world    = mycity
+route    = ring          ; only this route (leave out: the route nearest each vehicle)
+max      = 3             ; trips at once
+gap      = 25            ; seconds between departures
+vehicles = any           ; any | rev8 | a list of base form ids: FE001033, FE00780B
+trips    = mixed         ; laps (one lap, then home) | places (to a place) | mixed
+reach    = 700           ; m: how far from the route a parked vehicle may start
+
+A trip climbs over its parking spot to the lane, joins it, follows it (the lane
+that gets there sooner), leaves at the exit, flies over the place, sinks slowly
+and parks. On a lap it goes once round and back home.
+
+
+6. See it in game
+-----------------
+Settings > Gameplay Options > Flying Vehicle Overhaul > "Show traffic routes"
+places probes along the route your traffic uses, with larger ones at exits and
+places. Switch "Everyday traffic" on for vehicles to use it.
+
+To switch a whole file off, put  enabled = 0  under [file].

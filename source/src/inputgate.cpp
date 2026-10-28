@@ -27,6 +27,7 @@ namespace inputgate
 		std::atomic<unsigned> g_count{ 0 };
         std::array<std::atomic<bool>,256> g_keys{};
         std::array<std::array<std::uint8_t,256>,3> g_owner{}; // input queue is serialized by the game's queue lock
+        std::atomic<std::uint64_t> g_devicePress{0};
 
 		bool IsBlocked(std::uint32_t code, std::uint32_t bits)
 		{
@@ -54,6 +55,13 @@ namespace inputgate
                 else{constexpr int mouseKeys[]={1,2,4,5,6};if(code>=5)return;requested=g_keys[mouseKeys[code]].load();}
                 const float value=*reinterpret_cast<float*>(event+0x48);
                 const float seconds=*reinterpret_cast<float*>(event+0x4C);
+                if(value>0&&seconds==0){
+                    DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
+                    if(pid==GetCurrentProcessId()){
+                        const auto previous=g_devicePress.load(std::memory_order_relaxed);
+                        g_devicePress.store(((previous&~1ull)+2)|(device==kGamepad?1ull:0ull),std::memory_order_release);
+                    }
+                }
                 requested=requested&&GameplayAllowed();
                 const bool owned=inputownership::Own(g_owner[device][index],value>0,seconds==0,requested);
                 if(!owned||*reason)return; // never replace a native block reason
@@ -85,6 +93,7 @@ namespace inputgate
         if(keys[VK_SHIFT]){g_keys[VK_LSHIFT]=true;g_keys[VK_RSHIFT]=true;}
         if(keys[VK_MENU]){g_keys[VK_LMENU]=true;g_keys[VK_RMENU]=true;}
     }
+    std::uint64_t LastDevicePress(){return g_devicePress.load(std::memory_order_acquire);}
     bool GameplayAllowed()
     {
         DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);

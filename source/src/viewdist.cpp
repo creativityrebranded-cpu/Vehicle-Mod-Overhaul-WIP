@@ -20,8 +20,11 @@ namespace viewdist
 		constexpr std::uint32_t kObjectsValue = 0x05E86F70, kActorsValue = 0x05E86F30;
 		constexpr std::uint32_t kRebuild = 0x00573D40;      // FUN_140573d40
 
-		// On by default (2026-10-18, the user: "make the mod add this"): vehicles fade out at 3x the game's distance. settings.ini [view] objectFade=1 restores the game's own.
-		constexpr float kDefaultObjects = 3.0f;
+		// User requested the actual vehicle model at distance, including its natural
+		// subpixel appearance. Zero uses the engine's existing no-distance-fade
+		// path for loaded objects; it does not retain unloaded references or add visuals.
+		// An explicit settings.ini [view] objectFade value still takes precedence.
+		constexpr float kDefaultObjects = 0.0f;
 		ULONGLONG g_readAt = 0, g_checkAt = 0;
 		float g_wantObjects = kDefaultObjects, g_wantActors = 1.0f;
 		bool g_applied = false;

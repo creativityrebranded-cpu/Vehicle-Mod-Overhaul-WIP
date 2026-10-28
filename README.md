@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current version: **0.73.0** (Starfield 1.16.244, SFSE). Released on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current packaged version: **0.8.5** (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -82,21 +82,42 @@ before installing or upgrading.
 
 ## Installation
 
-1. Install SFSE: copy `sfse_1_16_244.dll` and `sfse_loader.exe` into the Starfield folder (next to `Starfield.exe`).
-2. Extract the game archive into **`Starfield/Data`** (the archive contains Data's contents). From a repository checkout, merge its **`Data`** folder into Starfield instead. The plugin ends up at
-   `<Starfield>\Data\SFSE\Plugins\FlyingVehicleOverhaul.dll`.
-3. Enable the data plugins that came with it (below Parked Vehicles in your load order):
-   - **`FVO_NPCPilots.esm`** - lets NPCs walk to a vehicle and get in. **Without it, NPCs never use vehicles.**
-   - **`FVO_CityPlacements.esm`** - the mod's own parked vehicles (35 in New Atlantis). Optional.
-   - **`FVO_ParkedVehiclesPatch.esm`** - turns the Parked Vehicles props into real, drivable vehicles (needs Parked Vehicles).
-4. Start the game with **`sfse_loader.exe`** (Steam running).
-5. Check it loaded: `Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log` starts with `Flying Vehicle Overhaul (FVO) ... loaded`.
+Release 0.8.5 is organized in a version folder with a main ZIP, separate optional
+Extra Vehicles and Parked Vehicles patch ZIPs, and an alternative all-in-one
+FOMOD ZIP. Matching source and hashes are alongside them. See
+[release packaging](docs/RELEASE_PACKAGING.md). Published 0.73.0 archives predate
+this installer layout.
 
-**Uninstall:** delete `Data\SFSE\Plugins\FlyingVehicleOverhaul.dll` (and the `.esm` files if you like). Vehicles in your save are kept.
+1. Install SFSE for Steam Starfield 1.16.244.
+2. Install the FOMOD ZIP through Vortex or Mod Organizer 2. The core DLL and
+   `FVO_NPCPilots.esm` always install. Both addon checkboxes start unchecked.
+3. Select **Extra parked vehicles - New Atlantis** only if wanted. Select the
+   **Parked Vehicles conversion patch** independently, with all its required
+   masters active. Unavailable choices list their dependencies in the installer.
+4. Enable `FVO_NPCPilots.esm` and the addon plugins you selected. Load the
+   conversion patch after its masters, then launch through SFSE.
+5. Check `Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log`.
+
+**Upgrading:** replace the previous FVO mod entry. Do not keep duplicate DLLs or
+old City Traffic, Scheduled Traffic, road-pool or `Vehicles - Real.esm` files
+from the old installation. Files installed by other mod entries or manually
+must be managed separately. Reinstall the FOMOD to change addon choices.
+
+**Manual installation:** copy only the contents of `00 Core` into `Starfield/Data`.
+Copy optional folder contents only when wanted and their dependencies are met.
+Do not copy the entire FOMOD archive into Data.
+
+Extra vehicles and converted props can increase CPU/physics load. Leave the
+addons unchecked while testing a core-only installation. This installer does
+not establish or fix the cause of reported FPS drops.
+
+See [installer details and validation](docs/FOMOD_INSTALLER.md).
 
 ---
 
 ## Controls
+
+Contextual help extends the original mod HUD elements in place, groups shared inputs and names information such as Target without requiring a button. Native game controls are not duplicated. Existing HUD positions and bindings are preserved; appearance awaits live verification.
 
 Version 0.73.0 gives each command its own binding row. Rebinding a row preserves the other device and unrelated contexts. Real overlapping assignments are refused. Recognized defaults upgrade to layout 4; edited lines are retained and the previous file is backed up.
 
@@ -123,6 +144,16 @@ Version 0.73.0 gives each command its own binding row. Rebinding a row preserves
 Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation names; Xbox Cross/Circle/Square/Triangle are A/B/X/Y. Native aim, fire and look remain on the game's controls. Physical flight is experimental.
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
+
+## What's new in 0.8.5
+
+- **AI navigation:** a new autopilot that scores the headings around the vehicle, plans short routes round obstacles and recovers from stuck spots through the most open direction (up included when flying is allowed). Combat prefers flight, traffic the ground.
+- **Entering and exiting:** you are never seated over an NPC driver; pulling a driver out uses the game's own get-up; exiting high up drops you beside the vehicle; a save-load crash is fixed.
+- **Passenger system:** entering a vehicle someone drives seats you as a passenger with no steering (their autopilot drives); G taps out and holds to take the wheel; followers take the passenger seats.
+- **Route making:** traffic flies routes in plain `.ini` files in `Data\SFSE\Plugins\FVO_Traffic` (rings, open or looping paths, exits, landing places, per-world rules). `HOW-TO-MAKE-ROUTES.txt` in that folder explains every line; "Show traffic routes" draws them with probes.
+- **Installer:** the Extra Vehicles addon has separate toggles for New Atlantis placements and city traffic; a new Traffic settings page.
+
+Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_0.8.5.txt](docs/NEXUS_POST_0.8.5.txt).
 
 ## What's new in 0.73.0
 
@@ -570,3 +601,13 @@ furniture state so NPCs can leave their seated pose and resume normal character 
 A separate authoring mode records scanner T markers as this mod's own vehicle-placement candidates. See
 [source recording instructions](source/README.md#placement-recording). These records will be reviewed and baked after collection;
 they do not depend on Carfield or Parked Vehicles.
+
+### Automatic New Atlantis placements
+
+
+- The current local experimental build uses FVO_ScheduledTraffic.esm alongside the original FVO_CityPlacements.esm. AirTraffic and CityTraffic are removed from the installed game. See docs/SCHEDULED_TRAFFIC.md. The remaining rebuild/spare-pool notes below describe the retired CityTraffic implementation; they are inactive with the current installed content.
+- On game startup, the DLL merges the baked city spots with your New Atlantis placement-markers.tsv, applies placement-removed.tsv and rebuilds the plugin if needed. Ordinary parked placements keep stable local IDs; removed identities remain disabled tombstones and are never assigned to different spots. The plugin embeds spot keys so the sidecar registry can be recovered.
+- During play, new city spots use up to 64 spare vehicles. Assignments stay stable as more spots are added. Removed ordinary spots hide their free vehicles; owned or occupied vehicles are left alone. Free pool vehicles reconcile on load or assignment, rather than being pulled back every two seconds.
+- The original 32 dedicated traffic homes remain reserved for traffic. The immediate pool covers ordinary parked placements. Extra pending spots beyond the free pool wait for a game restart; the persistent parked/retired ID range has 1,536 slots.
+- A verified backup is required before plugin replacement; ID reservations commit first. Unreadable/malformed data or replacement failure leaves the original plugin usable. The log reports rebuild status and deferred pool work.
+- Keep citybuild-ids.tsv and citypool-ids.tsv in the settings folder. An isolated dry-run tool and mandatory reference fixture are included with the standalone source. Live pool placement, physics and save-load behavior still require in-game verification.

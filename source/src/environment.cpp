@@ -41,7 +41,8 @@ world::VehicleInfo Vehicle(std::uint32_t id){
   const auto base=*reinterpret_cast<std::uintptr_t*>(ref+0x98);if(!base)return result;
   result.formId=id;result.ref=ref;const auto p=*reinterpret_cast<game::Vec3*>(ref+off::kRefPosition);
   result.pos[0]=p.x;result.pos[1]=p.y;result.pos[2]=p.z;result.heading=reinterpret_cast<game::Vec3*>(ref+off::kRefRotation)->z;
-  for(int i=0;i<3;++i){const double half=0.5*(*reinterpret_cast<float*>(base+0x54+i*4)-*reinterpret_cast<float*>(base+0x48+i*4));
+  // TESBoundObject bounds in 1.16.244: min xyz at +0x50, max xyz at +0x5C (2026-10-25; +0x48/+0x54 read 8 bytes early).
+  for(int i=0;i<3;++i){const double half=0.5*(*reinterpret_cast<float*>(base+0x5C+i*4)-*reinterpret_cast<float*>(base+0x50+i*4));
    result.half[i]=float(std::isfinite(half)&&half>=0.25&&half<=10?half:(i==1?5:3));}
  }__except(EXCEPTION_EXECUTE_HANDLER){return {};}
  return result;
@@ -76,6 +77,15 @@ Surface SurfaceAhead(std::uint32_t self,double x,double y,double z,double bearin
  out.known=known>=2;
  return out;
 }
+bool GroundAt(std::uint32_t self,double x,double y,double top,double bottom,Ground& out){
+ const float from[]={float(x),float(y),float(top)},to[]={float(x),float(y),float(bottom)};
+ prefetch::RayHit hit;if(!Ray(self,from,to,0x22806,hit,30000))return false;
+ out={};out.hit=hit.hit&&std::isfinite(hit.z);
+ if(out.hit){out.z=hit.z;out.water=hit.layer==11;out.normalOk=hit.normalOk&&std::isfinite(hit.nz);out.nz=out.normalOk?std::fabs(hit.nz):1.0;
+  if(!out.water)navmap::NoteGround(hit.x,hit.y,hit.z);}
+ return true;
+}
+unsigned Pending(){unsigned n=0;for(const auto&q:queries)if(!q.inFlight&&!q.done)++n;return n;}
 void Tick(){
  const auto now=GetTickCount64();
  for(int s=0;s<5;++s){auto&f=flights[s];if(!f.key)continue;prefetch::RayHit hit;unsigned age=0;

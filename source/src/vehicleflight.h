@@ -32,6 +32,9 @@ namespace vehicleflight
 	// The same from a profile's goal (vcontract::Goal): the nav settings and the target in one call. The one drive call for goal-driven pilots.
 	bool PilotFly(int pilot, std::uintptr_t vehicle, const vcontract::Goal& goal, unsigned timeoutMs = 0, bool keepGoing = true);
 	bool PilotActive(int pilot);
+	struct PhysicsStatus { bool bound = false, live = false; std::uint64_t serial = 0; };
+	// Fresh successful steps for the current bound instance; never saved.
+	PhysicsStatus PilotPhysics(int pilot);
 	const char* PilotEndReason(int pilot);  // why the pilot last stopped ("arrived", "stuck", ...)
 	void PilotStop(int pilot, const char* why);
 	std::uint32_t OwnRoverId();  // the player's own vehicle (form id), never flown by an NPC
@@ -42,14 +45,9 @@ namespace vehicleflight
 	struct DriveInput { float steer = 0, accel = 0, brake = 0; bool boost = false, vert = false; };  // steer + is right
 	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out);
 	// The player's custom map marker as a point in `vehicle`'s world (false: none, not loaded, another worldspace, too far).
-	bool Ramming(std::uint32_t vehicleId);
 	// Hold T on a place (on foot): the player's own vehicle (empty, or its crew driver) holds that point and defends from it; false when there is
 	// no vehicle or it cannot fly (logged). U afterwards makes it cover the player again.
 	bool SetGuardPoint(double x, double y);
-	// Hold T on a highlighted actor: the driven or own vehicle rams it in a straight line, flat out (ramlogic); refusals are logged with their reason.
-	bool RequestRam(std::uintptr_t actor);
-	// An NPC pilot's fight rams `actor` (npcvehicles' ram manoeuvre): the same straight run; when it ends the flight goes on. False: refused or a ram runs.
-	bool OrderRam(int pilot, std::uintptr_t vehicle, std::uintptr_t actor);
 	void FreshScannerTarget(); // explicit selection can reuse the same marker coordinates
 	void EndTargetSession(std::uintptr_t vehicle);
 	bool MarkerPoint(std::uintptr_t vehicle, double& x, double& y, double* z = nullptr);
@@ -82,7 +80,13 @@ namespace vehicleflight
 	// `set` overrides the autopilot's own for holdMs, then hands back. Channels left out stay with the autopilot.
 	struct Command
 	{
-		enum : unsigned { kThrottle = 1, kStrafe = 2, kVertical = 4, kYaw = 8, kPitch = 16, kRoll = 32, kBrake = 64, kGear = 128 };
+		enum : unsigned { kThrottle = 1, kStrafe = 2, kVertical = 4, kYaw = 8, kPitch = 16, kRoll = 32, kBrake = 64, kGear = 128,
+			// Scripted flight (flightscript.h): the command is the plan. Skips the planner's rollout check, avoidance speed caps and
+			// stuck recovery; stops only for a wall/person ahead (forward thrust) or a vehicle within 5 m in the direction of travel.
+			kScripted = 256,
+			// With kScripted: the script picks how it travels (travel: 1 float = the hover at the commanded height, 2 drive = the hover
+			// held just over the surface under it, following the road; the automatic hover-or-drive choice is skipped).
+			kTravel = 512 };
 		unsigned set = 0;
 		double throttle = 0;   // -1 full reverse .. 1 full forward (the gear's thrust)
 		double strafe = 0;     // -1 slide left .. 1 slide right
@@ -93,6 +97,7 @@ namespace vehicleflight
 		bool brake = false;
 		int gear = 0;          // 1-4
 		unsigned holdMs = 300;
+		int travel = 0;        // with kTravel: 1 float, 2 drive
 	};
 	void ClearPilotCommand(int pilot);
     bool ImpactSince(std::uint32_t vehicleId, unsigned long long since);

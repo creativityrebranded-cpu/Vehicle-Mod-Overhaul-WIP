@@ -63,7 +63,10 @@ int main(){
     *state=123;third(out,0,0,0);check(out[0]==1&&out[2]==0&&!vehiclecamera::ReadAttitude(a),"photo/on-foot/other camera state remains native");*state=image+0x04C28740;
     vehiclecamera::Publish(111,0.1,1);vehiclecamera::Reset();third(out,0,0,0);
     check(!vehiclecamera::ReadAttitude(a)&&out[2]==0,"load/stop reset clears snapshot and camera");
-    vehiclecamera::Publish(111,0.1,1);Sleep(510);check(!vehiclecamera::ReadAttitude(a),"stale main-thread command expires");
+    vehiclecamera::Publish(111,0.1,1);
+    const auto expiryDeadline=GetTickCount64()+550;
+    while(GetTickCount64()<expiryDeadline)Sleep(5);
+    check(!vehiclecamera::ReadAttitude(a),"stale main-thread command expires");
     vehiclecamera::Publish(111,0.1,1);third(out,0,0,0);check(out[2]<0,"fresh snapshot resumes after expiry");
     const auto saved=image;image=0;check(!vehiclecamera::ReadAttitude(a),"unreadable camera chain safely suppresses instrument");image=saved;
     patches=false;check(!vehiclecamera::Install(),"a failed call-site guard disables roll mode");

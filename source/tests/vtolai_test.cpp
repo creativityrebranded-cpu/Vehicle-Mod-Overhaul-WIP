@@ -1,4 +1,5 @@
 #include "vtolai.h"
+#include "bodyattitude.h"
 #include <cstdio>
 
 int main() {
@@ -26,6 +27,28 @@ int main() {
     check(close(r.y,-0.2*vtolai::kBankGain),"a roll aim from the planner wins over the turn bank");
     vtolai::Input bad=level; bad.yawRate=std::nan(""); r=vtolai::Rates(bad);
     check(vtol::Finite(r)&&close(r.z,0),"a non-finite yaw command flies straight");
+    // The physical branch must publish actual heading, including when it starts
+    // at a nonzero angle or crosses +/-pi. A frozen heading makes this loop spin.
+    struct Feedback { double bodyHeading=0; float bodyPitch=0, bodyRoll=0; } feedback;
+    for (double start : {0.0, 2.8, -2.8}) {
+        const double goal = start == 0.0 ? 1.5 : -start;
+        double heading = start;
+        for (int step=0; step<300; ++step) {
+            const float right[3]={float(std::cos(heading)),float(-std::sin(heading)),0};
+            const float forward[3]={float(std::sin(heading)),float(std::cos(heading)),0};
+            const float up[3]={0,0,1};
+            bodyattitude::Publish(feedback,right,forward,up);
+            auto pilot=level;
+            pilot.yawRate=std::clamp(1.6*vtolai::Wrap(goal-feedback.bodyHeading),-1.0,1.0);
+            const auto rates=vtolai::Rates(pilot);
+            heading=vtolai::Wrap(heading-rates.z/60.0);
+        }
+        check(std::fabs(vtolai::Wrap(goal-heading))<0.01,"physical heading feedback closes the turn without circling");
+    }
+    const float right[3]={1,0,0}, forward[3]={0,0.8f,0.6f}, up[3]={0,-0.6f,0.8f};
+    bodyattitude::Publish(feedback,right,forward,up);
+    check(close(feedback.bodyHeading,0)&&close(feedback.bodyPitch,std::atan2(0.6,0.8),1e-6)&&close(feedback.bodyRoll,0),
+        "orientation feedback includes pitch and roll in the same sample");
     std::printf("vtolai: %d checks, %d failures\n",checks,failed);
     return failed?1:0;
 }

@@ -1,4 +1,7 @@
 #include "vehicleflight.h"
+#include "airtraffic.h"
+#include "bodymass.h"
+#include "hookcost.h"
 #include "vehiclediag.h"
 #include "bindings.h"
 #include "passenger.h"
@@ -18,15 +21,18 @@
 #include "log.h"
 #include "modscene.h"
 #include "navmap.h"
+#include "autodrive.h"
 #include "navfield.h"
 #include "recovery.h"
 #include "environment.h"
 #include "bodybinding.h"
 #include "hoverlogic.h"
+#include "bodyattitude.h"
 #include "freeroll.h"
 #include "physicsstep.h"
 #include "vtolphysics.h"
 #include "vtolai.h"
+#include "vtolplan.h"
 #include "vtolassist.h"
 #include "vtolhooks.h"
 #include "vehiclecamera.h"
@@ -34,7 +40,6 @@
 #include "integrationlogic.h"
 #include "boostlogic.h"
 #include "altcontrol.h"
-#include "ramlogic.h"
 #include "targetsession.h"
 #include "scantarget.h"
 #include "npcvehicles.h"
@@ -45,7 +50,9 @@
 #include "vehicleworld.h"
 #include "vehiclehits.h"
 #include "realvehicles.h"
-#include "travelmode.h"
+#include "travelmode.h"
+#include "groundnav.h"
+
 #include "fvopaths.h"
 
 #include <Windows.h>
@@ -64,11 +71,11 @@
 #include <unordered_map>
 
 // Rover flight (0.57.0): a connected flight model that pushes the rover's own physics body instead of overwriting it.
-//  - On / off: double-tap the game's vertical boost (Space). Also off: settle onto the ground, hit something, or leave
+//  - On / off: the hover toggle (V). Also off: settle onto the ground, hit something, or leave
 //    the vehicle.
 //  - Controls (mouse-aim layout): the mouse aims, the nose follows the camera in yaw and pitch. A / D: roll.
-//    W: boost (hold) at the selected gear; S: brake (hold); tap Alt: cycle gears 1-4; hold Alt: descend.
-//    Neither W nor S: coast. Up / down keys: lift.
+//    W: boost (hold) at the selected gear; S: brake (hold); tap Alt: cycle gears 1-4.
+//    Neither W nor S: coast. Hold Space: climb; hold C: descend (2026-10-27, the user: Alt no longer descends).
 //  - Lift-off: switching on near the ground climbs to a short hover height first.
 //  - Avoidance (terrain assist): three corridors (ahead, left, right) are sampled with ground rays at three distances
 //    scaled by speed. Ahead clear: nothing. Ahead blocked but climbable in time: nose up and climb. Otherwise a clear
@@ -222,12 +229,14 @@ namespace vehicleflight
 		constexpr double kTrailStep = 4.0;           // m between points
 		constexpr double kTrailReach = 8.0;          // m: a point this close is passed
 		constexpr double kTrailOff = 25.0;           // m from the player: back to flying straight at them
+		constexpr double kTrailAwayMax = 40.0;       // m further from the player than when the trail started: it leads away, drop it
+		constexpr ULONGLONG kTrailBanMs = 10000;     // then no trail for this long
 		// Cruise height: just over the highest ground in the next corridor samples (rises fast, sinks slowly).
 		constexpr double kTerrainClear = 2.5;        // m over the highest ground ahead
 		constexpr double kCruiseSink = 1.5;          // m/s the cruise height comes down at most
 		// Goal height (2026-10-17): a pilot given the target's height flies at it (never under the terrain clearance),
 		// up to kGoalMaxAbove over the ground, and comes down at kGoalSink (a diving target is followed down).
-		constexpr double kGoalMaxAbove = 200.0;      // m
+		constexpr double kGoalMaxAbove = 400.0;      // m (was 200: the user's ring lanes sit ~305 / 345 m over the parked vehicles, 2026-10-28)
 		constexpr double kGoalSink = 8.0;            // m/s
 		// Speed matching (following): the player's speed along the way plus a share of the gap.
 		constexpr double kMatchGain = 0.5;           // (m/s) per m of gap
@@ -346,7 +355,8 @@ namespace vehicleflight
 		struct Shared
 		{
 			std::mutex lock;
-			hulllogic::Limits hull;
+			hulllogic::Limits hull;        // the limits in use: hullBase, or hulllogic::Physical(hullBase) while flying physically
+			hulllogic::Limits hullBase;    // this vehicle's own size-based limits (BindBody)
 			bool active = false;
 			float px = 0, py = 0, pz = 0;  // the rover reference's position (to find its body)
 			// commands (frame -> step)
@@ -418,6 +428,9 @@ namespace vehicleflight
 			double measW[3] = {};          // the last spin written (world)
 			bool matched = false;
 			unsigned steps = 0;
+			std::uint64_t stepSerial = 0;
+			ULONGLONG lastStepAt = 0;
+			std::uintptr_t lastStepInstance = 0;
 			// collision detection
 			float lastV[3] = {};
 			bool haveLast = false;
@@ -678,6 +691,77 @@ namespace vehicleflight
 			return b.motion ? b : Body{};
 		}
 
+        void ObserveChassisMass(std::uintptr_t vehicle,ULONGLONG now,std::uint64_t epoch)
+        {
+            __try {
+                const auto b=FindBody(vehicle,0,0,0,true);
+                if(!b.body||!b.motion||At<std::uint32_t>(b.body,0x50)!=b.id||
+                    (At<std::uint32_t>(b.body,0x54)&7)!=2)return;
+                const double inverse=vtol::Expand(std::uint16_t(At<std::uint64_t>(b.motion,0x40)>>48));
+                if(std::isfinite(inverse)&&inverse>1e-9&&inverse<1000)
+                    bodymass::observations.Observe(b.id,float(1/inverse),now,epoch);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        hookcost::Counter g_stepCost;
+        struct AirNativeState {
+            std::atomic_flag busy=ATOMIC_FLAG_INIT;
+        } g_airNative[airtrafficmath::kFleet];
+        bool AirReject(unsigned reason){airtraffic::nativeRejectReasons[reason].fetch_add(1,std::memory_order_relaxed);return false;}
+        bool ApplyAirBody(std::uintptr_t instance,std::uint32_t id,float seconds,const aircontrol::Target& t) {
+            __try {
+                using namespace airtrafficmath;
+                const double dt=physicsstep::ModelSeconds(seconds);if(!dt)return AirReject(0);
+                if(t.ref==g_driverVehicle.load()||t.epoch!=airtraffic::epoch.load())return AirReject(1);
+                const auto b=FindBody(instance,0,0,0,true);
+                if(!b.body||!b.motion||!bodybinding::Matches(b.id,id)||At<std::uint32_t>(b.body,0x50)!=id||(At<std::uint32_t>(b.body,0x54)&7)!=2)return AirReject(2);
+                const auto* R=reinterpret_cast<const float*>(b.body);
+                const auto* F=reinterpret_cast<const float*>(b.body+0x10);
+                const auto* U=reinterpret_cast<const float*>(b.body+0x20);
+                const auto* current=reinterpret_cast<const float*>(b.motion+0x60);
+                const Vec measuredVelocity{current[0],current[1],current[2]};
+                const double age=std::min(double(GetTickCount64()-t.at)/1000,.3);
+                const auto control=FollowReference(t.reference,t.position,t.velocity,measuredVelocity,age,std::atan2(F[0],F[1]),t.yaw,
+                    std::asin(std::clamp(double(F[2]),-1.0,1.0)),std::atan2(-R[2],U[2]),dt);
+                if(!control.valid)return AirReject(3);
+                if(t.epoch!=airtraffic::epoch.load()||t.ref==g_driverVehicle.load())return AirReject(1);
+                alignas(16) float spin[4]={float(R[0]*control.spin.x+F[0]*control.spin.y),float(R[1]*control.spin.x+F[1]*control.spin.y),float(R[2]*control.spin.x+F[2]*control.spin.y-control.spin.z),0};
+                VFn<void(*)(std::uintptr_t,std::uint32_t,const float*,int)>(b.write,0xB0)(b.write,id,spin,0);
+                auto* v=reinterpret_cast<float*>(b.motion+0x60);
+                v[0]=float(control.velocity.x);v[1]=float(control.velocity.y);v[2]=float(control.velocity.z);
+                return true;
+            } __except(EXCEPTION_EXECUTE_HANDLER){return AirReject(4);}
+        }
+        void AirStep(std::uintptr_t instance,std::uint32_t body,float seconds) {
+            if(!physicsstep::ModelSeconds(seconds))return;
+            const auto now=GetTickCount64();
+            for(unsigned i=0;i<airtrafficmath::kFleet;++i) {
+                aircontrol::Target target;if(!airtraffic::controls[i].Read(instance,body,now,target))continue;
+                auto& state=g_airNative[i];if(state.busy.test_and_set(std::memory_order_acquire))return;
+                const bool applied=ApplyAirBody(instance,body,seconds,target);
+                state.busy.clear(std::memory_order_release);
+                (applied?airtraffic::nativeSteps:airtraffic::nativeRejects).fetch_add(1,std::memory_order_relaxed);
+                return;
+            }
+        }
+        struct StepTiming {
+            LARGE_INTEGER start{},nativeStart{};std::uint64_t native=0;
+            StepTiming(){QueryPerformanceCounter(&start);}
+            void BeginNative(){QueryPerformanceCounter(&nativeStart);}
+            void EndNative(){LARGE_INTEGER at{};QueryPerformanceCounter(&at);native=at.QuadPart-nativeStart.QuadPart;}
+            ~StepTiming(){LARGE_INTEGER at{};QueryPerformanceCounter(&at);g_stepCost.Add(std::uint64_t(at.QuadPart-start.QuadPart)-native,native);}
+        };
+        void ReportStepCost()
+        {
+            static ULONGLONG began=0;const auto now=GetTickCount64();
+            if(!began){began=now;return;}if(now-began<10000)return;
+            hookcost::Samples samples;if(!g_stepCost.Take(samples))return;began=now;
+            if(!samples.count)return;
+            LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);const double ms=1000.0/frequency.QuadPart;
+            logger::Write("Vehicle physics cost: %llu calls; mod hook %.3f ms avg / %.3f worst; native step %.3f / %.3f; %llu telemetry samples skipped (elapsed call time, threads may overlap)",
+                static_cast<unsigned long long>(samples.count),ms*double(samples.hook)/samples.count,ms*samples.maxHook,
+                ms*double(samples.native)/samples.count,ms*samples.maxNative,static_cast<unsigned long long>(samples.skipped));
+        }
+
 		// Native impulse entry points are confirmed in both writer vtables in the pinned executable. Reject a
 		// different interface/body instead of invoking an unknown slot or falling back to a velocity overwrite.
 		bool ReadPhysicalMotion(const Body& b, vtol::Motion& motion)
@@ -889,6 +973,7 @@ namespace vehicleflight
 			const auto* velocity=reinterpret_cast<const float*>(b.motion+0x60);
 			for (int i=0;i<3;++i) { s.lastV[i]=s.v[i]=velocity[i]; s.lastW[i]=actualSpin[i]; s.measW[i]=actualSpin[i]; }
 			s.haveLast=true; s.haveLastW=false; s.bodyPitch=float(pitch); s.bodyRoll=float(roll); s.matched=true; ++s.steps;
+			++s.stepSerial; s.lastStepAt=GetTickCount64(); s.lastStepInstance=s.instance.load();
 			s.physSteps.fetch_add(1,std::memory_order_relaxed);
 			if (!player) return result;
 			g_physicalLinearError.store(float(vtol::Length(vec(velocity)-(body.velocity+output.linear*motion.inverseMass))),std::memory_order_relaxed);
@@ -978,12 +1063,14 @@ namespace vehicleflight
 
 		std::uint64_t StepDetour(std::uintptr_t vehicle, std::uintptr_t world, float seconds)
 		{
+			StepTiming timing;const auto massEpoch=bodymass::observations.Epoch();
 			g_nativeStepSamples.fetch_add(1, std::memory_order_relaxed);
 			g_nativeStepSeconds.store(seconds, std::memory_order_relaxed);
 			if (physicsstep::ModelSeconds(seconds) == 0.0) g_nativeStepSkipped.fetch_add(1, std::memory_order_relaxed);
 			// This hook sees every vehicle. Unowned steps must never default to the player's controller.
 			vehiclediag::NoteStep(vehicle);
 			const auto body=PhysicsBodyId(vehicle);const auto now=GetTickCount64();
+            ObserveChassisMass(vehicle,now,massEpoch);
 			bodybinding::Binding bindings[kPilots];
 			for(int i=0;i<kPilots;++i){auto&s=g_shs[i];std::lock_guard lk(s.lock);
 				const bool owns=bodybinding::Contains({s.sceneBodies,s.sceneCount},body) && (!s.instance.load()||s.bodyId.load()==body);
@@ -1000,8 +1087,10 @@ namespace vehicleflight
 			}
 			if (s) PreparePhysical(*s,vehicle);
 			for (auto& o : g_shs) if (&o!=s && o.physInstance.load()==vehicle) PhysicalRelease(o);  // a chassis nobody owns now
+			timing.BeginNative();
 			const auto result = g_original(vehicle, world, seconds);
-			if(!s)return result;
+			timing.EndNative();
+			if(!s){AirStep(vehicle,body,seconds);return result;}
 			const auto ref=s->vehicle.load();
 			if (ref && ref == g_lastDrivenVehicle.load(std::memory_order_relaxed)) {
 				(ref == g_driverVehicle.load(std::memory_order_relaxed) ? g_occupiedSteps : g_unoccupiedSteps).fetch_add(1, std::memory_order_relaxed);
@@ -1096,6 +1185,10 @@ namespace vehicleflight
 			if (!b.body) {
 				return result;
 			}
+			// Both models publish live orientation. StepPhysical returns before the stock
+			// rotation code; leaving heading there froze the AI's feedback during flight.
+			bodyattitude::Publish(g_sh, reinterpret_cast<const float*>(b.body),
+				reinterpret_cast<const float*>(b.body + 0x10), reinterpret_cast<const float*>(b.body + 0x20));
 			// Physical flight (player manual or, with its own setting, AI pilots); a faulted chassis flies the stock model.
 			if (g_sh.physical&&!g_sh.physicalFault)
 				return StepPhysical(g_sh,b,wNow,dt,result,lk);
@@ -1180,8 +1273,7 @@ namespace vehicleflight
 			const double hSpeed = std::hypot(v[0], v[1]);
 			const double speedK = std::clamp(hSpeed / 15.0, 0.3, 1.0);
 			// The body's heading in the camera's frame; the camera gap is a variable A / D (sin(gap / 2) shaped).
-			const double bodyHeading = std::atan2(double(F[0]), double(F[1]));
-			g_sh.bodyHeading = bodyHeading;
+			const double bodyHeading = g_sh.bodyHeading;
 			g_sh.camYaw = 0;
 			if (g_sh.haveView) {
 				g_sh.gap = Wrap(g_sh.view - bodyHeading);
@@ -1349,6 +1441,7 @@ namespace vehicleflight
 			g_sh.haveLast = true;
 			g_sh.matched = true;
 			++g_sh.steps;
+			++g_sh.stepSerial; g_sh.lastStepAt=GetTickCount64(); g_sh.lastStepInstance=vehicle;
 			return result;
 		}
 
@@ -1369,6 +1462,9 @@ namespace vehicleflight
 			bool active = false;
             bool landing=false;double landGround=0,landHeight=0;ULONGLONG landProofAt=0;
             bool groundHug=false;  // your empty vehicle "drives": the hover stays just over the ground and hops what a jump clears (travelmode)
+            groundnav::Status route;  // the ground-first route guiding this pilot this frame (setting "Ground planner and native driving")
+            bool routeSteer=false;    // its ground leg steers this frame (bearing and speed from the route)
+            double laneYaw=0;         // the lane planner's side offset this frame (re-added after the drive mode's own heading pick)
 			bool keyDown = false;
 			double hold = 3.0;
 			bool holding = false;
@@ -1448,6 +1544,11 @@ namespace vehicleflight
 			ULONGLONG floorUntil = 0;
 			bool trailOn = false;          // following the player's trail
 			unsigned long long trailSeq = 0;  // the trail point flown to
+			// The trail guard (2026-10-24 14:13 run: in New Atlantis the trail led the follower from 67 m to 134 m away): the
+			// distance to the goal when the trail started; past it by kTrailAwayMax the trail is dropped and banned for a while.
+			double trailStartDist = 0;
+			ULONGLONG trailBanUntil = 0, trailLogAt = 0;
+			ULONGLONG lostFrameAt = 0;     // the last frame the lost check ran: a gap (a pause, a menu) restarts its window
 			double cruiseHold = kCallSkim; // m: the terrain-ahead hold height
 			double throttle = 1.0;         // 0..1 share of the gear's thrust
 			bool aiGears = false;          // this frame: the AI gear tables apply
@@ -1495,25 +1596,34 @@ namespace vehicleflight
 			double vehGap = 1e9;           // m between the hulls (centres minus footprint radii)
 			double vehBearing = 0;         // from this vehicle to the other
 			double vehClosing = 0;         // m/s the gap shrinks
-			std::uint32_t ramActor=0,ramVehicle=0;
 			std::uint32_t vehId = 0;
 			bool vehYield = true;          // this vehicle gives way to that one (right of way by rank)
 			ULONGLONG vehLogAt = 0;
 			unsigned vehDropped = 0;       // probe samples dropped as "a vehicle, not ground" (logged)
+			// The autopilot's decision core (autodrive.h, 2026-10-27): one authority for heading, speed, drive/hover and escapes.
+			autodrive::Pilot ad;
+			autodrive::Output adOut;
+			bool adContact = false;        // a contact this frame (side bump or another vehicle), for its stuck/bump memory
+			ULONGLONG adLogAt = 0;
+			autodrive::Phase adLogPhase = autodrive::Phase::Travel;
+			bool adCombat = false;         // the pilot fights now: the hover keeps a low combat band (about 8 m more)
 		};
 		State g_gs[kPilots];
 		world::Snapshot g_vsnap;       // this frame's vehicle list (main thread)
 		bool g_vsnapOk = false;
 
 		// Main thread, caller holds Shared::lock. Missing identity disables writes until the scene proves ownership.
-		struct RamOrder{std::uint32_t vehicle=0,actor=0;int pilot=0;ULONGLONG started=0,lastAt=0;game::Vec3 last{};bool keep=false;}g_ram;  // keep: an NPC manoeuvre's ram, the flight goes on after it
 
 		void BindBody(Shared&s,std::uintptr_t ref)
 		{
 			std::uint32_t ids[16]={},count=0;
 			for(unsigned i=0;g_vsnapOk&&i<g_vsnap.count&&i<64;++i)if(g_vsnap.v[i].ref==ref){
 				const auto&v=g_vsnap.v[i];count=std::min(v.bodyCount,16u);std::copy(v.bodyIds,v.bodyIds+count,ids);
-				s.hull=hulllogic::For(v.half[0],v.half[1],v.half[2]);break;}
+				s.hullBase=hulllogic::For(v.half[0],v.half[1],v.half[2]);s.hull=s.physical?hulllogic::Physical(s.hullBase):s.hullBase;break;}
+			// 2026-10-28 (the user: "vehicles fell from the sky after a distance"): past the loaded-area edge (~190 m) a flying
+			// vehicle's bodies drop out of its 3D for a moment and come back (01:53 run: 1 -> 0 -> 1 -> 0 in 8 s). Each 0 reset the
+			// binding and physics state, and the vehicle fell in every gap. A momentary 0 for the same vehicle keeps the binding.
+			if(!count&&s.vehicle.load()==ref&&s.sceneCount){s.vehicle.store(ref);return;}
 			if(s.vehicle.load()!=ref||s.sceneCount!=count||!std::equal(ids,ids+count,s.sceneBodies)){
 				s.instance.store(0);s.bodyId.store(0);s.haveLast=false;s.matched=false;s.carryRun=0;s.physicalState={};s.physicalFault=false;
 				s.guardVehicle=0;s.guardInstance=0;s.sceneCount=count;std::copy(ids,ids+count,s.sceneBodies);
@@ -1749,9 +1859,9 @@ namespace vehicleflight
 			if (sp < 3.0) return;
 			const double travel = std::atan2(vx, vy);
 			for (const auto r : modscene::LoadedRefs()) {
-				if (!r || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r) || At<std::uint32_t>(r,off::kFormId)==g.ramActor) continue;
+				if (!r || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r)) continue;
 				const auto aboard=EngineFn<std::uintptr_t (*)(std::uintptr_t)>(addr::kPlayerVehicle)(r);
-				if (aboard == vehicle || (aboard && g.ramVehicle && At<std::uint32_t>(aboard,off::kFormId)==g.ramVehicle)) continue;
+				if (aboard == vehicle) continue;
 				const auto p = At<game::Vec3>(r, off::kRefPosition);
 				if (std::fabs(double(p.z) - vp.z) > 5.0) continue;
 				const double dx = double(p.x) - vp.x, dy = double(p.y) - vp.y, d = std::hypot(dx, dy);
@@ -1800,7 +1910,7 @@ namespace vehicleflight
 			const double sp = std::hypot(myVx, myVy);
 			for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
 				const auto& v = g_vsnap.v[i];
-				if (!v.formId || v.formId == self || v.formId==g.ramVehicle) continue;
+				if (!v.formId || v.formId == self) continue;
 				const double dx = v.pos[0] - pos.x, dy = v.pos[1] - pos.y, dz = v.pos[2] - pos.z;
 				if (std::fabs(dz) > 2.0 * (VehHalfZ(v) + 2.0)) continue;  // well above or below: no conflict
 				const double d = std::hypot(dx, dy);
@@ -1819,7 +1929,9 @@ namespace vehicleflight
 				for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
 					if (g_vsnap.v[i].formId == g.vehId) other = RankOf(g_vsnap.v[i]);
 				}
-				g.vehYield = myRank <= other;
+				// 2026-10-24: equal ranks both gave way, so two NPC vehicles side by side in bays waited for each other forever.
+				// Equal ranks: only the higher form id gives way.
+				g.vehYield = myRank < other || (myRank == other && self > g.vehId);
 			}
 			g.vehWarn = g.vehGap < 6.0 + sp * 1.2;
 			g.vehTouch = g.vehGap < 2.5;
@@ -1829,6 +1941,13 @@ namespace vehicleflight
 				logger::Write("%s: vehicle warning: %08X %.1f m (hull gap), closing %.1f m/s%s, %s; %u probe samples on vehicles dropped", who, g.vehId, g.vehGap, g.vehClosing,
 					g.vehTouch ? ", touching range" : "", g.vehYield ? "giving way" : "it gives way", g.vehDropped);
 			}
+		}
+		// 2026-10-24: a near vehicle only stops this one when it is in the way: within 60 degrees of the direction of travel
+		// (the nose when slow), or closing in. A parked neighbour 2 m to the side used to stop a departing vehicle forever.
+		bool TrafficInWay(const State& g, double sp, const double v[3], double heading)
+		{
+			const double travel = sp > 1.0 ? std::atan2(v[0], v[1]) : heading;
+			return std::cos(Wrap(g.vehBearing - travel)) > 0.5 || g.vehClosing > 0.5;
 		}
 		// Kept across relaunches: a pilot stuck again soon after climbing out is moved instead.
 		struct Escape { int count = 0; ULONGLONG at = 0; } g_escape[kPilots];
@@ -1976,7 +2095,7 @@ namespace vehicleflight
 			if (g_keys.chosen) {
 				return;
 			}
-            g_keys.toggle='V';g_keys.rollLeft='A';g_keys.rollRight='D';g_keys.up='Q';g_keys.down='Z';
+            g_keys.toggle='V';g_keys.rollLeft='A';g_keys.rollRight='D';g_keys.up=VK_SPACE;g_keys.down='C';
 			g_keys.call = 'N';
 			g_keys.follow = 'U';
 			for (const int vk : { g_keys.call, g_keys.follow })
@@ -2005,6 +2124,14 @@ namespace vehicleflight
 		std::uintptr_t PlayerVehicle(std::uintptr_t player)
 		{
 			return EngineFn<std::uintptr_t (*)(std::uintptr_t)>(addr::kPlayerVehicle)(player);
+		}
+		// The vehicle the player DRIVES: the one the game says they are in, unless they ride it as a passenger (2026-10-28, the
+		// user: "I still had control" in the passenger seat: these sites took the passenger for the driver, stopped the NPC pilot
+		// with "the player took the vehicle" and sent the player's keys to it).
+		std::uintptr_t DrivenBy(std::uintptr_t player)
+		{
+			const auto v = player ? PlayerVehicle(player) : 0;
+			return v && passenger::RidingVehicle() == At<std::uint32_t>(v, off::kFormId) ? 0 : v;
 		}
 
 		// ---- The player's rover, remembered by form id (resolved through the form map, never a stale pointer) ----
@@ -2249,7 +2376,6 @@ namespace vehicleflight
             g_cmds[idx]={};
             g.travel = {};  // a new flight decides hover or drive afresh
             g.groundHug = false;
-			if(g_ram.pilot==idx)g_ram={};
 			if (releasedVehicle) g_clearBoosts[idx] = releasedVehicle;  // its boost flags off at its next boost update
 			g.active = false;
 			g.landing=false;g.landProofAt=0;
@@ -2334,6 +2460,7 @@ namespace vehicleflight
 				g_sh.physicalFault=false;
 				g_sh.haveLastW = false;
 				g_sh.instance.store(0);g_sh.matched=false;
+				g_sh.stepSerial=0;g_sh.lastStepAt=0;g_sh.lastStepInstance=0;
 				g_sh.gEst = std::clamp(g_sh.gEst, 3.0, 20.0);  // a drained estimate would start a flight with no lift
 				g_sh.holding = false;
 				g_sh.haveLast = false;
@@ -2351,7 +2478,7 @@ namespace vehicleflight
 				return;
 			}
 			logger::Write("Rover flight: on at (%.0f, %.0f, %.0f)", pos.x, pos.y, pos.z);
-			notify::Log("Hover on - [W] accelerate [S] brake [Alt tap] gear [%s] boost (double tap: stays on)  [%s]/[%s] up/down  [Alt hold] down  [%s]/[%s] turn  [%s] off",
+			notify::Log("Hover on - [W] accelerate [S] brake [Alt tap] gear [%s] boost (double tap: stays on)  [%s]/[%s] up/down (hold)  [%s]/[%s] turn  [%s] off",
 				bindings::Label(bindings::Action::Boost, VK_LSHIFT).c_str(), bindings::Label(bindings::Action::LiftUp, g_keys.up).c_str(),
 				bindings::Label(bindings::Action::LiftDown, g_keys.down).c_str(), bindings::Label(bindings::Action::TurnLeft, g_mk.left).c_str(), bindings::Label(bindings::Action::TurnRight, g_mk.right).c_str(),
 				bindings::Label(bindings::Action::HoverToggle, g_keys.toggle).c_str());
@@ -2382,6 +2509,7 @@ namespace vehicleflight
 					g.asked[i].valid = false;
 					++g.vehDropped;
 				}
+				if (g.asked[i].valid && i != kCentre) navmap::NoteGround(g.asked[i].x, g.asked[i].y, g.asked[i].h);
 			}
 			// The centre ray starts 1.5 m under the rover (never its own body). On a raised floor (a city platform) that start
 			// is already under the floor and the ray finds the terrain far below (2026-10-17 15:08: "climbed to 245 m" at once,
@@ -2693,21 +2821,39 @@ namespace vehicleflight
 			const State& g = g_gs[idx];
 			double x = pos.x, y = pos.y, h = heading, v = v0, cost = 0;
 			const double vt = vmax * factor;
+			// Physical flight (2026-10-24, the user: AI tuned for physical flight): the velocity keeps its momentum and slides after a
+			// turn (vtolplan.h), starting from the body's real velocity, slide included. The standard model's velocity follows the nose.
+			const Shared& sh = g_shs[idx];
+			const bool physical = sh.physical && !sh.physicalFault;
+			vtolplan::State motion{ double(sh.v[0]), double(sh.v[1]), double(sh.bodyRoll) };
+			if (!std::isfinite(motion.vx) || !std::isfinite(motion.vy)) motion = { std::sin(heading)*v0, std::cos(heading)*v0, 0 };
+			const vtolplan::Limits motionLimits{ kMpcAccel * sh.hull.acceleration, kMpcDecel * sh.hull.acceleration, sh.hull.roll };
 			for (int k = 1; k <= kMpcSteps; ++k) {
 				const double t = k * kMpcDt;
 				const double w = (turnFirstOnly && t > 1.0) ? 0.0 : omega;
 				h += w * kMpcDt;
-				v += std::clamp(vt - v, -kMpcDecel * g_shs[idx].hull.acceleration * kMpcDt, kMpcAccel * g_shs[idx].hull.acceleration * kMpcDt);
-				x += (std::sin(h)*v+std::cos(h)*lateral)*kMpcDt;
-                y += (std::cos(h)*v-std::sin(h)*lateral)*kMpcDt;
+				double dx, dy;
+				if (physical) {
+					motion = vtolplan::Step(motion, h, w, vt, motionLimits, kMpcDt);
+					v = motion.vx * std::sin(h) + motion.vy * std::cos(h);
+					dx = (motion.vx + std::cos(h)*lateral) * kMpcDt;
+					dy = (motion.vy - std::sin(h)*lateral) * kMpcDt;
+				}
+				else {
+					v += std::clamp(vt - v, -kMpcDecel * sh.hull.acceleration * kMpcDt, kMpcAccel * sh.hull.acceleration * kMpcDt);
+					dx = (std::sin(h)*v+std::cos(h)*lateral)*kMpcDt;
+					dy = (std::cos(h)*v-std::sin(h)*lateral)*kMpcDt;
+				}
+				x += dx;
+                y += dy;
                 // Sweep each rollout segment, at the candidate altitude, with both hull sides.
                 const double rx=std::cos(h)*halfWidth,ry=-std::sin(h)*halfWidth;
-                const int samples=std::max(1,int(std::ceil(std::max(std::hypot(v,lateral)*kMpcDt/2.0,std::fabs(vz)*kMpcDt))));
+                const int samples=std::max(1,int(std::ceil(std::max(std::hypot(dx,dy)/2.0,std::fabs(vz)*kMpcDt))));
                 for(int n=1;n<=samples;++n) {
                     const double age=t-kMpcDt+kMpcDt*n/samples;
                     const double zz=pos.z+vz*age;
-                    const double px=x-(std::sin(h)*v+std::cos(h)*lateral)*kMpcDt*(1.0-double(n)/samples);
-                    const double py=y-(std::cos(h)*v-std::sin(h)*lateral)*kMpcDt*(1.0-double(n)/samples);
+                    const double px=x-dx*(1.0-double(n)/samples);
+                    const double py=y-dy*(1.0-double(n)/samples);
                     for(int nose=-1;nose<=1;++nose)for(int side=-1;side<=1;++side)for(int height=-1;height<=1;++height) {
                         const double sampleZ=zz+height*halfHeight;
                         const auto m=navmap::At(px+rx*side+nose*std::sin(h)*halfLength,py+ry*side+nose*std::cos(h)*halfLength,sampleZ);
@@ -2720,7 +2866,7 @@ namespace vehicleflight
 				if (g_vsnapOk) {
 					for (std::uint32_t i = 0; i < g_vsnap.count && i < 64; ++i) {
 						const auto& o = g_vsnap.v[i];
-						if (!o.formId || o.formId == self || o.formId==g.ramVehicle) continue;
+						if (!o.formId || o.formId == self) continue;
 						if (std::fabs(double(o.pos[2]) - (pos.z+vz*t)) > 2.0 * (VehHalfZ(o) + 2.0)) continue;
 						const double ox = o.pos[0] + o.vel[0] * t, oy = o.pos[1] + o.vel[1] * t;
 						const double gap = std::hypot(x - ox, y - oy) - VehRadius(o) - selfRadius;
@@ -2746,6 +2892,8 @@ namespace vehicleflight
 			State& g = g_gs[idx];
 			MpcOut out;
 			const ULONGLONG now = GetTickCount64();
+			// A gap in the frames (a pause, a menu) is not "no progress": the stuck watch starts again.
+			if (g.mpcAt && now - g.mpcAt > 2000) g.mpcProgAt = now;
 			if (now - g.mpcAt < kMpcEveryMs) {  // between plans: the last one
 				out.ok = g.mpcOk;
 				out.omega = g.mpcOmega;
@@ -3118,6 +3266,120 @@ namespace vehicleflight
 		}
 
 		bool CoverFighting();
+
+		// The autopilot's decision (autodrive.h) for this frame: inputs from what the vehicle and the shared map know now.
+		void AutodriveDecide(int idx, std::uintptr_t vehicle, const Goal& goal, const game::Vec3& pos, double heading, const double v[3],
+			bool groundOk, double groundZ, double above, const char* who)
+		{
+			State& g = g_gs[idx];
+			const Shared& sh = g_shs[idx];
+			autodrive::Input in;
+			const ULONGLONG nowMs = GetTickCount64();
+			in.now = double(nowMs) / 1000.0;
+			in.x = pos.x; in.y = pos.y; in.z = pos.z; in.heading = heading;
+			if (g.drive) { in.vx = std::sin(heading) * g.drvSp; in.vy = std::cos(heading) * g.drvSp; }
+			else { in.vx = v[0]; in.vy = v[1]; }
+			in.groundUnder = groundZ; in.groundOk = groundOk; in.above = above;
+			in.gx = goal.x; in.gy = goal.y; in.gz = goal.z; in.stop = std::max(goal.stop, 1.0);
+			in.keepGoing = goal.keepGoing; in.hold = goal.hold; in.cruise = goal.cruise; in.cruiseSpeed = goal.cruiseSpeed;
+			if (goal.keepGoing && !goal.cruise && !goal.hold) { in.targetVx = g_pvx; in.targetVy = g_pvy; }
+			const auto& nv = PilotNavOf(idx);
+			const std::uint32_t self = At<std::uint32_t>(vehicle, off::kFormId);
+			const double dist = std::hypot(goal.x - pos.x, goal.y - pos.y);
+			const bool occupied = idx >= 1 || g_driverVehicle.load(std::memory_order_relaxed) == vehicle;
+			// ---- Hard limits (2026-10-27, the user: contexts set preferences; limits always win) ----
+			// Your own vehicle's travel profile is your choice: Drive only / Hover only hold. An NPC profile's travel is
+			// only its default preference (0.8 meant it so: "a fight makes it hover"); the moment decides below.
+			in.permit = autodrive::Permit::Both;
+			if (idx == 0 && nv.travel == travelmode::Default::Drive) in.permit = autodrive::Permit::DriveOnly;
+			if (idx == 0 && nv.travel == travelmode::Default::Hover) in.permit = autodrive::Permit::HoverOnly;
+			// "Hover or drive" off (and no ground planner): vehicles hover, as before.
+			if (nv.travel == travelmode::Default::Auto && !features::On(features::Id::HoverOrDrive) && !groundnav::Enabled()) in.permit = autodrive::Permit::HoverOnly;
+			// Under 30 % health the hover fails: wheels only.
+			if (vehiclehits::HealthShare(self) < travelmode::kDamaged) { in.permit = autodrive::Permit::DriveOnly; in.hoverPossible = false; }
+			// A low ceiling (indoors, under a structure): no room to fly.
+			const double ceilingRoom = g.ceilValid ? g.ceilZ - pos.z - kVehicleTop : 1e9;
+			if (ceilingRoom < 6.0 && in.permit == autodrive::Permit::Both) in.permit = autodrive::Permit::DriveOnly;
+			// ---- What the moment prefers (strongest first) ----
+			const bool fighting = idx ? npcvehicles::PilotFighting(idx) : CoverFighting();
+			const bool fleeing = idx ? npcvehicles::PilotFleeing(idx) : false;
+			const bool catching = idx == 0 && g_follow && g_air.air;
+			const bool finalApproach = dist < 30.0 && (!goal.keepGoing || goal.hold);
+			bool air = false;
+			const char* why = "";
+			if (fighting) { air = true; why = "combat: low flight for a firing line"; }
+			else if (fleeing) { air = true; why = "fleeing: the straight way out"; }
+			else if (catching) { air = true; why = "catching you in the air"; }
+			else if (finalApproach) { air = false; why = "final approach: on the ground"; }
+			else if (realvehicles::PlaceOwner(vehicle) != 0) { air = false; why = "settlement: on the ground"; }
+			else if (idx == 0 && !occupied && !goal.keepGoing && dist > 150.0) { air = true; why = "long summon: flying"; }
+			else {
+				switch (nv.travel) {
+				case travelmode::Default::Hover: air = true; why = "profile: flying"; break;
+				case travelmode::Default::CopyPlayer: air = g_gs[0].active && !g_gs[0].drive && g_driverVehicle.load(std::memory_order_relaxed) != 0;
+					why = air ? "escort: you fly, it flies" : "escort: you drive, it drives"; break;
+				default: air = false; why = idx ? "traffic / profile: on the ground" : "on the ground"; break;
+				}
+			}
+			in.preferAir = air;
+			in.preferWhy = why;
+			g.adCombat = fighting;
+			in.speedLimit = nv.speedLimit > 0 ? double(nv.speedLimit) : 0.0;
+			if (in.permit == autodrive::Permit::Both && dist > 20.0)
+				in.waterAhead = environment::SurfaceAhead(self, pos.x, pos.y, pos.z, std::atan2(goal.x - pos.x, goal.y - pos.y), std::min(250.0, dist)).water;
+			in.contact = g.adContact;
+			g.adContact = false;
+			if (g.ceilValid) in.ceiling = std::max(0.0, g.ceilZ - pos.z - kVehicleTop);
+			in.onWheels = g.drive;  // the game's own wheels; otherwise the hover (held low for "drive")
+			in.self = self;
+			in.priority = nv.priority > 0 ? nv.priority : (idx == 0 ? 120 : 60);
+			std::array<autodrive::Other, 64> others{};
+			int count = 0;
+			for (unsigned k = 0; g_vsnapOk && k < g_vsnap.count && k < 64; ++k) {
+				const auto& w = g_vsnap.v[k];
+				if (w.formId == self) {
+					in.shape.halfWidth = std::max(0.6, double(w.half[0]));
+					in.shape.halfLength = std::max(1.0, double(w.half[1]));
+					in.shape.height = std::max(1.0, 2.0 * double(w.half[2]));
+					in.shape.originAbove = std::clamp(double(w.half[2]) - (double(w.center[2]) - double(w.pos[2])), 0.2, 2.5);
+					continue;
+				}
+				auto& o = others[count++];
+				o.id = w.formId;
+				o.x = w.pos[0]; o.y = w.pos[1]; o.z = w.pos[2];
+				o.vx = w.vel[0]; o.vy = w.vel[1];
+				o.radius = VehRadius(w);
+				o.priority = w.who == world::VehicleInfo::Who::Player ? 120 : 60;
+			}
+			in.others = others.data();
+			in.otherCount = count;
+			in.limits.driveTop = 22.0 * EnvSpeed();
+			in.limits.hoverTop = 35.0 * EnvSpeed();
+			in.limits.brake = std::clamp(sh.hull.brake, 2.5, 8.0);
+			in.limits.hoverClear = kCallSkim + EnvClimb();
+			auto map = [](double x, double y, double z) {
+				const navmap::Sample m = navmap::At(x, y, z);
+				autodrive::Cell c;
+				c.known = m.known; c.haveGround = m.haveGround; c.ground = m.ground;
+				c.solid = m.blocked; c.solidZ = m.blockedZ; c.object = m.objBlocked;
+				return c;
+			};
+			g.adOut = g.ad.Step(in, map);
+			const auto& o = g.adOut;
+			const bool notable = o.phase == autodrive::Phase::Reverse || o.phase == autodrive::Phase::Turn || o.phase == autodrive::Phase::Boxed ||
+				o.phase == autodrive::Phase::Yield;
+			if (o.modeChanged || o.stuckEvent || (o.phase != g.adLogPhase && notable) || nowMs - g.adLogAt >= 2000) {
+				g.adLogAt = nowMs;
+				g.adLogPhase = o.phase;
+				const double sp = std::hypot(in.vx, in.vy);
+				static const char* permits[3] = { "both", "drive only", "hover only" };
+				logger::Write("%s: autodrive %s (%s; %s), %s%s: want %.1f m/s (at %.1f), bearing %+.0f deg (heading %+.0f), path %s %.0f m (%s), %d open / %d blocked headings (mostly %s x%d), route %s, climb %.0f m, escape level %u%s%s; %.0f m to the goal; ground %.1f m under the reference%s",
+					who, autodrive::Name(o.mode), permits[int(in.permit)], in.preferWhy, autodrive::Name(o.phase), o.modeChanged ? " (mode changed)" : "", o.speed, sp, o.bearing * 57.2958, heading * 57.2958,
+					autodrive::Name(o.path.v), o.path.free, o.why && *o.why ? o.why : "-", o.usable, o.blocked, o.blockedWhy && *o.blockedWhy ? o.blockedWhy : "-", o.blockedWhyCount,
+					o.routed ? (o.routeReaches ? "to the goal" : "partial") : "none", o.climb, o.escapeLevel, o.trapped ? ", trapped (exploring)" : "", o.stuckEvent ? ", STUCK" : "", dist,
+					pos.z - groundZ, groundOk ? "" : " (no ground reading)");
+			}
+		}
 		// One frame of a hovering pilot: the assist, avoidance, height hold and (autopilot) the flight to the goal.
 		void Fly(int idx, std::uintptr_t vehicle, Goal goal, bool focused)
 		{
@@ -3125,7 +3387,9 @@ namespace vehicleflight
 			Shared& g_sh = g_shs[idx];
 			const char* wf = idx ? Who(idx) : "Rover flight";
 			const char* wc = idx ? Who(idx) : "Rover call";
-			g.ramActor=g.ramVehicle=0;
+			// Scripted flight (flightscript.h, 2026-10-24): the caller's command is the plan this frame.
+			const bool scripted = (g_cmds[idx].c.set & Command::kScripted) && GetTickCount64() < g_cmds[idx].until;
+			bool scriptTraffic = false;  // a vehicle within 5 m in the scripted direction of travel
             {
                 const auto& nav=PilotNavOf(idx);const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);const auto now=GetTickCount64();
                 const bool requested=g.autopilot&&goal.hold&&nav.landOnArrival&&std::hypot(goal.x-pos.x,goal.y-pos.y)<=goal.stop+2;
@@ -3144,45 +3408,6 @@ namespace vehicleflight
                 }
                 std::lock_guard lock(g_sh.lock);g_sh.landing=g.landing||g.groundHug;
             }
-			if(!g.autopilot&&g_ram.pilot==idx)g_ram={};
-			if(g_ram.vehicle==At<std::uint32_t>(vehicle,off::kFormId)&&g_ram.pilot==idx) {
-				const auto now=GetTickCount64();
-				const auto actor=RefById(g_ram.actor);
-				const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
-				const bool valid=actor&&!npcvehicles::IsDead(actor)&&Worldspace(actor)==Worldspace(vehicle);
-				const auto target=valid?At<game::Vec3>(actor,off::kRefPosition):pos;
-				bool contact;{std::lock_guard lk(g_sh.lock);contact=g_sh.collided;}
-				const double distance=std::hypot(target.x-pos.x,target.y-pos.y);
-				if(!g.autopilot||ramlogic::Finished(valid,now-g_ram.started,contact,distance,g_sh.hull.length+3)) {
-					logger::Write("Ram order: vehicle %08X -> actor %08X ended (%s)",g_ram.vehicle,g_ram.actor,
-						!g.autopilot?"autopilot off":!valid?"target lost":now-g_ram.started>=15000?"timeout":"impact");
-					const bool keep=g_ram.keep;g_ram={};
-					if(keep)return;  // a manoeuvre's ram: the NPC's fight takes the pilot back next frame
-					if(idx&&At<std::uint32_t>(vehicle,off::kFormId)==OwnRoverId())npcvehicles::SetCrewOrder(OwnRoverId(),npcvehicles::CrewOrder::Hold);
-					Stop(idx,"ram ended");return;
-				}
-				g.ramActor=g_ram.actor;const auto other=EngineFn<std::uintptr_t(*)(std::uintptr_t)>(addr::kPlayerVehicle)(actor);
-				g.ramVehicle=other?At<std::uint32_t>(other,off::kFormId):0;
-				const double dt=(now-g_ram.lastAt)/1000.0;double vx=0,vy=0;
-				if(g_ram.lastAt&&dt>0&&dt<1){vx=(target.x-g_ram.last.x)/dt;vy=(target.y-g_ram.last.y)/dt;if(std::hypot(vx,vy)>150)vx=vy=0;}
-				g_ram.last=target;g_ram.lastAt=now;
-				const double lead=ramlogic::Lead(distance,std::hypot(g_sh.v[0],g_sh.v[1]));
-				const double pass=g_sh.hull.length+4;
-				goal.x=target.x+vx*lead+(distance>0.1?(target.x-pos.x)/distance*pass:0);
-				goal.y=target.y+vy*lead+(distance>0.1?(target.y-pos.y)/distance*pass:0);
-				goal.z=target.z+1;goal.stop=0;goal.hold=false;goal.cruise=true;goal.cruiseSpeed=26*g_sh.hull.acceleration;goal.keepGoing=true;
-				// Straight line, flat out (2026-10-21, the user: "fly in a straight line as quickly as possible"): the ram steers the nose at the led
-				// point itself, full throttle in top gear; no planned path, detours or slowing for traffic. The autopilot keeps only the height
-				// (the target's, never under the terrain clearance).
-				g.drive=false;
-				const double speed=std::hypot(g_sh.v[0],g_sh.v[1]);
-				const double err=Wrap(std::atan2(goal.x-pos.x,goal.y-pos.y)-At<game::Vec3>(vehicle,off::kRefRotation).z);
-				Command c;
-				c.set=Command::kThrottle|Command::kYaw|Command::kStrafe|Command::kGear|Command::kBrake;
-				c.throttle=ramlogic::Throttle(err);c.yawRate=ramlogic::SteerRate(err,g_sh.hull.YawAt(speed));
-				c.strafe=0;c.gear=4;c.brake=false;c.holdMs=200;
-				g_cmds[idx]={c,now+c.holdMs};
-			}
 			VehicleWarning(idx, vehicle, wc);
 			if (g.autopilot) PersonAhead(idx, vehicle);
 			if (g.autopilot && IsDisabled(At<std::uint32_t>(vehicle, off::kFormId))) {
@@ -3200,6 +3425,7 @@ namespace vehicleflight
 						g_sh.collisionUp = false;
 					}
 				}
+				if (hit && g.autopilot && (g.vehTouch || !up)) g.adContact = true;
 				if (hit && g.vehTouch) {
 					// A contact with another vehicle: a plain collision (Havok resolves it); no floor, bump, detour or drive-mode score.
 					if (logger::Verbose() && GetTickCount64() - g_bumps[idx].ev >= kBumpDebounceMs) {
@@ -3311,11 +3537,56 @@ namespace vehicleflight
 			}
 			const double above = groundOk ? pos.z - g.ground : pos.z - g.baseZ;
 
-            if(g.autopilot && !g.routeHold && !g.ramActor) {  // a ram is a bounded straight run: no stuck recovery
+			// The new autopilot (autodrive.h) decides heading, speed, drive/hover and escapes; the 0.8 rules below stand aside.
+			const bool useAd = g.autopilot && !scripted && navmap::NewAutopilot();
+			if (useAd) {
+				LARGE_INTEGER adStart{}, adEnd{}, adFreq{};
+				QueryPerformanceCounter(&adStart);
+				AutodriveDecide(idx, vehicle, goal, pos, g.drive ? heading : bodyHeading, v, groundOk, groundOk ? g.ground : g.baseZ, above, wc);
+				QueryPerformanceCounter(&adEnd); QueryPerformanceFrequency(&adFreq);
+				{
+					// The autopilot's own cost (the FPS pass): average and worst per pilot, and the worst route search, every 10 s.
+					const double ms = 1000.0 * double(adEnd.QuadPart - adStart.QuadPart) / double(adFreq.QuadPart);
+					static double sum[kPilots] = {}, worst[kPilots] = {};
+					static unsigned calls[kPilots] = {};
+					static ULONGLONG reportAt = 0;
+					sum[idx] += ms; worst[idx] = std::max(worst[idx], ms); ++calls[idx];
+					const ULONGLONG tNow = GetTickCount64();
+					if (!reportAt) reportAt = tNow;
+					if (tNow - reportAt >= 10000) {
+						reportAt = tNow;
+						for (int k = 0; k < kPilots; ++k) if (calls[k])
+							logger::Write("Autopilot cost: %s %.3f ms avg / %.2f worst over %u decisions", k ? Who(k) : "Rover", sum[k] / calls[k], worst[k], calls[k]);
+						logger::Write("Autopilot cost: worst route search %.2f ms (one search a frame across pilots)", autodrive::WorstRouteMs());
+						autodrive::WorstRouteMs() = 0;
+						for (int k = 0; k < kPilots; ++k) { sum[k] = worst[k] = 0; calls[k] = 0; }
+					}
+				}
+				const auto& o = g.adOut;
+				// Walls come from the pilot's map judgement (a hillside hit is terrain there); the thin-ray wall warning braked on slopes.
+				const bool wall = o.path.v == autodrive::Verdict::Blocked && o.path.free < 6.0 && o.path.why &&
+					(std::string_view(o.path.why) == "wall" || std::string_view(o.path.why) == "object");
+				g.wallAhead = wall;
+				g.wallDist = wall ? o.path.free : 1e9;
+				g.wallL = g.wallR = 1e9;
+				g.detourAng = 0;
+				g.trailOn = false;
+				g.recovery.failed = false;
+				if (o.reverse) g.reverseUntil = GetTickCount64() + 150;
+				else if (g.reverseUntil > GetTickCount64()) g.reverseUntil = 0;
+				if (o.mode == autodrive::Mode::Drive) g.apClimb = false;
+				// In a fight the hover keeps a low band (about 8 m over the usual skim height): a firing line over cover, still
+				// under ceilings (the hold stays under any ceiling the rays see).
+				g.cruiseExtra = o.mode == autodrive::Mode::Hover ? o.climb + (g.adCombat ? 8.0 : 0.0) : 0.0;
+				g.laneZ = 0;
+			}
+
+            if(g.autopilot && !g.routeHold && !useAd) {
                 const double goalHeight=std::isfinite(goal.z) ? goal.z : 0;
                 if(g.recovery.Update(GetTickCount64(),pos.x,pos.y,pos.z,goal.x,goal.y,goalHeight,
                     AtDestination(vehicle,goal.x,goal.y,goal.z,goal.stop),!groundOk || (!matched && !g.drive))) {
                     navfield::Reset();
+                    groundnav::Invalidate(idx,"stuck recovery");
                     g.mpcEscapeUntil=GetTickCount64()+kMpcEscapeMs;
                     logger::Write("%s: recovery attempt %u of 3",wc,g.recovery.attempts);
                 }
@@ -3356,6 +3627,13 @@ namespace vehicleflight
 						g.trailOn = false;
 						logger::Write("%s: trail off (%.0f m from the goal)", wc, dist);
 					}
+					else if (dist > g.trailStartDist + kTrailAwayMax) {
+						// The trail leads away (a loop the player walked, a path through a building): fly at the goal instead.
+						g.trailOn = false;
+						g.trailBanUntil = GetTickCount64() + kTrailBanMs;
+						logger::Write("%s: trail off: it led away (%.0f m from the goal, %.0f m when it started); flying at the goal for %.0f s",
+							wc, dist, g.trailStartDist, kTrailBanMs / 1000.0);
+					}
 					else {
 						if (!TrailHas(g.trailSeq)) g.trailSeq = TrailNearest(pos.x, pos.y);
 						// skip ahead to any of the next few points that is closer (cut corners the player looped)
@@ -3367,8 +3645,32 @@ namespace vehicleflight
 						while (TrailHas(g.trailSeq + 1) && std::hypot(TrailAt(g.trailSeq).x - pos.x, TrailAt(g.trailSeq).y - pos.y) < kTrailReach) ++g.trailSeq;
 						const auto& w = TrailAt(g.trailSeq);
 						apBearing = std::atan2(w.x - pos.x, w.y - pos.y);
+						if (const ULONGLONG t = GetTickCount64(); t - g.trailLogAt >= 2000) {
+							g.trailLogAt = t;
+							logger::Write("%s: trail: point %llu of %u newer to go, at (%.0f, %.0f) %.0f m ahead; %.0f m from the goal (started %.0f)", wc,
+								g_trailNext - 1 - g.trailSeq, g_trailCount, w.x, w.y, std::hypot(w.x - pos.x, w.y - pos.y), dist, g.trailStartDist);
+						}
 					}
 				}
+				// The ground-first route (groundnav.h, 2026-10-25): round water, cliffs, steep ground and buildings, flying only
+				// where driving cannot go. On its ground legs its look-ahead point is the bearing (driving or the hover held low);
+				// the detours and the lane planner below still add their offsets. Scripts and rams keep their own way.
+				g.routeSteer = false;
+				if (!useAd && groundnav::Enabled() && !g.trailOn && !scripted && dist > stopR + 1.0) {
+					groundnav::Request grq;
+					grq.vehicle = At<std::uint32_t>(vehicle, off::kFormId);
+					grq.x = pos.x; grq.y = pos.y; grq.z = pos.z; grq.speed = g.drive ? g.drvSp : sp;
+					grq.airborne = !g.drive && !g.groundHug && above > 4.0;
+					grq.gx = goal.x; grq.gy = goal.y; grq.gz = goal.z; grq.stop = stopR;
+					grq.stopAtEnd = !(goal.keepGoing || goal.cruise || PilotNavOf(idx).passThrough);
+					for (unsigned i = 0; g_vsnapOk && i < g_vsnap.count && i < 64; ++i) if (g_vsnap.v[i].formId == grq.vehicle) {
+						grq.halfWidth = g_vsnap.v[i].half[0]; grq.halfLength = g_vsnap.v[i].half[1]; grq.height = 2.0 * g_vsnap.v[i].half[2]; break; }
+					grq.topSpeed = kDriveTop; grq.speedLimit = PilotNavOf(idx).speedLimit;
+					grq.latAccel = std::min(g_sh.hull.lateral, 5.0);  // ground grip: well under the hover's lateral limit
+					g.route = groundnav::Guide(idx, grq);
+					if (g.route.ok && g.route.guide.mode == groundplan::Mode::Ground && (g.drive || g.groundHug)) { apBearing = g.route.guide.bearing; g.routeSteer = true; }
+				}
+				else g.route = {};
 				apSteer = dist > 1.0;
 				apGear = dist > 80.0 ? 4 : dist > 40.0 ? 3 : 2;  // the gear from the distance left
 				const double brakeAt = stopR + std::max(sp*kCallBrakeSlack,g_sh.hull.StopDistance(sp));
@@ -3405,6 +3707,18 @@ namespace vehicleflight
 					boosting = g.throttle > 0.05;
 					sBrake = sp > want + 2.0;
 				}
+				if (useAd) {
+					// autodrive's heading and speed (apGear 4: the AI gear table's top stays out of the way; `top` below caps it).
+					const auto& o = g.adOut;
+					apBearing = o.bearing;
+					apSteer = o.phase != autodrive::Phase::Arrived;
+					apGear = 4;
+					g.aiGears = true;
+					const double cur = g.drive ? g.drvSp : sp;
+					g.throttle = o.reverse ? 0.0 : std::clamp((o.speed - cur) / 4.0, 0.0, 1.0);
+					boosting = g.throttle > 0.05;
+					sBrake = o.brake || (!o.reverse && cur > o.speed + 1.5);
+				}
 				if (g.apClimb) {
 					const bool freshGround = groundOk && g.groundAt >= g.autopilotSince;  // never the previous spot's ground
 					const bool overFloor = GetTickCount64() >= g.floorUntil || pos.z >= g.floorZ + kFloorClear;
@@ -3422,6 +3736,8 @@ namespace vehicleflight
 						apSteer = false;
 					}
 				}
+				// (autodrive has its own trap and stuck handling: the 0.8 lost and stuck checks stand aside for it.)
+				if (!useAd)
 				// Lost (behind terrain, circling in a pocket): moved next to the target. Judged per kLostMs window, against
 				// where the window started, never against the best distance ever: a moving target (the player flying off,
 				// a pursuit orbit) made "60 m now, best 5 m" read as lost while the vehicle was flying fine and chasing
@@ -3429,6 +3745,9 @@ namespace vehicleflight
 				// kLostMove in the window is chasing, not lost, however far behind it is.
 				{
 					const ULONGLONG tNow = GetTickCount64();
+					// A gap in the frames (a pause, a menu: 2026-10-24 14:13:28-44 read 17 paused seconds as "0 m moved") restarts the window.
+					if (g.lostFrameAt && tNow - g.lostFrameAt > 2000) g.bestAt = 0;
+					g.lostFrameAt = tNow;
 					if (!g.bestAt) {
 						g.bestAt = tNow;
 						g.bestDist = dist;
@@ -3463,7 +3782,7 @@ namespace vehicleflight
 					return;
 				}
 				// Stuck: accelerating but moved under 1 m in 3 s (twice in a row).
-				{
+				if (!useAd) {
 					double& lx = g.stuckX;
 					double& ly = g.stuckY;
 					ULONGLONG& lt = g.stuckAt;
@@ -3490,9 +3809,10 @@ namespace vehicleflight
 								e.at = nowMs;
 								g.reverseUntil = nowMs + kReverseMs;
 								g.detourAng = g.detourAng != 0 ? -g.detourAng : kAvoidSide;  // the other way out
-								if (goal.keepGoing && !goal.cruise && !goal.hold && !g.trailOn && g_trailCount > 3) {
+								if (goal.keepGoing && !goal.cruise && !goal.hold && !g.trailOn && g_trailCount > 3 && GetTickCount64() >= g.trailBanUntil) {
 									g.trailOn = true;
 									g.trailSeq = TrailNearest(pos.x, pos.y);
+							g.trailStartDist = std::hypot(goal.x - pos.x, goal.y - pos.y);
 								}
 								stuck = 0;
 								logger::Write("%s: stuck (moved %.1f m in 3 s); backing out, detour %+.0f deg", wc, moved, g.detourAng * 57.2958);
@@ -3549,9 +3869,11 @@ namespace vehicleflight
 			double yawWant = 0.0;
 
 			double top = (g.aiGears ? kAiGearTop[apGear] : boosting ? kGearTop[apGear] : std::max(kGearTop[apGear], kSpeedCap))*boostMultiplier;  // AI: the gear caps it
+			if (g.routeSteer) top = std::min(top, std::max(2.0, g.route.guide.speed));  // the route's speed: corners, slopes, what is ahead
 			if (g.autopilot) {
 				const auto& nv = PilotNavOf(idx);  // the profile's speed limit (0 = the gears' own)
 				if (nv.speedLimit > 0) top = std::min(top, double(nv.speedLimit));
+				if (useAd) top = std::min(top, g.adOut.speed + 1.0);
 			}
 			// ---- Avoidance controller (10 Hz decisions, held at least kAvoidHoldMs) ----
 			bool braking = sBrake;
@@ -3563,13 +3885,16 @@ namespace vehicleflight
 				g.lastR = r;
 				g.lastNeed = needF;
 				int want = 0;
-				if (g.autopilot && apSteer && !g.apClimb) {
+				if (useAd) {
+					want = 0;  // autodrive chose heading and speed; no assist turn, climb or stop on top of it
+				}
+				else if (g.autopilot && apSteer && !g.apClimb) {
 					// Corridors here are cast along the target bearing plus the detour (castHeading), not the velocity.
 					const ULONGLONG nowMs = GetTickCount64();
 					const bool hold = nowMs - g.detourAt < kDetourHoldMs;
 					// The planner first (drive mode keeps its own steering); no plan = the old rules below.
 					MpcOut mo;
-					if (!g.drive && kMpcEnabled) {
+					if (!g.drive && kMpcEnabled && !g.routeSteer) {  // a ground route's leg steers instead (the flight planner is for the air)
 						const double tdx = std::sin(apBearing), tdy = std::cos(apBearing);
 						const double tdist = g.trailOn && TrailHas(g.trailSeq) ? std::hypot(TrailAt(g.trailSeq).x - pos.x, TrailAt(g.trailSeq).y - pos.y)
 							: std::hypot(goal.x - pos.x, goal.y - pos.y);
@@ -3581,9 +3906,10 @@ namespace vehicleflight
 						if (top > knownCap) top = knownCap;
 						mo = MpcPlan(idx, vehicle, pos, bodyHeading, sp, std::max(top, 5.0), pos.x + tdx * reach, pos.y + tdy * reach, goal.z, wc);
 						// Escape with the player's trail available: follow it (the second cheap escape).
-						if (mo.escape && std::hypot(goal.x-pos.x,goal.y-pos.y)>kTrailOff && !g.trailOn && goal.keepGoing && !goal.cruise && !goal.hold && g_trailCount > 3) {
+						if (mo.escape && std::hypot(goal.x-pos.x,goal.y-pos.y)>kTrailOff && !g.trailOn && goal.keepGoing && !goal.cruise && !goal.hold && g_trailCount > 3 && GetTickCount64() >= g.trailBanUntil) {
 							g.trailOn = true;
 							g.trailSeq = TrailNearest(pos.x, pos.y);
+							g.trailStartDist = std::hypot(goal.x - pos.x, goal.y - pos.y);
 							logger::Write("%s: planner escape: following your trail (%u points)", wc, g_trailCount);
 						}
 					}
@@ -3593,9 +3919,10 @@ namespace vehicleflight
 						apBearing = bodyHeading + mo.omega / kApYawGain;
 						top = std::min(top, mo.speed);
 					}
-					else if (f == 2 && !hold && goal.keepGoing && !goal.cruise && !goal.hold && !g.trailOn && g_trailCount > 3 && std::hypot(goal.x - pos.x, goal.y - pos.y) > kTrailOff) {
+					else if (f == 2 && !hold && goal.keepGoing && !goal.cruise && !goal.hold && !g.trailOn && g_trailCount > 3 && std::hypot(goal.x - pos.x, goal.y - pos.y) > kTrailOff && nowMs >= g.trailBanUntil) {
 						g.trailOn = true;
 						g.trailSeq = TrailNearest(pos.x, pos.y);
+							g.trailStartDist = std::hypot(goal.x - pos.x, goal.y - pos.y);
 						g.detourAng = 0;
 						g.detourAt = nowMs;
 						logger::Write("%s: path blocked; following your trail (%u points)", wc, g_trailCount);
@@ -3645,7 +3972,6 @@ namespace vehicleflight
 							// that does not meet (routeplan.h).
 							routeplan::Query rq;
 							rq.selfId = At<std::uint32_t>(vehicle, 0x28);
-							rq.ignoreId=g.ramVehicle;
 							for(unsigned i=0;g_vsnapOk&&i<g_vsnap.count&&i<64;++i)if(g_vsnap.v[i].formId==rq.selfId){
 								for(int axis=0;axis<3;++axis)rq.half[axis]=g_vsnap.v[i].half[axis];break;}
 							rq.priority = PilotNavOf(idx).priority > 0 ? PilotNavOf(idx).priority : (idx == 0 ? 120 : 60);
@@ -3653,11 +3979,12 @@ namespace vehicleflight
 							rq.dir[0] = float(std::sin(apBearing));
 							rq.dir[1] = float(std::cos(apBearing));
 							rq.speed = float(std::max(g.drive ? g.drvSp : sp, 6.0));
-							rq.ground = g.drive;
+							rq.ground = g.drive || g.groundHug;  // on the ground (also the hover held low): side offsets and speed, no altitude lanes
 							rq.distToGoal = float(std::hypot(goal.x - pos.x, goal.y - pos.y));
 							const routeplan::Plan pl = routeplan::Update(idx, rq);
 							if (!mo.ok) apBearing += pl.yawOffset;  // (the planner already weighs the other vehicles)
-							g.laneZ = g.drive ? 0.0 : pl.laneZ;
+							g.laneYaw = mo.ok ? 0.0 : pl.yawOffset;
+							g.laneZ = (g.drive || g.groundHug) ? 0.0 : pl.laneZ;
 							if (pl.speedCap >= 0.0f) {
 								top = std::min(top, double(pl.speedCap));
 								if (pl.speedCap < 1.0f) {
@@ -3787,7 +4114,31 @@ namespace vehicleflight
 				bool decided = false, wantDrive = false, nativeWanted = false;
 				const char* travelWhy = "cramped";
 				// NPC pilots, and your own vehicle on autopilot (2026-10-21, the user: summon, follow, cover, guard, Auto), except a ram.
-				if ((idx >= 1 || !Ramming(g_roverId)) && features::On(features::Id::HoverOrDrive)) {
+				const auto& scmd = g_cmds[idx].c;
+				const int scriptTravel = scripted && (scmd.set & Command::kTravel) ? scmd.travel : 0;
+				if (useAd) {
+					// autodrive picks drive or hover (with dwell times); the game's own wheels when someone is aboard, else the hover held low.
+					decided = true;
+					wantDrive = g.adOut.mode == autodrive::Mode::Drive;
+					nativeWanted = wantDrive && occupied;
+					travelWhy = g.adOut.why && *g.adOut.why ? g.adOut.why : "autodrive";
+					const bool hug = wantDrive && !g.drive;
+					if (hug != g.groundHug) {
+						g.groundHug = hug;
+						logger::Write("%s: travel: %s (autodrive: %s)", wc, hug ? "on the ground (hover held low)" : "flying", travelWhy);
+					}
+				}
+				else if (scriptTravel == 1 || scriptTravel == 2) {
+					// The script decides (2026-10-25, the user: "drive and float when needed ... swapping based on obstacle based on script").
+					decided = true; wantDrive = scriptTravel == 2; nativeWanted = false;
+					travelWhy = wantDrive ? "script: drive" : "script: float";
+					const bool hug = wantDrive && !g.drive;
+					if (hug != g.groundHug) {
+						g.groundHug = hug;
+						logger::Write("%s: travel: %s (%s)", wc, hug ? "on the ground (hover held low)" : "flying", travelWhy);
+					}
+				}
+				else if (features::On(features::Id::HoverOrDrive) || groundnav::Enabled()) {
 					const auto& nv = PilotNavOf(idx);
 					travelmode::Inputs in;
 					in.profile = nv.travel;
@@ -3806,6 +4157,12 @@ namespace vehicleflight
 					in.damaged = vehiclehits::HealthShare(At<std::uint32_t>(vehicle, off::kFormId)) < travelmode::kDamaged;
 					in.cramped = g.cramped >= kCrampedOn;
 					in.inSettlement = realvehicles::PlaceOwner(vehicle) != 0;
+					if (g.route.ok) {  // the route already went round water, slopes and tall things: it decides where to fly
+						const auto& rg = g.route.guide;
+						in.planned = true;
+						in.planAir = rg.mode == groundplan::Mode::Air || (rg.nextMode == groundplan::Mode::Air && rg.toModeChange < 15.0);
+						in.planGroundToGoal = g.route.reachesGoal && g.route.endsOnGround;
+					}
 					const auto reason = travelmode::Decide(in);
 					if (travelmode::Step(g.travel, reason, tNow))
 						logger::Write("%s: travel: %s (%s)", wc, g.travel.mode == travelmode::Mode::Drive ? "drive" : "hover", reason.why);
@@ -3815,7 +4172,9 @@ namespace vehicleflight
 					// "Drive" is the hover held just over the ground, hopping what a jump clears (2026-10-21 run: the game's own drive
 					// left NPC vehicles stuck at speed 0 in towns, and it freezes an empty vehicle, bFreezeVehicleOnExit). The game's
 					// own drive is kept for you aboard, a cramped spot and a failing hover (damaged), entered only once down low.
-					nativeWanted = wantDrive && occupied && (idx == 0 || in.damaged || in.cramped);
+					// With the ground planner on, every vehicle with someone aboard drives with the game's own controls (an empty one cannot:
+					// the game freezes it, so it keeps the hover held low).
+					nativeWanted = wantDrive && occupied && (groundnav::Enabled() || idx == 0 || in.damaged || in.cramped);
 					const bool hug = wantDrive && !g.drive;
 					if (hug != g.groundHug) {
 						g.groundHug = hug;
@@ -3877,13 +4236,15 @@ namespace vehicleflight
 						g.steerSecs = 0;
 					}
 					const double spD = g.drvSp;
+                    if(!g.routeSteer && !useAd){  // no ground route: the flight field's best of 16 headings, then the lane planner's side offset again
                     const double level=std::max(double(pos.z),double(g.ground)+2.5);
                     const auto& field=navfield::Get(pos.x,pos.y,level,goal.x,goal.y,kMpcHalfWidth,true,goal.z);
                     double best=1e12,bearing=apBearing;
                     for(int n=0;n<16;++n){const double h=n*0.39269908169872414,reach=std::max(8.0,spD*1.5);
                         const double value=field.Value(pos.x+std::sin(h)*reach,pos.y+std::cos(h)*reach,level);
                         const double score=value+3*std::fabs(Wrap(h-bodyHeading));if(score<best){best=score;bearing=h;}}
-                    if(best<1e12)apBearing=bearing;
+                    if(best<1e12)apBearing=bearing+g.laneYaw;  // (2026-10-25: the pick used to drop the other-vehicle side offset)
+                    }
 
 					const double e = Wrap(apBearing - heading);  // + : the target is to the right
 					double steer = std::clamp(1.8 * e, -1.0, 1.0);
@@ -3926,6 +4287,23 @@ namespace vehicleflight
                     g.trip={true,g.recovery.failed?triplogic::Phase::Unreachable:triplogic::Status(groundOk,
                         triplogic::Reached(dist,goal.stop,std::isfinite(goal.z)?pos.z-goal.z:0,spD,groundOk),dist<=goal.stop+2,
                         std::isfinite(goal.z)?pos.z-goal.z:0,GetTickCount64()<g.reverseUntil,boxed),goal.x,goal.y,dist,spD,0,GetTickCount64()};
+					if (useAd) {
+						// autodrive's heading and speed on the game's own wheels.
+						const auto& o = g.adOut;
+						const double eAd = Wrap(o.bearing - heading);
+						steer = std::clamp(1.8 * eAd, -1.0, 1.0);
+						accel = std::clamp((o.speed - spD) / 4.0, 0.0, 1.0);
+						brake = spD > o.speed + 1.5 ? std::clamp((spD - o.speed) / 6.0, 0.0, 1.0) : 0.0;
+						fwdBoost = o.speed > kDriveTop && std::fabs(eAd) < 0.35;
+						vert = false;
+						if (o.reverse) { accel = 0.0; brake = 1.0; steer = -steer; }  // the brake pedal backs up once stopped; the nose swings toward the bearing
+						else if (o.brake || o.speed < 0.3) { accel = 0.0; brake = spD > 0.5 ? 1.0 : 0.0; }  // at rest no pedal: held, it would back up
+						// Last-moment brake only for a vehicle almost touching, in the direction of motion (a row of parked vehicles
+						// beside it never holds it: autodrive already steers round stopped ones and yields to moving ones).
+						const double motion = o.reverse ? heading + 3.14159265358979 : heading;
+						const bool inWay = g.vehWarn && g.vehGap < 1.2 && std::cos(Wrap(g.vehBearing - motion)) > 0.64;
+						if (g.personAhead || inWay) { accel = 0.0; brake = spD > 0.5 ? 1.0 : 0.0; fwdBoost = false; if (inWay && o.reverse) steer = 0; }
+					}
 					const bool driveBoost = !g.recovery.failed && (fwdBoost || (vert && accel > 0.4));  // (named so it no longer hides the booster-visuals `boost` above)
 					g.drvSteer = steer;
 					g_driveOut[idx].steer.store(float(steer * g.steerSign));
@@ -4049,7 +4427,7 @@ namespace vehicleflight
 						braking = sp > safe + 2.0;
 					}
 				}
-				if (g.vehWarn && g.vehYield && !g.apClimb) {
+				if (g.vehWarn && g.vehYield && !g.apClimb && !useAd) {
 					// Another vehicle close: ease off when it is ahead and closing, slide away from it (never a climb over it).
 					const double travel = sp > 2.0 ? std::atan2(v[0], v[1]) : bodyHeading;
 					if (std::fabs(Wrap(g.vehBearing - travel)) < 1.1 && g.vehClosing > 0.5) {
@@ -4078,10 +4456,23 @@ namespace vehicleflight
 					const auto& c = hc.c;
                     constexpr unsigned movement=Command::kThrottle|Command::kYaw|Command::kStrafe|Command::kVertical|Command::kGear;
                     const bool requestedMotion=(c.set&movement)!=0;
-                    const integrationlogic::MotionFence fence{g.recovery.failed,g.wallAhead,g.personAhead,g.vehWarn&&g.vehYield&&g.vehGap<5.0,top,sp};
-                    const bool allowMovement=!requestedMotion||integrationlogic::MovementAllowed(fence,ValidateCommand(idx,vehicle,pos,bodyHeading,sp,top,goal,c));
+                    const integrationlogic::MotionFence fence{g.recovery.failed,g.wallAhead,g.personAhead,g.vehWarn&&g.vehYield&&g.vehGap<5.0&&TrafficInWay(g,sp,v,bodyHeading),top,sp};
+                    // Scripted: no rollout check against the planner's field (it vetoed every move out of roofed bays);
+                    // only a vehicle in the direction the script drives stops the thrust (walls/people: the final envelope).
+                    if (scripted) {
+                        const double dir = c.throttle < 0 ? bodyHeading + 3.14159265358979 : bodyHeading;
+                        scriptTraffic = (c.set & Command::kThrottle) && std::fabs(c.throttle) > 0.01 && g.vehWarn && g.vehGap < 5.0 &&
+                            std::cos(Wrap(g.vehBearing - dir)) > 0.5;
+                        braking = false; strafe = 0;  // the planner's avoidance braking and side-steps do not apply
+                    }
+                    const bool allowMovement=scripted||!requestedMotion||integrationlogic::MovementAllowed(fence,ValidateCommand(idx,vehicle,pos,bodyHeading,sp,top,goal,c));
                     const unsigned allowed=c.set&((allowMovement?movement:0)|Command::kPitch|Command::kRoll|Command::kBrake);
                     const int cg = (allowed & Command::kGear) ? std::clamp(c.gear, 1, 4) : apGear;
+                    if (scripted) {  // the script picks the gear: the planner's path caps do not limit it
+                        top = kAiGearTop[cg];
+                        const auto& nv = PilotNavOf(idx); if (nv.speedLimit > 0) top = std::min(top, double(nv.speedLimit));
+                        g.cap = groundOk ? top : std::min(top, kSpeedCapBlind);
+                    }
 					if (allowed & Command::kThrottle) {
 						thrustAcc = braking?0.0:std::clamp(c.throttle,-1.0,1.0)*kThrust*kGearThrust[cg];
 						thrust = thrustAcc != 0.0;
@@ -4099,7 +4490,7 @@ namespace vehicleflight
 					if (allowed & Command::kGear) g.gear = cg;
 				}
 			}
-            if(g.autopilot&&!g.wallAhead&&!g.personAhead) {
+            if(g.autopilot&&!scripted&&!g.wallAhead&&!g.personAhead) {
                 const double yaw=integrationlogic::ArrivalYaw(bodyHeading,PilotNavOf(idx).arriveYaw,std::hypot(goal.x-pos.x,goal.y-pos.y),goal.stop,sp,g_sh.hull.YawAt(sp));
                 if(std::isfinite(yaw)){yawWant=yaw;thrustAcc=0;thrust=false;braking=true;}
             }
@@ -4113,12 +4504,13 @@ namespace vehicleflight
                 }
             }
             // The final envelope wins over all decision sources.
-            if(g.autopilot&&(g.wallAhead||g.personAhead||(g.vehWarn&&g.vehYield&&g.vehGap<5.0))) {
+            const bool vehicleInWay=useAd?(g.vehWarn&&g.vehGap<1.5&&TrafficInWay(g,sp,v,bodyHeading)):(g.vehWarn&&g.vehYield&&g.vehGap<5.0&&TrafficInWay(g,sp,v,bodyHeading));
+            if(g.autopilot&&(g.wallAhead||g.personAhead||(scripted?scriptTraffic:vehicleInWay))) {
                 thrustAcc=std::min(thrustAcc,0.0);thrust=thrustAcc!=0;braking=true;
             }
             if(g.autopilot&&sp>top+0.5){thrustAcc=std::min(thrustAcc,0.0);thrust=thrustAcc!=0;braking=true;}
             if(g.ceilValid&&pos.z>=g.ceilZ-kCeilClear-g_sh.hull.height&&vzOn&&vzCmd>0)vzCmd=0;
-            if(g.autopilot && g.recovery.failed) {
+            if(g.autopilot && !scripted && g.recovery.failed) {
                 thrustAcc=0; thrust=false; braking=true; strafe=0; yawWant=0;
                 vzOn=true; vzCmd=0;
                 g.holding=true; g.hold=std::max(kMinClearance,pos.z-refGround);
@@ -4165,6 +4557,8 @@ namespace vehicleflight
 					if (physical||g_sh.physical) logger::Write("%s: physical flight %s (%s)",Who(idx),physical?"on":"off",g.autopilot?"AI pilot":"manual");
 				}
 				g_sh.physical = physical;
+				// Physical flight plans with the chassis' real grip and brake (hulllogic::Physical): every planner reads g_sh.hull.
+				g_sh.hull = physical && !g_sh.physicalFault ? hulllogic::Physical(g_sh.hullBase) : g_sh.hullBase;
 				g_sh.assist = flightAssist;
 				g_sh.bankTest = bankTest;
 				g_sh.holding = g.holding;
@@ -4432,7 +4826,7 @@ namespace vehicleflight
 		const bool h = focused && bindings::Held(bindings::Action::HoverToggle, g_keys.toggle);
 		const bool pressed = focused && bindings::Triggered(bindings::Action::HoverToggle);
 		g.keyDown = h;
-		const auto driven = PlayerVehicle(player);
+		const auto driven = DrivenBy(player);
 		FirstPersonLookLimits(driven != 0);
 		g_boostRequest.store(driven && focused && !g.playerAuto && (bindings::Held(bindings::Action::Boost, VK_LSHIFT) || (g.active && g.wHold)));
 		if(!driven)g_meterBoost.store(false);
@@ -4614,7 +5008,7 @@ namespace vehicleflight
 				notify::Show("Escorts summoned");
 			}
 			if (callPressed && !scanCall) {
-				g_ram = {};
+				
 				logger::Write("Rover recall: N %s", nAct.hold ? "held" : "tapped");
 			}
 			// Crew: with a follower driving or free, the buttons go to the follower.
@@ -4885,16 +5279,13 @@ namespace vehicleflight
 			hoverui::SetFoot(!driven && g_roverId != 0, rover && !driven && !g.autopilot && toRover <= kNearBoard, callKey.c_str(), followKey.c_str(), useKey.c_str(), status,
 				overrides::SummonLabel(), overrides::CoverLabel(npcvehicles::IsInCombat(player)));
 			char line[64] = "";
-			const std::uint32_t drivenId = driven ? At<std::uint32_t>(driven, off::kFormId) : 0;
-			const bool ramLine = driven && Ramming(drivenId);
-			if (ramLine) std::snprintf(line, sizeof(line), "RAMMING");
-			else if (driven && g.playerAuto) {
+			if (driven && g.playerAuto) {
 				if (g.taxiMarker && ProgressFor(g_roverId).phase==triplogic::Phase::Arrived) std::snprintf(line, sizeof(line), "ARRIVED");
 				else if (g.taxiMarker) std::snprintf(line, sizeof(line), "%s  %.0f m", triplogic::Text(ProgressFor(g_roverId).phase), std::min(g.taxiLeft, 99999.0));
 				else std::snprintf(line, sizeof(line), "AIM + T");
 			}
-			hoverui::SetTripStatus((driven && g.playerAuto) || ramLine, line);
-			hoverui::SetAutoKey(driven ? scantarget::KeyName().c_str() : "");
+			hoverui::SetTripStatus(driven && g.playerAuto, line);
+			hoverui::SetAutoKey(driven ? bindings::Label(bindings::Action::AutoToggle).c_str() : "");
 			hoverui::SetFollow(g_follow);
 		}
 		std::uintptr_t heldVehicle = 0;
@@ -4960,12 +5351,34 @@ namespace vehicleflight
 			double cp;bool first;
 			if(CameraAimReading(vehicle,cp,first))g_camRest.Observe(cp,first,true);
 		}
+		// Hover toggle evidence and guard (2026-10-24 12:42-12:43 run: 5 of 7 L3 hover-offs came back on 0.17-0.23 s later, a
+		// second toggle in one press's time). Every raw L3 edge while driving is logged with how long it was held, and a toggle
+		// within kToggleGuardMs of the last one is ignored, so one click can never switch hover off and straight back on.
+		constexpr ULONGLONG kToggleGuardMs = 500;
+		static bool l3Was = false;
+		static ULONGLONG l3DownAt = 0, lastToggleAt = 0;
+		const ULONGLONG toggleNow = GetTickCount64();
+		const bool l3 = (bindings::PadState() & 0x0040u) != 0;  // bindlogic::kLS
+		if (l3 != l3Was) {
+			if (l3) l3DownAt = toggleNow;
+			if (driven) logger::Write("Hover toggle: L3 %s%s (hover %s)", l3 ? "down" : "up",
+				l3 ? "" : (" after " + std::to_string(toggleNow - l3DownAt) + " ms").c_str(), g.active ? "on" : "off");
+			l3Was = l3;
+		}
 		if (pressed && driven) {
-			if (g.active) {
-				Stop(bindings::Label(bindings::Action::HoverToggle, g_keys.toggle).c_str());
-				return;
+			if (lastToggleAt && toggleNow - lastToggleAt < kToggleGuardMs) {
+				logger::Write("Hover toggle: ignored a second toggle %llu ms after the last one (L3 %s); hover stays %s",
+					toggleNow - lastToggleAt, l3 ? "down" : "up", g.active ? "on" : "off");
 			}
-			Start(vehicle);
+			else {
+				lastToggleAt = toggleNow;
+				logger::Write("Hover toggle: %s (L3 %s)", g.active ? "off" : "on", l3 ? "down" : "up");
+				if (g.active) {
+					Stop(bindings::Label(bindings::Action::HoverToggle, g_keys.toggle).c_str());
+					return;
+				}
+				Start(vehicle);
+			}
 		}
 		if (!g.active) {
 			// Driving uses the same Alt-tap gear as hover; it caps the ground speed.
@@ -5171,15 +5584,34 @@ namespace vehicleflight
 		void PilotsTick()
 		{
 			const auto player = Ptr(addr::kPlayerCharacterPtr);
-			const auto driven = player ? PlayerVehicle(player) : 0;
+			const auto driven = DrivenBy(player);
+			// 2026-10-24 CPU fix (the user: "make flight and navigation cheaper"): NPC planning ran every update (40-50/s).
+			// Fly measures its own dt (clamped to 0.1 s) and the physics hook keeps applying the last targets, so 20 Hz is
+			// enough. A vehicle with no physics instance cannot move at all: plan it at 3 Hz until its body binds.
+			static ULONGLONG flownAt[kPilots] = {}, unboundSince[kPilots] = {};
+			static unsigned slowed = 0, flown = 0; static ULONGLONG reportAt = 0;
+			const ULONGLONG now = GetTickCount64();
 			for (int idx = 1; idx < kPilots; ++idx) {
-				if (!g_gs[idx].active) continue;
+				if (!g_gs[idx].active) { flownAt[idx] = unboundSince[idx] = 0; continue; }
 				const auto vehicle = RefById(g_jobs[idx].vehicleId);
 				const auto loaded = vehicle ? At<std::uintptr_t>(vehicle, off::kRefLoadedData) : 0;
 				if (!vehicle || vehicle != g_shs[idx].vehicle.load()) Stop(idx, "vehicle lost");
 				else if (vehicle == driven) Stop(idx, "the player took the vehicle");
 				else if (!loaded || !At<std::uintptr_t>(loaded, 0x08)) Stop(idx, "vehicle unloaded");
-				else Fly(idx, vehicle, g_jobs[idx].goal, false);
+				else {
+					if (g_shs[idx].instance.load()) unboundSince[idx] = 0;
+					else if (!unboundSince[idx]) unboundSince[idx] = now;
+					const bool unbound = unboundSince[idx] && now - unboundSince[idx] > 3000;
+					const ULONGLONG every = unbound ? 333 : 50;
+					if (flownAt[idx] && now - flownAt[idx] < every) continue;
+					flownAt[idx] = now;
+					if (unbound) ++slowed; else ++flown;
+					Fly(idx, vehicle, g_jobs[idx].goal, false);
+				}
+			}
+			if (now - reportAt >= 60000) {
+				if (slowed || flown) logger::Write("NPC flight planning: %u full-rate passes, %u slowed passes (no physics instance) in the last minute", flown, slowed);
+				reportAt = now; slowed = flown = 0;
 			}
 		}
 	}
@@ -5190,6 +5622,15 @@ namespace vehicleflight
 		const std::uint32_t id = At<std::uint32_t>(vehicle, 0x28);
 		if (vehicle == g_hoverVehicle.load() || (id == g_roverId && npcvehicles::CrewOrderOf(id) == npcvehicles::CrewOrder::None)) return false;  // the player's rover only for a crew job
 		if (IsDisabled(id)) return false;  // the hit counter switched its autopilot off
+		// 2026-10-28 (01:29 run): the player took an NPC job's vehicle and the job restarted the flight 1764 times ("the player
+		// took the vehicle" each frame). The vehicle the player sits in is refused.
+		if (const auto player = Ptr(addr::kPlayerCharacterPtr); player && PlayerVehicle(player) == vehicle && passenger::RidingVehicle() != id) return false;  // a passenger player rides with the NPC driver
+		// 2026-10-27 crash (21:18 run): after a world change an NPC job restarted the flight on its unloaded vehicle every
+		// 20 ms (hover on, "vehicle unloaded", hover off, again) until the game died. An unloaded vehicle is refused.
+		{
+			const auto loaded = At<std::uintptr_t>(vehicle, off::kRefLoadedData);
+			if (!loaded || !At<std::uintptr_t>(loaded, 0x08)) return false;
+		}
 		for (int i = 1; i < kPilots; ++i) {
 			if (i != pilot && g_gs[i].active && g_jobs[i].vehicleId == id) return false;  // one pilot per vehicle
 		}
@@ -5228,6 +5669,16 @@ namespace vehicleflight
 	}
 
 	bool PilotActive(int pilot) { return pilot >= 1 && pilot < kPilots && g_gs[pilot].active; }
+	PhysicsStatus PilotPhysics(int pilot)
+	{
+		if(pilot<1||pilot>=kPilots||!g_gs[pilot].active)return {};
+		auto& s=g_shs[pilot];std::lock_guard lk(s.lock);
+		PhysicsStatus out;const auto instance=s.instance.load();
+		out.bound=instance!=0;out.serial=s.stepSerial;
+		const auto now=GetTickCount64();
+		out.live=s.active&&s.autopilot&&s.matched&&instance&&s.lastStepInstance==instance&&s.lastStepAt&&now-s.lastStepAt<500;
+		return out;
+	}
 
 	bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out)
 	{
@@ -5292,7 +5743,7 @@ namespace vehicleflight
 
 	void CancelScannerTrip()
 	{
-		g_scanCall.store(false); g_goOnBoard.store(false); g_goAt.store(0);g_ram={};
+		g_scanCall.store(false); g_goOnBoard.store(false); g_goAt.store(0);
 		if (g_crewPending==npcvehicles::CrewOrder::Marker) g_crewPending=npcvehicles::CrewOrder::None;
 		if (npcvehicles::CrewOrderOf(g_roverId)==npcvehicles::CrewOrder::Marker)
 			npcvehicles::SetCrewOrder(g_roverId,npcvehicles::CrewOrder::Hold);
@@ -5314,7 +5765,7 @@ namespace vehicleflight
 	void ToggleAuto()
 	{
 		const auto player = Ptr(addr::kPlayerCharacterPtr);
-		const auto driven = player ? PlayerVehicle(player) : 0;
+		const auto driven = DrivenBy(player);
 		if (!driven) return;
 		if (g.playerAuto) {
 			g.playerAuto = false; g.autopilot = false; g.routeHold = false; g.holdId = 0;
@@ -5341,7 +5792,7 @@ namespace vehicleflight
 		if (npcvehicles::CrewOrderOf(g_roverId)==npcvehicles::CrewOrder::Hold)
 			npcvehicles::SetCrewOrder(g_roverId,npcvehicles::CrewOrder::Marker);
 		const auto player = Ptr(addr::kPlayerCharacterPtr);
-		const auto driven = player ? PlayerVehicle(player) : 0;
+		const auto driven = DrivenBy(player);
 		if (driven) {
 			const bool wasHovering = g.active && g_hoverVehicle.load() == driven;
 			if (!wasHovering) Start(driven);
@@ -5390,57 +5841,19 @@ namespace vehicleflight
 
 	AutoMode GetAutoMode() { return g_autoMode; }
 
-	bool Ramming(std::uint32_t vehicleId){return ramlogic::Owns(g_ram.vehicle,vehicleId,GetTickCount64()-g_ram.started);}
-	bool RequestRam(std::uintptr_t actor) {
-		const auto player=Ptr(addr::kPlayerCharacterPtr);if(!player||!actor)return false;
-		const auto vehicle=PlayerVehicle(player)?PlayerVehicle(player):Rover();
-		if(!vehicle){logger::Write("Ram order: refused (no driven or own vehicle)");return false;}
-		const auto id=At<std::uint32_t>(vehicle,off::kFormId),actorId=At<std::uint32_t>(actor,off::kFormId);
-		const char* why=ramlogic::Reject(npcvehicles::LooksLikeActor(actor),!npcvehicles::IsDead(actor),
-			EngineFn<std::uintptr_t(*)(std::uintptr_t)>(addr::kPlayerVehicle)(actor)==vehicle);
-		if (!why && npcvehicles::AreAllies(player, actor)) why = "friendly fire disabled";
-		if(!why&&(!Worldspace(vehicle)||Worldspace(actor)!=Worldspace(vehicle)))why="actor in another world";
-		if(!why&&IsDisabled(id))why="autopilot disabled after hits";
-		if(why){logger::Write("Ram order: vehicle %08X -> actor %08X refused (%s)",id,actorId,why);return false;}
-		const int pilot=npcvehicles::PilotFor(id);
-		EndTargetSession(vehicle);
-		if(!pilot){if(!g.active)Start(vehicle);g.autopilot=true;g.playerAuto=PlayerVehicle(player)==vehicle;
-			const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);g.holdId=id;g.holdX=pos.x;g.holdY=pos.y;g.holdZ=pos.z;g.routeHold=true;g.autopilotSince=GetTickCount64();}
-		else {vcontract::Goal goal;const auto target=At<game::Vec3>(actor,off::kRefPosition);
-			goal.x=target.x;goal.y=target.y;goal.z=target.z+1;goal.cruise=true;goal.cruiseSpeed=26;goal.stop=0;
-			if(!PilotFly(pilot,vehicle,goal)){logger::Write("Ram order: vehicle %08X -> actor %08X refused (crew pilot would not fly)",id,actorId);return false;}
-		}
-		g_ram={id,actorId,pilot,GetTickCount64()};
-		logger::Write("Ram order: vehicle %08X -> highlighted actor %08X",id,g_ram.actor);return true;
-	}
-
-	bool OrderRam(int pilot,std::uintptr_t vehicle,std::uintptr_t actor) {
-		if(pilot<1||pilot>=kPilots||!vehicle||!actor||g_ram.vehicle||!g_gs[pilot].active)return false;
-		const auto id=At<std::uint32_t>(vehicle,off::kFormId),actorId=At<std::uint32_t>(actor,off::kFormId);
-		if(IsDisabled(id)||npcvehicles::IsDead(actor)||Worldspace(actor)!=Worldspace(vehicle))return false;
-		const auto driverId = npcvehicles::VehicleDriverId(id);
-		const auto driver = driverId ? RefById(driverId) : 0;
-		if (driver && npcvehicles::AreAllies(driver, actor)) return false;
-		vcontract::Goal goal;const auto target=At<game::Vec3>(actor,off::kRefPosition);
-		goal.x=target.x;goal.y=target.y;goal.z=target.z+1;goal.cruise=true;goal.cruiseSpeed=26;goal.stop=0;
-		if(!PilotFly(pilot,vehicle,goal))return false;
-		g_ram={id,actorId,pilot,GetTickCount64()};g_ram.keep=true;
-		logger::Write("Ram order: NPC vehicle %08X -> %08X (manoeuvre)",id,actorId);return true;
-	}
-
 	bool SetGuardPoint(double x,double y) {
 		const double nan=std::numeric_limits<double>::quiet_NaN();  // skim the terrain there: the aimed height can be an estimate
 		if(npcvehicles::SetCrewGuard(g_roverId,x,y,nan))return true;
 		const auto rover=Rover();
 		if(!rover||IsDisabled(g_roverId)){logger::Write("Rover guard: refused (%s)",rover?"autopilot disabled after hits":"no vehicle");return false;}
-		g_follow=false;g_guard=true;g_ram={};
+		g_follow=false;g_guard=true;
 		if(!(g.active&&g_hoverVehicle.load()==rover))Start(rover);
 		g.autopilot=true;g.playerAuto=false;g.holdId=g_roverId;g.holdX=x;g.holdY=y;g.holdZ=nan;g.routeHold=true;g.autopilotSince=GetTickCount64();
 		logger::Write("Rover guard: %08X guards (%.0f, %.0f)",g_roverId,x,y);
 		return true;
 	}
 
-	void FreshScannerTarget() {g_targetSession.Selected();g_ram={};}
+	void FreshScannerTarget() {g_targetSession.Selected();}
 	void EndTargetSession(std::uintptr_t vehicle)
 	{
 		const auto player=Ptr(addr::kPlayerCharacterPtr);
@@ -5562,7 +5975,12 @@ namespace vehicleflight
     }
     double TurnLimit(std::uint32_t id) {
         world::Snapshot snap;if(world::Vehicles(snap))for(unsigned k=0;k<snap.count&&k<64;++k)if(snap.v[k].formId==id) {
-            const auto&v=snap.v[k];return hulllogic::For(v.half[0],v.half[1],v.half[2]).YawAt(std::hypot(v.vel[0],v.vel[1]));
+            const auto&v=snap.v[k];const double speed=std::hypot(v.vel[0],v.vel[1]);
+            // A pilot flying it physically turns within the chassis' real grip (hulllogic::Physical), so the combat AI's turn
+            // radius plans for its momentum too.
+            for(auto&sh:g_shs){const auto ref=sh.vehicle.load();
+                if(ref&&At<std::uint32_t>(ref,off::kFormId)==id){std::lock_guard lk(sh.lock);if(sh.active&&sh.physical)return sh.hull.YawAt(speed);}}
+            return hulllogic::For(v.half[0],v.half[1],v.half[2]).YawAt(speed);
         }
         return 0.8;
     }
@@ -5579,12 +5997,14 @@ namespace vehicleflight
 	void PilotStop(int pilot, const char* why)
 	{
 		if (PilotActive(pilot)) Stop(pilot, why);
+		groundnav::Forget(pilot);
 	}
 
 	std::uint32_t OwnRoverId() { return g_roverId; }
 
 	void Tick()
 	{
+        ReportStepCost();
 		g_vsnapOk = world::Vehicles(g_vsnap);
 		EnvTick();
 		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
@@ -5595,7 +6015,7 @@ namespace vehicleflight
 		PilotsTick();
 		for(auto&s:g_shs){std::lock_guard lk(s.lock);if(const auto ref=s.vehicle.load())BindBody(s,ref);}
 		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
-			if (!PlayerVehicle(player)) WatchFlip(Rover(), "Rover");  // never while the player drives it
+			if (!DrivenBy(player)) WatchFlip(Rover(), "Rover");  // never while the player drives it
 		}
 	}
 
@@ -5620,6 +6040,7 @@ namespace vehicleflight
 				g_shs[i].haveLast = false;
 				g_shs[i].collided = false;
 				g_shs[i].steps = 0;
+				g_shs[i].stepSerial=0;g_shs[i].lastStepAt=0;g_shs[i].lastStepInstance=0;
 				g_shs[i].guardVehicle = 0;
 				g_shs[i].autopilot = false;
 			}
@@ -5640,7 +6061,7 @@ namespace vehicleflight
 		g_camRest = CamRest{};
 		g_camPick = CamPick{};
 		g_boostRequest=false;g_meterBoost=false;g_meterVehicle=0;g_meterExhausted=false;
-		g_targetSession={};g_ram={};g_guard=false;g_cf=CoverFight{};
+		g_targetSession={};g_guard=false;g_cf=CoverFight{};
 		logger::Write("Rover flight: load reset discarded prior rover motion and body identity");
 	}
 }

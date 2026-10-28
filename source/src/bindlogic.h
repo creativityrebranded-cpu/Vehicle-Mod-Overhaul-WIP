@@ -566,11 +566,15 @@ struct Capture
 // The device the prompts name (2026-10-24, the user: change "only when a button from a source is used"). Mouse moves,
 // stick moves and held buttons never switch it; a fresh press from each device in the same tick keeps the current one.
 enum class Device { Keyboard, Pad };
+// WinUser.h VK_GAMEPAD_A..VK_GAMEPAD_RIGHT_THUMBSTICK_LEFT are
+// controller activity, even when GetAsyncKeyState exposes them as VKs.
+inline bool KeyboardMouseKey(unsigned vk){return vk>0&&vk<256&&!(vk>=0xC3&&vk<=0xDA);}
 // The controller buttons newly pressed between two states.
 inline std::uint32_t PadPresses(std::uint32_t prev, std::uint32_t now) { return now & ~prev & kPadPressBits; }
 struct DeviceTracker
 {
     Device device = Device::Keyboard;
+    std::uint64_t lastEvent=0;
     // True when the device changed.
     bool Update(bool keyPress, bool padPress)
     {
@@ -578,6 +582,10 @@ struct DeviceTracker
         const bool changed = next != device;
         device = next;
         return changed;
+    }
+    bool Observe(std::uint64_t event,bool keyPress,bool padPress){
+        if(event&&event!=lastEvent){lastEvent=event;return Update(!(event&1),bool(event&1));}
+        return Update(keyPress,padPress);
     }
 };
 }

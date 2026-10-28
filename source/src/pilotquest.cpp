@@ -1,4 +1,6 @@
 #include "pilotquest.h"
+#include "runtimeforms.h"
+#include "pilotlayout.h"
 
 #include "addresses.h"
 #include "game.h"
@@ -20,64 +22,56 @@ namespace pilotquest
 		template <class Fn>
 		Fn EngineFn(std::uint32_t rva) { return reinterpret_cast<Fn>(game::Base() + rva); }
 
-		constexpr std::uint32_t kLookupForm = 0x005DE3B0;   // (form id) -> TESForm*
 		constexpr std::uint32_t kForceInto = 0x00CFC990;    // FUN_140cfc990(quest, aliasId, ref, 6): ReferenceAlias.ForceRefTo
 		constexpr std::uint32_t kClearAlias = 0x00CFC590;   // FUN_140cfc590(quest, alias, 6, 0): ReferenceAlias.Clear
 		constexpr std::uint32_t kAliasIndex = 0x00CF72D0;   // FUN_140cf72d0(quest, aliasId) -> index into quest +0x90, -1 none
 		constexpr std::uint32_t kEvaluate = 0x01914750;     // FUN_141914750(actor, immediate, resetAI): console evp
 		constexpr std::uint32_t kVanillaQuest = 0x001D307E; // SQ_Passengers: gives the QUST form type byte
 		constexpr std::uint32_t kVanillaPack = 0x001C9CDA;  // DefaultPassengerShipInCombatPackage: the PACK form type byte
-		constexpr std::uint32_t kQuestLocal = 0x800, kPackLocal = 0x801, kActQuestLocal = 0x810;
-		constexpr int kSlots = 6;
+		constexpr int kSlots = pilotlayout::kSlots;
 
 		uptr g_quest = 0, g_actQuest = 0;  // g_actQuest: the second quest, whose pilot alias carries the ACTIVATE package
-		int g_index = -1;               // the plugin's load index; -2: probed, not loaded
+		std::uint32_t g_questId=0;bool g_missingReported=false;
 		ULONGLONG g_lastProbe = 0;
+#ifdef SP_RUNTIME_PERF_TEST
+        ULONGLONG g_testNow=10000;
+#endif
 		bool g_loggedRunning = false;
 
-		uptr Lookup(std::uint32_t id)
-		{
-			__try {
-				return EngineFn<uptr (*)(std::uint32_t)>(kLookupForm)(id);
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				return 0;
-			}
-		}
+		uptr Lookup(std::uint32_t id) {return runtimeforms::Lookup(id);}
 
 		std::uint8_t TypeOf(uptr form) { return form ? At<std::uint8_t>(form, 0x2E) : 0; }
 
 		void Probe()
 		{
+#ifdef SP_RUNTIME_PERF_TEST
+            const ULONGLONG now=g_testNow;
+#else
 			const ULONGLONG now = GetTickCount64();
+#endif
 			if (g_lastProbe && now - g_lastProbe < 5000) return;
 			g_lastProbe = now;
-			if (g_quest) {
-				// still the same form? (a save load rebuilds forms)
-				if (Lookup((std::uint32_t(g_index) << 24) | kQuestLocal) == g_quest) return;
-				g_quest = 0;
-				g_actQuest = 0;
-				g_index = -1;
-				g_loggedRunning = false;
-			}
-			const std::uint8_t qType = TypeOf(Lookup(kVanillaQuest)), pType = TypeOf(Lookup(kVanillaPack));
-			if (!qType || !pType) return;  // the game's forms are not up yet
-			for (std::uint32_t i = 1; i < 0xFE; ++i) {
-				const uptr q = Lookup((i << 24) | kQuestLocal), p = Lookup((i << 24) | kPackLocal);
-				if (q && p && TypeOf(q) == qType && TypeOf(p) == pType) {
-					g_quest = q;
-					g_index = int(i);
-					g_actQuest = Lookup((i << 24) | kActQuestLocal);
-					if (g_actQuest && TypeOf(g_actQuest) != qType) g_actQuest = 0;
-					logger::Write("Pilot quest: FVO_NPCPilots.esm found at load index %02X: quest %08X (%s), package %08X", i, (i << 24) | kQuestLocal,
-						(At<std::uint8_t>(q, 0x114) & 1) ? "running" : "NOT running", (i << 24) | kPackLocal);
-					return;
-				}
-			}
-			if (g_index == -1) {
-				g_index = -2;
-				logger::Write("Pilot quest: FVO_NPCPilots.esm is not loaded (enable it in Plugins.txt); NPCs cannot be sent to vehicles by quest package");
-			}
+            if(g_quest){
+                const auto current=runtimeforms::Resolve(pilotlayout::kBoardQuest);
+                if(current==g_questId&&Lookup(current)==g_quest)return;
+                g_quest=g_actQuest=0;g_questId=0;g_loggedRunning=false;
+            }
+            const auto qType=TypeOf(Lookup(kVanillaQuest)),pType=TypeOf(Lookup(kVanillaPack));
+            if(!qType||!pType)return;
+            const auto questId=runtimeforms::Resolve(pilotlayout::kBoardQuest);
+            const auto packId=runtimeforms::Resolve(pilotlayout::kBoardPackages.At(0));
+            const auto quest=Lookup(questId),package=Lookup(packId);
+            if(quest&&package&&TypeOf(quest)==qType&&TypeOf(package)==pType){
+                g_quest=quest;g_questId=questId;g_missingReported=false;
+                g_actQuest=Lookup(runtimeforms::Resolve(pilotlayout::kActivateQuest));
+                if(g_actQuest&&TypeOf(g_actQuest)!=qType)g_actQuest=0;
+                logger::Write("Pilot quest: %s resolved: quest %08X (%s), package %08X",pilotlayout::kBoardQuest.plugin,
+                    questId,(At<std::uint8_t>(quest,0x114)&1)?"running":"NOT running",packId);
+                return;
+            }
+            if(!g_missingReported){g_missingReported=true;
+                logger::Write("Pilot quest: %s is not loaded or its forms differ; NPC quest boarding unavailable",pilotlayout::kBoardQuest.plugin);}
+
 		}
 
 		bool ForceIn(uptr quest, int aliasId, uptr ref)
@@ -182,7 +176,7 @@ namespace pilotquest
 			const bool pkgOk = Readable(pkg, 0x40);
 			logger::Write("Pilot quest: slot %d diagnose: alias object %p (index %d) holds the NPC at:%s; NPC %08X runs package %08X type %d (ours are %08X..%08X); quest running %d",
 				g_diag.slot, reinterpret_cast<void*>(alias), int(idx), hits[0] ? hits : " NOWHERE", npcId, pkgOk ? At<std::uint32_t>(pkg, 0x28) : 0,
-				pkgOk ? int(At<std::int8_t>(pkg, 0x3C)) : -1, (std::uint32_t(g_index) << 24) | kPackLocal, (std::uint32_t(g_index) << 24) | (kPackLocal + kSlots - 1),
+				pkgOk ? int(At<std::int8_t>(pkg, 0x3C)) : -1, runtimeforms::Resolve(pilotlayout::kBoardPackages.At(0)), runtimeforms::Resolve(pilotlayout::kBoardPackages.At(std::size_t(kSlots-1))),
 				(At<std::uint8_t>(g_quest, 0x114) & 1) ? 1 : 0);
 		}
 	}
@@ -205,6 +199,7 @@ namespace pilotquest
 			logger::Write("Pilot quest: diagnose faulted");
 		}
 	}
+    void Reset(){g_quest=g_actQuest=0;g_questId=0;g_lastProbe=0;g_loggedRunning=false;g_missingReported=false;g_diag={};}
 
 	bool Retarget(int slot, uptr ref, uptr npc)
 	{
@@ -250,4 +245,25 @@ namespace pilotquest
 		ClearIn(g_actQuest, kSlots + slot);
 		logger::Write("Pilot quest: slot %d released", slot);
 	}
+    bool RouteTraffic(int slot,uptr npc,uptr marker) {
+        if(slot<0||slot>=18||!npc||!marker)return false;
+        const auto quest=runtimeforms::LookupChecked(runtimeforms::Resolve({"FVO_ScheduledTraffic.esm",0x800}));
+        if(!quest)return false;
+        __try {
+            if(TypeOf(quest)!=TypeOf(Lookup(kVanillaQuest))||!(At<std::uint8_t>(quest,0x114)&1))return false;
+            ClearIn(quest,slot);ClearIn(quest,18+slot);
+            if(!ForceIn(quest,18+slot,marker)||!ForceIn(quest,slot,npc)){ClearIn(quest,slot);ClearIn(quest,18+slot);return false;}
+            EngineFn<void (*)(uptr,int,int)>(kEvaluate)(npc,1,0);return true;
+        } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
+    void ReleaseTraffic(int slot,uptr npc) {
+        if(slot<0||slot>=18)return;
+        const auto quest=runtimeforms::LookupChecked(runtimeforms::Resolve({"FVO_ScheduledTraffic.esm",0x800}));
+        if(!quest)return;
+        ClearIn(quest,slot);ClearIn(quest,18+slot);
+        if(npc) __try {EngineFn<void (*)(uptr,int,int)>(kEvaluate)(npc,1,0);} __except(EXCEPTION_EXECUTE_HANDLER){}
+    }
+#ifdef SP_RUNTIME_PERF_TEST
+    namespace testing {void Clock(ULONGLONG now){g_testNow=now;}}
+#endif
 }

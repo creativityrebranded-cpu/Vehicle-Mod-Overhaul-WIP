@@ -70,6 +70,8 @@ namespace hoverui
 	// Scanner Target text (distance to what you look at); empty hides it. Uses the former Gang position and native style.
 	// Select Target in F7 to move it, on foot or in the vehicle; the scanner follows the same position.
 	void SetScan(const char* text);
+	// Main-thread scanner prerequisites, copied as booleans; no render-thread reference/physics reads.
+	void SetTargetHints(bool location,bool actor,bool hostile,bool exact,bool savedSpot);
 	// Native status rows and BasicButton action prompts; empty text hides the route group.
 	void SetRoute(const char* text,const char* skipKey="",const char* clearKey="",const char* retryKey="");
 }

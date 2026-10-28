@@ -189,6 +189,12 @@ namespace passenger
 			const auto site=environment::BoardingSite(vehicle);
             if(site.verdict!=environment::Verdict::Safe)return false;
             float pos[3]={float(site.x),float(site.y),float(site.z)};
+            // 2026-10-28 (the user, out of the passenger seat 330 m up: "I ended up immediately on the floor, didn't even
+            // fall"): the boarding site is on the ground. Well above it, the player is set 3.5 m to the vehicle's left at
+            // its own height and falls from there.
+            if (vp.z - site.z > 6.0) {
+                pos[0] = float(vp.x - std::cos(yaw) * 3.5); pos[1] = float(vp.y + std::sin(yaw) * 3.5); pos[2] = vp.z;
+            }
 			float rot[3] = { 0.0f, 0.0f, float(yaw) };
 			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
 			__try {
@@ -301,11 +307,35 @@ namespace passenger
 				return;
 			}
 			g_lead = 50.0;
-			notify::Show(npcvehicles::PilotFor(id) ? "Passenger: look to steer, W/S speed" : "Passenger");
+			notify::Show("Passenger");
 		}
 	}
 
 	std::uint32_t RidingVehicle() { return g_riding.load(); }
+	std::uintptr_t PassengerSeatKeyword(std::uintptr_t vehicle) { return vehicle ? PassengerSeat(vehicle) : 0; }
+	bool FinishPassengerSeat(std::uintptr_t player, std::uintptr_t vehicle)
+	{
+		const uptr seat = vehicle ? PassengerSeat(vehicle) : 0;
+		if (!player || !seat) return false;
+		const std::uint32_t id = At<std::uint32_t>(vehicle, off::kFormId);
+		g_riding = id;  // before seating, as in BoardTo
+		uptr link = 0;
+		__try {
+			EngineFn<void (*)(uptr, uptr, uptr*)>(kSeatLink)(player, vehicle, &link);
+			if (link) {
+				At<uptr>(link, 0x20) = seat;
+				EngineFn<void (*)(uptr)>(kSeatFinish)(player);
+				auto* rc = reinterpret_cast<volatile long*>(link + 8);
+				if (_InterlockedDecrement(rc) == 0) reinterpret_cast<void (*)(uptr, int)>((*reinterpret_cast<void***>(link))[0])(link, 1);
+			}
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER) { link = 0; }
+		if (!link || VehicleOf(player) != vehicle) { g_riding = 0; return false; }
+		g_lead = 50.0;
+		notify::Show("Passenger");
+		npcvehicles::AdoptDriver(vehicle);
+		return true;
+	}
 
 	bool BoardVehicle(std::uintptr_t player, std::uintptr_t vehicle)
 	{
@@ -387,8 +417,18 @@ namespace passenger
 				GetOut(player, "arrived");
 				return;
 			}
-            if(wheel){StartWheel(player,vehicle);return;}
-            if(exit){GetOut(player,"passenger exit command");return;}
+            // 2026-10-28 (the user: "g didn't work" in the passenger seat; no exit or take-the-wheel line in the log): when the
+            // bindings do not take input there, G is read directly: tap = out, hold 0.5 s = take the wheel.
+            static bool gDown = false, gHeld = false;
+            static ULONGLONG gAt = 0;
+            bool rawExit = false, rawWheel = false;
+            const bool rawG = !bindings::Allowed() && Focused() && (GetAsyncKeyState('G') & 0x8000) != 0;
+            if (rawG && !gDown) { gAt = now; gHeld = false; logger::Write("Passenger: G pressed (bindings not taking input here; read directly)"); }
+            if (rawG && gDown && !gHeld && now - gAt >= 500) { gHeld = true; rawWheel = true; }
+            if (!rawG && gDown && !gHeld) rawExit = true;
+            gDown = rawG;
+            if(wheel||rawWheel){StartWheel(player,vehicle);return;}
+            if(exit||rawExit){GetOut(player,"passenger exit command");return;}
 			if (!npcvehicles::PilotFor(riding) && !npcvehicles::HasDriver(riding)) GetOut(player, "the driver left");
 			return;
 		}

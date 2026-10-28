@@ -73,3 +73,12 @@ HUD editor
 - Keyboard: F7 opens/closes and saves. Page Up / Down select. Arrows move. Home / End change spacing. + / - resize. Delete resets the selected element. Ctrl increases movement steps.
 - Controller: with the scanner open, double tap View / Create to enter. LB / RB select the previous/next element. Left stick moves it. D-pad Left/Right changes spacing. RT / LT grows/shrinks it. X / Square resets it. L3 increases movement steps. B / Circle saves and closes.
 
+Contextual HUD help
+
+- Help adds short gesture explanations beside the original mod Summon, Follow, Hover/Land, Gear, Auto, Target and Route elements. It opens no separate help panel or controls browser.
+- Native game movement, look, fire, aim, health, boost, exit and scanner UI gain no duplicate help prompts.
+- Shared inputs have one visible owner per context. For example, eligible scanner ram/focus gestures join Summon/Follow when they share those buttons. Remapped keyboard/controller inputs regroup from their actual bindings.
+- Target stays a named information readout without a required button or UNBOUND warning. Placement replaces its destination gestures; deletion appears only near a saved spot and summon points require a real surface.
+- Toggle the existing Show hints action: J on keyboard, R3 tap while driving, or View/Create hold in the scanner. Default bindings and gameplay input handling are unchanged.
+- Existing HUD anchors and layout settings are preserved. The editor keeps readable names and previews only the selected hidden element; the former 44-row command guide and its editor choices are retired.
+- Context, grouping, rebinding and information labels have offline checks. Appearance and overlap still need an in-game test.

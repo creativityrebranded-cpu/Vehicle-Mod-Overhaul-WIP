@@ -15,5 +15,7 @@ namespace inputgate
 	void SetBlocked(std::uint32_t padBits);  // bindlogic controller bits; any thread
     void SetBlockedKeys(const std::array<bool,256>& keys);
     bool GameplayAllowed();
+    // Ordered fresh native button presses; low bit pad, upper bits sequence.
+    std::uint64_t LastDevicePress();
 	unsigned TakeBlockedCount();             // events blocked since the last call (for the log)
 }

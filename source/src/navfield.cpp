@@ -128,9 +128,13 @@ void Service(double milliseconds){
  const auto until=std::chrono::steady_clock::now()+std::chrono::microseconds(std::int64_t(milliseconds*1000));
  do {
   if(searching>=0&&search.wait_for(std::chrono::milliseconds(0))==std::future_status::ready){cache[searching]=search.get();work[searching].reset();searching=-1;}
-  bool pending=false;
+  // 2026-10-24 CPU fix: return as soon as no raster copying is left. The old loop spun (yield) for the whole
+  // budget while the worker searched, costing ~2 ms of main thread per update; the result is picked up next call.
+  bool progressed=false;
   for(int slot=0;slot<8;++slot)if(work[slot]&&slot!=searching){
-   pending=true;auto&r=*work[slot];const auto&f=r.field;
+   auto&r=*work[slot];const auto&f=r.field;
+   if(r.copied==r.solid.size()&&searching>=0)continue;  // copied, waiting for the worker: nothing to do now
+   progressed=true;
    const auto end=std::min(r.copied+std::size_t(256),r.solid.size());
    for(;r.copied<end;++r.copied){const int k=int(r.copied),h=k/Plane,i=k%N,j=(k%Plane)/N;
     const auto m=navmap::At((f.ox+i+0.5)*Cell,(f.oy+j+0.5)*Cell,f.bottom+h*2);
@@ -140,9 +144,9 @@ void Service(double milliseconds){
    if(r.copied==r.solid.size()&&searching<0){searching=slot;Raster ready=std::move(r);search=std::async(std::launch::async,[r=std::move(ready)]()mutable{return Build(std::move(r));});}
    if(std::chrono::steady_clock::now()>=until)return;
   }
-  if(!pending&&searching<0)return;
-  if(!pending)std::this_thread::yield();
+  if(!progressed)return;
  }while(std::chrono::steady_clock::now()<until);
 }
+bool Idle(){if(searching>=0)return false;for(const auto&w:work)if(w)return false;return true;}
 void Reset(){if(searching>=0){search.wait();searching=-1;}for(auto&w:work)w.reset();for(auto&f:cache)f=Field{};}
 }

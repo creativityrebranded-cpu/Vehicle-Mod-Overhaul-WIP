@@ -190,7 +190,6 @@ inline Facts Read(const World& w, const Unit& me, const Unit& it, const Unit* en
 // ---- Choosing ----
 struct Ctx
 {
-    bool allowRam = true;
     int alliesOnTarget = 1;          // my side's vehicles on this target, me included
     bool targetInConvoy = false, targetIsCargo = false, convoyHasEscorts = false;
     bool iDefendConvoy = false;
@@ -200,7 +199,8 @@ inline double Desire(T t, const Unit& me, const Unit& it, const bfm::Geo& g, con
 {
     const double ratio = Strength(me) / std::max(1.0, Strength(it));
     const double agg = (c.aggression - 0.5) * 0.2;
-    if (IsRam(t) && !c.allowRam) return 0.0;
+    // Rams and contact moves were removed (2026-10-25, the user: "remove vehicle rams"): never chosen.
+    if (MakesContact(t)) return 0.0;
     switch (t) {
     case T::TBone: return (g.aa > 1.1 && g.aa < 2.0 && g.range > 15.0 && g.range < 80.0 && g.mySpeed > g.itsSpeed && ratio >= 1.0) ? 0.75 + agg : 0.0;
     case T::RearRam: return (g.aa < 0.5 && g.mySpeed > g.itsSpeed + 5.0 && g.range < 50.0 && ratio >= 0.8) ? 0.7 + agg : 0.0;

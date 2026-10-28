@@ -104,7 +104,7 @@ int main()
         Tick(st, s, w, nt, o);
         check(!std::strstr(o.log, "ram"), "tactics off: no rams");
         State st2; Tick(st2, s, w, sw, o);
-        check(std::strstr(o.log, "ram") || std::strstr(o.log, "sideswipe") || std::strstr(o.log, "tactic"), "tactics on: a vehicle tactic is chosen");
+        check(!std::strstr(o.log, "ram") && !std::strstr(o.log, "sideswipe"), "tactics on, T-bone geometry: still no ram or sideswipe (removed 2026-10-25)");
     }
     {
         State st; Output o; Switches nm = sw; nm.morale = false;

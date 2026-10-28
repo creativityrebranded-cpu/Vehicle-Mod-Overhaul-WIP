@@ -137,6 +137,13 @@ int main()
         check(PadPresses(0, kA | kLDown) == kA, "a button pressed while the stick moves is a press");
         check(PadPresses(kA, kA) == 0, "a held button is not a new press");
         check(PadPresses(0, kRT) == kRT && PadPresses(kRT, kRT | kLT) == kLT, "a trigger press counts as a button");
+        DeviceTracker native;
+        check(native.Observe(3,true,true)&&native.device==Device::Pad,"native controller source resolves a simultaneous keyboard polling alias");
+        check(!native.Observe(3,false,false)&&native.device==Device::Pad,"the last native event cannot replay a device change");
+        check(native.Observe(4,true,true)&&native.device==Device::Keyboard,"a later native keyboard press wins even when both poll flags are set");
+        check(native.Observe(7,false,false)&&native.device==Device::Pad,"native gamepad presses work without XInput polling");
+        check(native.Observe(7,true,false)&&native.device==Device::Keyboard,"keyboard fallback still works when the native hook has no new event");
+        check(KeyboardMouseKey('W')&&KeyboardMouseKey(1)&&!KeyboardMouseKey(0xC3)&&!KeyboardMouseKey(0xDA),"gamepad virtual keys never impersonate keyboard or mouse activity");
     }
     {
         // Layout 3: situations and tap / hold gestures (the approved no-chord map).

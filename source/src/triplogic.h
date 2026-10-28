@@ -6,10 +6,10 @@ inline bool Reached(double distance, double stop, double heightError, double spe
  return ready && std::isfinite(distance) && std::isfinite(heightError) && std::isfinite(speed) &&
   distance <= stop + 2.0 && std::fabs(heightError) <= 2.5 && speed <= 1.5;
 }
-inline Phase Status(bool ready, bool reached, bool near, double heightError, bool escaping, bool blocked) {
+inline Phase Status(bool ready, bool reached, bool nearDestination, double heightError, bool escaping, bool blocked) {
  if(!ready) return Phase::WaitingTerrain;
  if(reached) return Phase::Arrived;
- if(near && std::fabs(heightError)>2.5) return Phase::AdjustingHeight;
+ if(nearDestination && std::fabs(heightError)>2.5) return Phase::AdjustingHeight;
  if(escaping) return Phase::FindingWay;
  if(blocked) return Phase::Blocked;
  return Phase::Travelling;

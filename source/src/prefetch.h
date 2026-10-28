@@ -50,7 +50,7 @@ namespace prefetch
 	// (64-bit, bit n = layer n). Queued and run like the ground probes; the nearest hit comes back next frame.
 	// 0..20: pilot * 3 + corridor (pilots 0..6, straight / left / right); 24..44: pilot * 3 + k, the sweep rays that feed the nav map;
 	// 48..61: pilot * 2 + k, the ceiling rays (straight up, up and ahead).
-	enum { kRaySlots = 62 };
+	enum { kRayAirTraffic0=62,kRayAirTrafficCount=16,kRaySlots=kRayAirTraffic0+kRayAirTrafficCount };
 	struct RayHit
 	{
 		bool hit = false;

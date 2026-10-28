@@ -1,4 +1,5 @@
 #pragma once
+#include "fvo_addon_api.h"
 
 #include <cstdint>
 
@@ -8,11 +9,16 @@
 // NPC the player faces to the nearest free vehicle: the FVO_NPCPilots.esm quest package walks it there (running in combat or when the vehicle
 // is over 40 m away), the seat keyword is given, and the instant seat puts it in (the animated entry is paused: kAnimatedEntry = false);
 // aboard it follows the player. The EXIT key (Insert) and RequestExit take NPCs out (the game's dismount, then the instant exit). The context
-// engine (context.cpp) can also board fighters by itself. The game's put-the-player-in call seats the NPC instead of the player for
-// vehicles an NPC job uses.
+// engine (context.cpp) can also board fighters by itself. Player refusals happen before entry animation. The sit action carries
+// its actual actor into the player-only completion hook, so NPC completions never clear the player's seating state.
 namespace npcvehicles
 {
-	void Install(); // hooks the game's put-the-player-in-this-vehicle call (seats the NPC instead)
+    // Dedicated timetable owns decisions; normal combat/escort AI must not touch this leased job.
+    int ClaimScheduled(std::uintptr_t actor,std::uintptr_t vehicle);
+    void ReleaseScheduled(int pilot,std::uint32_t expectedVehicle);
+    bool ScheduledLease(int pilot,std::uint32_t actor,std::uint32_t vehicle);
+    bool PrepareScheduledSeat(std::uintptr_t actor,std::uintptr_t vehicle);
+	void Install(); // pre-entry gate and actor-scoped completion hooks
 	void BeginFrame(); // native driver index once per frame, before world::Publish
 	void Tick();   // main thread, every frame
 	void Reset();  // a save load
@@ -34,6 +40,21 @@ namespace npcvehicles
 	vcontract::SeatState ExitStateOf(std::uintptr_t actor);
 	// Boarding for vcontract::SeatProvider::board: asDriver only (companion seats are not solved). The NPC walks, gets in, then follows like a job.
 	bool BoardNpc(std::uintptr_t actor, std::uintptr_t vehicle, bool asDriver);
+	// The game's instant seat for an NPC standing at the vehicle (no walk, no job): the city traffic's pilots (citytraffic.cpp).
+	// True when the NPC is in that vehicle afterwards.
+	bool SeatNow(std::uintptr_t actor, std::uintptr_t vehicle);
+    // Once-only initialization of an authored air-traffic actor/vehicle pair.
+    // Uses the native snap interaction; not a pedestrian entry-site request.
+    bool AssembleTrafficOccupant(std::uintptr_t actor,std::uintptr_t vehicle);
+    // Scheduled traffic only: put the leased driver back in after a vehicle reload dropped it. True when seated after.
+    bool ReseatScheduled(int pilot,std::uintptr_t actor,std::uintptr_t vehicle);
+    // Inside create-reference only (the "on created" hook): seat a just-created actor before it joins the world.
+    // -1 fault, 0 no interaction, 1 interaction built but not snapped, 2 seated.
+    int SeatNewborn(std::uintptr_t actor,std::uintptr_t vehicle);
+    int SitState(std::uintptr_t actor);   // 0 not sitting, -1 unreadable, else the game's sit state
+    int SnapNow(std::uintptr_t actor,std::uintptr_t vehicle);  // instant seat on a loaded actor (also when already linked)
+    bool ResumeSavedSeat(std::uintptr_t actor,std::uintptr_t vehicle); // reuse saved interaction; never build another
+	std::uintptr_t VehicleOf(std::uintptr_t actor);  // the vehicle the actor sits in, 0 when none
 	// ---- For the context engine (context.cpp): main thread only.
 	bool IsInCombat(std::uintptr_t actor);
 	bool IsDead(std::uintptr_t actor);
@@ -56,7 +77,9 @@ namespace npcvehicles
 	// The vehicle weapon of a vehicle no NPC job drives (the player's own rover on overwatch): held while `fire`; the shots are turned at (x, y, z).
 	bool FireVehicleWeapon(std::uint32_t vehicleId, bool fire, double x, double y, double z, std::uint32_t target = 0, std::uint32_t targetVehicle = 0);
 	bool SetCombatFocus(std::uint32_t target); // 0 clears the player's explicit focus; native hostility is retained
-	std::uint32_t CombatFocus();
+	std::uint32_t CombatFocus();       // the focused person (a focused vehicle's current driver)
+	std::uint32_t CombatFocusVehicle(); // the focused vehicle, 0 when a person on foot (or nothing) is focused
+	bool IsVehicleRef(std::uintptr_t ref);   // a vehicle reference
 	// Crew orders (2026-10-20, the user: with followers, the vehicle buttons send a follower to drive the player's own vehicle and do what was asked).
 	// Follow: the follower drives it after the player (an escort: it defends, rescues, scouts); Marker: it flies to the player's map marker and
 	// does the Auto behaviour there (vehicleflight::GetAutoMode: stop / orbit / patrol).
@@ -75,6 +98,9 @@ namespace npcvehicles
 	//  transit: to (x, y), then it walks the rest of its way; patrol: two laps round the vehicle's parking place, then home; a fight ends any task.
 	bool StartTransit(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);
 	bool StartPatrol(std::uintptr_t actor, std::uintptr_t vehicle);
+	// The player rides `vehicle` as a passenger: its driver (seated, or posed in the driver seat) gets an autopilot job if it
+	// has none, so the vehicle drives itself. true when a job flies it.
+	bool AdoptDriver(std::uintptr_t vehicle);
 	// Return home: a following job's vehicle flies back to where it was taken from and parks there (false: no home known, or already there).
 	bool SendHome(std::uint32_t vehicleId);
 	int CivilJobs();                                         // jobs running a civil task now
@@ -92,6 +118,8 @@ namespace npcvehicles
 	bool ActorFree(std::uintptr_t actor);                    // alive, on foot, no job, not a follower
 	// Supply run: drives to (x, y) (another settlement / outpost), waits there, comes back, parks.
 	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);
+	// An addon's scripted trip (fvo_addon_api.h): boards, then flies the addon's goal each frame, then parks at home.
+	bool StartScripted(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);
 	// Recall: every escort drops its fight for `ms` and comes back into formation.
 	void Recall(unsigned ms);
 	// The player's stance (the stance key, 2026-10-21): it sets the Combat and Weapons classes of the player's own vehicle and every follower's

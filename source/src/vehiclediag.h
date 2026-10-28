@@ -8,6 +8,7 @@
 // setting and how far the vehicle moved. The first link that reads 0 is the broken one.
 namespace vehiclediag
 {
+	bool PrepareForDataLoad();               // before persistent vehicle records are read
 	void Install();                          // hooks the vehicle component update (counting only)
 	void NoteStep(std::uintptr_t instance);  // from the physics step hook, every call (any owner)
 	void Tick();                             // main thread, once per frame

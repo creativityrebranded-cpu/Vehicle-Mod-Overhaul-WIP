@@ -1,0 +1,25 @@
+Latest local update — 25 October 2026
+Not yet published as a new numbered release.
+
+- Added a FOMOD installer: the core is required; extra New Atlantis parked vehicles and the Parked Vehicles patch are independent, unchecked options.
+- Added addon dependency checks against each ESM's actual masters. The renamed conversion patch is blocked while Vehicles - Real.esm remains installed.
+- Added individual movement and sizing inside status-card and route groups. Group movement/resizing preserves child arrangements; foot and vehicle cards retain separate child layouts.
+- Fixed the status card dropping its fourth escort row when other lines filled the old limit.
+- Fixed the information panel moving twice under All vehicle HUD.
+- Added an experimental ground-first route planner and native ground driving setting, off by default. Corrected vehicle bounds and retained avoidance offsets during ground guidance.
+- Extended focus fire to hostile-driven vehicles, retaining the vehicle target through driver changes until it becomes empty, wrecked or unavailable.
+- Removed player ram orders, deliberate AI ram/sideswipe attacks, and their setting/binding. Collision damage remains.
+- Removed legacy City Traffic, Scheduled Traffic, the GHN road pool and GHN content from this package. Optional New Atlantis parked placements remain available.
+- Reduced repeated work through bounded discovery, retry backoff, cached lookups, batched gameplay logging, coalesced updates and native chassis mass observations.
+- Built and passed all 50 runtime test suites. FOMOD schema/archive and 8,748 dependency/selection combinations pass.
+- Jemison CPU/FPS reports remain under investigation. A live performance improvement and native Vortex/MO2 installer UI behavior have not been confirmed.
+
+0.73.0 — previous controls update
+
+- Separated previously bundled command handlers and device slots.
+- Added scoped binding-conflict checks, fixed keyboard defaults and layout-4 migration with a backup.
+- Added landing-before-driver-exit handling and native ground-input remapping.
+- Preserved button ownership through release; blocked gameplay actions in modal UI and separated scanner input from occupied-vehicle Activate.
+- Added controller HUD editing, placement recording and area summon-point tools.
+
+Historical 0.73.0 notes described ram commands and experimental City Traffic work. Those are superseded by the removals above in the latest local package.

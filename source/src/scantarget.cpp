@@ -6,8 +6,8 @@
 #include "game.h"
 #include "mappoints.h"
 #include "scannercontext.h"
-#include "ramlogic.h"
 #include "targetinput.h"
+#include "coverfight.h"
 #include "npcvehicles.h"
 #include "vehiclehits.h"
 #include "realvehicles.h"
@@ -15,7 +15,8 @@
 #include "log.h"
 #include "notify.h"
 #include "prefetch.h"
-#include "vehicleflight.h"
+#include "vehicleflight.h"
+
 #include "fvopaths.h"
 
 #include <Windows.h>
@@ -424,7 +425,7 @@ namespace scantarget
 			}
 			if(g_chain.size()>3) panel+="\n+"+std::to_string(g_chain.size()-3)+" more stops";
 			const std::string retryKey=progress.phase==triplogic::Phase::Unreachable?bindings::Label(bindings::Action::RetryTrip, g_retryKey):"";
-			const std::string skipKey=bindings::Label(bindings::Action::SkipStop, g_skipKey),clearKey=bindings::Label(bindings::Action::Scanner, g_key);
+			const std::string skipKey=bindings::Label(bindings::Action::SkipStop, g_skipKey),clearKey=bindings::Label(bindings::Action::ClearRoute, g_key);
 			hoverui::SetRoute(panel.c_str(),skipKey.c_str(),clearKey.c_str(),retryKey.c_str());
 		}
 
@@ -469,7 +470,8 @@ namespace scantarget
 			g_setAt = now; g_setDist = selected.dist; g_setEstimated = selected.estimated; g_setName = selected.name;
 		}
 
-		// A T hold (1 s) acts on what was aimed at when it was pressed: a highlighted person or vehicle is rammed straight away; a place is held:
+		// A T hold (1 s) acts on what was aimed at when it was pressed: a highlighted person or vehicle becomes the focus target your vehicles
+		// shoot (2026-10-25: rams removed; vehicles too, whoever drives them); a place is held:
 		// on foot your vehicle guards it and defends from it, driving you fly there and hold (the route is replaced).
 		void Hold(bool driving, ULONGLONG now)
 		{
@@ -477,10 +479,12 @@ namespace scantarget
 			const auto actor = RefById(g_pressedActor);
 			const auto pick = hoverui::ScannerPickContext();
 			logger::Write("Target selection (hold): native form %08X handle %08X actor %08X driving %d", pick.form, pick.handle, g_pressedActor, driving ? 1 : 0);
-			if (actor) {
-				if (vehicleflight::RequestRam(actor)) notify::Show("Ram order set");
-				else notify::Show("Ram order unavailable");
-				return;
+			const bool aimedVehicle = g_pressedFocus && npcvehicles::IsVehicleRef(RefById(g_pressedFocus));
+			if (actor || aimedVehicle) {
+				const bool vehicle = aimedVehicle || npcvehicles::VehicleOf(actor);
+				if (npcvehicles::SetCombatFocus(actor ? g_pressedActor : g_pressedFocus)) { notify::Show(vehicle ? "Focus fire: that vehicle" : "Focus fire set"); return; }
+				// A person who is not hostile: say so. A parked or friendly vehicle: the place it stands is held / guarded as before.
+				if (actor) { notify::Show("Focus fire: aim at a hostile person or a vehicle with a hostile driver"); return; }
 			}
 			const auto& selected = g_pressedTarget;
 			if (!selected.valid) { notify::Show("Scanner marker: nothing to mark"); return; }
@@ -509,9 +513,18 @@ namespace scantarget
 		const bool scanner = hoverui::IsScannerOpen();
 		const bool driving = reinterpret_cast<uptr (*)(uptr)>(game::Base() + addr::kPlayerVehicle)(player) != 0;
 		const Target t = scanner ? Look(player, now, !driving && realvehicles::RecordingPlacements()) : Target{};
+        const auto aimedActor=scanner?HighlightedActor():0;
+        const auto pick=scanner?hoverui::ScannerPickContext():hoverui::ScannerPick{};
+        const auto focusActor=aimedActor?aimedActor:scanner?RefById(npcvehicles::VehicleDriverId(pick.form)):0;
+        const auto focusPosition=focusActor?At<game::Vec3>(focusActor,off::kRefPosition):game::Vec3{};
+        const auto playerPosition=At<game::Vec3>(player,off::kRefPosition);
+        const bool canFocus=focusActor&&!npcvehicles::IsDead(focusActor)&&npcvehicles::AreHostile(player,focusActor)&&
+            scannercontext::Range3D(focusPosition.x-playerPosition.x,focusPosition.y-playerPosition.y,focusPosition.z-playerPosition.z)<=coverfight::kChaseKeep;
+        const bool savedSpot=scanner&&!driving&&realvehicles::RecordingPlacements()&&t.valid&&realvehicles::HasPlacementNear(t.x,t.y,t.z);
+        hoverui::SetTargetHints(t.valid,aimedActor!=0,canFocus,t.valid&&!t.estimated,savedSpot);
         struct Selection {Target target;std::uint32_t actor=0,focus=0;double heading=0;bool scanner=false;};
         static std::array<Selection,std::size_t(bindings::Action::Count)> selections;
-        const bindings::Action commands[]={bindings::Action::Scanner,bindings::Action::GuardPoint,bindings::Action::Ram,
+        const bindings::Action commands[]={bindings::Action::Scanner,bindings::Action::GuardPoint,
             bindings::Action::FocusTarget,bindings::Action::SavePlacement,bindings::Action::DeletePlacement,bindings::Action::SetSummonPoint};
         for(auto command:commands){
             auto& saved=selections[std::size_t(command)];
@@ -527,12 +540,10 @@ namespace scantarget
             g_pressedFocus=saved.focus;g_pressedHeading=saved.heading;
             if(command==bindings::Action::Scanner){if(scanner)Select(player,now);}
             else if(command==bindings::Action::GuardPoint){
-                if(saved.actor)notify::Show("Guard point: aim at a location");else Hold(driving,now);
-            }else if(command==bindings::Action::Ram){
-                const auto actor=RefById(saved.actor);
-                notify::Show(actor&&vehicleflight::RequestRam(actor)?"Ram order set":"Ram: aim at a person or vehicle in the scanner");
+                Hold(driving,now);
             }else if(command==bindings::Action::FocusTarget){
-                notify::Show(saved.focus&&npcvehicles::SetCombatFocus(saved.focus)?"Focus fire set":"Aim at a hostile target to focus fire");
+                const bool vehicle=saved.focus&&(npcvehicles::IsVehicleRef(RefById(saved.focus))||npcvehicles::VehicleOf(RefById(saved.focus)));
+                notify::Show(saved.focus&&npcvehicles::SetCombatFocus(saved.focus)?(vehicle?"Focus fire: that vehicle":"Focus fire set"):"Aim at a hostile person or a vehicle with a hostile driver");
             }else if(!driving&&scanner&&realvehicles::RecordingPlacements()){
                 const auto& point=saved.target;
                 if(command==bindings::Action::SavePlacement){
@@ -570,9 +581,8 @@ namespace scantarget
 			std::snprintf(buf + n, sizeof(buf) - n, "  +%zu queued", g_chain.size());
 		}
 		if(realvehicles::RecordingPlacements()){
-			const auto key=KeyName();
-			std::snprintf(buf,sizeof(buf),"PLACEMENT MODE | %s | %s: save  hold: delete  double: summon point",
-				t.valid?(t.estimated?"aim closer: estimated surface":"surface ready"):"aim at a surface",key.c_str());
+			std::snprintf(buf,sizeof(buf),"PLACEMENT MODE | %s",
+				t.valid?(t.estimated?"aim closer: estimated surface":"surface ready"):"aim at a surface");
 		}
 		hoverui::SetScan(buf);
 		static ULONGLONG lastLog = 0;

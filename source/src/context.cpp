@@ -1,4 +1,8 @@
 #include "context.h"
+#include "runtimeforms.h"
+#include "environment.h"
+#include "passenger.h"
+#include "citytraffic.h"
 #include "features.h"
 #include "addresses.h"
 #include "controlmap.h"
@@ -13,6 +17,8 @@
 #include "vehicleworld.h"
 #include "traffic.h"
 #include "mappoints.h"
+#include "trafficpick.h"
+#include "fvo_addon_api.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -48,6 +54,29 @@ namespace context
 
 		uptr Player() { return *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr); }
 		game::Vec3 PosOf(uptr ref) { return *reinterpret_cast<game::Vec3*>(ref + off::kRefPosition); }
+		// Everyday traffic only takes a vehicle with its 3D loaded, and never a runtime-spawned (FF) vehicle of a base from a full
+		// plugin other than Starfield.esm (vanilla and Vehicles.esm bases are 00 / FE); see the traffic block (2026-10-28 crashes).
+		// More than 4 m over the ground under it (a downward ray; while the answer is pending it counts as high).
+		bool HighOverGround(std::uint32_t id, uptr ref)
+		{
+			const auto p = PosOf(ref);
+			environment::Ground g;
+			if (!environment::GroundAt(id, p.x, p.y, p.z + 2.0, p.z - 60.0, g)) return true;
+			return !g.hit || p.z - g.z > 4.0;
+		}
+		bool TrafficSafe(uptr ref, std::uint32_t formId)
+		{
+			__try {
+				const uptr loaded = *reinterpret_cast<uptr*>(ref + off::kRefLoadedData);
+				if (!loaded || !*reinterpret_cast<uptr*>(loaded + 0x08)) return false;
+				const uptr base = *reinterpret_cast<uptr*>(ref + 0x98);
+				const std::uint32_t baseId = base ? *reinterpret_cast<std::uint32_t*>(base + off::kFormId) : 0;
+				return !((formId >> 24) == 0xFF && (baseId >> 24) != 0x00 && (baseId >> 24) != 0xFE);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
 		double Dist(const game::Vec3& a, const game::Vec3& b) { return std::hypot(double(a.x) - b.x, double(a.y) - b.y); }
 
 		void ReadSwitch(ULONGLONG now)
@@ -73,6 +102,7 @@ namespace context
 				if (!v.ref || v.who == world::VehicleInfo::Who::Player || v.who == world::VehicleInfo::Who::Npc) continue;
 				if (v.formId == vehicleflight::OwnRoverId()) continue;  // your own vehicle: the flight code never lets an NPC fly it
 				if (npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) || vehicleflight::AutopilotDisabled(v.formId)) continue;
+				if (citytraffic::IsTrafficVehicle(v.formId)) continue;  // the city traffic's own vehicles (FVO_CityTraffic.esm)
 				const double d = std::hypot(double(v.pos[0]) - p.x, double(v.pos[1]) - p.y);
 				if (d >= bestD) continue;
 				if (enemy && !npcvehicles::FighterMayTake(enemy, v.ref)) continue;  // their faction's own, unowned in their own camp, or unowned in the open
@@ -101,7 +131,12 @@ namespace context
 		//    use within kTransitNear -> drives there, parks in a clear spot, gets out and walks on.
 		//  - Patrol: an owned, parked vehicle within kCivilRange, its owner (or a member of the owning faction) within kPatrolNear and calm -> two laps
 		//    round its place, home, park. Each vehicle at most once per kPatrolEveryMs.
-		constexpr int kCivilMax = 2;
+		constexpr int kCivilMax = 4;  // 2026-10-27: everyday traffic (trafficpick.h) shares this cap; fights keep the other pilot slots
+		constexpr ULONGLONG kTrafficEveryMs = 15000;
+		ULONGLONG g_trafficAt = 0;
+		FvoTrafficOffer g_provider = nullptr;       // an addon's traffic provider (FVO_CityPlacements.dll: the ring traffic)
+		FvoTick_t g_addonTick = nullptr;            // an addon's main-thread tick (route markers)
+		std::unordered_map<std::uint32_t, double> g_trafficUsed;  // vehicle -> when it last started a traffic trip (s)
 		constexpr double kShareNear = 15.0, kShareGoal = 100.0;
 		// Supply run: an owner by its parked vehicle, a settlement or outpost (the planet's map points) kSupplyMin..kSupplyMax away -> out, wait, back.
 		constexpr double kSupplyMin = 200.0, kSupplyMax = 1000.0;
@@ -172,6 +207,71 @@ namespace context
 					return;
 				}
 			}
+
+			// Everyday traffic (trafficpick.h, 2026-10-27): a steady cadence of round trips from the parked vehicles near you.
+			if (features::On(features::Id::Traffic) && now - g_trafficAt >= kTrafficEveryMs) {
+				g_trafficAt = now;
+				std::vector<trafficpick::Vehicle> tv;
+				std::vector<uptr> tvRef;
+				for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
+					const auto& v = g_snap.v[i];
+					if (!v.ref || v.who == world::VehicleInfo::Who::Player || v.who == world::VehicleInfo::Who::Npc) continue;
+					if (v.formId == vehicleflight::OwnRoverId() || npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) ||
+						vehicleflight::AutopilotDisabled(v.formId) || citytraffic::IsTrafficVehicle(v.formId)) continue;
+					// 2026-10-28 crashes (01:16, 01:44, both at Starfield.exe+0x1817391 in the game's AI): each time a runtime-spawned
+					// modded vehicle (a Star Wars pack balutar, base 0800080F, no physics) was nearby, and at 01:44 traffic had just sent
+					// an NPC to board it. Traffic takes only vehicles with their 3D loaded, and no runtime-spawned (FF) vehicle of
+					// a base from a full plugin other than Starfield.esm (vanilla and Vehicles.esm bases are 00 / FE).
+					if (!TrafficSafe(v.ref, v.formId)) continue;
+					tv.push_back({ v.formId, double(v.pos[0]), double(v.pos[1]), true });
+					tvRef.push_back(v.ref);
+				}
+				std::vector<trafficpick::Person> tp;
+				for (const uptr r : actors) {
+					if (!npcvehicles::ActorFree(r) || npcvehicles::HostileToPlayer(r)) continue;
+					const auto q = PosOf(r);
+					tp.push_back({ r, q.x, q.y, true });
+				}
+				std::vector<trafficpick::Place> places;
+				{
+					std::vector<mappoints::Point> pts;
+					const float p3[3] = { float(pp.x), float(pp.y), float(pp.z) };
+					if (mappoints::WorldPoints(p3, pts)) for (const auto& q : pts) places.push_back({ double(q.x), double(q.y) });
+				}
+				const double nowS = double(now) / 1000.0;
+				const auto pick = trafficpick::Choose(tv, tp, places, pp.x, pp.y, nowS, npcvehicles::CivilJobs(), g_trafficUsed);
+				if (pick.kind != trafficpick::Kind::None) {
+					const auto& v = tv[pick.vehicle];
+					const uptr driver = tp[pick.person].ref;
+					g_trafficUsed[v.id] = nowS;  // rests even when refused, so one bad pair is not retried every scan
+					const std::uint32_t did = *reinterpret_cast<std::uint32_t*>(driver + off::kFormId);
+					if (!npcvehicles::MayUse(driver, tvRef[pick.vehicle])) {
+						logger::Write("Traffic: NPC %08X may not use vehicle %08X; next scan", did, v.id);
+					}
+					else if (FvoTripClaim claim{}; g_provider && g_provider(v.x, v.y, 0.0, v.id, &claim) && claim.step) {
+						// An addon takes the pick as a scripted trip (FVO_CityPlacements.dll: the ring).
+						const bool ok = npcvehicles::StartScripted(driver, tvRef[pick.vehicle], claim);
+						logger::Write("Traffic: NPC %08X takes vehicle %08X on a %s -> %s", did, v.id, claim.name ? claim.name : "scripted trip", ok ? "driving" : "refused");
+						if (ok) return;
+					}
+					else if (pick.kind == trafficpick::Kind::RoundTrip) {
+						const bool ok = npcvehicles::StartSupply(driver, tvRef[pick.vehicle], pick.to.x, pick.to.y);
+						logger::Write("Traffic: NPC %08X takes vehicle %08X on a round trip, %.0f m out to (%.0f, %.0f) -> %s", did, v.id, pick.tripLength, pick.to.x, pick.to.y, ok ? "driving" : "refused");
+						if (ok) return;
+					}
+					else if (g_provider) {
+						// 2026-10-28 (the user: traffic should follow the ring they gave, not fly laps): with the ring addon loaded,
+						// a pick it declines (ring busy, departures spaced, out of reach) waits for the next scan instead.
+						logger::Write("Traffic: NPC %08X / vehicle %08X: the ring takes no more trips right now; no laps, next scan", did, v.id);
+					}
+					else {
+						const bool ok = npcvehicles::StartPatrol(driver, tvRef[pick.vehicle]);
+						logger::Write("Traffic: NPC %08X takes vehicle %08X on laps round its home (no settlement or outpost 200-1000 m away) -> %s", did, v.id, ok ? "driving" : "refused");
+						if (ok) return;
+					}
+				}
+			}
+
 			// Patrol.
 			for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
 				const auto& v = g_snap.v[i];
@@ -346,7 +446,10 @@ namespace context
 					if (g_snap.v[k].formId == j.vehicle) vi = &g_snap.v[k];
 				}
 				const float speed = vi ? std::hypot(vi->vel[0], vi->vel[1]) : 99.0f;
-				const bool calm = !playerFight && !npcvehicles::IsInCombat(j.npc) && speed < kStillSpeed;
+				// 2026-10-28 (03:25 run: "calm and parked" ordered the player and driver out 310 m up): never the vehicle the player
+				// rides as a passenger (they get out with their own key) and never one hovering well over the ground.
+				const bool riddenOrHigh = passenger::RidingVehicle() == j.vehicle || (vi && vi->ref && HighOverGround(j.vehicle, vi->ref));
+				const bool calm = !playerFight && !npcvehicles::IsInCombat(j.npc) && speed < kStillSpeed && !riddenOrHigh;
 				if (!calm) { g_calmSince.erase(j.vehicle); continue; }
 				auto& since = g_calmSince[j.vehicle];
 				if (!since) since = now;
@@ -367,6 +470,7 @@ namespace context
 
 	void Tick()
 	{
+		if (g_addonTick) g_addonTick();
 		const ULONGLONG now = GetTickCount64();
 		ReadSwitch(now);
 		static ULONGLONG firstAt = now;
@@ -390,6 +494,51 @@ namespace context
 		g_triedAt.clear();
 		g_jobSeen.clear();
 		g_calmSince.clear();
-		g_tickAt = g_scanAt = g_civilAt = 0; g_civilTried.clear();g_patrolledAt.clear();g_lastPackage.clear();
+		g_tickAt = g_scanAt = g_civilAt = g_trafficAt = 0; g_civilTried.clear();g_patrolledAt.clear();g_lastPackage.clear();g_trafficUsed.clear();
 	}
+}
+
+// ---- Exports for FVO addons (fvo_addon_api.h) ----
+extern "C" __declspec(dllexport) int FVO_RegisterTrafficProvider(FvoTrafficOffer offer)
+{
+	context::g_provider = offer;
+	logger::Write("Traffic: addon traffic provider %s", offer ? "registered" : "removed");
+	return 1;
+}
+extern "C" __declspec(dllexport) void FVO_Log(const char* line)
+{
+	if (line) logger::Write("%s", line);
+}
+extern "C" __declspec(dllexport) int FVO_WorldName(char* out, int size)
+{
+	if (!out || size <= 1) return 0;
+	out[0] = 0;
+	__try {
+		const auto player = *reinterpret_cast<const std::uintptr_t*>(game::Base() + addr::kPlayerCharacterPtr);
+		const std::uintptr_t cell = player ? *reinterpret_cast<const std::uintptr_t*>(player + off::kRefParentCell) : 0;
+		const std::uintptr_t ws = cell ? *reinterpret_cast<const std::uintptr_t*>(cell + off::kCellWorldspace) : 0;
+		if (!ws) return 0;
+		auto** table = *reinterpret_cast<void***>(ws);
+		const char* name = reinterpret_cast<const char* (*)(std::uintptr_t)>(table[0x4D])(ws);  // as air traffic reads it
+		int i = 0;
+		for (; name && name[i] && i < size - 1; ++i) out[i] = name[i];
+		out[i] = 0;
+		return i > 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return 0; }
+}
+extern "C" __declspec(dllexport) unsigned FVO_BaseOf(unsigned refId)
+{
+	__try {
+		const std::uintptr_t ref = runtimeforms::Lookup(refId);
+		const std::uintptr_t base = ref ? *reinterpret_cast<const std::uintptr_t*>(ref + 0x98) : 0;
+		return base ? *reinterpret_cast<const std::uint32_t*>(base + off::kFormId) : 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+extern "C" __declspec(dllexport) int FVO_RegisterTick(FvoTick_t tick)
+{
+	context::g_addonTick = tick;
+	logger::Write("Context: addon tick %s", tick ? "registered" : "removed");
+	return 1;
 }

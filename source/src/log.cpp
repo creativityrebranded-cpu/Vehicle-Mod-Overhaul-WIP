@@ -1,12 +1,15 @@
 #include "log.h"
 #include "plugininfo.h"
-#include "trace.h"
+#include "trace.h"
+
 #include "fvopaths.h"
+#include "logbuffer.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
 
 #include <cstdarg>
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -20,6 +23,18 @@ namespace logger
 	{
 		std::FILE* g_file = nullptr;
 		std::mutex g_lock;
+        char g_buffer[65536]{};
+        logbuffer::Policy g_flush;
+#ifdef SP_LOG_TEST
+        ULONGLONG g_testTime=1000;
+#endif
+        ULONGLONG Now() {
+#ifdef SP_LOG_TEST
+            return g_testTime;
+#else
+            return GetTickCount64();
+#endif
+        }
 	}
 
 	void Init()
@@ -35,24 +50,28 @@ namespace logger
 		const std::wstring path = dir + L"\\" + plugininfo::Name() + L".log";
 		MoveFileExW(path.c_str(), (dir + L"\\" + plugininfo::Name() + L".prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
 		g_file = _wfopen(path.c_str(), L"w");
+        if(g_file)std::setvbuf(g_file,g_buffer,_IOFBF,sizeof(g_buffer));
 	}
 
 	bool Verbose()
 	{
-		static ULONGLONG lastRead = 0;
-		static bool value = false;
+		static std::atomic<ULONGLONG> lastRead{0};
+		static std::atomic<bool> value{false};
 		const ULONGLONG now = GetTickCount64();
-		if (!lastRead || now - lastRead >= 5000) {
-			lastRead = now;
-			PWSTR docs = nullptr;
-			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-				const std::wstring ini = fvopaths::Settings();
-				CoTaskMemFree(docs);
-				value = GetPrivateProfileIntW(L"log", L"verbose", 0, ini.c_str()) != 0;
-			}
-		}
-		return value;
+        auto previous=lastRead.load(std::memory_order_relaxed);
+        if((!previous||(now>=previous&&now-previous>=5000))&&lastRead.compare_exchange_strong(previous,now)) {
+            const auto& ini=fvopaths::Settings();
+            if(!ini.empty())value.store(GetPrivateProfileIntW(L"log",L"verbose",0,ini.c_str())!=0,std::memory_order_relaxed);
+        }
+		return value.load(std::memory_order_relaxed);
 	}
+
+    void Service() {
+        if(!g_file)return;
+        std::lock_guard lock(g_lock);
+        const auto now=Now();g_flush.Begin(now);
+        if(g_flush.Due(now)){std::fflush(g_file);g_flush.Flushed(now);}
+    }
 
 	void Write(const char* fmt, ...)
 	{
@@ -68,8 +87,10 @@ namespace logger
 		va_end(args);
 		{
 			std::lock_guard lock(g_lock);
-			std::fprintf(g_file, "[%02u:%02u:%02u.%03u] %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, text);
-			std::fflush(g_file);
+			const int bytes=std::fprintf(g_file, "[%02u:%02u:%02u.%03u] %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, text);
+            if(bytes>0)g_flush.Added(std::size_t(bytes));
+            const auto now=Now();
+            if(g_flush.Due(now)){std::fflush(g_file);g_flush.Flushed(now);}
 		}
 		trace::Raw("log", text);
 	}
@@ -86,4 +107,10 @@ namespace logger
 		std::fputc('\n', g_file);
 		std::fflush(g_file);
 	}
+#ifdef SP_LOG_TEST
+    namespace testing {
+        void Open(std::FILE* file) {g_file=file;g_flush={};if(file)std::setvbuf(file,g_buffer,_IOFBF,sizeof(g_buffer));}
+        void Clock(ULONGLONG now) {g_testTime=now;}
+    }
+#endif
 }

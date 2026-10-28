@@ -46,7 +46,6 @@ struct Situation
     bool hitRecently = false, allyWrecked = false, allyDriverKilled = false, leaderKilled = false, playerOnFoot = false, reinforcements = false;
     int alliesOnTarget = 1, enemiesOnMe = 1;
     bool targetInConvoy = false, targetIsCargo = false, iDefendConvoy = false;
-    bool allowRam = true;
     double breakOff = 0.3;
     bfm::Weapon weapon;
     bool civilian = false;
@@ -197,7 +196,7 @@ inline void Tick(State& st, const Situation& input, const steer::World& w, const
         if (sw.tactics) {
             if (!st.factsAt || now - st.factsAt >= kFactsMs || st.factsFoe != s.foe.id) { st.facts = tactics::Read(w, s.me.unit, s.foe.unit, s.enemies, s.enemyCount); st.factsAt = now; st.factsFoe = s.foe.id; }
             facts = st.facts;
-            tactics::Ctx tc; tc.allowRam = s.allowRam; tc.alliesOnTarget = s.alliesOnTarget; tc.targetInConvoy = s.targetInConvoy; tc.targetIsCargo = s.targetIsCargo;
+            tactics::Ctx tc; tc.alliesOnTarget = s.alliesOnTarget; tc.targetInConvoy = s.targetInConvoy; tc.targetIsCargo = s.targetIsCargo;
             tc.iDefendConvoy = s.iDefendConvoy; tc.aggression = person.aggression;
             for (int i = 0; i < int(tactics::T::Count); ++i) b.tac[i] = s.foe.inVehicle || !tactics::MakesContact(tactics::T(i)) ? tactics::Desire(tactics::T(i), s.me.unit, s.foe.unit, g, facts, tc) : 0.0;
             if (facts.pinnedMe) edge(true, brain::Impulse::Pinned, 3000);

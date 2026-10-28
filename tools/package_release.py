@@ -20,23 +20,47 @@ def write_zip(destination, files):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True, help="Release root; a version-named subfolder is created automatically")
     parser.add_argument("--version", required=True, help="e.g. 0.72.0")
+    parser.add_argument("--traffic-content", choices=("auto", "air", "legacy"), default="auto", help="Legacy format only")
+    parser.add_argument("--format", choices=("bundle", "fomod", "legacy"), default="bundle")
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--source-dir", type=Path)
+    parser.add_argument("--sfse-dir", type=Path)
+    parser.add_argument("--schema", type=Path)
+    parser.add_argument("--test-results", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    output = args.output_dir.resolve()
+    from package_release_bundle import build_release, version_folder
+    output=version_folder(args.output_dir,args.version)
+    if args.format in ("bundle","fomod"):
+        if args.traffic_content != "auto":
+            parser.error("--traffic-content requires --format legacy; the current FOMOD offers parked vehicles only")
+        from package_fomod import build
+        builder=build_release if args.format=="bundle" else build
+        builder(args.data_dir or root / "Data", args.source_dir or root / "source",
+              args.sfse_dir or root / "source/third_party/sfse", args.output_dir.resolve() if args.format=="bundle" else output,
+              args.version, args.schema, args.test_results)
+        return
     output.mkdir(parents=True, exist_ok=True)
     version = args.version
     binary = output / f"FlyingVehicleOverhaul-{version}.zip"
     source_zip = output / f"FlyingVehicleOverhaul-{version}-source.zip"
+    use_air = args.traffic_content == "air" or (args.traffic_content == "auto" and (root / "Data/FVO_AirTraffic.esm").is_file())
+    city = "FVO_AirTraffic.esm" if use_air else ("FVO_CityTraffic.esm" if (root / "Data/FVO_CityTraffic.esm").is_file() else "FVO_CityPlacements.esm")
     files = [(root / "Data" / name, name) for name in (
-        "FVO_NPCPilots.esm", "FVO_CityPlacements.esm", "SFSE/Plugins/FlyingVehicleOverhaul.dll")]
+        "FVO_NPCPilots.esm", city, "SFSE/Plugins/FlyingVehicleOverhaul.dll")]
     for source, _ in files:
         if not source.is_file():
             raise FileNotFoundError(source)
     guide = root / "docs" / f"NEXUS_DESCRIPTION_{version}.txt"
     if guide.is_file():
         files.append((guide, "Docs/FlyingVehicleOverhaul.txt"))
+    if use_air:
+        air_guide = root / "docs/AIR_TRAFFIC.md"
+        if not air_guide.is_file():
+            raise FileNotFoundError(air_guide)
+        files.append((air_guide, "Docs/AirTraffic.md"))
     write_zip(binary, files)
     source_root = root / "source"
     source_files = []

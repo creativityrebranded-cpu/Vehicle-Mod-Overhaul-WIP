@@ -72,7 +72,6 @@ struct Settings
 {
     int stage = 4;                // states of stages 1..stage
     double zone = 150.0;          // m around the anchor
-    bool allowRam = false;        // stage 4
     double breakOff = 0.30;       // health share
     std::uint64_t holdMs = 1500;  // a freely chosen state is kept at least this long
     double speedScale = 1.0;      // [combat] boost=0 -> 0.7
@@ -148,7 +147,7 @@ inline int StageOf(State s)
 inline bool Allowed(State s, const Settings& set)
 {
     const bool ramLike = s == State::Ram || s == State::Sideswipe;
-    return StageOf(s) <= set.stage && (!ramLike || set.allowRam);
+    return StageOf(s) <= set.stage && !ramLike;  // rams and sideswipes removed (2026-10-25)
 }
 
 // The state wanted now and why (for the log). The hold is applied here; Enter() records a change.

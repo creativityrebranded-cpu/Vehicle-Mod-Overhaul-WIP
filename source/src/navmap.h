@@ -46,6 +46,7 @@ namespace navmap
 		bool objOverruled = false;  // a box covered it, but a ray flew through here at this height recently: open (the box was wrong here)
 		bool free = false;      // a ray passed through this height
 		int contacts = 0;
+		float blockedZ = 0;     // the height of the remembered solid hit (valid when blocked): a hillside hit sits at the ground, a wall above it
 	};
 	Sample At(double x, double y, double z);
 
@@ -82,6 +83,7 @@ namespace navmap
 	};
 	HeadingChoice ChooseHeading(const HeadingQuery& q);
 	bool RaysEnabled();            // nav.ini [nav] rays=0 stops every engine ray and hull-sweep query (default on); the walls-only nav map then gets nothing from them
+	bool NewAutopilot();           // nav.ini [nav] autopilot=0 goes back to 0.8's autopilot rules (default 1: autodrive.h)
 	bool HullEnabled();            // nav.ini [nav] shape=0 turns the hull-sized sweeps off (default on); a fault turns them off by itself
 	// For the log line: the straight way's thin ray and hull sweep verdicts side by side this frame.
 	void NoteHull(bool rayBlocked, bool hullBlocked);

@@ -1,4 +1,6 @@
 #include "vehicle_probe.h"
+#include "updateschedule.h"
+#include "hookcost.h"
 
 #include "addresses.h"
 #include "game.h"
@@ -478,10 +480,22 @@ namespace vehicle_probe
 
 		using Update = void (*)(std::uintptr_t, std::uintptr_t);
 		Update g_original = nullptr;
+        updateschedule::Pulse g_updates;
+        hookcost::Counter g_updateCost;
+        // Report and publish even when TES is temporarily absent. Publishing
+        // after probe work means consumers see a completed native update.
+        struct FinishedUpdate {
+            LARGE_INTEGER start{},nativeEnd{};
+            ~FinishedUpdate(){LARGE_INTEGER end{};QueryPerformanceCounter(&end);
+                g_updateCost.Add(end.QuadPart-nativeEnd.QuadPart,nativeEnd.QuadPart-start.QuadPart);
+                g_updates.Post();}
+        };
 
 		void Detour(std::uintptr_t system, std::uintptr_t argument)
 		{
+            LARGE_INTEGER start{},nativeEnd{};QueryPerformanceCounter(&start);
 			g_original(system, argument);
+            QueryPerformanceCounter(&nativeEnd);FinishedUpdate finished{start,nativeEnd};
 			const auto base = game::Base();
 			const auto tes = *reinterpret_cast<std::uintptr_t*>(base + addr::kTESPtr);
 			if (!tes) return;
@@ -510,6 +524,19 @@ namespace vehicle_probe
 			if (player) shipmodel::OnPlayerUpdate(player);
 		}
 	}
+
+    std::uint64_t UpdateSerial(){return g_updates.Serial();}
+    void ReportUpdateCost()
+    {
+        static ULONGLONG began=0;const auto now=GetTickCount64();
+        if(!began){began=now;return;}if(now-began<10000)return;
+        hookcost::Samples samples;if(!g_updateCost.Take(samples))return;began=now;
+        if(!samples.count)return;
+        LARGE_INTEGER frequency{};QueryPerformanceFrequency(&frequency);const double ms=1000.0/frequency.QuadPart;
+        logger::Write("Vehicle game-update cost: %llu updates; FVO probes+ship model %.3f ms avg / %.3f worst; native original %.3f / %.3f; %llu timing samples skipped (elapsed call time)",
+            static_cast<unsigned long long>(samples.count),ms*double(samples.hook)/samples.count,ms*samples.maxHook,
+            ms*double(samples.native)/samples.count,ms*samples.maxNative,static_cast<unsigned long long>(samples.skipped));
+    }
 
 	bool Install()
 	{

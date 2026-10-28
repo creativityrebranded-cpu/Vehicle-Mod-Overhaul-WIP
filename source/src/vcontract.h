@@ -68,7 +68,7 @@ namespace vcontract
 
 	// The class of a profile (2026-10-20, the user): a vehicle holds one profile of each class at once, so choosing where it goes never replaces
 	// how it fights or when it shoots. Navigation: escort, hold, return home, patrol, hauler, courier, scout, cruise. Combat: attack, defend (the
-	// ram is a one-shot order, vehicleflight::RequestRam). Weapons: free fire (default), opportunistic, hold fire, never (the player's seat).
+	// rams were removed 2026-10-25). Weapons: free fire (default), opportunistic, hold fire, never (the player's seat).
 	enum class Class : std::uint8_t { Navigation = 0, Combat = 1, Weapons = 2 };
 	inline constexpr int kClasses = 3;
 

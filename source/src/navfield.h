@@ -13,6 +13,7 @@ struct Field {
 };
 const Field& Get(double x,double y,double z,double gx,double gy,double width,bool objects,
  double gz=std::numeric_limits<double>::quiet_NaN());
-void Service(double milliseconds=2.0); // main-thread raster budget; search runs on an owned worker
+void Service(double milliseconds=2.0); // main-thread raster budget; search runs on an owned worker (never waited for)
+bool Idle(); // no raster copying or worker search outstanding (tests drain with Service until Idle)
 void Reset();
 }

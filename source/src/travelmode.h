@@ -38,14 +38,28 @@ struct Inputs
     bool damaged = false, cramped = false;
     bool catching = false;         // the player's own vehicle going under a falling / jumping player
     bool inSettlement = false;     // the place it stands in has an owner (a settlement, outpost or town)
+    // The ground planner's route (groundnav, 2026-10-25), when one guides this vehicle. It has already gone round water,
+    // steep ground, cliffs and tall obstacles, so the straight-line checks (water / rough / too tall ahead) are its job then.
+    bool planned = false;
+    bool planAir = false;          // on an air leg now, or its take-off is just ahead
+    bool planGroundToGoal = false; // the route reaches the goal on the ground (a high goal is reached by driving)
 };
-struct Reason { Mode mode = Mode::Hover; bool blocking = false; const char* why = ""; };
+// route: a decision of the planner's route; it switches at once (the route chose where) and holds nothing afterwards.
+struct Reason { Mode mode = Mode::Hover; bool blocking = false; const char* why = ""; bool route = false; };
+inline constexpr std::uint64_t kRouteMinMs = 1500;  // a route's mode changes at most this often
 
 inline Reason Decide(const Inputs& in)
 {
     if (in.catching) return { Mode::Hover, true, "catching you" };
     if (in.damaged) return { Mode::Drive, true, "damaged: the hover fails" };
     if (in.cramped) return { Mode::Drive, true, "cramped" };
+    if (in.planned) {
+        if (in.planAir) return { Mode::Hover, false, "route: no ground way here (air leg)", true };
+        if (in.fighting) return { Mode::Hover, false, "fighting" };
+        if (in.fleeing) return { Mode::Hover, false, "fleeing" };
+        if (in.goalAbove > kGoalAbove && !in.planGroundToGoal) return { Mode::Hover, false, "goal far above" };
+        return { Mode::Drive, false, "route: on the ground", true };
+    }
     if (in.waterAhead) return { Mode::Hover, true, "water ahead" };
     if (in.clearNeed > in.jumpHeight && in.clearNeed <= kWallNeed) return { Mode::Hover, true, "obstacle taller than a jump" };
     if (in.roughAhead) return { Mode::Hover, true, "rough ground ahead" };
@@ -77,6 +91,13 @@ struct Hold
 inline bool Step(Hold& h, const Reason& r, std::uint64_t now)
 {
     if (!h.started) { h = { r.mode, true, now, r.mode, now, r.blocking ? now + kBlockedHoldMs : 0 }; return true; }
+    if (r.route) {
+        // The route decided: no settle time and no hold from an earlier blocking reason, only a short guard against flapping.
+        h.want = r.mode; h.wantSince = now; h.blockedUntil = 0;
+        if (r.mode == h.mode || now - h.since < kRouteMinMs) return false;
+        h.mode = r.mode; h.since = now;
+        return true;
+    }
     if (r.blocking && r.mode == h.mode) h.blockedUntil = now + kBlockedHoldMs;  // still blocked: keep holding
     if (r.mode != h.want) { h.want = r.mode; h.wantSince = now; }
     if (r.mode == h.mode) return false;

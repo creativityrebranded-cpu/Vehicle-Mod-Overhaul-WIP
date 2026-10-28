@@ -1,15 +1,36 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyingVehicleOverhaul VERSION 0.73.0 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 0.8.5 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(native_route_session_test tests/native_route_session_test.cpp)
+target_include_directories(native_route_session_test PRIVATE src)
+add_executable(native_movement_output_test tests/native_movement_output_test.cpp)
+target_include_directories(native_movement_output_test PRIVATE src)
+add_executable(native_movement_controller_test tests/native_movement_controller_test.cpp src/native_movement_controller.cpp)
+target_include_directories(native_movement_controller_test PRIVATE src)
+add_executable(autodrive_test tests/autodrive_test.cpp)
+target_include_directories(autodrive_test PRIVATE src)
+add_executable(boardinggate_test tests/boardinggate_test.cpp src/hook.cpp)
+target_include_directories(boardinggate_test PRIVATE src)
+target_compile_definitions(boardinggate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+add_executable(hudspread_test tests/hudspread_test.cpp)
+target_include_directories(hudspread_test PRIVATE src)
+add_executable(trafficpick_test tests/trafficpick_test.cpp)
+target_include_directories(trafficpick_test PRIVATE src)
+add_executable(ringtrip_test tests/ringtrip_test.cpp)
+target_include_directories(ringtrip_test PRIVATE src)
+add_executable(trafficdata_test tests/trafficdata_test.cpp)
+target_include_directories(trafficdata_test PRIVATE src)
+add_executable(trafficroute_test tests/trafficroute_test.cpp)
+target_include_directories(trafficroute_test PRIVATE src)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 if(NOT MSVC)
-    message(FATAL_ERROR "FlyingVehicleOverhaul builds with MSVC (Visual Studio 2022 Build Tools).")
+    message(FATAL_ERROR "SeamlessPlanets builds with MSVC (Visual Studio 2022 Build Tools).")
 endif()
 
-# Only sfse/PluginAPI.h is used (MIT, bundled in third_party/sfse with its notice).
-set(SFSE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sfse" CACHE PATH "SFSE headers")
+set(SFSE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../ref/sfse" CACHE PATH "SFSE source")
 function(sp_options target)
     target_include_directories(${target} PRIVATE src "${SFSE_ROOT}")
     target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
@@ -18,20 +39,51 @@ endfunction()
 
 add_library(sp_common STATIC
     src/game.cpp src/hook.cpp src/log.cpp src/notify.cpp src/telemetry.cpp
-    src/anchor.cpp src/trace.cpp src/controlmap.cpp)
+    src/anchor.cpp src/trace.cpp src/controlmap.cpp src/runtimeforms.cpp src/runtimecells.cpp)
 sp_options(sp_common)
+
+# One owner for every traversal hook and every derived world state.
+add_library(SeamlessPlanets SHARED
+    src/main.cpp src/api_core.cpp src/landing.cpp src/diagnostics.cpp
+    src/recentre.cpp src/watchpoint.cpp src/terrainguard.cpp src/hexgrid.cpp
+    src/sphere.cpp src/handoff.cpp src/playarea.cpp src/navgen.cpp
+    src/hangwatch.cpp src/rebase.cpp src/parking.cpp src/gametick.cpp
+    src/autosave.cpp src/crash.cpp src/prefetch.cpp src/content.cpp
+    src/globe.cpp src/flight.cpp src/shipflight.cpp src/shipmodel.cpp
+    src/camtune.cpp src/flightmodel.cpp src/flighttune.cpp
+    src/distant.cpp src/modscene.cpp src/stream.cpp)
+sp_options(SeamlessPlanets)
+target_link_libraries(SeamlessPlanets PRIVATE sp_common Synchronization)
 
 # The rover flight DLL has its own main loop, ground probes and scene update
 # when SeamlessPlanets is not installed. With the core present it uses its API.
 
 add_library(FlyingVehicleOverhaul SHARED
-    src/main_vehicle.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/crash.cpp
-    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
+    src/native_movement_controller.cpp src/native_movement_engine.cpp src/native_movement_probe.cpp
+    src/main_vehicle.cpp src/resources.cpp src/airtraffic.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/citytraffic.cpp src/citystartup.cpp src/cityfiles.cpp src/crash.cpp
+    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
     src/vehicleflight.cpp src/vehiclecamera.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(FlyingVehicleOverhaul)
 target_compile_definitions(FlyingVehicleOverhaul PRIVATE SP_FEATURE_VEHICLE)
-target_link_libraries(FlyingVehicleOverhaul PRIVATE sp_common Synchronization)
+target_link_libraries(FlyingVehicleOverhaul PRIVATE sp_common Synchronization Dxgi)
+
+# FVO City Placements addon (2026-10-27): the ring ambient traffic beside FVO_CityPlacements.esm; talks to core through fvo_addon_api.h.
+add_library(FVO_CityPlacements SHARED src/main_cityplacements.cpp)
+sp_options(FVO_CityPlacements)
+target_link_libraries(FVO_CityPlacements PRIVATE Shell32 Ole32)
+
+# Gravspace was deleted 2026-10-22 (source in disabled_gravspace_20261022/Source). Gravlanes was deleted 2026-10-24 at the user's request.
+
+# Interactive Cover: on-foot run-to-cover mod (notes/INTERACTIVE_COVER_PLAN.md). Standalone; test stage for now.
+add_library(InteractiveCover SHARED src/main_cover.cpp src/cover_test.cpp src/crash.cpp)
+sp_options(InteractiveCover)
+target_link_libraries(InteractiveCover PRIVATE sp_common Synchronization)
+
+add_executable(flightscript_test tests/flightscript_test.cpp)
+add_executable(scriptbuild_test tests/scriptbuild_test.cpp)
+sp_options(scriptbuild_test)
+sp_options(flightscript_test)
 
 add_executable(navfield_test tests/navfield_test.cpp src/navfield.cpp)
 sp_options(navfield_test)
@@ -75,36 +127,88 @@ sp_options(combat_relations_test)
 add_executable(native_integration_test tests/native_integration_test.cpp)
 sp_options(native_integration_test)
 
-add_executable(placementlogic_test tests/placementlogic_test.cpp)
-sp_options(placementlogic_test)
-add_executable(bindlogic_test tests/bindlogic_test.cpp)
-sp_options(bindlogic_test)
-
-add_executable(travelmode_test tests/travelmode_test.cpp)
-sp_options(travelmode_test)
-
 add_executable(physicssetup_test tests/physicssetup_test.cpp)
 sp_options(physicssetup_test)
 
 add_executable(physicsstep_test tests/physicsstep_test.cpp)
 sp_options(physicsstep_test)
+
 add_executable(vtolphysics_test tests/vtolphysics_test.cpp)
 sp_options(vtolphysics_test)
+
 add_executable(vtolai_test tests/vtolai_test.cpp)
 sp_options(vtolai_test)
+
+add_executable(vtolplan_test tests/vtolplan_test.cpp)
+sp_options(vtolplan_test)
+
+add_executable(ringlogic_test tests/ringlogic_test.cpp)
+sp_options(ringlogic_test)
+add_executable(ringschedule_test tests/ringschedule_test.cpp)
+sp_options(ringschedule_test)
+add_executable(citybuild_test tests/citybuild_test.cpp)
+sp_options(citybuild_test)
+add_executable(citybuild_dryrun tests/citybuild_dryrun.cpp src/cityfiles.cpp)
+sp_options(citybuild_dryrun)
+add_executable(cityfiles_test tests/cityfiles_test.cpp src/cityfiles.cpp)
+sp_options(cityfiles_test)
+add_executable(listenerboot_test tests/listenerboot_test.cpp)
+sp_options(listenerboot_test)
+add_executable(framework_test tests/framework_test.cpp)
+sp_options(framework_test)
+add_executable(performance_test tests/performance_test.cpp src/log.cpp)
+sp_options(performance_test)
+target_compile_definitions(performance_test PRIVATE SP_LOG_TEST)
+add_executable(runtimeperf_test tests/runtimeperf_test.cpp src/controlmap.cpp src/navseed.cpp src/runtimeforms.cpp src/runtimecells.cpp src/vehicleworld.cpp src/pilotquest.cpp)
+sp_options(runtimeperf_test)
+target_compile_definitions(runtimeperf_test PRIVATE SP_RUNTIME_PERF_TEST)
+target_link_libraries(runtimeperf_test PRIVATE Shell32 Ole32)
+add_executable(connections_test tests/connections_test.cpp)
+sp_options(connections_test)
+
+add_executable(npcactivity_test tests/npcactivity_test.cpp)
+sp_options(npcactivity_test)
+
+add_executable(airtraffic_test tests/airtraffic_test.cpp)
+sp_options(airtraffic_test)
+add_executable(trafficschedule_test tests/trafficschedule_test.cpp)
+sp_options(trafficschedule_test)
+
 add_executable(cameraroll_test tests/cameraroll_test.cpp)
 sp_options(cameraroll_test)
+
 add_executable(hook_call_test tests/hook_call_test.cpp src/hook.cpp)
 sp_options(hook_call_test)
+
 add_executable(vehiclecamera_test tests/vehiclecamera_test.cpp src/vehiclecamera.cpp)
 sp_options(vehiclecamera_test)
+
+add_executable(placementlogic_test tests/placementlogic_test.cpp)
+sp_options(placementlogic_test)
+add_executable(bindlogic_test tests/bindlogic_test.cpp)
+sp_options(bindlogic_test)
+add_executable(commandinput_test tests/commandinput_test.cpp)
+sp_options(commandinput_test)
+
+add_executable(travelmode_test tests/travelmode_test.cpp)
+sp_options(travelmode_test)
+
+add_executable(groundplan_test tests/groundplan_test.cpp)
+sp_options(groundplan_test)
+
 add_executable(freeroll_test tests/freeroll_test.cpp)
 sp_options(freeroll_test)
 add_executable(vtolassist_test tests/vtolassist_test.cpp)
 sp_options(vtolassist_test)
-
 add_executable(placementedit_test tests/placementedit_test.cpp)
 sp_options(placementedit_test)
-
-add_executable(commandinput_test tests/commandinput_test.cpp)
-sp_options(commandinput_test)
+add_executable(hudprompts_test tests/hudprompts_test.cpp)
+sp_options(hudprompts_test)
+add_executable(inlinehints_test tests/inlinehints_test.cpp)
+sp_options(inlinehints_test)
+add_executable(hudchildren_test tests/hudchildren_test.cpp)
+sp_options(hudchildren_test)
+add_executable(featureinstaller_test tests/featureinstaller_test.cpp)
+sp_options(featureinstaller_test)
+add_executable(placementenable_test tests/placementenable_test.cpp)
+sp_options(placementenable_test)

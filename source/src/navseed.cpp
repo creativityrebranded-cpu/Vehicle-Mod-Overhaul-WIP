@@ -1,4 +1,5 @@
 #include "navseed.h"
+#include "runtimeforms.h"
 
 #include "addresses.h"
 #include "game.h"
@@ -30,17 +31,23 @@ namespace navseed
 		constexpr double kRadius = 250.0;          // m around the player
 		constexpr ULONGLONG kPassMs = 2000;        // a new pass this often
 		constexpr unsigned kPerFrame = 300;        // references looked at per frame
-		constexpr unsigned kRefLimit = 12000;
+		// 8000 like the NPC systems (2026-10-27 stutter pass): asking for more than another caller already took this frame
+		// forced a second full scene scan in the same frame (up to 12000 engine reference visits).
+		constexpr unsigned kRefLimit = 8000;
 		constexpr double kMaxHalf = 60.0;          // m: bigger boxes are left to the probes
 		constexpr double kMinHalf = 0.2;
 		// The same 3D and body reads as vehicleworld.cpp (proven there): ref +0xB8 loaded data, +0x08 root; NiAVObject collision object +0x110,
 		// world bound sphere +0x100 (centre xyz, radius +0x0C), children +0x138 / count +0x142, vtable +0x20 "as node"; bhkNPCollisionObject
 		// vfunc +0x138 = physics collision, FUN_142376C70(colObj, uint32* out) = body id.
-		constexpr std::uint32_t kBoundMin = 0x48, kBoundMax = 0x54, kWorldBound = 0x100, kCollision = 0x110, kChildren = 0x138, kChildCount = 0x142,
+		constexpr std::uint32_t kBoundMin = 0x50, kBoundMax = 0x5C /* 1.16.244 TESBoundObject bounds (were 0x48/0x54: 8 bytes early, 2026-10-25) */, kWorldBound = 0x100, kCollision = 0x110, kChildren = 0x138, kChildCount = 0x142,
 			kVIsNode = 0x20, kVAsNP = 0x138, kBodyIdOf = 0x02376C70, kNoBody = 0xFFFFFF;
 
-		// The pass walks this frame's shared list of loaded references (modscene::LoadedRefs, one scan per frame), never a list kept from an
-		// earlier frame: a reference unloaded meanwhile would be a dangling pointer.
+		// Capture IDs once per pass; resolve each small slice in its current frame.
+		// No raw reference pointers survive a frame or an unload.
+        std::vector<std::uint32_t> g_ids;
+#ifdef SP_RUNTIME_PERF_TEST
+        ULONGLONG g_testNow=10000;
+#endif
 		bool g_inPass = false;
 		std::size_t g_pos = 0;
 		ULONGLONG g_passAt = 0, g_logAt = 0;
@@ -155,13 +162,28 @@ namespace navseed
 		}
 	}
 
+    namespace {
+        std::uint32_t FormId(uptr ref) {
+            __try {return ref?At<std::uint32_t>(ref,off::kFormId):0;}
+            __except(EXCEPTION_EXECUTE_HANDLER){return 0;}
+        }
+        bool SeedId(std::uint32_t id,uptr player) {
+            __try {
+                const auto ref=runtimeforms::Lookup(id);
+                return ref&&ref!=player&&At<std::uint32_t>(ref,off::kFormId)==id&&Seed(ref);
+            } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+        }
+    }
 	void Tick()
 	{
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		if (!player) return;
+#ifdef SP_RUNTIME_PERF_TEST
+        const ULONGLONG now=g_testNow;
+#else
 		const ULONGLONG now = GetTickCount64();
-		const auto refs = modscene::LoadedRefs(kRefLimit);
-		if (!g_inPass || g_pos >= refs.size()) {
+#endif
+		if (!g_inPass || g_pos >= g_ids.size()) {
 			if (g_inPass) {
 				navmap::NoteSeeded(g_cx, g_cy, kRadius);  // the pass is complete: the area is known
 				if (now - g_logAt >= (logger::Verbose() ? 10000ull : 600000ull) || !g_logAt) {
@@ -171,6 +193,8 @@ namespace navseed
 				g_inPass = false;
 			}
 			if (now - g_passAt < kPassMs) return;
+            g_ids.clear();
+            for(const auto ref:modscene::LoadedRefs(kRefLimit))if(const auto id=FormId(ref))g_ids.push_back(id);
 			g_passAt = now;
 			const auto pp = At<game::Vec3>(player, off::kRefPosition);
 			g_cx = pp.x;
@@ -185,13 +209,13 @@ namespace navseed
 			}
 			if (g_solid.size() > 30000) g_solid.clear();
 		}
-		const std::size_t end = std::min(refs.size(), g_pos + kPerFrame);
-		const uptr playerRef = player;
+		const std::size_t end = std::min(g_ids.size(), g_pos + kPerFrame);
+        LARGE_INTEGER began{},frequency{};QueryPerformanceCounter(&began);QueryPerformanceFrequency(&frequency);
+		const auto first=g_pos;
 		for (; g_pos < end; ++g_pos) {
-			const uptr r = refs[g_pos];
-			if (r == playerRef) continue;
+            if(g_pos>first&&(g_pos-first)%16==0){LARGE_INTEGER at{};QueryPerformanceCounter(&at);if(double(at.QuadPart-began.QuadPart)>frequency.QuadPart*0.0005)break;}
 			++g_looked;
-			if (Seed(r)) ++g_objects;
+			if (SeedId(g_ids[g_pos],player)) ++g_objects;
 		}
 	}
 
@@ -202,5 +226,9 @@ namespace navseed
 		g_passAt = 0;
 		g_solid.clear();
 		g_vehicles.clear();
+        g_ids.clear();
 	}
+#ifdef SP_RUNTIME_PERF_TEST
+    namespace testing {void Clock(ULONGLONG now){g_testNow=now;}}
+#endif
 }

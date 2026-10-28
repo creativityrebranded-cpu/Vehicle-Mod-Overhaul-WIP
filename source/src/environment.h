@@ -15,5 +15,10 @@ bool LineBlocked(const float from[3],const float to[3]);
 // over a few frames; known = at least two points answered.
 struct Surface {bool known=false,water=false,rough=false;double at=0;};
 Surface SurfaceAhead(std::uint32_t self,double x,double y,double z,double bearing,double reach);
+// One downward ray at (x, y) between top and bottom (layer mask as SurfaceAhead): false while it is pending. The answer is
+// cached 30 s; ask again each frame until it comes (an unasked query is dropped after 2 s). Ground planner sensing (groundnav).
+struct Ground {bool hit=false,water=false;double z=0,nz=1;bool normalOk=false;};
+bool GroundAt(std::uint32_t self,double x,double y,double top,double bottom,Ground& out);
+unsigned Pending(); // queries waiting for a ray slot (the ground sensing keeps its asks below a share of the queue)
 void Tick();void Reset();
 }
