@@ -21,7 +21,7 @@ New in 0.8.5
 * Entering and exiting: you are no longer seated over an NPC driver. Holding to pull a driver out now uses the game's own get-up, so they step out instead of hanging in a sitting pose. Exiting high up drops you beside the vehicle. Fixed a save-load crash.
 * Passenger system: entering a vehicle someone drives seats you as a passenger. You have no steering there; the NPC's autopilot drives and your movement keys are blocked. G taps out and holds to take the wheel.
 * Route making: traffic routes are plain .ini files in Data\SFSE\Plugins\FVO_Traffic. Draw rings or open/looping paths, add exits and landing places and set per-world rules. "Show traffic routes" places probes along them. A step-by-step guide is included (see Making your own routes).
-* Installer: the Extra Vehicles addon now has separate toggles for New Atlantis placements and city traffic; a new Traffic page holds its settings.
+* Installer: the same options as 0.8, so updates keep your choices. New Atlantis City Traffic now installs the route traffic; New Atlantis City Placements installs the parked vehicles; pick either or both. Show traffic routes joins Everyday traffic.
 
 Making your own routes
 
@@ -40,7 +40,7 @@ Downloads and included files
 * FlyingVehicleOverhaul-0.8.5.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
 * FlyingVehicleOverhaul-0.8.5-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds New Atlantis parked vehicles; FVO_CityPlacements.dll with FVO_Traffic\NewAtlantis.ini and the route guide adds city traffic. Use either or both. Includes its guide.
 * FlyingVehicleOverhaul-0.8.5-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
-* FlyingVehicleOverhaul-0.8.5-FOMOD.zip — all-in-one alternative: the main files, both Extra Vehicles toggles and the patch, with dependency checks and grouped feature setup for Vortex/MO2. Addons start unchecked. Use this instead of the separate ZIPs.
+* FlyingVehicleOverhaul-0.8.5-FOMOD.zip — all-in-one alternative: the main files, City Traffic, City Placements and the patch, with dependency checks and grouped feature setup for Vortex/MO2. Addons start unchecked. Use this instead of the separate ZIPs.
 
 Installation and updating
 

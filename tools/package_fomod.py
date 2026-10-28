@@ -22,13 +22,13 @@ RETIRED = ('FVO_CityTraffic.esm',)
 IMPLICIT_MASTERS = {'starfield.esm'}
 SCHEMA_URL = 'https://raw.githubusercontent.com/Nexus-Mods/fomod-installer/master/src/InstallScripting/XmlScript/Schemas/XmlScript5.0.xsd'
 PROFILE = 'SFSE/Plugins/FlyingVehicleOverhaul.features/'
-FEATURE_PAGES = ('Flight and Navigation','NPCs and Combat','Traffic','HUD')
+FEATURE_PAGES = ('Flight and Navigation','NPCs and Combat','HUD')  # the 0.8 pages: an update keeps the same installer layout
 FIXED_FEATURES = {'Placement':False,'PlacementMode':False,'DebugLog':False}
 FEATURE_GROUPS = {
     'HoverOrDrive':FEATURE_PAGES[0], 'FreeRoll':FEATURE_PAGES[0], 'FlightAssist':FEATURE_PAGES[0],
     'PhysicalVtol':FEATURE_PAGES[0], 'PhysicalAi':FEATURE_PAGES[0], 'NativeGround':FEATURE_PAGES[0],
-    'NpcVehicles':FEATURE_PAGES[1], 'CombatAi':FEATURE_PAGES[1], 'VehicleDamage':FEATURE_PAGES[1], 'Witnesses':FEATURE_PAGES[1], 'Traffic':FEATURE_PAGES[2], 'RouteMarkers':FEATURE_PAGES[2],
-    'HealthBars':FEATURE_PAGES[3], 'StatusCard':FEATURE_PAGES[3],
+    'NpcVehicles':FEATURE_PAGES[1], 'CombatAi':FEATURE_PAGES[1], 'VehicleDamage':FEATURE_PAGES[1], 'Witnesses':FEATURE_PAGES[1], 'Traffic':FEATURE_PAGES[1], 'RouteMarkers':FEATURE_PAGES[1],
+    'HealthBars':FEATURE_PAGES[2], 'StatusCard':FEATURE_PAGES[2],
     'Placement':None, 'PlacementMode':None, 'DebugLog':None,
 }
 
@@ -136,11 +136,13 @@ def module_config(dependencies, features):
         'Choose your feature settings on the following grouped pages, or keep your current settings. '
         'When upgrading, replace your old FVO installation instead of enabling two copies.')
     ET.SubElement(ET.SubElement(core, 'typeDescriptor'), 'type', name='Required')
-    addons = ET.SubElement(ET.SubElement(groups, 'group', name='Extra Vehicles addon (choose either or both; unchecked by default)', type='SelectAny'),
+    # 0.8.5: the 0.8 group and option names, so a manager update keeps a user's earlier choices.
+    addons = ET.SubElement(ET.SubElement(groups, 'group', name='Optional addons (unchecked by default)', type='SelectAny'),
                            'plugins', order='Explicit')
     # 0.8.5: route traffic (the addon DLL + traffic files) works with any parked vehicles, so it is its own choice.
-    traffic = ET.SubElement(addons, 'plugin', name='Extra Vehicles: city traffic')
+    traffic = ET.SubElement(addons, 'plugin', name='New Atlantis City Traffic')
     ET.SubElement(traffic, 'description').text = (
+        'Replaces the 0.8 FVO_CityTraffic.esm (remove it if another mod entry still supplies it). '
         'Traffic that flies routes defined in plain text files: SFSE/Plugins/FVO_Traffic/NewAtlantis.ini (a two-lane ring round '
         'New Atlantis with four exits and landing places) and HOW-TO-MAKE-ROUTES.txt. Uses any parked vehicles (vanilla, Carfield, '
         'Parked Vehicles or the New Atlantis parked vehicles below). Needs only the core.')
@@ -148,14 +150,12 @@ def module_config(dependencies, features):
     for name in (CITY_DLL, CITY_TRAFFIC, ROUTE_GUIDE):
         ET.SubElement(files, 'file', source='11 Route Traffic/'+name, destination=name, priority='0')
     ET.SubElement(ET.SubElement(traffic, 'typeDescriptor'), 'type', name='Optional')
-    option(addons, 'Extra Vehicles: New Atlantis placements',
+    option(addons, 'New Atlantis City Placements',
            'Adds parked vehicles around New Atlantis. Vehicle types stay as authored. Remove the superseded FVO_CityTraffic.esm if installed. '
            'Requires active: '+', '.join(dependencies[CITY])+'.',
            '10 City Placements/'+CITY, CITY, dependencies[CITY],
            ('FVO_CityTraffic.esm', 'FlyingVehicleOverhaul - Placements.esm'))
-    patches = ET.SubElement(ET.SubElement(groups, 'group', name='Optional patch (unchecked by default)', type='SelectAny'),
-                            'plugins', order='Explicit')
-    option(patches, 'Parked Vehicles conversion patch',
+    option(addons, 'Parked Vehicles conversion patch',
            'Converts Parked Vehicles pack-in props into usable REV-8, Moon Jumper and Deimog vehicles, '
            'including its procedural placements. Removes their duplicate decorative wheels and turrets. '
            'Locations come from Parked Vehicles; this adds no FVO city placements. '

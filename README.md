@@ -151,7 +151,7 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 - **Entering and exiting:** you are never seated over an NPC driver; pulling a driver out uses the game's own get-up; exiting high up drops you beside the vehicle; a save-load crash is fixed.
 - **Passenger system:** entering a vehicle someone drives seats you as a passenger with no steering (their autopilot drives); G taps out and holds to take the wheel; followers take the passenger seats.
 - **Route making:** traffic flies routes in plain `.ini` files in `Data\SFSE\Plugins\FVO_Traffic` (rings, open or looping paths, exits, landing places, per-world rules). `HOW-TO-MAKE-ROUTES.txt` in that folder explains every line; "Show traffic routes" draws them with probes.
-- **Installer:** the Extra Vehicles addon has separate toggles for New Atlantis placements and city traffic; a new Traffic settings page.
+- **Installer:** the same options and pages as 0.8 (updates keep choices); New Atlantis City Traffic installs the route traffic, New Atlantis City Placements the parked vehicles.
 
 Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_0.8.5.txt](docs/NEXUS_POST_0.8.5.txt).
 

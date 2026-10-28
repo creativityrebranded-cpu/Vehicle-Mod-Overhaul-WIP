@@ -71,13 +71,12 @@ def verify(path, schema=None):
         check(len(optional) == 2, 'Placements and conversion patch are gated by their masters')
         addon_groups = [g for g in root.findall('installSteps/installStep/optionalFileGroups/group')
                         if g.get('type') == 'SelectAny']
-        check(len(addon_groups) == 2, 'Extra Vehicles group and the patch group')
-        extra_group, patch_group = addon_groups
-        extra_plugins = extra_group.findall('plugins/plugin')
-        check([p.get('name') for p in extra_plugins] == ['Extra Vehicles: city traffic', 'Extra Vehicles: New Atlantis placements'],
-              'Extra Vehicles offers city traffic and placements as separate toggles')
-        traffic, city = extra_plugins
-        patch, = patch_group.findall('plugins/plugin')
+        check(len(addon_groups) == 1 and addon_groups[0].get('name') == 'Optional addons (unchecked by default)',
+              'One addon group with the 0.8 name')
+        addon_plugins = addon_groups[0].findall('plugins/plugin')
+        check([p.get('name') for p in addon_plugins] == ['New Atlantis City Traffic', 'New Atlantis City Placements', 'Parked Vehicles conversion patch'],
+              'Addon option names match the published 0.8 / 0.8.1 installers')
+        traffic, city, patch = addon_plugins
         check(optional == [city, patch], 'Only placements and the patch carry master gates')
         check(traffic.find('typeDescriptor/type').get('name') == 'Optional', 'City traffic needs only the core')
         check({f.get('destination') for f in traffic.findall('files/file')} == {CITY_DLL, CITY_TRAFFIC, ROUTE_GUIDE},
@@ -103,8 +102,8 @@ def verify(path, schema=None):
         hidden=[f for f in features if not f['configurable']]
         check({f['id'] for f in hidden}=={'Placement','PlacementMode','DebugLog'},'Randomizer, authoring and verbose logging are excluded')
         pages=root.findall('installSteps/installStep')[1:]
-        check([p.get('name') for p in pages]==['Flight and Navigation','NPCs and Combat','Traffic','HUD'],
-              'Feature switches have four pages with no randomizer page')
+        check([p.get('name') for p in pages]==['Flight and Navigation','NPCs and Combat','HUD'],
+              'Feature switches keep the three 0.8 pages')
         counts=[]
         for page in pages:
             groups=page.findall('optionalFileGroups/group');counts.append(len(groups))
@@ -121,7 +120,7 @@ def verify(path, schema=None):
                     check(file.get('destination')==PROFILE+feature['section']+'.'+feature['key']+'.ini','Feature output goes to the runtime import folder')
                     ini=configparser.ConfigParser();ini.read_string(archive.read(file.get('source')).decode('ascii'))
                     check(dict(ini['feature'])=={'section':feature['section'],'key':feature['key'],'value':str(int(enabled))},'Every on/off fragment identifies the exact runtime setting')
-        check(counts==[6,4,2,2],'Gameplay choices grouped 6/4/2/2')
+        check(counts==[6,6,2],'Gameplay choices grouped 6/6/2')
         check(not next(f for f in features if f['id']=='RouteMarkers')['default'],'Route probes are off by default')
         shown={g.get('name') for p in pages for g in p.findall('optionalFileGroups/group')}
         check('Placement mode' not in shown and 'Detailed log' not in shown,'Removed option labels are not shown')
