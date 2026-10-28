@@ -1,27 +1,27 @@
 Update/Installation Notice:
 If you're using an older version and updating, delete all the older files and replace with the newer files. FVO is also now compatible with mod managers.
 
-Flying Vehicle Overhaul 0.8.5 — Early WIP
+Flying Vehicle Overhaul 0.8.6 — Early WIP
 Hover vehicles with gears, terrain following and autopilot. Summon your vehicle, have it follow or cover you, send it along scanner routes, ride with NPC drivers, or let city traffic fly routes you write in simple text files. NPCs can use compatible vehicles for travel and combat.
 What it does
 
 * Hover flight: four gears, boost, climb, descend and terrain following. Standard hover works with Physical VTOL switched off.
-* Physical flight — experimental: thrust, torque, native mass and inertia produce momentum and banking. Flight assist stabilizes drift and rotation; camera roll and an attitude instrument show pitch and bank. Separate player and AI settings, both off by default.
+* Physical flight: thrust, torque, native mass and inertia produce momentum and banking, for you and every AI pilot. Flight assist stabilizes drift and rotation; camera roll and an attitude instrument show pitch and bank. Off by default.
 * Autopilot and routes: summon, follow, cover, guard and scanner destinations. Chain stops, retry a held trip or skip a stop. Navigation considers terrain, walls, ceilings, people, vehicles, weather and darkness.
 * Seats and passengers: get into a vehicle someone is driving and you ride as a passenger while their autopilot drives. Hold to pull the driver out and take the wheel. Followers take the passenger seats when you drive.
 * Combat and faction reactions: vehicle manoeuvres, squad roles, morale, attacks and retreats. Set Defend / Attack / Hold fire, or focus a hostile person or hostile-driven vehicle. Ownership and allegiance govern vehicle use and friendly-fire protection.
 * Damage and wrecks: shots and collisions damage occupied and empty vehicles, can injure occupants and can leave wrecks. Vehicle health stays with the chassis through driver changes.
 * Traffic and routes: calm NPCs take parked vehicles on trips. With city traffic installed they climb onto routes defined in text files, follow them to the exit nearest their destination and land, or lap and return home.
-* Ground navigation — experimental: optional ground-first route planning around terrain hazards and buildings, with native driving for occupied vehicles. Off by default.
+* Ground navigation: ground-first route planning around terrain hazards and buildings, with native driving for occupied vehicles.
 * Controls and HUD: separate keyboard/controller bindings with context, tap, hold and double tap. One vehicle prompt changes with context. Move and resize HUD groups, status-card elements, route text, escort rows and action slots.
 
-New in 0.8.5
+New in 0.8.5 and 0.8.6
 
 * AI navigation: a new autopilot steers by scoring headings round the vehicle and plans short routes round obstacles. It recovers from stuck spots by trying the most open direction, including up when flying is allowed. Combat prefers flight, traffic prefers the ground; climbs to high lanes work.
 * Entering and exiting: you are no longer seated over an NPC driver. Holding to pull a driver out now uses the game's own get-up, so they step out instead of hanging in a sitting pose. Exiting high up drops you beside the vehicle. Fixed a save-load crash.
 * Passenger system: entering a vehicle someone drives seats you as a passenger. You have no steering there; the NPC's autopilot drives and your movement keys are blocked. G taps out and holds to take the wheel.
 * Route making: traffic routes are plain .ini files in Data\SFSE\Plugins\FVO_Traffic. Draw rings or open/looping paths, add exits and landing places and set per-world rules. "Show traffic routes" places probes along them. A step-by-step guide is included (see Making your own routes).
-* Installer: the same options as 0.8, so updates keep your choices. New Atlantis City Traffic now installs the route traffic; New Atlantis City Placements installs the parked vehicles; pick either or both. Show traffic routes joins Everyday traffic.
+* Settings and summon: the menu is down to six switches (the rest is always on). Summoning from far away while high in the air now brings the vehicle to the ground below you. Placement mode was removed; recorded spots stay.
 
 Making your own routes
 
@@ -37,10 +37,10 @@ Requirements
 
 Downloads and included files
 
-* FlyingVehicleOverhaul-0.8.5.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
-* FlyingVehicleOverhaul-0.8.5-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds New Atlantis parked vehicles; FVO_CityPlacements.dll with FVO_Traffic\NewAtlantis.ini and the route guide adds city traffic. Use either or both. Includes its guide.
-* FlyingVehicleOverhaul-0.8.5-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
-* FlyingVehicleOverhaul-0.8.5-FOMOD.zip — all-in-one alternative: the main files, City Traffic, City Placements and the patch, with dependency checks and grouped feature setup for Vortex/MO2. Addons start unchecked. Use this instead of the separate ZIPs.
+* FlyingVehicleOverhaul-0.8.6.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
+* FlyingVehicleOverhaul-0.8.6-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds New Atlantis parked vehicles; FVO_CityPlacements.dll with FVO_Traffic\NewAtlantis.ini and the route guide adds city traffic. Use either or both. Includes its guide.
+* FlyingVehicleOverhaul-0.8.6-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
+* FlyingVehicleOverhaul-0.8.6-FOMOD.zip — all-in-one alternative: the main files, City Traffic, City Placements and the patch, with dependency checks and grouped feature setup for Vortex/MO2. Addons start unchecked. Use this instead of the separate ZIPs.
 
 Installation and updating
 
@@ -52,8 +52,8 @@ Installation and updating
 Settings and defaults
 
 * Feature settings: Settings > Gameplay Options > Flying Vehicle Overhaul. Bindings: Settings > Controls.
-* On by default: NPC vehicle use, full combat AI, hover-or-drive behavior, damage and wrecks, health bars, status card, crash witnesses, everyday traffic and flight assist.
-* Off by default: free roll, player Physical VTOL, AI Physical VTOL, ground planning/native driving and Show traffic routes. Placement recording and detailed logging also default off. Saved settings can override defaults.
+* The six switches: Physical flight (off; you and AI pilots), Flight assist (on), Free roll (off), NPCs use vehicles (on), Everyday traffic (on) and Show traffic routes (off).
+* Always on: full combat AI, hover-or-drive, ground navigation, damage and wrecks, health bars, status card and crash witnesses. Detailed logging is a settings.ini line ([log] verbose=1) for bug reports.
 
 Configuration folder: Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul
 

@@ -1136,7 +1136,7 @@ namespace hoverui
 			if (!NewObject(movie, out, "Array")) return false;
 			TextOption(movie,*out,kFeatureHeader,5,kCategoryName,"Vehicle gameplay and display settings.",false);
 			for (int i = 0; i < int(features::Id::Count); ++i) {
-				if (!features::Available(features::Id(i))) continue;
+				if (!features::InMenu(features::Id(i))) continue;  // the streamlined menu (features.h)
 				const auto& f = features::InfoOf(features::Id(i));
 				Value e;
 				if (!NewObject(movie, &e, "Object")) continue;
@@ -1331,7 +1331,11 @@ namespace hoverui
 					for (const bool pad : { false, true }) {
 						if (pad ? !anyPad : !anyKbm) continue;
 						OurControlRow(movie, all, names, -1, pad, category, sort + ++k);
-						for (int a = 0; a < int(bindings::Action::Count); ++a) OurControlRow(movie, all, names, a, pad, category, sort + ++k);
+						for (int a = 0; a < int(bindings::Action::Count); ++a) {
+							// Placement mode was removed (2026-10-28, the user: "a build tool for me"): its key rows are not listed.
+							if (bindings::kDefs[a].layer == bindings::Layer::Placement) continue;
+							OurControlRow(movie, all, names, a, pad, category, sort + ++k);
+						}
 					}
 					double selection = 0;
 					GetNumber(list, "selectedIndex", selection);

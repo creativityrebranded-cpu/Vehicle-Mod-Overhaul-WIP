@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyingVehicleOverhaul VERSION 0.8.5 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 0.8.6 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

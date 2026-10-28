@@ -22,14 +22,15 @@ RETIRED = ('FVO_CityTraffic.esm',)
 IMPLICIT_MASTERS = {'starfield.esm'}
 SCHEMA_URL = 'https://raw.githubusercontent.com/Nexus-Mods/fomod-installer/master/src/InstallScripting/XmlScript/Schemas/XmlScript5.0.xsd'
 PROFILE = 'SFSE/Plugins/FlyingVehicleOverhaul.features/'
-FEATURE_PAGES = ('Flight and Navigation','NPCs and Combat','HUD')  # the 0.8 pages: an update keeps the same installer layout
-FIXED_FEATURES = {'Placement':False,'PlacementMode':False,'DebugLog':False}
+FEATURE_PAGES = ('Flight and Navigation','NPCs and Combat')  # 0.8.6: the streamlined menu (features.h InMenu); page names kept
+# Not offered: removed or development switches (written off) and the always-on features (written on; the DLL ignores them anyway).
+ALWAYS_ON = ('CombatAi','HoverOrDrive','VehicleDamage','HealthBars','StatusCard','Witnesses','NativeGround')
+FIXED_FEATURES = {'Placement':False,'PlacementMode':False,'DebugLog':False,'PhysicalAi':False, **{name:True for name in ALWAYS_ON}}
 FEATURE_GROUPS = {
-    'HoverOrDrive':FEATURE_PAGES[0], 'FreeRoll':FEATURE_PAGES[0], 'FlightAssist':FEATURE_PAGES[0],
-    'PhysicalVtol':FEATURE_PAGES[0], 'PhysicalAi':FEATURE_PAGES[0], 'NativeGround':FEATURE_PAGES[0],
-    'NpcVehicles':FEATURE_PAGES[1], 'CombatAi':FEATURE_PAGES[1], 'VehicleDamage':FEATURE_PAGES[1], 'Witnesses':FEATURE_PAGES[1], 'Traffic':FEATURE_PAGES[1], 'RouteMarkers':FEATURE_PAGES[1],
-    'HealthBars':FEATURE_PAGES[2], 'StatusCard':FEATURE_PAGES[2],
-    'Placement':None, 'PlacementMode':None, 'DebugLog':None,
+    'PhysicalVtol':FEATURE_PAGES[0], 'FlightAssist':FEATURE_PAGES[0], 'FreeRoll':FEATURE_PAGES[0],
+    'NpcVehicles':FEATURE_PAGES[1], 'Traffic':FEATURE_PAGES[1], 'RouteMarkers':FEATURE_PAGES[1],
+    'HoverOrDrive':None, 'NativeGround':None, 'CombatAi':None, 'VehicleDamage':None, 'Witnesses':None, 'HealthBars':None, 'StatusCard':None,
+    'PhysicalAi':None, 'Placement':None, 'PlacementMode':None, 'DebugLog':None,
 }
 
 
@@ -174,7 +175,7 @@ def module_config(dependencies, features):
         if apply:
             for feature in features:
                 if feature['configurable']:continue
-                ET.SubElement(files,'file',source=f"40 Features/{feature['id']}/Off.ini",
+                ET.SubElement(files,'file',source=f"40 Features/{feature['id']}/{'On' if FIXED_FEATURES[feature['id']] else 'Off'}.ini",
                               destination=PROFILE+feature['section']+'.'+feature['key']+'.ini',priority='0')
         ET.SubElement(ET.SubElement(plugin,'conditionFlags'),'flag',name='configure_features').text='Yes' if apply else 'No'
         ET.SubElement(ET.SubElement(plugin,'typeDescriptor'),'type',name='Recommended' if apply else 'Optional')

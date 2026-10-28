@@ -1,0 +1,14 @@
+FVO 0.8.6 - a shorter settings menu, a summon fix and placement mode removed
+
+This update follows 0.8.5 (AI navigation, entering and exiting, the passenger system and your own traffic routes) with three changes.
+
+The settings menu is now six switches. Physical flight is one switch for you and every AI pilot: thrust, torque, mass and inertia, so speed builds and coasts and turns bank. It stays off by default. Flight assist (on) and Free roll (off) are next to it. NPCs use vehicles, Everyday traffic and Show traffic routes cover the rest. Full combat AI, hover-or-drive, ground navigation, damage and wrecks, health bars, the status card and crash witnesses are now always on and no longer in the menu. Your existing settings file keeps working; old switches for always-on features are simply ignored. Detailed logging moved to a settings.ini line ([log] verbose=1) for bug reports.
+
+Summoning from far away now works when you are high in the air. Before, the vehicle only looked for ground 120 m below your height, so it could say it had moved to you while never arriving. It now finds the ground under the pickup spot, tries two more spots round you if the first is a slope or a roof edge, and shows CALLING until it has really moved.
+
+Placement mode, the scanner tool for recording parking spots, was removed; it was a build tool. The spots already recorded stay, and so do summon points you set.
+
+INSTALL / UPDATE
+Use FlyingVehicleOverhaul-0.8.6.zip plus any addon ZIPs, or the FOMOD instead. The installer keeps the same options as 0.8 and 0.8.5: New Atlantis City Traffic (route traffic DLL and files) and New Atlantis City Placements (ESM) are separate; use either or both. Its feature pages now show only the six switches. Replace the previous FVO entry, enable FVO_NPCPilots.esm and launch through SFSE for Steam Starfield 1.16.244. Choose "Keep existing gameplay settings" to keep your configuration.
+
+Still WIP: combat at different levels and the far summon fix need more testing. Please include your FVO log when something goes wrong.

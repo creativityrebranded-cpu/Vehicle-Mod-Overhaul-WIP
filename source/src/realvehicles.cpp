@@ -705,7 +705,9 @@ namespace realvehicles
 		flag.resize(slash+1);flag+=L"Data\\SFSE\\Plugins\\";
 		const bool flagged=GetFileAttributesW((flag+L"FlyingVehicleOverhaul.placement-recording").c_str())!=INVALID_FILE_ATTRIBUTES||
 			GetFileAttributesW((flag+L"SeamlessVehicle.placement-recording").c_str())!=INVALID_FILE_ATTRIBUTES;  // the pre-0.73.0 name still counts
-		const bool active=flagged||features::On(features::Id::PlacementMode);
+		// The spot recorder was the user's build tool (removed 2026-10-28): neither the flag file nor the setting turns it on.
+		(void)flagged;
+		const bool active=false;
 		if(!told||enabled!=active){enabled=active;told=true;logger::Write("Placement recorder: %s; scanner taps %s",enabled?"ON":"off",enabled?"save native vehicle parking positions":"use normal controls");}
 		return enabled;
 	}

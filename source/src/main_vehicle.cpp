@@ -346,7 +346,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 85, "FlyingVehicleOverhaul", "seemless",
+	SFSEPluginVersionData::kVersion, 86, "FlyingVehicleOverhaul", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -372,7 +372,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Write("Flying Vehicle Overhaul (FVO) 0.8.5 loaded; core optional");
+	logger::Write("Flying Vehicle Overhaul (FVO) 0.8.6 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

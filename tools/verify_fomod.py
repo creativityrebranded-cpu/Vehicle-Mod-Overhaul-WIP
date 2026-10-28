@@ -10,7 +10,7 @@ import json
 from pathlib import Path, PurePosixPath
 import xml.etree.ElementTree as ET
 import zipfile
-from package_fomod import masters, DLL, PILOTS, PATCH, CITY, CITY_DLL, CITY_TRAFFIC, ROUTE_GUIDE, RETIRED, PROFILE
+from package_fomod import masters, DLL, PILOTS, PATCH, CITY, CITY_DLL, CITY_TRAFFIC, ROUTE_GUIDE, RETIRED, PROFILE, ALWAYS_ON
 
 
 def dependencies_match(node, states):
@@ -98,12 +98,12 @@ def verify(path, schema=None):
                       + tuple(r.casefold() for r in RETIRED)), 'Removed content not reintroduced')
         features=json.loads(archive.read('fomod/features.json'))
         check(len(features)==17 and len({f['id'] for f in features})==17,'Complete runtime profile has 17 distinct keys')
-        check(len([f for f in features if f['configurable']])==14,'Only 14 gameplay switches are configurable')
+        check(len([f for f in features if f['configurable']])==6,'Only the 6 menu switches are configurable')
         hidden=[f for f in features if not f['configurable']]
-        check({f['id'] for f in hidden}=={'Placement','PlacementMode','DebugLog'},'Randomizer, authoring and verbose logging are excluded')
+        check({f['id'] for f in hidden}=={'Placement','PlacementMode','DebugLog','PhysicalAi',*ALWAYS_ON},'Removed, development, merged and always-on switches are excluded')
         pages=root.findall('installSteps/installStep')[1:]
-        check([p.get('name') for p in pages]==['Flight and Navigation','NPCs and Combat','HUD'],
-              'Feature switches keep the three 0.8 pages')
+        check([p.get('name') for p in pages]==['Flight and Navigation','NPCs and Combat'],
+              'Feature switches on the two remaining 0.8 pages')
         counts=[]
         for page in pages:
             groups=page.findall('optionalFileGroups/group');counts.append(len(groups))
@@ -120,15 +120,16 @@ def verify(path, schema=None):
                     check(file.get('destination')==PROFILE+feature['section']+'.'+feature['key']+'.ini','Feature output goes to the runtime import folder')
                     ini=configparser.ConfigParser();ini.read_string(archive.read(file.get('source')).decode('ascii'))
                     check(dict(ini['feature'])=={'section':feature['section'],'key':feature['key'],'value':str(int(enabled))},'Every on/off fragment identifies the exact runtime setting')
-        check(counts==[6,6,2],'Gameplay choices grouped 6/6/2')
+        check(counts==[3,3],'Gameplay choices grouped 3/3')
         check(not next(f for f in features if f['id']=='RouteMarkers')['default'],'Route probes are off by default')
         shown={g.get('name') for p in pages for g in p.findall('optionalFileGroups/group')}
         check('Placement mode' not in shown and 'Detailed log' not in shown,'Removed option labels are not shown')
         for f in hidden:
-            check(f"40 Features/{f['id']}/On.ini" not in names,'No enabled payload for a removed development option')
-            ini=configparser.ConfigParser();ini.read_string(archive.read(f"40 Features/{f['id']}/Off.ini").decode('ascii'))
-            check(ini['feature']['value']=='0','Removed development switch fixed off in configured profiles')
-        check(all(not f['default'] for f in features if f['id'] in ('PhysicalVtol','PhysicalAi','NativeGround','FreeRoll')),'Experimental physics and ground planner remain off by default')
+            on=f['id'] in ALWAYS_ON
+            check(f"40 Features/{f['id']}/{'Off' if on else 'On'}.ini" not in names,'A fixed switch ships only its fixed value')
+            ini=configparser.ConfigParser();ini.read_string(archive.read(f"40 Features/{f['id']}/{'On' if on else 'Off'}.ini").decode('ascii'))
+            check(ini['feature']['value']==('1' if on else '0'),'Fixed switch written at its fixed value in configured profiles')
+        check(all(not f['default'] for f in features if f['id'] in ('PhysicalVtol','PhysicalAi','FreeRoll')),'Physical flight and free roll remain off by default')
         check(not next(f for f in features if f['id']=='Placement')['default'],'Retired randomizer compatibility key fixed off')
         mode=root.find("installSteps/installStep/optionalFileGroups/group[@name='Feature configuration']")
         check(mode is not None and mode.get('type')=='SelectExactlyOne','Setup offers configure or keep existing')

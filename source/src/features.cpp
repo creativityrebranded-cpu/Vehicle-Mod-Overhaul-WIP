@@ -27,14 +27,14 @@ namespace features
 			{ Id::StatusCard, "Vehicle status card", "The card that shows what your vehicle is doing.", L"hud", L"card", true },
 			{ Id::Witnesses, "Crash witnesses", "Bystanders flee or cower near a vehicle crash.", L"witness", L"enabled", true },
 			{ Id::Placement, "Removed vehicle randomizer", "Compatibility key only; vehicle types remain as supplied by their plugins.", L"placement", L"enabled", false },
-			{ Id::FreeRoll, "Free roll (hover)", "Your hovering vehicle can roll all the way round and turns about its own axes. Off: the roll stops at 46 degrees and levels by itself.", L"flight", L"freeRoll", false },
+			{ Id::FreeRoll, "Free roll", "Your hover can roll all the way round and turns about its own axes. Off: the roll stops at 46 degrees and levels by itself.", L"flight", L"freeRoll", false },
 			{ Id::FlightAssist, "Flight assist", "Free roll levels near upright. With Physical VTOL, bounded thrusters and torque stabilize drift and spin. Off: manual VTOL retains uncommanded momentum.", L"flight", L"assist", true },
-			{ Id::PhysicalVtol, "Physical VTOL (experimental)", "Player hover uses thruster forces and torque with native mass and inertia. Flight assist stabilizes it; off preserves uncommanded spin and drift. No wing aerodynamics yet.", L"flight", L"physicalVtol", false },
+			{ Id::PhysicalVtol, "Physical flight", "Hover vehicles fly with thruster forces and torque on their native mass and inertia: speed builds and coasts, turns bank. Applies to your vehicle and to every AI pilot (autopilot, summons, NPC drivers). Off: the standard hover.", L"flight", L"physicalVtol", false },
 			{ Id::PhysicalAi, "Physical VTOL for AI pilots (experimental)", "Autopilot trips, summons and NPC-driven vehicles fly with thruster forces and torque on native mass and inertia: turns bank, speed builds and coasts. A vehicle whose speed the game keeps wiping falls back to the standard flight.", L"flight", L"physicalAi", false },
 			{ Id::PlacementMode, "Placement mode", "The scanner's action key edits vehicle spots instead of targeting. Tap: save a parking spot where you aim. Hold: delete the saved spot you aim at. Double tap: make it this area's summon point, where your vehicle appears when summoned from far away. Spots take effect after the placements are rebuilt.", L"placement", L"recording", false },
 			{ Id::NativeGround, "Ground planner and native driving (experimental)", "Vehicles plan their routes on the ground first: around water, cliffs, steep slopes and buildings, on roads where there are any, flying only where driving cannot go. Vehicles with a driver use the game's own ground driving. Off: the old hover-or-drive rules.", L"nav", L"groundPlanner", false },
 			{ Id::DebugLog, "Detailed log", "Writes much more to the mod's log, for bug reports.", L"log", L"verbose", false },
-			{ Id::Traffic, "Everyday traffic", "Calm NPCs take parked vehicles near you on round trips to nearby settlements and outposts, then park them again. No vehicles are created.", L"context", L"traffic", true },
+			{ Id::Traffic, "Everyday traffic", "Calm NPCs take parked vehicles near you on trips. With city traffic installed they fly the routes in Data/SFSE/Plugins/FVO_Traffic: onto a route, off at the exit nearest a landing place, or a lap and home. No vehicles are created.", L"context", L"traffic", true },
 			{ Id::RouteMarkers, "Show traffic routes", "Probes in the sky along every route in the FVO_Traffic files of the world you are in, larger ones at exits and landing places. The routes themselves are only defined in the files.", L"traffic", L"markers", false },
 		};
 
@@ -104,6 +104,8 @@ namespace features
 	bool On(Id id)
 	{
 		if (!Available(id)) return false;
+		if (AlwaysOn(id)) return true;
+		if (id == Id::PhysicalAi) id = Id::PhysicalVtol;  // one Physical flight switch for the player and every pilot
 		if (!g_loaded) {
 			// Before the first Tick (a hook at load): the defaults, the ini read once.
 			static std::once_flag once;

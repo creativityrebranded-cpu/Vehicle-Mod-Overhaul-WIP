@@ -29,7 +29,22 @@ namespace features
 		RouteMarkers,   // [traffic] markers: probes along the traffic files' routes, exits and places (routeprobes.h)
 		Count
 	};
-	inline constexpr bool Available(Id id) { return id != Id::Placement; }
+	// Placement (the old randomizer) and PlacementMode (the spot recorder, removed 2026-10-28: the user's own build tool) keep
+	// their ids and keys so settings.ini numbering is unchanged; neither is offered or can be switched on.
+	inline constexpr bool Available(Id id) { return id != Id::Placement && id != Id::PlacementMode; }
+	// The streamlined menu (2026-10-28, the user: "a lot of things are going to be on no matter what and some things can just
+	// be combined"): these are always on (keys kept so old settings files still line up; an old 0 is ignored).
+	inline constexpr bool AlwaysOn(Id id)
+	{
+		return id == Id::CombatAi || id == Id::HoverOrDrive || id == Id::VehicleDamage || id == Id::HealthBars || id == Id::StatusCard ||
+			id == Id::Witnesses || id == Id::NativeGround;
+	}
+	// Shown in the settings menu: Physical flight (it also drives AI pilots: PhysicalAi follows PhysicalVtol), Flight assist,
+	// Free roll, NPCs use vehicles, Everyday traffic, Show traffic routes. The detailed log stays a settings.ini line.
+	inline constexpr bool InMenu(Id id)
+	{
+		return Available(id) && !AlwaysOn(id) && id != Id::PhysicalAi && id != Id::DebugLog;
+	}
 
 	struct Info
 	{

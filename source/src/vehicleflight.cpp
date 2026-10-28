@@ -2222,6 +2222,7 @@ namespace vehicleflight
 			double x = 0, y = 0, z = 0, yaw = 0;
 			ULONGLONG asked = 0;
 			bool summonPoint = false;  // to the area's summon point, not next to the player
+			int tries = 0;             // spots already found unsafe (FinishMove tries others round the player)
 		} g_move;
 		ULONGLONG g_movedAt = 0;  // the last summon move (the HUD says "MOVED TO YOU" for a few seconds)
 		bool g_movedToPoint = false;  // ... or "AT SUMMON POINT"
@@ -2320,7 +2321,7 @@ namespace vehicleflight
 			double sx, sy, sz, syaw;
 			if (summonPoint && realvehicles::SummonPointNear(pp.x, pp.y, sx, sy, sz, syaw)) {
 				g_move = { true, sx, sy, sz, syaw, GetTickCount64(), true };
-				prefetch::RequestGround(prefetch::kSlotRescue0, float(sx), float(sy), float(sz) + 60.0f, 0.0f, 400.0f);
+				prefetch::RequestGround(prefetch::kSlotRescue0, float(sx), float(sy), float(sz) + 60.0f, 0.0f, 3000.0f);
 				logger::Write("Rover call: moving it to this area's summon point (%.1f, %.1f, %.1f), %.0f m from the player", sx, sy, sz,
 					std::hypot(sx - pp.x, sy - pp.y));
 				return;
@@ -2329,7 +2330,7 @@ namespace vehicleflight
 			// 12 m behind the player and 3 m to the right (out of view), facing the way the player faces.
 			const double fx = std::sin(yaw), fy = std::cos(yaw), rx = std::cos(yaw), ry = -std::sin(yaw);
 			g_move = { true, pp.x + rx * 3.0 - fx * 12.0, pp.y + ry * 3.0 - fy * 12.0, pp.z, yaw, GetTickCount64() };
-			prefetch::RequestGround(prefetch::kSlotRescue0, float(g_move.x), float(g_move.y), pp.z + 60.0f, 0.0f, 400.0f);
+			prefetch::RequestGround(prefetch::kSlotRescue0, float(g_move.x), float(g_move.y), pp.z + 60.0f, 0.0f, 3000.0f);  // 400 m missed the ground under a player high in the air
 		}
 
 		void FinishMove(std::uintptr_t player)
@@ -2337,10 +2338,31 @@ namespace vehicleflight
 			if (!g_move.pending) return;
 			if(vehiclehits::Wrecked(g_roverId)||IsDisabled(g_roverId)){g_move.pending=false;return;}
             const auto rover=Rover();
-            const auto site=environment::CheckSite(g_roverId,g_move.x,g_move.y,g_move.z,g_move.yaw);
+            // 2026-10-28 (the user: a summon 400 m away while high in the air said "moved to you" and the vehicle never came): the
+            // site check casts from 6 m over to 120 m under the height it is given, which was the player's. The ground under the
+            // spot (the long ray asked for in AskMove) is the height to check at; until that ray answers, wait.
+            double checkZ=g_move.z;
+            {
+                float ground=0;unsigned age=0;
+                if(prefetch::LatestGround(prefetch::kSlotRescue0,ground,age)&&age<120&&ground>-1.0e30f&&std::isfinite(ground))checkZ=double(ground)+2.0;
+                else if(GetTickCount64()-g_move.asked<6000)return;
+            }
+            const auto site=environment::CheckSite(g_roverId,g_move.x,g_move.y,checkZ,g_move.yaw);
             if(site.verdict!=environment::Verdict::Safe) {
-                if(GetTickCount64()-g_move.asked<4000)return;
-                g_move.pending=false;notify::Show("Summon: no safe pickup site");logger::Write("Summon refused: %s",site.reason);return;
+                const bool decided=site.verdict==environment::Verdict::Unsafe;
+                if(!decided&&GetTickCount64()-g_move.asked<6000)return;
+                // An unsafe spot (slope, roof edge, water) is not the end of the summon: two more spots round the player,
+                // 15 m out and 120 degrees apart, each with its own long ground ray.
+                if(!g_move.summonPoint&&g_move.tries<2){
+                    ++g_move.tries;
+                    const auto pp=At<game::Vec3>(player,off::kRefPosition);
+                    const double a=g_move.yaw+3.14159265358979+g_move.tries*2.0943951;
+                    g_move.x=pp.x+std::sin(a)*15.0;g_move.y=pp.y+std::cos(a)*15.0;g_move.asked=GetTickCount64();
+                    prefetch::RequestGround(prefetch::kSlotRescue0,float(g_move.x),float(g_move.y),pp.z+60.0f,0.0f,3000.0f);
+                    logger::Write("Summon: spot %d unsafe (%s); trying another at (%.0f, %.0f)",g_move.tries,site.reason,g_move.x,g_move.y);
+                    return;
+                }
+                g_move.pending=false;notify::Show("Summon: no safe pickup site");logger::Write("Summon refused after %d spots: %s",g_move.tries+1,site.reason);return;
             }
             g_move.pending=false;
 			const auto cell = At<std::uintptr_t>(player, off::kRefParentCell);
@@ -5270,7 +5292,8 @@ namespace vehicleflight
 				else if (g_remote && vcontract::AssignedTo(g_roverId))  // the empty vehicle runs its navigation profile: SCOUT, RETURN HOME
 					std::snprintf(status, sizeof(status), "%s", profileclass::Upper(vcontract::AssignedTo(g_roverId)->name).c_str());
 				else if (g.autopilot) std::snprintf(status, sizeof(status), "SUMMONING  %.0f m", std::min(toRover, 9999.0));
-				else if (g_move.pending || (g_movedAt && nowMs - g_movedAt < 4000)) std::snprintf(status, sizeof(status), (g_move.pending ? g_move.summonPoint : g_movedToPoint) ? "AT SUMMON POINT" : "MOVED TO YOU");
+				else if (g_move.pending) std::snprintf(status, sizeof(status), "CALLING");  // not "moved" until it has (2026-10-28)
+				else if (g_movedAt && nowMs - g_movedAt < 4000) std::snprintf(status, sizeof(status), g_movedToPoint ? "AT SUMMON POINT" : "MOVED TO YOU");
 			}
 			const std::string callKey = bindings::Label(bindings::Action::Summon, g_keys.call);
 			const std::string followKey = bindings::Label(bindings::Action::Cover, g_keys.follow);
