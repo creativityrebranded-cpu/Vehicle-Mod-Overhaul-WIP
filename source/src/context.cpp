@@ -536,6 +536,24 @@ extern "C" __declspec(dllexport) unsigned FVO_BaseOf(unsigned refId)
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+// A reference's position, when it is loaded in the player's worldspace (the traffic addon's city anchors, 2026-10-28).
+extern "C" __declspec(dllexport) int FVO_RefPos(unsigned refId, double* xyz)
+{
+	if (!xyz) return 0;
+	__try {
+		const std::uintptr_t ref = runtimeforms::Lookup(refId);
+		const auto player = *reinterpret_cast<const std::uintptr_t*>(game::Base() + addr::kPlayerCharacterPtr);
+		if (!ref || !player) return 0;
+		const std::uintptr_t cell = *reinterpret_cast<const std::uintptr_t*>(ref + off::kRefParentCell);
+		const std::uintptr_t pcell = *reinterpret_cast<const std::uintptr_t*>(player + off::kRefParentCell);
+		const std::uintptr_t ws = cell ? *reinterpret_cast<const std::uintptr_t*>(cell + off::kCellWorldspace) : 0;
+		if (!ws || !pcell || ws != *reinterpret_cast<const std::uintptr_t*>(pcell + off::kCellWorldspace)) return 0;
+		const float* p = reinterpret_cast<const float*>(ref + off::kRefPosition);
+		xyz[0] = p[0]; xyz[1] = p[1]; xyz[2] = p[2];
+		return 1;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 extern "C" __declspec(dllexport) int FVO_RegisterTick(FvoTick_t tick)
 {
 	context::g_addonTick = tick;

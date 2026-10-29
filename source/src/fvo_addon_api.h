@@ -28,6 +28,21 @@ typedef int (*FvoWorldName_t)(char* out, int size);                  // export "
 typedef unsigned (*FvoBaseOf_t)(unsigned refId);                     // export "FVO_BaseOf": a reference's base form id; 0 unknown
 // export "FVO_SetRouteMarkers": probes for `world` at `count` points (x, y, z, scale each); shown while "Show traffic routes" is on.
 typedef void (*FvoSetRouteMarkers_t)(const char* world, const float* xyzs, int count);
+// export "FVO_RefPos" (2026-10-28): a reference's position (x, y, z) while it is loaded in the player's worldspace; 0 otherwise.
+typedef int (*FvoRefPos_t)(unsigned refId, double* xyz);
+// Cold-start pool (2026-10-28): spawn spots on the ground for `world`; core makes one vehicle with a seated citizen driver per
+// spot (once per save, reused afterwards) and, once the driver sits, asks `trip` for a trip (return 1 and fill `out`; 0 = not
+// yet, asked again in 2 s). heading: radians, clockwise from north.
+struct FvoPoolSpot { double x, y, z, heading; };
+typedef int (*FvoPoolTrip)(int spot, unsigned vehicleId, double x, double y, double z, FvoTripClaim* out);
+typedef void (*FvoPoolSet_t)(const char* world, const FvoPoolSpot* spots, int count, FvoPoolTrip trip);  // export "FVO_PoolSet"
+// Auto on routes (2026-10-28, the user: "a destination with a traffic route nearby adds as one of the vehicles and uses it to get
+// to the nearest exit to the destination and then continue from there"). When the player's Auto starts for a marker, core asks
+// the planner once: return 1 and fill `out` with a trip from (x, y, z) to (tx, ty, tz) along a route (climb, a free lane slot,
+// the lane, out at the exit nearest the target); 0 = no route helps (Auto flies straight). Core flies the trip's goals, then
+// the rest of the way to the marker when the step returns non-zero.
+typedef int (*FvoRoutePlanner)(unsigned vehicleId, double x, double y, double z, double tx, double ty, double tz, FvoTripClaim* out);
+typedef int (*FvoRegisterRoutePlanner_t)(FvoRoutePlanner planner);  // export "FVO_RegisterRoutePlanner"; 1: registered
 typedef void (*FvoTick_t)();                                         // called by core every frame on the main thread
 typedef int (*FvoRegisterTick_t)(FvoTick_t tick);                    // export "FVO_RegisterTick"; 1: registered
 }

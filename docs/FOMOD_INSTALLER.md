@@ -40,7 +40,15 @@ Packaging requires a source and DLL with the feature-import bridge; it refuses
 an older DLL that would silently ignore the new installer choices.
 
 - Required core: `FlyingVehicleOverhaul.dll`, `FVO_NPCPilots.esm`, install guide.
-- Optional, unchecked: New Atlantis parked vehicles (`FVO_CityPlacements.esm`).
+- Optional, ticked (0.9.0): City Traffic (`FVO_CityPlacements.dll`, `HOW-TO-MAKE-ROUTES.txt`).
+  Its pages: **City traffic routes** (one choice per route, all ticked: New Atlantis ring and
+  district loop, Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead,
+  Paradiso, Red Mile), **Traffic options** (traffic already flying, or starts empty: the same
+  route files with `start_on_route = 0`; New Atlantis's cold-start spots file is skipped) and
+  **Route beacons** (show/hide; shown only with "Choose features in this installer", because
+  keep mode ignores feature files). Route files install through flag-gated conditional
+  installs (`city_traffic`, `route_<key>`, `coldstart`) from `11 Route Traffic/Flying` or `/Empty`.
+- Optional, ticked: City Placements, parked vehicles in nine cities (`FVO_CityPlacements.esm`).
 - Optional, unchecked: Parked Vehicles conversion (`FVO_ParkedVehiclesPatch.esm`).
 
 The optional components are independent. Each becomes selectable only when

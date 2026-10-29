@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import re
 import zipfile
-from package_fomod import build, write_zip, DLL, PILOTS, PATCH, CITY, CITY_DLL, CITY_TRAFFIC, ROUTE_GUIDE
+from package_fomod import build, write_zip, DLL, PILOTS, PATCH, CITY, CITY_DLL, ROUTE_GUIDE, ROUTE_FILES, TRAFFIC_DIR
 
 
 def version_folder(release_root,version):
@@ -59,12 +59,20 @@ Do not install source ZIPs into the game.
 
 Two separate parts; install either or both into Starfield/Data with the main package:
 
-1. New Atlantis placements: FVO_CityPlacements.esm adds parked vehicles around New
-   Atlantis. Enable it in your plugin list after its masters.
-2. City traffic: SFSE/Plugins/FVO_CityPlacements.dll and SFSE/Plugins/FVO_Traffic/
-   (NewAtlantis.ini, a ring round New Atlantis, and HOW-TO-MAKE-ROUTES.txt). Needs no
-   ESM; it uses whatever parked vehicles are there. Every .ini in FVO_Traffic is a
-   route file you can edit or add.
+1. City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities.
+   Enable it in your plugin list after its masters.
+2. City traffic: SFSE/Plugins/FVO_CityPlacements.dll and SFSE/Plugins/FVO_Traffic/:
+   route files for New Atlantis (NewAtlantis.ini, the ring, with its cold-start spots in
+   NewAtlantis-ColdStart.ini; NewAtlantis-3D.ini, the district loop), Akila City,
+   Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso and Red Mile,
+   and HOW-TO-MAKE-ROUTES.txt. Needs no ESM; it uses whatever parked vehicles are there.
+   Every .ini in FVO_Traffic is a route file you can edit, add or delete (delete a
+   city's file to leave it without route traffic).
+
+These route files start with traffic already flying (start_on_route = N: vehicles with
+seated drivers, made once per save). Set start_on_route = 0 in a file for traffic that
+comes only from parked vehicles. Route beacons: "Show traffic routes" in the game's
+settings menu. The FOMOD installer offers all of this as choices.
 
 Leave out the part you do not want: delete the ESM (or keep it disabled) for traffic
 only, or delete the DLL and the FVO_Traffic folder for placements only.
@@ -80,7 +88,7 @@ Vehicles - Real.esm patch.
     with zipfile.ZipFile(fomod) as z:
         extra_entries={CITY:z.read('10 City Placements/'+CITY),
                        CITY_DLL:z.read('11 Route Traffic/'+CITY_DLL),
-                       CITY_TRAFFIC:z.read('11 Route Traffic/'+CITY_TRAFFIC),
+                       **{name:z.read('11 Route Traffic/Flying/'+name[len(TRAFFIC_DIR):]) for name in ROUTE_FILES},
                        ROUTE_GUIDE:z.read('11 Route Traffic/'+ROUTE_GUIDE),
                        'Docs/FlyingVehicleOverhaul-ExtraVehicles.txt':extra_guide}
         patch_entries={PATCH:z.read('20 Parked Vehicles Patch/'+PATCH),
@@ -103,11 +111,11 @@ Vehicles - Real.esm patch.
 Choose one installation method:
 
 1. Separate ZIPs: {main.name} (required), plus optional
-   {extra.name} (New Atlantis placements ESM and/or city traffic DLL + route files;
-   use either or both) and {patch.name} (needs Parked Vehicles).
+   {extra.name} (City Placements ESM and/or city traffic DLL + route files for
+   eleven routes; use either or both) and {patch.name} (needs Parked Vehicles).
 
 2. Installer: {fomod.name}
-   Use Vortex/MO2 for grouped feature settings, the two Extra Vehicles toggles and the patch.
+   Use Vortex/MO2 for grouped feature settings, city traffic route by route, City Placements and the patch.
    This replaces the separate ZIPs.
 
 Source for developers: {source.name}

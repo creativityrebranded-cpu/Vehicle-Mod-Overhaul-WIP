@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current packaged version: **0.8.6** (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current packaged version: **0.9.0** (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -82,7 +82,7 @@ before installing or upgrading.
 
 ## Installation
 
-Release 0.8.6 is organized in a version folder with a main ZIP, separate optional
+Release 0.9.0 is organized in a version folder with a main ZIP, separate optional
 Extra Vehicles and Parked Vehicles patch ZIPs, and an alternative all-in-one
 FOMOD ZIP. Matching source and hashes are alongside them. See
 [release packaging](docs/RELEASE_PACKAGING.md). Published 0.73.0 archives predate
@@ -90,10 +90,10 @@ this installer layout.
 
 1. Install SFSE for Steam Starfield 1.16.244.
 2. Install the FOMOD ZIP through Vortex or Mod Organizer 2. The core DLL and
-   `FVO_NPCPilots.esm` always install. Both addon checkboxes start unchecked.
-3. Select **Extra parked vehicles - New Atlantis** only if wanted. Select the
-   **Parked Vehicles conversion patch** independently, with all its required
-   masters active. Unavailable choices list their dependencies in the installer.
+   `FVO_NPCPilots.esm` always install. City Traffic and City Placements start ticked.
+3. Choose the city traffic routes, whether traffic starts already flying, and route
+   beacons. Select the **Parked Vehicles conversion patch** independently, with all its
+   required masters active. Unavailable choices list their dependencies in the installer.
 4. Enable `FVO_NPCPilots.esm` and the addon plugins you selected. Load the
    conversion patch after its masters, then launch through SFSE.
 5. Check `Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log`.
@@ -145,6 +145,15 @@ Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation 
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
 
+## What's new in 0.9.0
+
+- **City traffic in ten cities:** eleven routes (New Atlantis slanted ring and district loop, Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso, Red Mile), chosen city by city in the installer.
+- **Traffic already flying:** vehicles with seated drivers start on the routes, made once per save and reused (`start_on_route`).
+- **Traffic beyond the loaded area:** FVO vehicles and drivers pass the game's loaded-area wall, stay persistent and keep moving visibly past the loaded cells (`loadedarea.cpp`, `[physics] fvoWallPass`).
+- **Exits:** wreck occupants and drivers who get out to fight stand up with the game's get-up.
+- **City Placements** in nine cities; **route beacons** on by default; new default HUD layout.
+- **Installer:** routes per city, traffic already flying or starting empty, route beacons; City Traffic and City Placements pre-ticked.
+
 ## What's new in 0.8.6
 
 - **Settings menu:** six switches (Physical flight for you and AI pilots, Flight assist, Free roll, NPCs use vehicles, Everyday traffic, Show traffic routes); combat AI, hover-or-drive, ground navigation, damage, health bars, status card and witnesses are always on.
@@ -159,7 +168,7 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 - **Route making:** traffic flies routes in plain `.ini` files in `Data\SFSE\Plugins\FVO_Traffic` (rings, open or looping paths, exits, landing places, per-world rules). `HOW-TO-MAKE-ROUTES.txt` in that folder explains every line; "Show traffic routes" draws them with probes.
 - **Installer:** the same options and pages as 0.8 (updates keep choices); New Atlantis City Traffic installs the route traffic, New Atlantis City Placements the parked vehicles.
 
-Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_0.8.6.txt](docs/NEXUS_POST_0.8.6.txt).
+Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_0.9.0.txt](docs/NEXUS_POST_0.9.0.txt).
 
 ## What's new in 0.73.0
 

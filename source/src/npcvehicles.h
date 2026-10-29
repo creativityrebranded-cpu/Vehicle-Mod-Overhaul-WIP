@@ -23,6 +23,8 @@ namespace npcvehicles
 	void Tick();   // main thread, every frame
 	void Reset();  // a save load
 	bool UsesVehicle(std::uint32_t vehicleId);  // an NPC job is boarding / driving it
+	// Every vehicle an NPC job has (not idle) and its NPC (form ids); returns how many were written. Main thread.
+	int FlownVehicles(std::uint32_t* vehicles, std::uint32_t* drivers, int max);
 	// The pilot (1..) whose NPC drives this vehicle (a job following), else 0.
 	int PilotFor(std::uint32_t vehicleId);
 	// Anyone (a job NPC, a gang driver, a stranger) sits in the driver seat of this vehicle.
@@ -120,6 +122,8 @@ namespace npcvehicles
 	bool StartSupply(std::uintptr_t actor, std::uintptr_t vehicle, double x, double y);
 	// An addon's scripted trip (fvo_addon_api.h): boards, then flies the addon's goal each frame, then parks at home.
 	bool StartScripted(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);
+	// The same for a driver already sitting in the vehicle (the cold-start pool): no walk, no boarding; the job takes it aboard.
+	bool StartScriptedSeated(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);
 	// Recall: every escort drops its fight for `ms` and comes back into formation.
 	void Recall(unsigned ms);
 	// The player's stance (the stance key, 2026-10-21): it sets the Combat and Weapons classes of the player's own vehicle and every follower's

@@ -1,7 +1,7 @@
 Update/Installation Notice:
 If you're using an older version and updating, delete all the older files and replace with the newer files. FVO is also now compatible with mod managers.
 
-Flying Vehicle Overhaul 0.8.6 — Early WIP
+Flying Vehicle Overhaul 0.9 — Early WIP
 Hover vehicles with gears, terrain following and autopilot. Summon your vehicle, have it follow or cover you, send it along scanner routes, ride with NPC drivers, or let city traffic fly routes you write in simple text files. NPCs can use compatible vehicles for travel and combat.
 What it does
 
@@ -11,11 +11,21 @@ What it does
 * Seats and passengers: get into a vehicle someone is driving and you ride as a passenger while their autopilot drives. Hold to pull the driver out and take the wheel. Followers take the passenger seats when you drive.
 * Combat and faction reactions: vehicle manoeuvres, squad roles, morale, attacks and retreats. Set Defend / Attack / Hold fire, or focus a hostile person or hostile-driven vehicle. Ownership and allegiance govern vehicle use and friendly-fire protection.
 * Damage and wrecks: shots and collisions damage occupied and empty vehicles, can injure occupants and can leave wrecks. Vehicle health stays with the chassis through driver changes.
-* Traffic and routes: calm NPCs take parked vehicles on trips. With city traffic installed they climb onto routes defined in text files, follow them to the exit nearest their destination and land, or lap and return home.
+* City traffic: routes over ten cities (New Atlantis, Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso and Red Mile). Traffic is already flying when you arrive, and calm NPCs also take parked vehicles onto the routes, fly to the exit nearest their destination and land, or lap and return home. Routes are plain text files you can edit or add.
 * Ground navigation: ground-first route planning around terrain hazards and buildings, with native driving for occupied vehicles.
 * Controls and HUD: separate keyboard/controller bindings with context, tap, hold and double tap. One vehicle prompt changes with context. Move and resize HUD groups, status-card elements, route text, escort rows and action slots.
 
-New in 0.8.5 and 0.8.6
+New in 0.9
+
+* City traffic in ten cities: eleven routes, two of them in New Atlantis (a slanted ring round the city and a loop through its districts). Choose them city by city in the installer.
+* Traffic already flying: vehicles with seated drivers start on the routes, so a city has traffic as soon as you arrive. They are made once per save and reused. The installer can turn this off.
+* City Placements now adds parked vehicles in nine cities, not only New Atlantis.
+* Traffic far from you keeps flying: vehicles no longer bounce off the edge of the loaded area or hang in the sky past it, and their drivers stay seated. The game's own safety net stays in place for everything else.
+* Shot-down vehicles: their occupants, and drivers who get out to fight, now stand up and walk off instead of staying in the sitting pose.
+* Route beacons along the traffic lanes, their exits and landing places; on by default, a choice in the installer and a switch in the menu.
+* New default HUD layout.
+
+Earlier: 0.8.5 and 0.8.6
 
 * AI navigation: a new autopilot steers by scoring headings round the vehicle and plans short routes round obstacles. It recovers from stuck spots by trying the most open direction, including up when flying is allowed. Combat prefers flight, traffic prefers the ground; climbs to high lanes work.
 * Entering and exiting: you are no longer seated over an NPC driver. Holding to pull a driver out now uses the game's own get-up, so they step out instead of hanging in a sitting pose. Exiting high up drops you beside the vehicle. Fixed a save-load crash.
@@ -37,10 +47,10 @@ Requirements
 
 Downloads and included files
 
-* FlyingVehicleOverhaul-0.8.6.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
-* FlyingVehicleOverhaul-0.8.6-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds New Atlantis parked vehicles; FVO_CityPlacements.dll with FVO_Traffic\NewAtlantis.ini and the route guide adds city traffic. Use either or both. Includes its guide.
-* FlyingVehicleOverhaul-0.8.6-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
-* FlyingVehicleOverhaul-0.8.6-FOMOD.zip — all-in-one alternative: the main files, City Traffic, City Placements and the patch, with dependency checks and grouped feature setup for Vortex/MO2. Addons start unchecked. Use this instead of the separate ZIPs.
+* FlyingVehicleOverhaul-0.9.0.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
+* FlyingVehicleOverhaul-0.9.0-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds parked vehicles in nine cities; FVO_CityPlacements.dll with the route files in FVO_Traffic (all eleven routes, traffic already flying) and the route guide adds city traffic. Use either or both. Includes its guide.
+* FlyingVehicleOverhaul-0.9.0-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
+* FlyingVehicleOverhaul-0.9.0-FOMOD.zip — all-in-one alternative for Vortex/MO2: the main files, City Traffic with its routes chosen city by city, traffic already flying or starting empty, route beacons on or off, City Placements and the patch, with dependency checks and grouped feature setup. City Traffic and City Placements start ticked. Use this instead of the separate ZIPs.
 
 Installation and updating
 
@@ -52,7 +62,7 @@ Installation and updating
 Settings and defaults
 
 * Feature settings: Settings > Gameplay Options > Flying Vehicle Overhaul. Bindings: Settings > Controls.
-* The six switches: Physical flight (off; you and AI pilots), Flight assist (on), Free roll (off), NPCs use vehicles (on), Everyday traffic (on) and Show traffic routes (off).
+* The six switches: Physical flight (off; you and AI pilots), Flight assist (on), Free roll (off), NPCs use vehicles (on), Everyday traffic (on) and Show traffic routes (on).
 * Always on: full combat AI, hover-or-drive, ground navigation, damage and wrecks, health bars, status card and crash witnesses. Detailed logging is a settings.ini line ([log] verbose=1) for bug reports.
 
 Configuration folder: Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul
@@ -85,8 +95,8 @@ HUD editor
 
 Status and known issues
 
-* Early WIP: hover flight, summon/follow, passenger seats, pulling a driver out and route trips have been seen working in game. Parking descent, route probes and follower seating still need gameplay testing.
-* Traffic: some NPCs give up walking to their vehicle; a few trips run at once; vehicles do not yet start already on a route. Pulling out a neutral driver counts as theft and can turn nearby NPCs hostile.
+* Early WIP: hover flight, summon/follow, passenger seats, pulling a driver out, city traffic, vehicle health and wreck exits have been seen working in game. Parking descent and follower seating still need gameplay testing.
+* Traffic: some NPCs give up walking to their vehicle. Far beyond the loaded area there is no ground, so traffic out there stays on its lanes. Pulling out a neutral driver counts as theft and can turn nearby NPCs hostile.
 * Performance: Jemison CPU/FPS drops were reported with 0.73.0; the cause remains unisolated. Extra live vehicles can increase CPU/physics load. Compare with optional addons disabled when reporting performance.
 
 Reporting and compatibility

@@ -94,6 +94,8 @@
 //    switches to hover on autopilot and flies to the player with the same model and terrain assist, the player's
 //    bearing standing in for the camera and accelerate / brake chosen from the distance; it stops kCallStop away.
 //  - Elevation assist: a height hold above the terrain (rising early for higher ground ahead) and a 2.5 m floor.
+#include "fvo_addon_api.h"
+
 namespace vehicleflight
 {
 	// Internal: the navigation settings of the profile driving this pilot (pilot 0 = the player's vehicle), stored with each goal and read by the navigation service.
@@ -1461,6 +1463,9 @@ namespace vehicleflight
 		{
 			bool active = false;
             bool landing=false;double landGround=0,landHeight=0;ULONGLONG landProofAt=0;
+            // Descend before the drop (2026-10-28, the user: "all vehicles descend to a certain point before they can drop off ...
+            // except for manual flying for me"): a stop asked while an autopilot-flown vehicle is high is held until it is down.
+            bool settle=false, settleForce=false; double settleX=0, settleY=0, settleFrom=0; ULONGLONG settleAt=0; char settleWhy[64]={};
             bool groundHug=false;  // your empty vehicle "drives": the hover stays just over the ground and hops what a jump clears (travelmode)
             groundnav::Status route;  // the ground-first route guiding this pilot this frame (setting "Ground planner and native driving")
             bool routeSteer=false;    // its ground leg steers this frame (bearing and speed from the route)
@@ -1499,6 +1504,8 @@ namespace vehicleflight
 			double taxiMx = 0, taxiMy = 0, taxiLeft = 0;
 			bool taxiArrived = false;
 			double taxiMz = std::numeric_limits<double>::quiet_NaN();
+			FvoTripClaim taxiRoute{};      // Auto on a traffic route to the marker (the addon's trip); step null = straight
+			bool taxiRouteAsked = false;   // the planner was asked for this marker
 			TripProgress trip;
             recovery::Budget recovery;
 			bool apClimb = false;          // the first climb straight up, before moving
@@ -1608,6 +1615,12 @@ namespace vehicleflight
 			autodrive::Phase adLogPhase = autodrive::Phase::Travel;
 			bool adCombat = false;         // the pilot fights now: the hover keeps a low combat band (about 8 m more)
 		};
+		// m over the ground under which an autopilot-flown vehicle may switch its flight off (the hover floor kMinClearance is 2.5 m):
+		// any higher, it descends first (Settle). Followers park only under it too.
+		constexpr double kDropMaxAbove = 3.5;
+		// A descent that does not get down in time ends anyway: 20 s plus 1 s per 5 m it started above the ground (2026-10-28 18:43
+		// run: 306 m and 351 m up after the drivers were lost; a flat 25 s dropped them from about 150 m).
+		constexpr ULONGLONG kSettleBaseMs = 20000;
 		State g_gs[kPilots];
 		world::Snapshot g_vsnap;       // this frame's vehicle list (main thread)
 		bool g_vsnapOk = false;
@@ -2135,6 +2148,7 @@ namespace vehicleflight
 		}
 
 		// ---- The player's rover, remembered by form id (resolved through the form map, never a stale pointer) ----
+		FvoRoutePlanner g_routePlanner = nullptr;  // the traffic addon (FVO_RegisterRoutePlanner)
 		std::uint32_t g_roverId = 0;
 		std::atomic<bool> g_scanCall{ false }, g_goOnBoard{ false };  // the scanner marker button: summon, then Auto on boarding
 		std::atomic<ULONGLONG> g_goAt{ 0 };
@@ -2387,8 +2401,11 @@ namespace vehicleflight
 			}
 		}
 
+		bool Settle(int idx, const char* why);
+		void SettleTick(int idx, std::uintptr_t vehicle);
 		void Stop(int idx, const char* why)
 		{
+			if (Settle(idx, why)) return;
 			g_shs[idx].physOn.store(false); PhysicalRelease(g_shs[idx]);
 			if (!idx) vehiclecamera::Reset();
 			State& g = g_gs[idx];
@@ -3487,7 +3504,16 @@ namespace vehicleflight
 					else {
 						g.reverseUntil = nowMs + kReverseMs;
 						g.detourAng = g.detourAng != 0 ? -g.detourAng : kAvoidSide;
-						logger::Write("%s: bumped (%.0f m/s); backing off, detour %+.0f deg", wc, delta, g.detourAng * 57.2958);
+						// What it hit, as far as the vehicles go (2026-10-28, the user: "what collision was there?"): the nearest other vehicle.
+						std::uint32_t nearId = 0; double nearD = 1e9;
+						for (unsigned k = 0; g_vsnapOk && k < g_vsnap.count && k < 64; ++k) {
+							const auto& o = g_vsnap.v[k];
+							if (o.ref == vehicle) continue;
+							const double dd = std::sqrt(std::pow(o.pos[0] - pos.x, 2) + std::pow(o.pos[1] - pos.y, 2) + std::pow(o.pos[2] - pos.z, 2));
+							if (dd < nearD) { nearD = dd; nearId = o.formId; }
+						}
+						logger::Write("%s: bumped (%.0f m/s) at z %.1f; nearest vehicle %08X %.1f m away%s; backing off, detour %+.0f deg", wc, delta, pos.z,
+							nearId, nearD < 1e8 ? nearD : -1.0, nearD < 8.0 ? " (likely what it hit)" : " (not a vehicle: a building or object)", g.detourAng * 57.2958);
 					}
 				}
 				else if (hit) {
@@ -5228,7 +5254,9 @@ namespace vehicleflight
 					}
 				}
 				else if (playerStill && distP < kFollowFar && !g_air.air && !CoverFighting()) {
-					Stop("follow: player stopped; parked");
+					// 2026-10-28 18:12: parked 7.2 m up and dropped. Park only once down (ground unknown: as before); higher, it keeps flying down.
+					const double above = PilotAboveGround(0, rover);
+					if (!std::isfinite(above) || above < kDropMaxAbove) Stop("follow: player stopped; parked");
 				}
 			}
 		}
@@ -5454,6 +5482,8 @@ namespace vehicleflight
 				if (TaxiMarker(player, vehicle, mid, mx, my, &goal.z)) {
 					if (mid != g.taxiMarker || std::hypot(mx - g.taxiMx, my - g.taxiMy) > 2.0 ||
 						(std::isfinite(goal.z) && (!std::isfinite(g.taxiMz) || std::fabs(goal.z - g.taxiMz) > 2.5))) {
+						if (g.taxiRoute.step) { g.taxiRoute = {}; PilotNav(0, vcontract::NavParams{}); }
+						g.taxiRouteAsked = false;
 						g.taxiMarker = mid;
 						g.taxiMx = mx;
 						g.taxiMy = my;
@@ -5467,7 +5497,41 @@ namespace vehicleflight
 					goal.x = mx;
 					goal.y = my;
 					goal.stop = kTaxiStop;
-					if (g_autoMode == AutoMode::Orbit && g.taxiLeft < kOrbitRadius + 20.0) {
+					// A traffic route on the way (the addon's planner, asked once per marker): fly its trip, then on to the marker.
+					if (g_routePlanner && !g.taxiRouteAsked && !g.taxiArrived) {
+						g.taxiRouteAsked = true;
+						FvoTripClaim c{};
+						const double tz = std::isfinite(goal.z) ? goal.z : pos.z;
+						if (g_routePlanner(At<std::uint32_t>(vehicle, off::kFormId), pos.x, pos.y, pos.z, mx, my, tz, &c) && c.step) {
+							g.taxiRoute = c;
+							notify::Log("Auto: taking the traffic route");
+							logger::Write("Rover taxi: %s to marker %08X", c.name ? c.name : "route trip", mid);
+						}
+					}
+					bool onRoute = false;
+					if (g.taxiRoute.step) {
+						FvoTripGoal tg{};
+						if (g.taxiRoute.step(g.taxiRoute.user, pos.x, pos.y, pos.z, &tg) == 0) {
+							onRoute = true;
+							goal.x = tg.x; goal.y = tg.y; goal.z = tg.z;
+							goal.stop = tg.stop > 0 ? tg.stop : 6.0;
+							vcontract::NavParams nav;
+							nav.passThrough = tg.passThrough != 0;
+							nav.speedLimit = tg.speed;
+							nav.priority = 100;
+							PilotNav(0, nav);
+						}
+						else {
+							g.taxiRoute = {};
+							PilotNav(0, vcontract::NavParams{});
+							logger::Write("Rover taxi: off the route; on to marker %08X (%.0f m)", mid, g.taxiLeft);
+							notify::Log("Auto: off the route, on to your marker");
+						}
+					}
+					if (onRoute) {
+						g.taxiOrbit = false;
+					}
+					else if (g_autoMode == AutoMode::Orbit && g.taxiLeft < kOrbitRadius + 20.0) {
 						// Orbit: a point a little ahead round the circle (clockwise), kept going instead of holding over the marker.
 						const double ang = std::atan2(pos.x - mx, pos.y - my) + 0.45;
 						goal.x = mx + std::sin(ang) * kOrbitRadius;
@@ -5499,7 +5563,7 @@ namespace vehicleflight
 					goal.y = g.taxiWaitY;
 					goal.stop = 1.5;
 				}
-				goal.hold = !g.taxiOrbit || g.taxiWait;
+				goal.hold = (!g.taxiOrbit || g.taxiWait) && !g.taxiRoute.step;
 			}
 		}
 		else if (g.autopilot && g_remote) {
@@ -5578,6 +5642,7 @@ namespace vehicleflight
 				goal.keepGoing = true;
 			}
 		}
+		if (g_gs[0].settle) { SettleTick(0, vehicle); return; }
 		Fly(0, vehicle, goal, focused);
 	}
 
@@ -5601,6 +5666,57 @@ namespace vehicleflight
 				r = 0;
 			}
 			return r;
+		}
+
+		// Descend before the drop. A stop for an autopilot-flown vehicle (every NPC pilot; the player's own vehicle while Auto, follow
+		// or a call flies it, never the player's manual flight) that is more than kDropMaxAbove over known ground is held: the
+		// vehicle hovers straight down over where it is, and the stop happens once it is down (or after kSettleMaxMs). Reasons that
+		// must end the flight at once are not held (the vehicle gone or unloaded, a wreck, the player taking it, a flip, landed).
+		bool Settle(int idx, const char* why)
+		{
+			State& g = g_gs[idx];
+			if (g.settleForce) { g.settleForce = false; g.settle = false; return false; }
+			static const char* const kNow[] = { "landed", "vehicle lost", "rover lost", "unloaded", "the player took", "flipped", "autopilot off", "wreck", "died",
+				"world", "load", "reset", "board", "player got in", "you drive", "manual", "recall", "too far", "follower drives" };
+			for (const char* k : kNow) if (why && std::strstr(why, k)) { g.settle = false; return false; }
+			if (g.settle) return true;  // already descending: the stop it waits for is the first one
+			if (!g.active || (!idx && !g.autopilot)) return false;  // not flying, or the player flies it by hand
+			const auto vehicle = idx ? RefById(g_jobs[idx].vehicleId) : RefById(g_roverId);
+			if (!vehicle || vehiclehits::Wrecked(At<std::uint32_t>(vehicle, off::kFormId))) return false;
+			const double above = PilotAboveGround(idx, vehicle);
+			if (!std::isfinite(above) || above <= kDropMaxAbove) return false;
+			const auto p = At<game::Vec3>(vehicle, off::kRefPosition);
+			g.settle = true; g.settleX = p.x; g.settleY = p.y; g.settleFrom = above; g.settleAt = GetTickCount64();
+			std::snprintf(g.settleWhy, sizeof(g.settleWhy), "%s", why ? why : "stop");
+			logger::Write("%s: %.1f m up: descending before it stops (%s)", idx ? Who(idx) : "Rover call", above, g.settleWhy);
+			return true;
+		}
+		void SettleTick(int idx, std::uintptr_t vehicle)
+		{
+			State& g = g_gs[idx];
+			const double above = PilotAboveGround(idx, vehicle);
+			const bool down = std::isfinite(above) && above <= kDropMaxAbove;
+			if (down || GetTickCount64() - g.settleAt > kSettleBaseMs + ULONGLONG(g.settleFrom * 200.0)) {
+				char why[64];
+				std::snprintf(why, sizeof(why), "%s", g.settleWhy);
+				logger::Write("%s: %s; stopping (%s)", idx ? Who(idx) : "Rover call", down ? "down" : "descent took too long", why);
+				g.settleForce = true;
+				Stop(idx, why);
+				return;
+			}
+			// Straight down: a commanded sink rate with the brakes on (a hold goal right over the vehicle counted as "arrived"
+			// and the height never changed, 2026-10-28 18:28 run: 36 m up for 25 s).
+			Command c;
+			c.set = Command::kVertical | Command::kBrake | Command::kThrottle | Command::kScripted;  // scripted: no rollout veto on the sink
+			c.vertical = -std::clamp(std::isfinite(above) ? (above - kDropMaxAbove) * 0.25 : 3.0, 2.0, 12.0);  // faster high up, gentle near the ground
+			c.brake = true; c.throttle = 0; c.holdMs = 300;
+			g_cmds[idx].c = c;
+			g_cmds[idx].until = GetTickCount64() + c.holdMs;
+			Goal goal;
+			goal.x = g.settleX; goal.y = g.settleY;
+			goal.z = std::numeric_limits<double>::quiet_NaN();
+			goal.stop = 1.5; goal.hold = true; goal.keepGoing = true;
+			Fly(idx, vehicle, goal, false);
 		}
 
 		// NPC pilots: every frame while hovering, the same frame logic as the player's autopilot.
@@ -5629,6 +5745,7 @@ namespace vehicleflight
 					if (flownAt[idx] && now - flownAt[idx] < every) continue;
 					flownAt[idx] = now;
 					if (unbound) ++slowed; else ++flown;
+					if (g_gs[idx].settle) { SettleTick(idx, vehicle); continue; }
 					Fly(idx, vehicle, g_jobs[idx].goal, false);
 				}
 			}
@@ -5642,6 +5759,18 @@ namespace vehicleflight
 	bool PilotFly(int pilot, std::uintptr_t vehicle, double x, double y, double stop, unsigned timeoutMs, bool keepGoing, double z)
 	{
 		if (pilot < 1 || pilot >= kPilots || !vehicle) return false;
+		if (g_gs[pilot].settle) {
+			if (g_jobs[pilot].vehicleId == At<std::uint32_t>(vehicle, off::kFormId)) {
+				g_gs[pilot].settle = false;  // flying on: the descent before the stop is cancelled
+				logger::Write("%s: descent cancelled (a new flight)", Who(pilot));
+			}
+			else {  // this pilot is wanted for another vehicle: the descending one stops now
+				char why[64];
+				std::snprintf(why, sizeof(why), "%s", g_gs[pilot].settleWhy);
+				g_gs[pilot].settleForce = true;
+				Stop(pilot, why);
+			}
+		}
 		const std::uint32_t id = At<std::uint32_t>(vehicle, 0x28);
 		if (vehicle == g_hoverVehicle.load() || (id == g_roverId && npcvehicles::CrewOrderOf(id) == npcvehicles::CrewOrder::None)) return false;  // the player's rover only for a crew job
 		if (IsDisabled(id)) return false;  // the hit counter switched its autopilot off
@@ -5692,6 +5821,13 @@ namespace vehicleflight
 	}
 
 	bool PilotActive(int pilot) { return pilot >= 1 && pilot < kPilots && g_gs[pilot].active; }
+	double PilotAboveGround(int pilot, std::uintptr_t vehicle)
+	{
+		if (pilot < 0 || pilot >= kPilots || !vehicle) return std::numeric_limits<double>::quiet_NaN();
+		const State& s = g_gs[pilot];
+		if (!s.haveGround || GetTickCount64() - s.groundAt > 1500) return std::numeric_limits<double>::quiet_NaN();
+		return double(At<game::Vec3>(vehicle, off::kRefPosition).z) - s.ground;
+	}
 	PhysicsStatus PilotPhysics(int pilot)
 	{
 		if(pilot<1||pilot>=kPilots||!g_gs[pilot].active)return {};
@@ -5957,6 +6093,12 @@ namespace vehicleflight
 		ULONGLONG g_navAt[kPilots] = {};
 	}
 
+	void SetRoutePlanner(FvoRoutePlanner planner)
+	{
+		g_routePlanner = planner;
+		logger::Write("Rover taxi: route planner %s (Auto takes a traffic route when one helps)", planner ? "registered" : "removed");
+	}
+
 	void PilotNav(int pilot, const vcontract::NavParams& nav)
 	{
 		if (pilot < 0 || pilot >= kPilots) return;
@@ -6089,3 +6231,8 @@ namespace vehicleflight
 	}
 }
 
+extern "C" __declspec(dllexport) int FVO_RegisterRoutePlanner(FvoRoutePlanner planner)
+{
+	vehicleflight::SetRoutePlanner(planner);
+	return 1;
+}

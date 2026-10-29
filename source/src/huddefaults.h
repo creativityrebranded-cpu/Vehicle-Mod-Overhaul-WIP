@@ -2,13 +2,13 @@
 #include "hudchildren.h"
 #include <sstream>
 
-// Captured from the user's saved HUD layout, 2026-10-25 15:29.
+// Captured from the user's saved HUD layout, 2026-10-28 20:41 (0.9.0 defaults).
 // Positions/sizes/hint visibility only; no ride counter or gameplay settings.
 namespace huddefaults {
 inline constexpr char Layout[] = R"FVOHUD(
-cluster = 371.0 -247.0 62.0 0
-column = 726.0 -254.0 54.5
-gearbox = 431.4 63.2
+cluster = 372.0 -247.0 62.0 0
+column = 727.0 -254.0 54.5
+gearbox = 432.4 63.2
 nudge_W = 7.0 -63.0
 nudge_A = -24.0 2.0
 nudge_S = 0.0 0.0
@@ -19,9 +19,10 @@ nudge_hover = -770.0 92.0
 scanner_key = 1739.0 961.0
 scanner_follow = 1665.0 961.0
 scanner_status = 1701.0 908.0
-route = 38.0 111.0
-attitude = 2.0 415.0
-attitude_text = 2.0 337.5
+route = 39.0 129.0
+route_scanner = 39.0 129.0
+attitude = 3.0 415.0
+attitude_text = 3.0 337.5
 show_all = 1
 size_W = 1.25
 size_A = 1.30
@@ -43,21 +44,22 @@ size_autoline = 1.80
 size_ganginveh = 1.90
 size_vehiclesinveh = 1.80
 size_route = 1.30
+size_route_scanner = 1.30
 size_attitude = 0.90
 size_attitude_text = 1.40
-foot = -292.4 -237.4
-extras = -990.0 -143.0
-foot_summon = -9.0 25.0
-foot_follow = 165.0 24.0
+foot = -330.4 -241.4
+extras = -1473.0 205.0
+foot_summon = 6.0 -7.0
+foot_follow = 154.0 -10.0
 foot_getin = -96.0 32.0
 foot_status = 64.0 -100.0
-foot_gang = 65.0 -185.0
-foot_pass = 51.0 -88.0
-foot_eject = -243.0 -135.0
-foot_vehicles = 66.0 -238.0
-nudge_autoline = 994.0 -166.0
-nudge_ganginveh = 989.0 -484.0
-nudge_vehiclesinveh = 992.0 -412.0
+foot_gang = 65.0 -252.0
+foot_pass = 51.0 -48.0
+foot_eject = -244.0 -95.0
+foot_vehicles = 66.0 -360.0
+nudge_autoline = 994.0 63.0
+nudge_ganginveh = 915.0 -469.0
+nudge_vehiclesinveh = 919.0 -412.0
 prompt_kb_scanner = 46 138 1 1
 prompt_kb_summon = 46 168 1 1
 prompt_kb_cover = 46 198 1 1
@@ -145,9 +147,9 @@ prompt_pad_native_fire = 0 0 1 0
 prompt_pad_native_aim = 0 0 1 0
 prompt_pad_native_look = 0 0 1 0
 child_foot_0 = 0.000000 0.000000 1.000000
-child_foot_1 = 0.000000 0.000000 1.000000
+child_foot_1 = 0.000000 -104.347826 1.000000
 child_foot_2 = 0.000000 0.000000 1.000000
-child_foot_3 = 0.000000 0.000000 1.000000
+child_foot_3 = 0.000000 284.057971 1.000000
 child_foot_4 = 0.000000 0.000000 1.000000
 child_foot_5 = 0.000000 0.000000 1.000000
 child_foot_6 = 0.000000 0.000000 1.000000
@@ -179,6 +181,25 @@ child_route_15 = 0.000000 0.000000 1.000000
 child_action_0 = 0.000000 0.000000 1.000000
 child_action_1 = 0.000000 0.000000 1.000000
 child_action_2 = 0.000000 0.000000 1.000000
+child_sroute_0 = 0.000000 0.000000 1.000000
+child_sroute_1 = 0.000000 0.000000 1.000000
+child_sroute_2 = 0.000000 0.000000 1.000000
+child_sroute_3 = 0.000000 0.000000 1.000000
+child_sroute_4 = 0.000000 0.000000 1.000000
+child_sroute_5 = 0.000000 0.000000 1.000000
+child_sroute_6 = 0.000000 0.000000 1.000000
+child_sroute_7 = 0.000000 0.000000 1.000000
+child_sroute_8 = 0.000000 0.000000 1.000000
+child_sroute_9 = 0.000000 0.000000 1.000000
+child_sroute_10 = 0.000000 0.000000 1.000000
+child_sroute_11 = 0.000000 0.000000 1.000000
+child_sroute_12 = 0.000000 0.000000 1.000000
+child_sroute_13 = 0.000000 0.000000 1.000000
+child_sroute_14 = 0.000000 0.000000 1.000000
+child_sroute_15 = 0.000000 0.000000 1.000000
+child_saction_0 = 0.000000 0.000000 1.000000
+child_saction_1 = 0.000000 0.000000 1.000000
+child_saction_2 = 0.000000 0.000000 1.000000
 )FVOHUD";
 inline const hudchildren::Layout& Children(){
     static const auto value=[] {

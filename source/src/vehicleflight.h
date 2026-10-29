@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fvo_addon_api.h"
 #include <limits>
 
 #include <cstdint>
@@ -32,6 +33,8 @@ namespace vehicleflight
 	// The same from a profile's goal (vcontract::Goal): the nav settings and the target in one call. The one drive call for goal-driven pilots.
 	bool PilotFly(int pilot, std::uintptr_t vehicle, const vcontract::Goal& goal, unsigned timeoutMs = 0, bool keepGoing = true);
 	bool PilotActive(int pilot);
+	// Height of `vehicle` over the ground this pilot last read (0 = the player's rover); NaN when not known.
+	double PilotAboveGround(int pilot, std::uintptr_t vehicle);
 	struct PhysicsStatus { bool bound = false, live = false; std::uint64_t serial = 0; };
 	// Fresh successful steps for the current bound instance; never saved.
 	PhysicsStatus PilotPhysics(int pilot);
@@ -56,6 +59,8 @@ namespace vehicleflight
 	void RequestScannerTrip();
 	// T tapped outside the scanner while driving (2026-10-21, the user): Auto on (to the marker / route) or off (you drive).
 	void ToggleAuto();
+	// The traffic addon's route planner for Auto (fvo_addon_api.h FVO_RegisterRoutePlanner).
+	void SetRoutePlanner(FvoRoutePlanner planner);
 	void RetryScannerTrip();
     void CancelScannerTrip(); // hold current position, preserving hover and the crew driver
 	struct TripProgress {

@@ -1,12 +1,23 @@
 #include "trafficdata.h"
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 
 static int g_fail = 0;
 static void Check(bool ok, const char* what) { if (!ok) { ++g_fail; std::printf("FAIL %s\n", what); } }
 
-int main()
+int main(int argc, char** argv)
 {
     using namespace trafficdata;
+    if (argc > 1) {  // trafficdata_test FILE.ini ...: read real traffic files and list what was understood and what was skipped
+        Data d;
+        for (int i = 1; i < argc; ++i) { std::ifstream f(argv[i]); std::stringstream t; t << f.rdbuf(); Read(t.str(), argv[i], d); }
+        std::printf("%d file(s): %zu route(s), %zu exit(s), %zu place(s), %zu rule(s), %zu anchored world(s)\n", d.files, d.routes.size(),
+            d.exits.size(), d.places.size(), d.traffic.size(), d.anchors.size());
+        for (const auto& r : d.routes) std::printf("  route %s in %s: %zu point(s)\n", r.name.c_str(), r.world.c_str(), r.points.size());
+        for (const auto& p : d.problems) std::printf("  skipped %s\n", p.c_str());
+        return d.problems.empty() ? 0 : 1;
+    }
     {
         Data d;
         Read(R"(; comment
@@ -71,6 +82,31 @@ start_on_route = 3
         Data d;
         AddRingroad("JemisonPlanetWorld1", ringlogic::Format(ringlogic::Default(10, 20, 0)), d);
         Check(d.routes.size() == 1 && d.routes[0].name == "ringroad" && SameWorld(d, d.routes[0].world, "JemisonPlanetWorld1"), "the editor's ring is a route in its world");
+    }
+    {
+        Data d;
+        Read("[world.akila]\nanchor = 0027D001 10 20 30, 0027D002 -5 6 7\n"
+             "[route.loop]\nworld = akila\ntype = path\npoints = 0 0 100, 50 0 110\nclosed = 1\n"
+             "[route.ring]\nworld = akila\ncentre = 1 2\nheight = 50\n"
+             "[place.pad]\nworld = akila\npoint = 5 5 40\n[spawn.s1]\nworld = akila\npoint = 1 1 41\nheading = 90\n"
+             "[traffic.akila]\nworld = akila\nstart_on_route = 4\n", "akila.ini", d);
+        Check(d.problems.empty(), "an anchored world needs no id");
+        Check(d.anchors.count("akila") && d.anchors["akila"].size() == 2 && d.anchors["akila"][1].id == 0x0027D002 &&
+            d.anchors["akila"][1].at.x == -5, "anchors read");
+        Check(!SameWorld(d, "akila", "CheyennePlanetWorld9"), "not active until an anchor is found");
+        PlaceWorld(d, "akila", "CheyennePlanetWorld9", { 300, -400, -20 });
+        Check(SameWorld(d, "akila", "CheyennePlanetWorld9"), "found: the player's world is the city's");
+        Check(d.routes[0].points[1].x == 350 && d.routes[0].points[1].y == -400 && d.routes[0].points[1].z == 90, "path moved into game coordinates");
+        Check(d.routes[1].shape.cx == 301 && d.routes[1].shape.cy == -398 && d.routes[1].shape.z == 30, "ring moved");
+        Check(d.places[0].at.x == 305 && d.places[0].at.z == 20, "place moved");
+        Check(d.spawns.size() == 1 && d.spawns[0].heading == 90 && d.spawns[0].at.x == 301 && d.spawns[0].at.z == 21, "spawn spot read and moved");
+        Check(d.traffic[0].startOnRoute == 4, "pool size");
+        Data t;
+        Read("[route.r]\ncentre = 0 0\nheight = 100\ntilt = 8\ntilt_toward = 200\n", "t.ini", t);
+        Check(t.routes.size() == 1 && t.routes[0].tilt == 8 && t.routes[0].tiltToward == 200, "ring tilt read");
+        Data e;
+        Read("[world.x]\nanchor = 0027D001 10 20\n", "x.ini", e);
+        Check(e.anchors.empty() && e.problems.size() == 2, "a bad anchor is named and the world is skipped");
     }
     std::printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
     return g_fail ? 1 : 0;

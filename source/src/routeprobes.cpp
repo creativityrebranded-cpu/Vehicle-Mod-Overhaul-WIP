@@ -26,7 +26,7 @@ namespace routeprobes
 		uptr Ptr(std::uint32_t rva) { return *reinterpret_cast<uptr*>(game::Base() + rva); }
 		template <class F> F EngineFn(std::uint32_t rva) { return reinterpret_cast<F>(game::Base() + rva); }
 		constexpr std::uint32_t kFormId = 0x28, kFormFlags = 0x20, kDisabledFlag = 0x800, kBaseForm = 0x98;
-		constexpr int kMax = 160;            // probes per world at most
+		constexpr int kMax = 200;            // probes per world at most
 		constexpr int kPerFrame = 2;         // placed or moved per frame (spread over frames: no hitch)
 
 		std::mutex g_lock;
@@ -126,10 +126,51 @@ namespace routeprobes
 		}
 
 		const std::wstring& Ini() { static const std::wstring p = fvopaths::File(L"routeprobes.ini"); return p; }
+
+		// The probe model (2026-10-28, the user: the beacons "are too crowded and too large ... maybe small lights"): routeprobes.ini
+		// [look] model = a form id (default 00190DBD, NATheMastLightPuck01: the small round lights of the MAST); the old outpost
+		// beacon if that form is missing. Read every 10 s, so a changed model applies while playing.
+		constexpr std::uint32_t kPuck = 0x00190DBD;
+		uptr ProbeBase()
+		{
+			static uptr base = 0;
+			static ULONGLONG readAt = 0;
+			const ULONGLONG now = GetTickCount64();
+			if (base && now - readAt < 10000) return base;
+			readAt = now;
+			wchar_t text[32]{};
+			GetPrivateProfileStringW(L"look", L"model", L"", text, 32, Ini().c_str());
+			unsigned id = 0;
+			if (std::swscanf(text, L"%x", &id) != 1 || !id) {
+				id = kPuck;
+				WritePrivateProfileStringW(L"look", L"model", L"00190DBD", Ini().c_str());
+			}
+			base = Lookup(id);
+			if (!base) base = Ptr(addr::kBeaconBaseObject);
+			return base;
+		}
 		std::wstring Wide(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 		void LoadIds(const std::string& world)
 		{
 			g_ids.clear();
+			// Probes made with another model (the beacons before 2026-10-28): hidden and forgotten; new ones are made.
+			wchar_t style[32]{};
+			GetPrivateProfileStringW(L"style", Wide(world).c_str(), L"", style, 32, Ini().c_str());
+			wchar_t want[32];
+			const uptr base = ProbeBase();
+			std::swprintf(want, 32, L"%08X", base ? At<std::uint32_t>(base, kFormId) : 0u);
+			if (std::wstring(want) != style) {
+				std::vector<wchar_t> old(4096);
+				GetPrivateProfileStringW(L"probes", Wide(world).c_str(), L"", old.data(), DWORD(old.size()), Ini().c_str());
+				std::string text;
+				for (const wchar_t* c = old.data(); *c; ++c) text.push_back(char(*c));
+				std::size_t at = 0; unsigned id = 0; int used = 0, n = 0;
+				while (std::sscanf(text.c_str() + at, "%x%n", &id, &used) == 1) { if (const uptr r = Lookup(id)) { Show(r, false); ++n; } at += used; }
+				WritePrivateProfileStringW(L"probes", Wide(world).c_str(), L"", Ini().c_str());
+				WritePrivateProfileStringW(L"style", Wide(world).c_str(), want, Ini().c_str());
+				if (n) logger::Write("Route markers: %d probe(s) of the old look hidden for %s; new ones are made", n, world.c_str());
+				return;
+			}
 			std::vector<wchar_t> w(4096);
 			GetPrivateProfileStringW(L"probes", Wide(world).c_str(), L"", w.data(), DWORD(w.size()), Ini().c_str());
 			std::string text;
@@ -191,14 +232,14 @@ namespace routeprobes
 			if (GetTickCount64() - g_doneAt < 10000) return;
 			g_cursor = 0;
 		}
-		const uptr base = Ptr(addr::kBeaconBaseObject);
+		const uptr base = ProbeBase();
 		const int end = g_cursor + kPerFrame;
 		for (; g_cursor < end && g_cursor < int(std::max(g_now.size(), g_ids.size())); ++g_cursor) {
 			const int i = g_cursor;
 			if (i >= int(g_now.size())) { if (const uptr ref = Lookup(g_ids[i])) Show(ref, false); continue; }  // more probes than points
 			if (i >= int(g_ids.size())) g_ids.push_back(0);
 			uptr ref = Lookup(g_ids[i]);
-			if (ref && base && At<uptr>(ref, kBaseForm) != base) ref = 0;  // the id is something else in this save
+			if (ref && base && At<uptr>(ref, kBaseForm) != base) { Show(ref, false); ref = 0; }  // something else in this save, or the old look
 			float pos[3] = { g_now[i].x, g_now[i].y, g_now[i].z };
 			if (!ref) {
 				g_ids[i] = Place(base, cell, ws, pos, g_now[i].scale);

@@ -13,6 +13,7 @@
 #include "realvehicles.h"
 #include "runtimecells.h"
 #include "ringroad.h"
+#include "trafficpool.h"
 #include "routeprobes.h"
 #include "citytraffic.h"
 #include "citystartup.h"
@@ -31,6 +32,7 @@
 #include "scantarget.h"
 #include "bindings.h"
 #include "inputgate.h"
+#include "loadedarea.h"
 #include "vehiclediag.h"
 #include "native_movement_probe.h"
 #include "mappoints.h"
@@ -134,6 +136,7 @@ namespace
 		realvehicles::Reset();
 		ringroad::Reset();
 		routeprobes::Reset();
+		trafficpool::Reset();
 		citytraffic::Reset();
         airtraffic::Reset();
         pilotquest::Reset();
@@ -186,8 +189,8 @@ namespace
         profiles::Tick();context::Tick();mark(3);
         npcvehicles::Tick();passenger::Tick();mark(4);
         // (The native movement-controller probe did its job, 2026-10-27: every vehicle has a controller. Off: it took an engine lock every 5 s.)
-        vehicleflight::Tick();vehiclediag::Tick();mark(5);
-        part(1,"ship vehicle",[]{shipvehicle::Tick();});part(1,"vehicle registry",[]{realvehicles::Tick();});part(1,"ring road",[]{ringroad::Tick();});part(1,"route markers",[]{routeprobes::Tick();});
+        vehicleflight::Tick();vehiclediag::Tick();loadedarea::Tick();mark(5);
+        part(1,"ship vehicle",[]{shipvehicle::Tick();});part(1,"vehicle registry",[]{realvehicles::Tick();});part(1,"ring road",[]{ringroad::Tick();});part(1,"route markers",[]{routeprobes::Tick();});part(1,"traffic pool",[]{trafficpool::Tick();});
         part(1,"city traffic",[]{citytraffic::Tick();});part(1,"air traffic",[]{airtraffic::Tick();});part(1,"scanner target",[]{scantarget::Tick();});
         part(1,"traffic destinations",[]{traffic::Tick();});part(1,"view distance",[]{viewdist::Tick();});part(1,"keep in sight",[]{vehiclekeep::Tick();});
         part(1,"log writer",[]{logger::Service();});mark(6);
@@ -272,7 +275,7 @@ namespace
 
     void InstallFeatureSystems() {
         world::SetServices({realvehicles::ForEachLoadedStep,vehicleflight::OwnRoverId,npcvehicles::VehicleDriverId,npcvehicles::UsesVehicle});
-        hoverui::Install();inputgate::Install();mappoints::Install();
+        hoverui::Install();inputgate::Install();mappoints::Install();loadedarea::Install();
         npcvehicles::Install();profiles::Install();vehicleaim::Install();
         vehiclediag::Install();vehiclehits::InstallEnemyBar();flighttune::Load();
     }
@@ -346,7 +349,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 86, "FlyingVehicleOverhaul", "seemless",
+	SFSEPluginVersionData::kVersion, 90, "FlyingVehicleOverhaul", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -372,7 +375,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Write("Flying Vehicle Overhaul (FVO) 0.8.6 loaded; core optional");
+	logger::Write("Flying Vehicle Overhaul (FVO) 0.9.0 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

@@ -1,3 +1,4 @@
+#include "loadedarea.h"
 #include "vehicle_probe.h"
 #include "updateschedule.h"
 #include "hookcost.h"
@@ -229,6 +230,7 @@ namespace vehicle_probe
 			for (std::uint32_t i = 0; i < n; ++i) {
 				std::uint8_t* h = fr.hits + i * 0x70;
 				if (F<std::int32_t>(h, 0x68) != 1) continue;
+				if (loadedarea::IsWall(F<std::uint32_t>(h, 0x48))) continue;  // the game's loaded-area wall: FVO vehicles pass it
 				const float hx = F<float>(h, 0), hy = F<float>(h, 4), hz = F<float>(h, 8);
 				const float d = std::sqrt((hx - r.from[0]) * (hx - r.from[0]) + (hy - r.from[1]) * (hy - r.from[1]) + (hz - r.from[2]) * (hz - r.from[2]));
 				if (!(d < best) || d > len + 1.0f) continue;
@@ -360,7 +362,7 @@ namespace vehicle_probe
 				const float hx = F<float>(h, 0), hy = F<float>(h, 4), hz = F<float>(h, 8);
 				const std::uint32_t bodyId = F<std::uint32_t>(h, 0x48), layer = F<std::uint32_t>(h, 0x5C) & 0x7F;
 				if (!std::isfinite(hx) || !std::isfinite(hy) || !std::isfinite(hz)) continue;
-				if (bodyId == ownId || ((layer == 13 || layer == 17) && hz < start[2] + 0.5f)) {  // (terrain at or under the vehicle's origin is the height probes' job; the thin ray sits 1 m above it)
+				if (bodyId == ownId || loadedarea::IsWall(bodyId) || ((layer == 13 || layer == 17) && hz < start[2] + 0.5f)) {  // (terrain at or under the vehicle's origin is the height probes' job; the thin ray sits 1 m above it)
 					++out.skipped;
 					continue;
 				}

@@ -15,6 +15,46 @@ CITY = 'FVO_CityPlacements.esm'
 CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'
 CITY_TRAFFIC = 'SFSE/Plugins/FVO_Traffic/NewAtlantis.ini'
 ROUTE_GUIDE = 'SFSE/Plugins/FVO_Traffic/HOW-TO-MAKE-ROUTES.txt'
+TRAFFIC_DIR = 'SFSE/Plugins/FVO_Traffic/'
+# 0.9.0: one installer choice per city route (the user: "the routes for each city and make it in the fomod capable of
+# selecting which you want"). key, label, description (None: made from the file), files.
+ROUTES = (
+    ('NewAtlantisRing', 'New Atlantis: Ring',
+     'The slanted ring round New Atlantis: high over the MAST, low over the spaceport, with four exits and landing places.',
+     ('NewAtlantis.ini', 'NewAtlantis-ColdStart.ini')),
+    ('NewAtlantisLoop', 'New Atlantis: District loop',
+     'A 3D loop through the spaceport, commercial district, embassies, lodge and residential areas, 25 m over the rooftops.',
+     ('NewAtlantis-3D.ini',)),
+    ('AkilaCity', 'Akila City', None, ('AkilaCity.ini',)),
+    ('Cydonia', 'Cydonia', None, ('Cydonia.ini',)),
+    ('EleosRetreat', 'Eleos Retreat', None, ('EleosRetreat.ini',)),
+    ('Gagarin', 'Gagarin', None, ('Gagarin.ini',)),
+    ('HopeTown', 'HopeTown', None, ('HopeTown.ini',)),
+    ('Neon', 'Neon', None, ('Neon.ini',)),
+    ('NewHomestead', 'New Homestead', None, ('NewHomestead.ini',)),
+    ('Paradiso', 'Paradiso', None, ('Paradiso.ini',)),
+    ('RedMile', 'Red Mile', None, ('RedMile.ini',)),
+)
+COLD_START_ONLY = ('NewAtlantis-ColdStart.ini',)  # spawn spots only: not installed when traffic starts empty
+ROUTE_FILES = tuple(TRAFFIC_DIR+name for _, _, _, files in ROUTES for name in files)
+VARIANTS = (('Yes', 'Flying'), ('No', 'Empty'))  # coldstart flag -> payload folder under '11 Route Traffic/'
+
+
+def starts_empty(name, data):
+    """The same route file with no cold-start traffic (start_on_route = 0)."""
+    text = data.decode('utf-8')
+    new, count = re.subn(r'(?m)^(\s*start_on_route\s*=\s*)\d+', r'\g<1>0', text)
+    if count != 1:
+        raise ValueError(f'{name}: expected one start_on_route line, found {count}')
+    return new.encode('utf-8')
+
+
+def route_description(label, description, data):
+    if description:
+        return description
+    text = data.decode('utf-8')
+    exits, places = text.count('[exit.'), text.count('[place.')
+    return f'A traffic loop over {label} with {exits} exit(s) and {places} landing place(s).'
 # Superseded experimental city content must not overlap current placements.
 RETIRED = ('FVO_CityTraffic.esm',)
 # The base game is implicit in the Starfield install context. Managers need not
@@ -24,11 +64,11 @@ SCHEMA_URL = 'https://raw.githubusercontent.com/Nexus-Mods/fomod-installer/maste
 PROFILE = 'SFSE/Plugins/FlyingVehicleOverhaul.features/'
 FEATURE_PAGES = ('Flight and Navigation','NPCs and Combat')  # 0.8.6: the streamlined menu (features.h InMenu); page names kept
 # Not offered: removed or development switches (written off) and the always-on features (written on; the DLL ignores them anyway).
-ALWAYS_ON = ('CombatAi','HoverOrDrive','VehicleDamage','HealthBars','StatusCard','Witnesses','NativeGround')
+ALWAYS_ON = ('CombatAi','HoverOrDrive','VehicleDamage','HealthBars','StatusCard','Witnesses','NativeGround','WallPass')
 FIXED_FEATURES = {'Placement':False,'PlacementMode':False,'DebugLog':False,'PhysicalAi':False, **{name:True for name in ALWAYS_ON}}
 FEATURE_GROUPS = {
     'PhysicalVtol':FEATURE_PAGES[0], 'FlightAssist':FEATURE_PAGES[0], 'FreeRoll':FEATURE_PAGES[0],
-    'NpcVehicles':FEATURE_PAGES[1], 'Traffic':FEATURE_PAGES[1], 'RouteMarkers':FEATURE_PAGES[1],
+    'NpcVehicles':FEATURE_PAGES[1], 'Traffic':FEATURE_PAGES[1], 'RouteMarkers':'Route beacons', 'WallPass':None,
     'HoverOrDrive':None, 'NativeGround':None, 'CombatAi':None, 'VehicleDamage':None, 'Witnesses':None, 'HealthBars':None, 'StatusCard':None,
     'PhysicalAi':None, 'Placement':None, 'PlacementMode':None, 'DebugLog':None,
 }
@@ -43,7 +83,7 @@ def feature_definitions(source_dir):
     for name,label,description,section,key,default in re.findall(pattern,source):
         items.append({'id':name,'label':label,'description':description,'section':section,'key':key,'default':default=='true',
                       'page':FEATURE_GROUPS[name],'configurable':name not in FIXED_FEATURES})
-    if len(items)!=17 or len({(f['section'],f['key']) for f in items})!=len(items):
+    if len(items)!=18 or len({(f['section'],f['key']) for f in items})!=len(items):
         raise ValueError('Feature list changed or could not be parsed; review installer coverage')
     return items
 
@@ -97,7 +137,7 @@ def add_dependencies(parent, required):
         ET.SubElement(deps, 'fileDependency', file=name, state='Active')
 
 
-def option(parent, name, description, source, destination, required, conflicts=(), companions=()):
+def option(parent, name, description, source, destination, required, conflicts=(), companions=(), usable='Optional'):
     plugin = ET.SubElement(parent, 'plugin', name=name)
     ET.SubElement(plugin, 'description').text = description
     files = ET.SubElement(plugin, 'files')
@@ -115,10 +155,10 @@ def option(parent, name, description, source, destination, required, conflicts=(
         ET.SubElement(pattern, 'type', name='NotUsable')
     pattern = ET.SubElement(patterns, 'pattern')
     add_dependencies(pattern, required)
-    ET.SubElement(pattern, 'type', name='Optional')
+    ET.SubElement(pattern, 'type', name=usable)
 
 
-def module_config(dependencies, features):
+def module_config(dependencies, features, route_texts):
     ET.register_namespace('xsi', 'http://www.w3.org/2001/XMLSchema-instance')
     root = ET.Element('config', {'{http://www.w3.org/2001/XMLSchema-instance}noNamespaceSchemaLocation':
                                 'http://qconsulting.ca/fo3/ModConfig5.0.xsd'})
@@ -137,25 +177,25 @@ def module_config(dependencies, features):
         'Choose your feature settings on the following grouped pages, or keep your current settings. '
         'When upgrading, replace your old FVO installation instead of enabling two copies.')
     ET.SubElement(ET.SubElement(core, 'typeDescriptor'), 'type', name='Required')
-    # 0.8.5: the 0.8 group and option names, so a manager update keeps a user's earlier choices.
-    addons = ET.SubElement(ET.SubElement(groups, 'group', name='Optional addons (unchecked by default)', type='SelectAny'),
+    # 0.9.0: City Traffic and City Placements are pre-ticked; the routes are chosen city by city on their own page.
+    addons = ET.SubElement(ET.SubElement(groups, 'group', name='Optional addons', type='SelectAny'),
                            'plugins', order='Explicit')
-    # 0.8.5: route traffic (the addon DLL + traffic files) works with any parked vehicles, so it is its own choice.
-    traffic = ET.SubElement(addons, 'plugin', name='New Atlantis City Traffic')
+    traffic = ET.SubElement(addons, 'plugin', name='City Traffic')
     ET.SubElement(traffic, 'description').text = (
-        'Replaces the 0.8 FVO_CityTraffic.esm (remove it if another mod entry still supplies it). '
-        'Traffic that flies routes defined in plain text files: SFSE/Plugins/FVO_Traffic/NewAtlantis.ini (a two-lane ring round '
-        'New Atlantis with four exits and landing places) and HOW-TO-MAKE-ROUTES.txt. Uses any parked vehicles (vanilla, Carfield, '
-        'Parked Vehicles or the New Atlantis parked vehicles below). Needs only the core.')
+        'Traffic that flies routes over the cities, from plain text files in SFSE/Plugins/FVO_Traffic. Choose the cities on '
+        'the next page. Includes HOW-TO-MAKE-ROUTES.txt for writing your own. Uses any parked vehicles (vanilla, Carfield, '
+        'Parked Vehicles or City Placements). Needs only the core. Replaces the 0.8 FVO_CityTraffic.esm (remove it if '
+        'another mod entry still supplies it).')
     files = ET.SubElement(traffic, 'files')
-    for name in (CITY_DLL, CITY_TRAFFIC, ROUTE_GUIDE):
+    for name in (CITY_DLL, ROUTE_GUIDE):
         ET.SubElement(files, 'file', source='11 Route Traffic/'+name, destination=name, priority='0')
-    ET.SubElement(ET.SubElement(traffic, 'typeDescriptor'), 'type', name='Optional')
-    option(addons, 'New Atlantis City Placements',
-           'Adds parked vehicles around New Atlantis. Vehicle types stay as authored. Remove the superseded FVO_CityTraffic.esm if installed. '
-           'Requires active: '+', '.join(dependencies[CITY])+'.',
+    ET.SubElement(ET.SubElement(traffic, 'conditionFlags'), 'flag', name='city_traffic').text = 'Yes'
+    ET.SubElement(ET.SubElement(traffic, 'typeDescriptor'), 'type', name='Recommended')
+    option(addons, 'City Placements',
+           'Adds parked vehicles in nine cities, for NPCs and traffic to use. Vehicle types stay as authored. Remove the superseded '
+           'FVO_CityTraffic.esm if installed. Requires active: '+', '.join(dependencies[CITY])+'.',
            '10 City Placements/'+CITY, CITY, dependencies[CITY],
-           ('FVO_CityTraffic.esm', 'FlyingVehicleOverhaul - Placements.esm'))
+           ('FVO_CityTraffic.esm', 'FlyingVehicleOverhaul - Placements.esm'), usable='Recommended')
     option(addons, 'Parked Vehicles conversion patch',
            'Converts Parked Vehicles pack-in props into usable REV-8, Moon Jumper and Deimog vehicles, '
            'including its procedural placements. Removes their duplicate decorative wheels and turrets. '
@@ -194,6 +234,52 @@ def module_config(dependencies, features):
                 ET.SubElement(files,'file',source=f"40 Features/{feature['id']}/{state}.ini",
                               destination=PROFILE+feature['section']+'.'+feature['key']+'.ini',priority='0')
                 ET.SubElement(ET.SubElement(plugin,'typeDescriptor'),'type',name='Recommended' if enabled==feature['default'] else 'Optional')
+    # 0.9.0: city routes, the cold-start choice and the route beacons, shown with City Traffic.
+    step=ET.SubElement(steps,'installStep',name='City traffic routes')
+    ET.SubElement(ET.SubElement(step,'visible',operator='And'),'flagDependency',flag='city_traffic',value='Yes')
+    routes=ET.SubElement(ET.SubElement(ET.SubElement(step,'optionalFileGroups',order='Explicit'),'group',name='Routes',type='SelectAny'),'plugins',order='Explicit')
+    for key,label,description,names in ROUTES:
+        plugin=ET.SubElement(routes,'plugin',name=label)
+        ET.SubElement(plugin,'description').text=route_description(label,description,route_texts[names[0]])+' Uncheck to leave this city without route traffic.'
+        ET.SubElement(ET.SubElement(plugin,'conditionFlags'),'flag',name='route_'+key).text='Yes'
+        ET.SubElement(ET.SubElement(plugin,'typeDescriptor'),'type',name='Recommended')
+    step=ET.SubElement(steps,'installStep',name='Traffic options')
+    ET.SubElement(ET.SubElement(step,'visible',operator='And'),'flagDependency',flag='city_traffic',value='Yes')
+    arrive=ET.SubElement(ET.SubElement(ET.SubElement(step,'optionalFileGroups',order='Explicit'),'group',name='Traffic when you arrive',type='SelectExactlyOne'),'plugins',order='Explicit')
+    for flag,label,text,kind in (('Yes','Already flying','Vehicles with seated drivers start on the routes, so a city has traffic as soon as you arrive. They are made once per save and reused.','Recommended'),
+                                 ('No','Starts empty','No vehicles are made: route traffic comes only from parked vehicles that NPCs walk to and take.','Optional')):
+        plugin=ET.SubElement(arrive,'plugin',name=label)
+        ET.SubElement(plugin,'description').text=text
+        ET.SubElement(ET.SubElement(plugin,'conditionFlags'),'flag',name='coldstart').text=flag
+        ET.SubElement(ET.SubElement(plugin,'typeDescriptor'),'type',name=kind)
+    beacons=next(f for f in features if f['id']=='RouteMarkers')
+    step=ET.SubElement(steps,'installStep',name='Route beacons')
+    visible=ET.SubElement(step,'visible',operator='And')
+    ET.SubElement(visible,'flagDependency',flag='city_traffic',value='Yes')
+    ET.SubElement(visible,'flagDependency',flag='configure_features',value='Yes')
+    options=ET.SubElement(ET.SubElement(ET.SubElement(step,'optionalFileGroups',order='Explicit'),'group',name=beacons['label'],type='SelectExactlyOne'),'plugins',order='Explicit')
+    for enabled in (True,False):
+        plugin=ET.SubElement(options,'plugin',name='Show' if enabled else 'Hide')
+        ET.SubElement(plugin,'description').text=('Beacons stand along every traffic lane, at its exits and at landing places, in the world you are in. '
+            'Only the beacons: the routes themselves fly either way. Also a switch in the game\'s settings menu.' if enabled else
+            'No beacons; traffic still flies its routes.')
+        files=ET.SubElement(plugin,'files')
+        ET.SubElement(files,'file',source=f"40 Features/RouteMarkers/{'On' if enabled else 'Off'}.ini",
+                      destination=PROFILE+beacons['section']+'.'+beacons['key']+'.ini',priority='0')
+        ET.SubElement(ET.SubElement(plugin,'typeDescriptor'),'type',name='Recommended' if enabled==beacons['default'] else 'Optional')
+    # Each chosen route installs its file(s) in the variant the cold-start choice picked.
+    conditional=ET.SubElement(ET.SubElement(root,'conditionalFileInstalls'),'patterns')
+    for key,label,description,names in ROUTES:
+        for flag,folder in VARIANTS:
+            chosen=[name for name in names if folder=='Flying' or name not in COLD_START_ONLY]
+            pattern=ET.SubElement(conditional,'pattern')
+            deps=ET.SubElement(pattern,'dependencies',operator='And')
+            ET.SubElement(deps,'flagDependency',flag='city_traffic',value='Yes')
+            ET.SubElement(deps,'flagDependency',flag='route_'+key,value='Yes')
+            ET.SubElement(deps,'flagDependency',flag='coldstart',value=flag)
+            files=ET.SubElement(pattern,'files')
+            for name in chosen:
+                ET.SubElement(files,'file',source=f'11 Route Traffic/{folder}/{name}',destination=TRAFFIC_DIR+name,priority='0')
     return xml_bytes(root)
 
 
@@ -218,7 +304,7 @@ def build(data_dir, source_dir, sfse_dir, output, version, schema=None, test_res
         raise ValueError('Invalid version label')
     if not (sfse_dir/'sfse/PluginAPI.h').is_file():
         raise FileNotFoundError('SFSE headers missing: '+str(sfse_dir))
-    inputs = {name: (data_dir/name).read_bytes() for name in (DLL, PILOTS, PATCH, CITY, CITY_DLL, CITY_TRAFFIC, ROUTE_GUIDE)}
+    inputs = {name: (data_dir/name).read_bytes() for name in (DLL, PILOTS, PATCH, CITY, CITY_DLL, ROUTE_GUIDE, *ROUTE_FILES)}
     if inputs[DLL][:2] != b'MZ':
         raise ValueError('Expected a Windows DLL')
     if b'Installer features:' not in inputs[DLL]:
@@ -234,7 +320,8 @@ def build(data_dir, source_dir, sfse_dir, output, version, schema=None, test_res
     dependencies = {name: masters(inputs[name]) for name in (PILOTS, PATCH, CITY)}
     if dependencies[PILOTS] != ['Starfield.esm']:
         raise ValueError('Core pilot plugin acquired new dependencies; review installer requirements')
-    config = module_config(dependencies, features)
+    route_texts = {name[len(TRAFFIC_DIR):]: inputs[name] for name in ROUTE_FILES}
+    config = module_config(dependencies, features, route_texts)
     if schema is not None:
         from lxml import etree
         schema_tree = etree.parse(str(schema))
@@ -248,13 +335,15 @@ def build(data_dir, source_dir, sfse_dir, output, version, schema=None, test_res
 
 Use Vortex or Mod Organizer 2 to install the FOMOD ZIP and follow its installer.
 Core always installs: FlyingVehicleOverhaul.dll, FVO_NPCPilots.esm and this guide.
-Extra Vehicles addon, two independent choices (both unchecked):
-- New Atlantis placements: FVO_CityPlacements.esm adds parked vehicles around New
-  Atlantis. Requires: {', '.join(dependencies[CITY])}. Enable it after its masters.
-- City traffic: SFSE/Plugins/FVO_CityPlacements.dll and the traffic files in
-  SFSE/Plugins/FVO_Traffic (NewAtlantis.ini: a ring round New Atlantis;
-  HOW-TO-MAKE-ROUTES.txt: how to write your own). Needs only the core and uses
-  whatever parked vehicles are there. Every *.ini in FVO_Traffic is read.
+Optional addons (City Traffic and City Placements are ticked by default):
+- City Traffic: SFSE/Plugins/FVO_CityPlacements.dll and route files in
+  SFSE/Plugins/FVO_Traffic, chosen city by city: New Atlantis (ring and district
+  loop), Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead,
+  Paradiso and Red Mile. HOW-TO-MAKE-ROUTES.txt explains writing your own; every
+  *.ini in FVO_Traffic is read. Traffic can start already flying (vehicles with
+  seated drivers, made once per save) or empty. Route beacons can be shown or hidden.
+- City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities.
+  Requires: {', '.join(dependencies[CITY])}. Enable it after its masters.
 Remove the old FVO_CityTraffic.esm and FlyingVehicleOverhaul - Placements.esm if present.
 Optional, unchecked: FVO_ParkedVehiclesPatch.esm converts Parked Vehicles'
 pack-in props into usable REV-8, Moon Jumper and Deimog vehicles, including its
@@ -289,8 +378,10 @@ different mod or manual install. Reinstall this package to change its choices.
 Removing old plugins can cause missing-plugin warnings in saves that used them.
 
 Manual install: copy only the contents of '00 Core' into Starfield/Data.
-For Extra Vehicles city traffic, also copy '11 Route Traffic' contents into Data.
-For Extra Vehicles placements, also copy '10 City Placements' contents into Data
+For city traffic, copy '11 Route Traffic/SFSE' into Data, then the route files you want
+from '11 Route Traffic/Flying' (traffic already flying) or '11 Route Traffic/Empty'
+(starts empty) into Data/SFSE/Plugins/FVO_Traffic.
+For City Placements, also copy '10 City Placements' contents into Data
 and enable FVO_CityPlacements.esm after its masters.
 For the optional patch, also copy '20 Parked Vehicles Patch' contents into Data
 and enable FVO_ParkedVehiclesPatch.esm after its masters.
@@ -305,7 +396,7 @@ validation.
     numeric = re.match(r'\d+(?:\.\d+){1,3}', version)
     version_attrs = {'MachineVersion': numeric.group(0)} if numeric else {}
     ET.SubElement(info, 'Version', version_attrs).text = version
-    ET.SubElement(info, 'Description').text = 'Core, grouped gameplay feature choices and an optional Parked Vehicles conversion patch.'
+    ET.SubElement(info, 'Description').text = 'Core, grouped gameplay feature choices, city traffic routes city by city, City Placements and an optional Parked Vehicles conversion patch.'
     entries = {'fomod/ModuleConfig.xml': config, 'fomod/info.xml': xml_bytes(info),
                'fomod/features.json': (json.dumps(features,indent=2)+'\n').encode(),
                'README.txt': readme, '00 Core/Docs/FlyingVehicleOverhaul-INSTALL.txt': readme,
@@ -313,9 +404,12 @@ validation.
                '20 Parked Vehicles Patch/'+PATCH: inputs[PATCH],
                '10 City Placements/'+CITY: inputs[CITY],
                '11 Route Traffic/'+CITY_DLL: inputs[CITY_DLL],
-               '11 Route Traffic/'+CITY_TRAFFIC: inputs[CITY_TRAFFIC],
                '11 Route Traffic/'+ROUTE_GUIDE: inputs[ROUTE_GUIDE]}
     entries.update(feature_payload(features))
+    for name,data in route_texts.items():
+        entries['11 Route Traffic/Flying/'+name]=data
+        if name not in COLD_START_ONLY:
+            entries['11 Route Traffic/Empty/'+name]=starts_empty(name,data)
     output.mkdir(parents=True, exist_ok=True)
     archive = output/f'FlyingVehicleOverhaul-{version}-FOMOD.zip'
     write_zip(archive, entries)

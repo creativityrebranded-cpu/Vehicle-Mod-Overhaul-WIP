@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import zipfile
-from package_fomod import DLL,PILOTS,PATCH,CITY,CITY_DLL,CITY_TRAFFIC,ROUTE_GUIDE
+from package_fomod import DLL,PILOTS,PATCH,CITY,CITY_DLL,ROUTE_GUIDE,ROUTE_FILES,TRAFFIC_DIR
 from verify_fomod import verify
 
 
@@ -23,7 +23,7 @@ def verify_bundle(folder,schema=None):
             archives[role]={name:archive.read(name) for name in archive.namelist()}
     expected={
         'main':{DLL,PILOTS,'Docs/FlyingVehicleOverhaul-INSTALL.txt'},
-        'extra':{CITY,CITY_DLL,CITY_TRAFFIC,ROUTE_GUIDE,'Docs/FlyingVehicleOverhaul-ExtraVehicles.txt'},
+        'extra':{CITY,CITY_DLL,ROUTE_GUIDE,*ROUTE_FILES,'Docs/FlyingVehicleOverhaul-ExtraVehicles.txt'},
         'patch':{PATCH,'Docs/FlyingVehicleOverhaul-ParkedVehiclesPatch.txt'},
     }
     for role,names in expected.items():assert set(archives[role])==names,(role,'unexpected deployed files')
@@ -32,7 +32,8 @@ def verify_bundle(folder,schema=None):
     assert archives['main'][PILOTS]==fomod['00 Core/'+PILOTS]
     assert hashlib.sha256(archives['main'][DLL]).hexdigest()==metadata['dll_sha256']
     assert archives['extra'][CITY]==fomod['10 City Placements/'+CITY]
-    for name in (CITY_DLL,CITY_TRAFFIC,ROUTE_GUIDE):assert archives['extra'][name]==fomod['11 Route Traffic/'+name]
+    for name in (CITY_DLL,ROUTE_GUIDE):assert archives['extra'][name]==fomod['11 Route Traffic/'+name]
+    for name in ROUTE_FILES:assert archives['extra'][name]==fomod['11 Route Traffic/Flying/'+name[len(TRAFFIC_DIR):]],'Extra ZIP routes = installer flying variant'
     assert archives['patch'][PATCH]==fomod['20 Parked Vehicles Patch/'+PATCH]
     assert ET.fromstring(fomod['fomod/info.xml']).findtext('Version')==version
     assert f'Flying Vehicle Overhaul (FVO) {version} loaded'.encode() in archives['main'][DLL]

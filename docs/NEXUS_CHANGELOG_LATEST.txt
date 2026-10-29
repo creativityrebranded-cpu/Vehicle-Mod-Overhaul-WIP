@@ -1,3 +1,16 @@
+0.9.0 — 28 October 2026
+
+- City traffic: eleven routes over ten cities (New Atlantis ring and district loop, Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso, Red Mile), with exits, landing places and rooftop clearance. The New Atlantis ring is slanted to clear the MAST.
+- Traffic already flying on arrival: vehicles with seated drivers start on the routes, made once per save and reused (start_on_route in each route file; 0 turns it off).
+- Traffic beyond the loaded area: FVO-flown vehicles and their drivers pass the game's loaded-area wall (no bounce, no drivers pulled from their seats), stay persistent, and keep their visible position in step with their physics past the loaded cells. The wall stays for everything else (it is also the game's fell-through-the-world rescue and projectile cull).
+- Wreck occupants and drivers getting out to fight leave through the game's own get-up, as pulling a driver out does; no more stuck sitting pose.
+- City Placements: parked vehicles in nine cities.
+- Route beacons (Show traffic routes) on by default.
+- Installer: city traffic route by route, traffic already flying or starting empty, route beacons; City Traffic and City Placements pre-ticked; option names changed from "New Atlantis City Traffic/Placements" to "City Traffic/Placements".
+- Default HUD layout updated.
+- Removed the experimental virtual travel for far traffic.
+- Built and passed all 62 offline test suites; FOMOD schema validation and 14,633 installer checks pass. Native Vortex/MO2 installer UI not run.
+
 Latest local update — 25 October 2026
 Not yet published as a new numbered release.
 

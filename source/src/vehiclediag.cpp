@@ -11,6 +11,8 @@
 #include "vehicleflight.h"
 #include "vehiclehits.h"
 #include "vehicleworld.h"
+#include "npcvehicles.h"
+#include "runtimeforms.h"
 
 #include <Windows.h>
 #include <intrin.h>
@@ -607,6 +609,44 @@ namespace vehiclediag
 		return it == g_comps.end() ? 0 : it->second.component;
 	}
 
+	// Read-only evidence for active jobs, including those omitted from the nearby snapshot.
+	// Parent cells can be persistent; positional grid coverage is measured separately.
+	struct RangeView {
+		game::Vec3 pos{};
+		bool valid=false, loaded=false;
+		int parentState=-1, positionState=-1;
+		unsigned gridEntries=0;
+	};
+	RangeView ReadRange(uptr ref) {
+		RangeView r;
+		__try {
+			if (!ref) return r;
+			r.pos=At<game::Vec3>(ref,off::kRefPosition);
+			if (!std::isfinite(r.pos.x)||!std::isfinite(r.pos.y)||!std::isfinite(r.pos.z)) return r;
+			const uptr loaded=At<uptr>(ref,off::kRefLoadedData);
+			r.loaded=loaded && At<uptr>(loaded,off::kLoadedData3D);
+			const uptr parent=At<uptr>(ref,off::kRefParentCell);
+			if(parent) r.parentState=At<std::uint8_t>(parent,off::kCellState);
+			const uptr tes=*reinterpret_cast<uptr*>(game::Base()+addr::kTESPtr);
+			if(tes) {
+				r.gridEntries=At<unsigned>(tes,off::kTESGridCount);
+				const auto entries=At<uptr*>(tes,off::kTESGridCells);
+				// Bounded diagnostic only. Do not claim coverage for entries not inspected.
+				for(unsigned i=0;entries && i<std::min(r.gridEntries,4096u);++i) {
+					const uptr entry=entries[i], cell=entry?At<uptr>(entry,off::kGridEntryCell):0;
+					if(!cell || (At<std::uint8_t>(cell,0x48)&1) || (At<unsigned>(cell,off::kCellFormFlags)&0x400)) continue;
+					const uptr ext=At<uptr>(cell,off::kCellExterior);
+					if(ext && double(At<int>(ext,0))==std::floor(r.pos.x/100.0) &&
+						double(At<int>(ext,4))==std::floor(r.pos.y/100.0)) {
+						r.positionState=At<std::uint8_t>(cell,off::kCellState); break;
+					}
+				}
+			}
+			r.valid=true;
+		} __except(EXCEPTION_EXECUTE_HANDLER) { r.valid=false; }
+		return r;
+	}
+
 	void Tick()
 	{
 		GuardTick();
@@ -617,7 +657,8 @@ namespace vehiclediag
 		if (first) return;  // the first window starts now
 		const uptr player = *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr);
 		world::Snapshot snap;
-		if (!player || !world::Vehicles(snap)) return;
+		if (!player) return;
+		if (!world::Vehicles(snap)) snap={}; // active-job evidence must survive an empty scan
 		const auto pp = At<game::Vec3>(player, off::kRefPosition);
 		std::vector<const world::VehicleInfo*> nearby;
 		for (std::uint32_t i = 0; i < snap.count && i < 64; ++i) {
@@ -636,6 +677,28 @@ namespace vehiclediag
 			for (const auto& [id, c] : comps) g_comps[id] = Comp{ c.component, 0 };  // keep the component, restart the count
 		}
         const auto skippedSteps=g_steps.Drain([&](uptr instance,unsigned count){steps[instance]=count;});
+		npcvehicles::JobInfo jobs[32]{};
+		const int jobCount=npcvehicles::Jobs(jobs,32);
+		for(int j=0;j<jobCount;++j) {
+			const auto& job=jobs[j];
+			const uptr vehicle=runtimeforms::Lookup(job.vehicle), actor=runtimeforms::Lookup(job.npc);
+			const auto vr=ReadRange(vehicle), ar=ReadRange(actor);
+			const auto comp=comps.find(job.vehicle);
+			const Read r=comp!=comps.end() && comp->second.component?ReadComponent(comp->second.component):Read{};
+			const auto step=steps.find(r.instance);
+			const int pilot=npcvehicles::PilotFor(job.vehicle);
+			const auto physics=vehicleflight::PilotPhysics(pilot);
+			bool inSnapshot=false; unsigned sceneBodies=0;
+			for(unsigned i=0;i<snap.count && i<64;++i) if(snap.v[i].formId==job.vehicle) {
+				inSnapshot=true; sceneBodies=snap.v[i].bodyCount; break;
+			}
+			logger::Write("Traffic range: %08X pilot %d, distance %.1f m, height %.1f; vehicle ref %d 3D %d, driver ref %d 3D %d seated %d; grid entries %u position cell %d parent cell %d; snapshot %d scene bodies %u; native updates %u instance %d steps %u; FVO active %d bound %d live %d serial %llu",
+				job.vehicle,pilot,vr.valid?std::hypot(vr.pos.x-pp.x,vr.pos.y-pp.y):-1.0,vr.valid?double(vr.pos.z):0.0,
+				vr.valid?1:0,vr.loaded?1:0,ar.valid?1:0,ar.loaded?1:0,actor&&vehicle&&npcvehicles::VehicleOf(actor)==vehicle?1:0,
+				vr.gridEntries,vr.positionState,vr.parentState,inSnapshot?1:0,sceneBodies,comp!=comps.end()?comp->second.updates:0u,r.ok&&r.instance?1:0,
+				step!=steps.end()?step->second:0u,vehicleflight::PilotActive(pilot)?1:0,physics.bound?1:0,physics.live?1:0,
+				static_cast<unsigned long long>(physics.serial));
+		}
 		logger::Write("Vehicle probe: %zu vehicles within %.0f m; component updates hook %s; freeze on exit %u; %zu components updated, %zu instances stepped in %.0f s",
 			nearby.size(), kNear, g_hooked ? "on" : "OFF", freeze, comps.size(), steps.size(), kEveryMs / 1000.0);
         if(skippedSteps)

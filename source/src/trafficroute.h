@@ -18,7 +18,7 @@
 namespace trafficroute {
 using trafficdata::Vec;
 constexpr int kRingSamples = 96;
-constexpr double kLead = 70.0, kReach = 25.0, kClimbSlack = 8.0;
+constexpr double kLead = 70.0, kReach = 25.0, kClimbSlack = 8.0, kClimbLean = 20.0;
 
 struct Line {
     bool closed = true;
@@ -32,10 +32,13 @@ inline Line Build(const trafficdata::Route& r)
     Line l;
     if (r.ring) {
         l.closed = true;
+        const double toward = r.tiltToward * ringlogic::kPi / 180.0, slope = std::tan(r.tilt * ringlogic::kPi / 180.0);
         for (int i = 0; i < kRingSamples; ++i) {
             const auto p = ringlogic::At(r.shape, 2.0 * ringlogic::kPi * i / kRingSamples);
-            l.lane[0].push_back({ p.x, p.y, p.z });
-            l.lane[1].push_back({ p.x, p.y, p.z + r.shape.gap });
+            // slanted: higher toward `tiltToward`, by the distance from the centre along that direction
+            const double z = p.z + slope * ((p.x - r.shape.cx) * std::sin(toward) + (p.y - r.shape.cy) * std::cos(toward));
+            l.lane[0].push_back({ p.x, p.y, z });
+            l.lane[1].push_back({ p.x, p.y, z + r.shape.gap });
         }
         return l;
     }
@@ -164,7 +167,14 @@ inline Goal Step(const Line& l, Trip& t, double x, double y, double z)
     const Vec join = At(l, t.lane, joinU);
     if (t.leg == Leg::Climb) {
         if (z >= join.z - kClimbSlack) { t.leg = Leg::Join; }
-        else { g.x = t.home.x; g.y = t.home.y; g.z = join.z; g.stop = 4.0; return g; }
+        else {
+            // Up, leaning up to kClimbLean toward the lane: a goal straight overhead is 0 m away sideways, which the autopilot took
+            // for "arrived" in a settlement and stayed on the ground (2026-10-28 18:11, a cold-start vehicle idle 131 s at its spot).
+            const double dx = join.x - t.home.x, dy = join.y - t.home.y, d = std::hypot(dx, dy);
+            const double k = d > 1.0 ? std::min(kClimbLean, d) / d : 0.0;
+            g.x = t.home.x + dx * k; g.y = t.home.y + dy * k; g.z = join.z; g.stop = 4.0;
+            return g;
+        }
     }
     if (t.leg == Leg::Join) {
         if (std::hypot(join.x - x, join.y - y) < kReach && std::fabs(z - join.z) < kReach) {
@@ -200,4 +210,5 @@ inline Goal Step(const Line& l, Trip& t, double x, double y, double z)
     g.x = to.x; g.y = to.y; g.z = z; g.stop = 6.0;
     return g;
 }
+
 }

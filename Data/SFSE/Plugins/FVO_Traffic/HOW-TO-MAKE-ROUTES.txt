@@ -48,6 +48,8 @@ rotation = 0                  ; degrees, clockwise
 lanes    = 2                  ; lane 0 clockwise, lane 1 counter-clockwise
 lane_gap = 40                 ; m lane 1 sits above lane 0
 speed    = 25                 ; m/s along the route
+tilt     = 0                  ; degrees: a slanted ring climbs toward tilt_toward and dips opposite
+tilt_toward = 0               ; degrees clockwise from north (the high side); height is then the centre's
 
 A path (points in order, each "x y z", separated by commas):
 

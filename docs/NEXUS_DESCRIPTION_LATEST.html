@@ -1,0 +1,90 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Flying Vehicle Overhaul 0.8 — Nexus description</title><style>body{background:#29292e;color:#e3e3e3;font:300 14px/21px Inter,Arial,sans-serif;max-width:1000px;margin:0 auto;padding:24px}h2{font-size:28px;line-height:42px;font-weight:400;margin:20px 0 10px}p{margin:0 0 14px}ul{list-style:disc;margin:0 0 14px 15px;padding:0 0 0 15px}li{margin:0 0 10px 20px}strong{font-weight:700}a{color:#e6a158}</style></head><body><p><strong>Flying Vehicle Overhaul 0.8 — Early WIP</strong></p>
+<p>Hover vehicles with gears, terrain following and autopilot. Summon your vehicle, have it follow or cover you, send it along scanner routes, or let a follower drive while you ride as a passenger. NPCs can use compatible vehicles for travel and combat.</p>
+<h2>What it does</h2>
+<ul>
+<li><strong>Hover flight:</strong> four gears, boost, climb, descend and terrain following. Standard hover works with Physical VTOL switched off.</li>
+<li><strong>Physical flight — experimental:</strong> thrust, torque, native mass and inertia produce momentum and banking. Flight assist stabilizes drift and rotation; camera roll and an attitude instrument show pitch and bank. Separate player and AI settings, both off by default.</li>
+<li><strong>Autopilot and routes:</strong> summon, follow, cover, guard and scanner destinations. Chain stops, retry a held trip or skip a stop. Navigation considers terrain, walls, ceilings, people, vehicles, weather and darkness.</li>
+<li><strong>Followers and passengers:</strong> request a follower driver, ride with an NPC or take the wheel. Escorts can defend, intercept, scout and rescue; a following vehicle can attempt to catch you from below.</li>
+<li><strong>Combat and faction reactions:</strong> vehicle manoeuvres, squad roles, morale, attacks and retreats. Set Defend / Attack / Hold fire, or focus a hostile person or hostile-driven vehicle. Ownership and allegiance govern vehicle use and friendly-fire protection.</li>
+<li><strong>Damage and wrecks:</strong> shots and collisions damage occupied and empty vehicles, can injure occupants and can leave wrecks. Vehicle health stays with the chassis through driver changes.</li>
+<li><strong>NPC activity:</strong> compatible vehicles can support trips, shared rides, patrols and supply runs when suitable NPCs and vehicles are available.</li>
+<li><strong>Ground navigation — experimental:</strong> optional ground-first route planning around terrain hazards and buildings, with native driving for occupied vehicles. Off by default.</li>
+<li><strong>Controls and HUD:</strong> separate keyboard/controller bindings with context, tap, hold and double tap. Move and resize HUD groups together or adjust individual status-card elements, route text, escort rows and action slots within them.</li>
+</ul>
+<h2>New in 0.8</h2>
+<ul>
+<li><strong>FOMOD installer:</strong> independent choices for the two content addons, plus individual feature switches grouped under Flight and Navigation, NPCs and Combat, HUD, and Parked Vehicles.</li>
+<li><strong>Settings import:</strong> choose features during installation or Keep existing settings. Choices apply on the next launch; unchanged installer choices preserve later in-game adjustments. Bindings and saved HUD layouts remain intact.</li>
+<li><strong>Installer fixes:</strong> corrected XML parsing and the false Starfield.esm prerequisite check. Addon choices check their required masters. Placement recording and detailed logging are not installer choices.</li>
+<li><strong>HUD editing:</strong> individual movement and sizing inside groups; fixed the fourth escort row and duplicate information-panel movement. My current HUD arrangement is now the built-in default; existing saved layouts take priority.</li>
+<li><strong>Navigation and combat:</strong> added experimental ground planning/native driving, off by default, and focus fire against hostile-driven vehicles.</li>
+<li><strong>Downloads:</strong> separate main and optional-addon packages, with an alternative all-in-one FOMOD.</li>
+</ul>
+<h2>Requirements</h2>
+<ul>
+<li><strong>Steam Starfield 1.16.244</strong> and its matching <strong>Starfield Script Extender (SFSE)</strong>. Launch through sfse_loader.exe. Game Pass and Microsoft Store are not supported.</li>
+<li><strong>Core-game vehicle content</strong> is sufficient for the main mod and Extra Vehicles addon. Carfield and Parked Vehicles are optional; only the Parked Vehicles conversion patch requires Parked Vehicles and its listed vehicle-content masters.</li>
+</ul>
+<h2>Downloads and included files</h2>
+<ul>
+<li><strong>FlyingVehicleOverhaul-0.8.zip — main:</strong> FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.</li>
+<li><strong>FlyingVehicleOverhaul-0.8-ExtraVehicles.zip — optional:</strong> FVO_CityPlacements.esm adds parked vehicles around New Atlantis using core-game vehicle content. No separate vehicle mod required. Includes its guide.</li>
+<li><strong>FlyingVehicleOverhaul-0.8-ParkedVehiclesPatch.zip — optional:</strong> FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod&#39;s static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Do not enable alongside the older Vehicles - Real.esm conversion patch.</li>
+<li><strong>FlyingVehicleOverhaul-0.8-FOMOD.zip — all-in-one alternative:</strong> the same main files and both optional addons, with dependency checks and grouped feature setup for Vortex/MO2. Both addons start unchecked. Use this instead of the separate ZIPs.</li>
+</ul>
+<h2>Installation and updating</h2>
+<ul>
+<li><strong>Mod manager:</strong> install the FOMOD, or install the main ZIP plus whichever optional addon ZIPs you want.</li>
+<li><strong>Manual:</strong> extract the main ZIP and wanted addon ZIPs into Starfield\Data. The DLL belongs in Data\SFSE\Plugins. Do not extract the entire FOMOD archive into Data.</li>
+<li><strong>Enable plugins:</strong> FVO_NPCPilots.esm and whichever optional addon ESMs you installed. Launch through SFSE; restart after replacing the DLL.</li>
+<li><strong>Updating:</strong> replace the previous FVO installation. Remove SeamlessVehicle.dll if upgrading from that older filename; leaving both DLLs installed loads both copies. An unchecked addon does not remove a copy installed through another mod entry or manually.</li>
+</ul>
+<h2>Settings and defaults</h2>
+<ul>
+<li><strong>Feature settings:</strong> Settings &gt; Gameplay Options &gt; Flying Vehicle Overhaul. <strong>Bindings:</strong> Settings &gt; Controls.</li>
+<li><strong>On by default:</strong> NPC vehicle use, full combat AI, hover-or-drive behavior, damage and wrecks, health bars, status card, crash witnesses, parked-vehicle support and flight assist.</li>
+<li><strong>Off by default:</strong> free roll, player Physical VTOL, AI Physical VTOL and experimental ground planning/native driving. Placement recording and detailed logging also default off. Existing saved settings can override defaults.</li>
+<li><strong>Parked-vehicle support</strong> does not install either optional content addon.</li>
+</ul>
+<p>Configuration folder: Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul</p>
+<ul>
+<li><strong>settings.ini:</strong> feature settings. <strong>bindings.ini:</strong> keyboard/controller bindings. <strong>hoverui.ini:</strong> HUD positions and sizes. FlyingVehicleOverhaul.log is one folder above these files.</li>
+</ul>
+<h2>Keyboard and mouse defaults</h2>
+<ul>
+<li><strong>Driving:</strong> W/S accelerate/brake; A/D turn or roll; mouse looks/aims. V hover/land; Q/Z climb/descend; Alt tap next gear, hold descend. Shift boosts; double tap locks throttle in flight. Fresh boost or brake releases the lock.</li>
+<li><strong>Vehicle commands:</strong> T with scanner closed toggles Auto; movement takes control back. E exits, landing first while hovering. B toggles flight assist; K cycles stance; right bracket cycles your vehicle&#39;s navigation profile; J shows all hints.</li>
+<li><strong>On foot:</strong> N tap summon, hold recall vehicle and escorts. U tap follow/cover, hold request a follower driver. Facing an occupied vehicle, Activate tap boards as passenger; hold takes the driver&#39;s seat.</li>
+<li><strong>Passenger:</strong> G tap nearby boards; as passenger, tap exits and hold takes the wheel. Look to steer and W/S adjust speed when a taxi destination is not supplying guidance. F9 cycles escort navigation profiles.</li>
+<li><strong>Scanner:</strong> T tap destination/queued stop, double tap clear route, hold guard/focus an aimed hostile. H focus fire; O clear focus; semicolon retry; left bracket skip stop.</li>
+</ul>
+<h2>Controller defaults</h2>
+<p>Xbox / PlayStation names. Hold: 0.5 seconds; double tap: within 0.3 seconds. Custom bindings override these defaults.</p>
+<ul>
+<li><strong>Driving:</strong> left stick throttle/brake/turn/roll; right stick look. L3 hover/land; A/Cross tap gear, hold descend; Y/Triangle climb; X/Square descend. RB/R1 boost, double tap throttle lock. B/Circle exits with landing first. RT/R2 fires; LT/L2 aims.</li>
+<li><strong>Vehicle commands:</strong> D-pad Left tap Auto, hold navigation profile; Up recalls escorts; Right cycles stance; Down toggles flight assist in flight. R3 tap shows all hints.</li>
+<li><strong>Scanner orders:</strong> B/Circle tap summon, hold recall escorts too. L3 tap follow/cover, hold follower driver, double tap focus fire. Y/Triangle tap destination/stop, hold guard/focus, double tap clear route.</li>
+<li><strong>Scanner route actions:</strong> D-pad Left tap retry, hold navigation profile, double tap clear focus. Right tap skip, hold ride along, double tap escort profiles. View/Create tap stance, hold all hints, double tap HUD editor.</li>
+<li><strong>Passenger:</strong> A/Cross tap exit, hold take the wheel. Right stick steers; left stick up/down changes speed when a taxi destination is not supplying guidance.</li>
+</ul>
+<h2>HUD editor</h2>
+<ul>
+<li><strong>Keyboard:</strong> F7 opens/saves/closes; Page Up/Down selects; arrows move; Home/End adjust supported spacing; +/- resize; Delete resets the selection; Ctrl increases movement steps.</li>
+<li><strong>Controller:</strong> scanner View/Create double tap opens; LB/RB selects; left stick moves; D-pad Left/Right adjusts spacing; RT/LT resizes; X/Square resets; L3 increases movement steps; B/Circle saves/closes.</li>
+<li><strong>Groups and elements:</strong> moving a panel carries its arrangement; individual children retain their own offsets and sizes. Foot and vehicle status cards have separate layouts. The enemy vehicle health bar remains attached to the native enemy meter.</li>
+</ul>
+<h2>Status and known issues</h2>
+<ul>
+<li><strong>Early WIP:</strong> basic hover flight and summon/follow have been seen working in game. Recent navigation, combat, escort, controller, HUD and physical-flight changes need further gameplay testing; automated checks do not establish live performance.</li>
+<li><strong>Vehicle behavior:</strong> Physical AI may turn wide or overshoot. Parked vehicles may start partly inside the ground or hop. Atmospheric lift/stalls and save/load persistence of transient vehicle jobs are not included.</li>
+<li><strong>Performance:</strong> Jemison CPU/FPS drops were reported with 0.73.0. The cause remains unisolated; 0.8 is not a confirmed fix. Extra live vehicles can increase CPU/physics load. Compare with both optional addons disabled when reporting performance.</li>
+</ul>
+<h2>Reporting and compatibility</h2>
+<ul>
+<li>Include your game/mod version, input device, location, optional plugins, command used and scanner/driving/passenger state. Copy Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log before restarting; include bindings.ini for custom-control problems.</li>
+<li>Mods changing the same vehicle physics, AI, controls, HUD hooks or placement areas may conflict. Game updates require a compatible build.</li>
+</ul>
+<h2>Credits</h2>
+<ul><li>The SFSE team.</li><li>The authors of Carfield and Parked Vehicles (SarthesArai), whose parked-vehicle data the optional patch supports.</li></ul>
+<p>Source code and development notes: <a href="https://github.com/creativityrebranded-cpu/Vehicle-Mod-Overhaul-WIP">GitHub</a></p></body></html>

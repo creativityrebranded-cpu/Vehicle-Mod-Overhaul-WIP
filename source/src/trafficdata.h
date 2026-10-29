@@ -22,11 +22,16 @@ struct Route {
     ringlogic::Ring shape;           // a ring
     std::vector<Vec> points;         // a path, in order
     bool closed = false;             // a path that joins its last point back to its first (a loop: figure eight, oval)
+    // A slanted ring (2026-10-28, the user: "the ring for traffic for new atlantis could be slanted"): tilted `tilt` degrees, its
+    // high side toward `tiltToward` (degrees clockwise from north). `height` is the height at the centre.
+    double tilt = 0, tiltToward = 0;
     int lanes = 2;
     double width = 20, speed = 25;
 };
 struct Exit { std::string name, route; double at = 0; };  // ring: degrees round from north; path: point index
 struct Place { std::string name, world, exitName; Vec at; double radius = 40; };
+// A cold-start spawn spot (2026-10-28): on the ground, flat and open; heading in degrees clockwise from north.
+struct Spawn { std::string name, world; Vec at; double heading = 0; };
 enum class Trips { Laps, Places, Mixed };
 struct Traffic {
     std::string name, world;
@@ -35,14 +40,21 @@ struct Traffic {
     bool anyVehicle = true, rev8 = false;
     std::vector<unsigned> bases;     // vehicle base form ids allowed (empty with anyVehicle)
     Trips trips = Trips::Laps;
-    int startOnRoute = 0;            // read; not acted on yet
+    int startOnRoute = 0;            // the cold-start pool: vehicles spawned with seated drivers at the world's [spawn.*] spots
     std::string route;               // only this route (empty: the nearest route of the world)
 };
+// A world written in a city's own coordinates (2026-10-28, the user: "install for all the auto method"): the game lays a
+// city over its planet at a spot it picks when you land, so neither the planet world's name nor the shift is known ahead.
+// anchor = FORMID x y z, ... names references of the city with their positions in the city's .esm; the first one found
+// loaded in the player's world gives both: the world is the player's, the shift is its live position minus its file one.
+struct AnchorRef { unsigned id = 0; Vec at; };
 struct Data {
     std::map<std::string, std::string> worlds;  // world name -> id (the worldspace's editor name)
+    std::map<std::string, std::vector<AnchorRef>> anchors;  // world name -> its anchor references (city coordinates)
     std::vector<Route> routes;
     std::vector<Exit> exits;
     std::vector<Place> places;
+    std::vector<Spawn> spawns;
     std::vector<Traffic> traffic;
     std::vector<std::string> problems;          // "file: [section] key: why"
     int files = 0;
@@ -118,8 +130,26 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
         if (kind == "file") continue;
         if (name.empty()) { bad(sec, "", "a section needs a name (kind.name)"); continue; }
         if (kind == "world") {
-            if (get("id").empty()) bad(sec, "id", "missing");
-            else data.worlds[name] = get("id");
+            if (!get("anchor").empty()) {
+                std::string list = get("anchor");
+                for (auto& c : list) if (c == ',') c = ' ';
+                std::istringstream items(list);
+                std::string id, x, y, z;
+                std::vector<AnchorRef> refs;
+                while (items >> id) {
+                    char* end = nullptr;
+                    const unsigned long form = std::strtoul(id.c_str(), &end, 16);
+                    AnchorRef a;
+                    if (!(items >> x >> y >> z) || !end || *end || !form || !Number(x, a.at.x) || !Number(y, a.at.y) || !Number(z, a.at.z)) {
+                        bad(sec, "anchor", "needs FORMID x y z (comma between anchors)"); refs.clear(); break;
+                    }
+                    a.id = unsigned(form);
+                    refs.push_back(a);
+                }
+                if (!refs.empty()) data.anchors[name] = refs;
+            }
+            if (!get("id").empty()) data.worlds[name] = get("id");
+            else if (!data.anchors.count(name)) bad(sec, "id", "missing (or give anchor = ...)");
         }
         else if (kind == "route") {
             Route r;
@@ -144,6 +174,9 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
                 num(sec, kv, "rotation", rot);
                 r.shape.rotation = rot * ringlogic::kPi / 180.0;
                 num(sec, kv, "lane_gap", r.shape.gap);
+                num(sec, kv, "tilt", r.tilt);
+                num(sec, kv, "tilt_toward", r.tiltToward);
+                r.tilt = std::clamp(r.tilt, -45.0, 45.0);
                 r.shape = ringlogic::Clean(r.shape);
             }
             else {
@@ -171,6 +204,16 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
             p.at = { v[0], v[1], v[2] };
             num(sec, kv, "radius", p.radius);
             data.places.push_back(p);
+        }
+        else if (kind == "spawn") {
+            Spawn s;
+            s.name = name; s.world = Lower(get("world"));
+            bool ok = true;
+            const auto v = Numbers(get("point"), ok);
+            if (!ok || v.size() != 3) { bad(sec, "point", "needs x y z"); continue; }
+            s.at = { v[0], v[1], v[2] };
+            num(sec, kv, "heading", s.heading);
+            data.spawns.push_back(s);
         }
         else if (kind == "traffic") {
             Traffic t;
@@ -204,7 +247,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
             else if (!trips.empty() && trips != "laps") bad(sec, "trips", "places, laps or mixed");
             data.traffic.push_back(t);
         }
-        else bad(sec, "", "unknown section kind (file, world, route, exit, place, traffic)");
+        else bad(sec, "", "unknown section kind (file, world, route, exit, place, spawn, traffic)");
     }
 }
 
@@ -216,6 +259,21 @@ inline void AddRingroad(const std::string& worldId, const std::string& ringText,
     Route route;
     route.name = "ringroad"; route.world = "#" + Lower(worldId); route.file = "ringroad.ini"; route.shape = r;
     data.routes.push_back(route);
+}
+
+// An anchored world found in game: it is `gameWorld`, and everything written in it moves by `shift` into game coordinates.
+inline void PlaceWorld(Data& d, const std::string& name, const std::string& gameWorld, const Vec& shift)
+{
+    d.worlds[name] = gameWorld;
+    for (auto& r : d.routes) {
+        if (r.world != name) continue;
+        r.shape.cx += shift.x; r.shape.cy += shift.y; r.shape.z += shift.z;
+        for (auto& p : r.points) { p.x += shift.x; p.y += shift.y; p.z += shift.z; }
+    }
+    for (auto& p : d.places)
+        if (p.world == name) { p.at.x += shift.x; p.at.y += shift.y; p.at.z += shift.z; }
+    for (auto& s : d.spawns)
+        if (s.world == name) { s.at.x += shift.x; s.at.y += shift.y; s.at.z += shift.z; }
 }
 
 // The world key of a [world.NAME] or of a ringroad.ini ring ("#" + its id), lower case; matched against the game's world.

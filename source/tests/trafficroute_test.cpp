@@ -25,6 +25,16 @@ int main()
     ring.shape = ringlogic::Clean({ 0, 0, 300, 600, 1, 0, 40 });
     const Line rl = Build(ring);
     {
+        trafficdata::Route slant = ring;
+        slant.tilt = 10; slant.tiltToward = 0;  // high side north
+        const Line sl = Build(slant);
+        double north = -1e9, south = 1e9;
+        for (const auto& p : sl.lane[0]) { if (p.y > 590) north = p.z; if (p.y < -590) south = p.z; }
+        const double rise = 600 * std::tan(10 * 3.14159265358979 / 180);
+        Check(std::fabs(north - (300 + rise)) < 1 && std::fabs(south - (300 - rise)) < 1, "a slanted ring is higher on its high side, lower opposite");
+        Check(std::fabs(sl.lane[1][0].z - sl.lane[0][0].z - 40) < 1e-9, "lane 1 keeps its gap on a slanted ring");
+    }
+    {
         // The user's case: parked 300 m under the lane. The climb must reach the lane, then a full lap, then home.
         Vec p{ 50, 40, 0 };
         Trip t = StartLap(rl, 0, p);

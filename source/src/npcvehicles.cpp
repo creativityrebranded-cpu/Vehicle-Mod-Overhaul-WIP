@@ -19,9 +19,11 @@
 #include "modscene.h"
 #include "notify.h"
 #include "passenger.h"
+#include "runtimecells.h"
 #include "pilotquest.h"
 #include "vcontract.h"
 #include "vehicleflight.h"
+#include "vehiclekeep.h"
 #include "environment.h"
 #include "targetsession.h"
 #include "traffic.h"
@@ -177,6 +179,9 @@ namespace npcvehicles
 			bool waiting = false;              // the player is indoors: parked, waiting at the door
 			int pMode = -1;                    // pursuer in a fight: 10 attack / flank, 12 intercept, 13 overwatch, 14 retreat, 15 block
 			int task = 0;                      // civil task: 0 none, 1 transit, 2 patrol, 3 return home, 4 parking, 9 addon scripted trip
+			bool coldStart = false;            // a cold-start pool driver (seated at creation, not by the game's get-in): its AI's dismount wish is ignored on a trip
+			bool coldStartLogged = false;
+			int reseats = 0; ULONGLONG reseatAt = 0;  // a cold-start driver knocked out of its seat on a trip: instant seats tried
 			FvoTripClaim trip{};               // task 9: an addon's scripted trip (fvo_addon_api.h), e.g. the ring traffic
 			double taskX = 0, taskY = 0;       // transit: where to; parking: the clear spot
 			std::uint32_t startPlace = 0;      // transit: the owner of the place it set out from (0: open ground)
@@ -237,6 +242,7 @@ namespace npcvehicles
 		constexpr ULONGLONG kReaggroMs = 5000;     // combat re-asked this often while out of combat
 		bool g_traceSeat = false;                  // log the seat check's helpers while one of OUR get-in calls runs
 		std::atomic<std::uint32_t> g_nativeExits[kJobs];
+		std::atomic<std::uint32_t> g_ignoredColdExit{ 0 };  // logged on the main thread
 		bool g_allowDismount = false;              // only our own Leave() takes a job's NPC out of its vehicle
 		// Vehicle weapon (the game's own path, 1.16.244): the player's VehicleHandler (PlayerControls, vtable
 		// 0x144C43E58) sets its input block at +0x80 (fire = +0x9F, from "VehicleFireWeapon"), and each frame
@@ -330,10 +336,41 @@ namespace npcvehicles
 		// FUN_141995460(actor, vehicle, &link) builds and starts the Mount / Passenger interaction, then FUN_141993710(actor,
 		// vehicle, 1) seats with snap = 1. (FUN_141993710 with 0 alone, tried earlier, is the walk variant and returned 0.)
 		constexpr std::uint32_t kInteraction = 0x01995460;
+		// Whether the game can find a seat of `vehicle` for `actor` at all: the seat picker FUN_1412B2C40 (the first seat marker
+		// whose keyword the actor carries), else its fallback FUN_1412B2A90 (a seat from the vehicle's 3D). With neither, the seat
+		// link FUN_141995460 reads a null seat (2026-10-28 17:56 fault at Starfield.exe+0x1A9C41A, read 0x8: an NPC given the
+		// REV-8's seat keyword was snapped into an FE00780B vehicle). Called direct: FVO hooks this picker at call sites only.
+		bool HasSeatFor(uptr actor, uptr vehicle)
+		{
+			__try {
+				if (EngineFn<uptr (*)(uptr, uptr)>(0x012B2C40)(actor, vehicle)) return true;
+				return EngineFn<uptr (*)(uptr)>(0x012B2A90)(vehicle) != 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				return false;
+			}
+		}
 		int SnapSeat(uptr actor, uptr vehicle, int& seated)
 		{
 			seated = -1;
 			uptr link = 0;
+			// The seat link's interaction start (FUN_141A9C350) reads the actor's AI process (+0x228) +8 unchecked: an actor without
+			// a process faulted there (2026-10-28 17:56, Starfield.exe+0x1A9C41A, rax 0, read 0x8). Not loaded enough: no seat now.
+			bool hasProcess = false;
+			__try { hasProcess = At<uptr>(actor, 0x228) != 0; }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			if (!hasProcess) {
+				logger::Write("NPC vehicles: NPC %08X has no AI process yet: instant seat into %08X skipped", At<std::uint32_t>(actor, off::kFormId),
+					At<std::uint32_t>(vehicle, off::kFormId));
+				seated = 0;
+				return 0;
+			}
+			if (!HasSeatFor(actor, vehicle)) {
+				logger::Write("NPC vehicles: no seat in vehicle %08X for NPC %08X (no seat keyword it carries, no 3D seat): instant seat skipped",
+					At<std::uint32_t>(vehicle, off::kFormId), At<std::uint32_t>(actor, off::kFormId));
+				seated = 0;
+				return 0;
+			}
 			__try {
 				EngineFn<void (*)(uptr, uptr, uptr*)>(kInteraction)(actor, vehicle, &link);
 				seated = EngineFn<char (*)(uptr, uptr, char)>(kBoardDirect)(actor, vehicle, 1) ? 1 : 0;
@@ -2303,9 +2340,24 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: [%d] %s; parking at a clear spot (%.0f, %.0f)", j.pilot, why, j.taskX, j.taskY);
 		}
 
+
+
 		// One frame of a civil task (a Following job with j.task set).
 		void TaskTick(Job& j, uptr npc, uptr vehicle, uptr player, bool aboard, ULONGLONG now)
 		{
+			if (!aboard && j.coldStart && j.task == 9 && npc && !IsDead(npc) && j.reseats < 5) {
+				// A traffic driver knocked out of its seat (2026-10-28 18:28 run: drivers out after 5-14 m/s bumps): straight back in
+				// (the instant seat, no walk) while the vehicle keeps its course; five tries a second apart (a vehicle still scraping a
+				// building knocked the driver out again within 0.5 s, 18:43 run), then it ends as before.
+				if (now - j.reseatAt >= 1000) {
+					j.reseatAt = now;
+					++j.reseats;
+					const int r = SeatNewborn(npc, vehicle);
+					logger::Write("NPC vehicles: [%d] traffic driver %08X knocked out of %08X: seated again -> %d (try %d)", j.pilot, j.npc, j.vehicle, r, j.reseats);
+				}
+				return;
+			}
+			if (aboard && j.reseats && now - j.reseatAt > 5000) j.reseats = 0;  // seated and settled: replenish retries
 			if (!aboard) {
 				logger::Write("NPC vehicles: [%d] NPC %08X left the vehicle (task)", j.pilot, j.npc);
 				vehicleflight::PilotStop(j.pilot, "driver got out");
@@ -2564,6 +2616,19 @@ namespace npcvehicles
 		// back to the instant exit; afterwards make sure the NPC does not stand inside the vehicle.
 		constexpr ULONGLONG kExitWatchMs = 6000;  // the animated exit gets this long before the instant exit is used
 
+		// The game's own get-up out of a seat (actor vtable +0xB30): what FUN_141951FB0 does for a seated actor and what the
+		// kick-out (TakeSeat) uses. Unlike the instant exit and the forced furniture state 0, the NPC plays its stand-up and
+		// ends on foot (2026-10-28 21:24 run: a shot-down driver ejected with the instant exit stayed in the sitting pose,
+		// "animation reset not taken"; another stayed aboard when the instant exit was refused).
+		bool StandUp(uptr npc)
+		{
+			__try {
+				reinterpret_cast<void (*)(uptr)>((*reinterpret_cast<void***>(npc))[0xB30 / 8])(npc);
+				return true;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
 		bool InstantExit(uptr npc, bool eject = false)
 		{
             const auto vehicle=InVehicle(npc);
@@ -2629,7 +2694,13 @@ namespace npcvehicles
 				Set(j, Phase::Leaving);  // the animated exit was started; the Leaving case watches it and falls back to the instant exit
 				return;
 			}
-			// Refused (or fault): the instant exit now.
+			// Refused: the game's get-up first (the kick-out's way out); Leaving watches it and falls back to the instant exit.
+			if (StandUp(npc)) {
+				logger::Write("NPC vehicles: [%d] exit: dismount refused; asked the game's get-up (actor vtable +0xB30); the instant exit after %.0f s if still seated",
+					j.pilot, kExitWatchMs / 1000.0);
+				Set(j, Phase::Leaving);
+				return;
+			}
 			const bool ok = InstantExit(npc);
 			logger::Write("NPC vehicles: [%d] exit: dismount refused; instant exit %s; NPC %s the vehicle", j.pilot, ok ? "called" : "FAULTED", InVehicle(npc) ? "is STILL in" : "left");
 			ClearOfVehicle(npc, vehicle, j.pilot);
@@ -2653,6 +2724,8 @@ namespace npcvehicles
 			double lx = 0, ly = 0, lz = 0;
 			bool refused = false;  // finished with the actor still aboard (the instant exit failed too)
 			bool landed = false;   // Eject with waitLanded: the vehicle came to rest (or the wait ran out)
+			bool rested = false;   // ... and it really came to rest
+			bool standAsked = false, standLogged = false; ULONGLONG standAt = 0;  // the game's get-up was asked (wreck at rest)
 		};
 		constexpr ULONGLONG kEjectLandMs = 6000;
 		constexpr int kExitTasks = 12;
@@ -2881,9 +2954,21 @@ namespace npcvehicles
 						const bool rest = now - t.stillSince >= 500;
 						if (!rest && now - t.t0 < kEjectLandMs) continue;
 						t.landed = true;
+						t.rested = rest;
 						logger::Write("NPC vehicles: eject NPC %08X: vehicle %08X %s after %.1f s (height %.1f)", t.npc, t.veh,
 							rest ? "came to rest" : "still moving, ejecting anyway", (now - t.t0) / 1000.0, vp.z);
 					}
+					// At rest: the game's get-up (the kick-out's way), 3 s to play; the NPC being out ends the task above.
+					// Still aboard after that (or the vehicle never rested): the instant eject below.
+					if (t.rested && !t.standAsked) {
+						t.standAsked = true; t.standAt = now;
+						if (StandUp(npc)) {
+							logger::Write("NPC vehicles: eject NPC %08X: asked the game's get-up (actor vtable +0xB30); the instant eject in 3 s if still seated", t.npc);
+							continue;
+						}
+					}
+					if (t.standAsked && now - t.standAt < 3000) continue;
+					if (t.standAsked && !t.standLogged && (t.standLogged = true)) logger::Write("NPC vehicles: eject NPC %08X: still seated 3 s after the get-up; instant eject", t.npc);
 					world::Snapshot ejectWorld;
 					const world::VehicleInfo* hull = nullptr;
 					if (world::Vehicles(ejectWorld)) for (unsigned k = 0; k < ejectWorld.count && k < 64; ++k)
@@ -3030,9 +3115,11 @@ namespace npcvehicles
 			const ULONGLONG now = GetTickCount64();
 			if (ExitTaskFor(j.npc)) return;  // an exit request owns this NPC until it finishes
 			const uptr npc = RefById(j.npc), vehicle = RefById(j.vehicle);
+			// Route traffic stays on native physics at every distance. The former virtual
+			// cutoff was derived from a visibility heuristic, not measured physics coverage.
 			if (!npc || !vehicle) {
 				logger::Write("NPC vehicles: [%d] %s lost", j.pilot, !npc ? "NPC" : "vehicle");
-				vehicleflight::PilotStop(j.pilot, "lost");
+				vehicleflight::PilotStop(j.pilot, !npc ? "driver lost" : "vehicle lost");  // a driver lost leaves the vehicle to descend first
 				Set(j, Phase::Idle);
 				return;
 			}
@@ -3588,7 +3675,9 @@ namespace npcvehicles
 					}
 				}
 				else if (have && vehicleflight::PilotActive(j.pilot)) {
-					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar && !busyGoal) {
+					const double above = vehicleflight::PilotAboveGround(j.pilot, vehicle);
+					// Parked only once down (2026-10-28: a follower parked in the air dropped); ground unknown: as before.
+					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar && !busyGoal && (!std::isfinite(above) || above < 3.5)) {
 						vehicleflight::PilotStop(j.pilot, "follow: player stopped; parked");
 						j.parked = true;
 						logger::Write("NPC vehicles: [%d] parked %.0f m from you (NPC stays aboard)", j.pilot, toPlayer);
@@ -4936,6 +5025,8 @@ namespace npcvehicles
 		if (xdown && !g_exitDown) ExitAllJobs();
 		g_exitDown = xdown;
 		pilotquest::Tick();
+		if (const auto cold = g_ignoredColdExit.exchange(0))
+			logger::Write("NPC vehicles: cold-start driver %08X: its AI wants to dismount; ignored while its trip runs", cold);
 		for(auto&pending:g_nativeExits)if(const auto id=pending.exchange(0)) {
 			if(const auto actor=RefById(id);actor && InVehicle(actor)) {
 				vcontract::ExitRequest req;req.timeoutMs=8000;StartExit(actor,req);
@@ -5044,8 +5135,16 @@ namespace npcvehicles
 		{
 			if(!g_allowDismount && actor) {
 				const auto id=At<std::uint32_t>(actor,off::kFormId);
-				for(int i=0;i<kJobs;++i)if(g_jobs[i].npc==id && g_jobs[i].phase==Phase::Following)
+				for(int i=0;i<kJobs;++i)if(g_jobs[i].npc==id && g_jobs[i].phase==Phase::Following) {
+					// 2026-10-28 18:07 run: every cold-start driver's AI asked to dismount within seconds of each trip start (it was
+					// seated directly, not by the game's get-in, so its own package keeps wanting to walk). The game refused each exit,
+					// but turning the wish into an exit stopped the trip. On its scripted trip it is ignored; the game decides as before.
+					if (g_jobs[i].coldStart && g_jobs[i].task == 9) {
+						if (!g_jobs[i].coldStartLogged) { g_jobs[i].coldStartLogged = true; g_ignoredColdExit.store(id); }
+						continue;
+					}
 					g_nativeExits[i].store(id);
+				}
 			}
 			// Native AI owns its exit intent. Never trap a driver in an endless refusal loop.
 			return g_dismountOriginal(actor);
@@ -5347,6 +5446,17 @@ namespace npcvehicles
 	}
 
 	bool UsesVehicle(std::uint32_t vehicleId) { return vehicleId && Busy(vehicleId); }
+
+	int FlownVehicles(std::uint32_t* vehicles, std::uint32_t* drivers, int max)
+	{
+		int n = 0;
+		for (const auto& j : g_jobs) {
+			if (n >= max) break;
+			if (j.phase == Phase::Idle || !j.vehicle) continue;
+			vehicles[n] = j.vehicle; drivers[n] = j.npc; ++n;
+		}
+		return n;
+	}
 
 	int PilotFor(std::uint32_t vehicleId)
 	{
@@ -5701,6 +5811,35 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: [%d] %s: NPC %08X takes vehicle %08X", j.pilot, claim.name ? claim.name : "scripted trip", j.npc, j.vehicle);
 		}
 		return true;
+	}
+
+	bool StartScriptedSeated(std::uintptr_t actor, std::uintptr_t vehicle, const FvoTripClaim& claim)
+	{
+		if (!actor || !vehicle || !claim.step || IsDead(actor) || InVehicle(actor) != vehicle) return false;
+		const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId), npcId = At<std::uint32_t>(actor, off::kFormId);
+		if (Busy(vehId) || Busy(npcId) || vehicleflight::AutopilotDisabled(vehId)) return false;
+		for (auto& j : g_jobs) {
+			if (j.phase != Phase::Idle) continue;
+			j = Job{};
+			j.pilot = int(&j - g_jobs) + 1;
+			j.npc = npcId; j.vehicle = vehId;
+			j.profile = Profile::Escort;
+			j.cmd = true;  // no instant-seat fallback: it is already seated
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			j.homeX = vp.x; j.homeY = vp.y; j.haveHome = true;
+			j.originX = vp.x; j.originY = vp.y; j.haveOrigin = true;
+			j.task = 9; j.taskX = vp.x; j.taskY = vp.y; j.taskStep = 0; j.taskAt = GetTickCount64();
+			j.trip = claim;
+			j.coldStart = true;
+			// The pilot quest's get-in package, as a walking driver gets: without a package that keeps it in, the citizen's own AI
+			// stood every cold-start driver up 6 s after it sat (2026-10-28 17:34 run, all three at once).
+			const bool pkg = pilotquest::Assign(j.pilot - 1, actor, vehicle);
+			if (!pkg) logger::Write("NPC vehicles: [%d] cold start: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)", j.pilot, npcId);
+			Set(j, Phase::Boarding);  // the next tick finds it aboard and hands it to the pilot
+			logger::Write("NPC vehicles: [%d] %s: seated NPC %08X drives vehicle %08X (cold start)", j.pilot, claim.name ? claim.name : "scripted trip", npcId, vehId);
+			return true;
+		}
+		return false;
 	}
 
 	bool SeatNow(std::uintptr_t actor, std::uintptr_t vehicle)
@@ -6390,3 +6529,4 @@ void BeginFrame()
 	}
 
 }
+

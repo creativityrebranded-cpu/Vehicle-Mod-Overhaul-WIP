@@ -33,6 +33,9 @@ namespace vehiclekeep
 		constexpr std::uint32_t kFullLodFlag = 0x10000, kPersistentFlag = 0x400, kDisabledFlag = 0x800, kDeletedFlag = 0x20;
 		constexpr ULONGLONG kEvalMs = 250, kReleaseOutOfSightMs = 10000, kForgetMs = 120000, kSettleMs = 10000;
 		constexpr double kCellMetres = 100.0;
+		// Where holding starts: a little inside the attached grid's half-width (grid entries, 25 for 5x5 -> 190 m).
+		// A visibility estimate only, not where the game's physics stops.
+		double HoldEdge(unsigned cells) { return cells ? std::max(120.0, std::sqrt(double(cells)) * 50.0 - 60.0) : 0.0; }
 
 		struct Held { bool setLod = false, setPersist = false; ULONGLONG since = 0, seen = 0; double maxDist = 0; bool had3DFar = false; };
 
@@ -136,7 +139,7 @@ namespace vehiclekeep
 			if (ref) Undo(ref, h.setLod, h.setPersist);
 			RefView after;
 			const bool readAfter = ref && ReadRef(ref, after);
-			logger::Write("Keep in sight: released %08X (%s) at %.0f m after %.1f s, farthest %.0f m, 3D while past the cell edge: %s; flags now 0x%X",
+			logger::Write("Keep in sight: released %08X (%s) at %.0f m after %.1f s, farthest %.0f m, 3D beyond hold estimate: %s; flags now 0x%X",
 				id, why, dist, double(GetTickCount64() - h.since) / 1000.0, h.maxDist, h.had3DFar ? "yes" : "no", readAfter ? after.flags : 0u);
 			WriteJournal();
 		}
@@ -206,7 +209,7 @@ namespace vehiclekeep
 			const unsigned grid = runtimecells::GridSize();
 			if (!grid) return;
 			// The attached area's half-width around the player; start holding a little inside it so nothing pops out.
-			const double edge = std::max(120.0, std::sqrt(double(grid)) * kCellMetres * 0.5 - 60.0);
+			const double edge = HoldEdge(grid);
 			const double cosCone = std::cos(double(g_coneDeg) * 3.14159265358979 / 180.0);
 			const std::uint32_t own = vehicleflight::OwnRoverId();
 
@@ -261,7 +264,7 @@ namespace vehiclekeep
 				h.since = h.seen = now;
 				h.maxDist = dPlayer;
 				g_held[id] = h;
-				logger::Write("Keep in sight: holding %08X at %.0f m (cell edge %.0f m)%s, 3D %s, flags 0x%X -> 0x%X",
+				logger::Write("Keep in sight: holding %08X at %.0f m (visibility hold estimate %.0f m)%s, 3D %s, flags 0x%X -> 0x%X",
 					id, dPlayer, edge, inSight ? "" : " (occupied / traffic, out of view)", after.has3D ? "loaded" : "none", v.flags, after.flags);
 				WriteJournal();
 			}
@@ -276,7 +279,7 @@ namespace vehiclekeep
 						farthest = std::max(farthest, std::hypot(double(v.pos.x) - pv.pos.x, double(v.pos.y) - pv.pos.y));
 					}
 				}
-				logger::Write("Keep in sight: %zu held, %u with 3D loaded, farthest %.0f m (cell edge %.0f m)", g_held.size(), with3D, farthest, edge);
+				logger::Write("Keep in sight: %zu held, %u with 3D loaded, farthest %.0f m (visibility hold estimate %.0f m)", g_held.size(), with3D, farthest, edge);
 			}
 		}
 	}

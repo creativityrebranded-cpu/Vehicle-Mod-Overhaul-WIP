@@ -35,7 +35,8 @@ namespace features
 			{ Id::NativeGround, "Ground planner and native driving (experimental)", "Vehicles plan their routes on the ground first: around water, cliffs, steep slopes and buildings, on roads where there are any, flying only where driving cannot go. Vehicles with a driver use the game's own ground driving. Off: the old hover-or-drive rules.", L"nav", L"groundPlanner", false },
 			{ Id::DebugLog, "Detailed log", "Writes much more to the mod's log, for bug reports.", L"log", L"verbose", false },
 			{ Id::Traffic, "Everyday traffic", "Calm NPCs take parked vehicles near you on trips. With city traffic installed they fly the routes in Data/SFSE/Plugins/FVO_Traffic: onto a route, off at the exit nearest a landing place, or a lap and home. No vehicles are created.", L"context", L"traffic", true },
-			{ Id::RouteMarkers, "Show traffic routes", "Probes in the sky along every route in the FVO_Traffic files of the world you are in, larger ones at exits and landing places. The routes themselves are only defined in the files.", L"traffic", L"markers", false },
+			{ Id::RouteMarkers, "Show traffic routes", "Probes in the sky along every route in the FVO_Traffic files of the world you are in, larger ones at exits and landing places. The routes themselves are only defined in the files.", L"traffic", L"markers", true },
+			{ Id::WallPass, "FVO vehicles pass the loaded-area wall", "The game keeps an invisible box round the loaded cells: moving bodies that touch its sides bounce back, and characters are moved back inside (this pulled traffic drivers out of their seats). On: vehicles FVO is flying and their drivers pass the side walls and are not moved back; everything else, and the floor, stay as the game made them.", L"physics", L"fvoWallPass", true },
 		};
 
 		std::atomic<bool> g_on[kCount];

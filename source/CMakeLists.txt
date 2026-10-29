@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyingVehicleOverhaul VERSION 0.8.6 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 0.9.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,8 +60,8 @@ target_link_libraries(SeamlessPlanets PRIVATE sp_common Synchronization)
 
 add_library(FlyingVehicleOverhaul SHARED
     src/native_movement_controller.cpp src/native_movement_engine.cpp src/native_movement_probe.cpp
-    src/main_vehicle.cpp src/resources.cpp src/airtraffic.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/citytraffic.cpp src/citystartup.cpp src/cityfiles.cpp src/crash.cpp
-    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
+    src/main_vehicle.cpp src/resources.cpp src/airtraffic.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/trafficpool.cpp src/citytraffic.cpp src/citystartup.cpp src/cityfiles.cpp src/crash.cpp
+    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
     src/vehicleflight.cpp src/vehiclecamera.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(FlyingVehicleOverhaul)
