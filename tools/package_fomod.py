@@ -16,6 +16,8 @@ CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'
 CITY_TRAFFIC = 'SFSE/Plugins/FVO_Traffic/NewAtlantis.ini'
 ROUTE_GUIDE = 'SFSE/Plugins/FVO_Traffic/HOW-TO-MAKE-ROUTES.txt'
 TRAFFIC_DIR = 'SFSE/Plugins/FVO_Traffic/'
+HEADER_IMAGE = 'fomod/images/header.png'  # 0.9.0: the banner (docs/images/fomod-header.png)
+HEADER_PATH = r'fomod\images\header.png'  # as FOMOD files usually write it
 # 0.9.0: one installer choice per city route (the user: "the routes for each city and make it in the fomod capable of
 # selecting which you want"). key, label, description (None: made from the file), files.
 ROUTES = (
@@ -163,6 +165,7 @@ def module_config(dependencies, features, route_texts):
     root = ET.Element('config', {'{http://www.w3.org/2001/XMLSchema-instance}noNamespaceSchemaLocation':
                                 'http://qconsulting.ca/fo3/ModConfig5.0.xsd'})
     ET.SubElement(root, 'moduleName').text = 'Flying Vehicle Overhaul'
+    ET.SubElement(root, 'moduleImage', path=HEADER_PATH, showImage='true', showFade='true', height='-1')
     files = ET.SubElement(root, 'requiredInstallFiles')
     for name in (DLL, PILOTS, 'Docs/FlyingVehicleOverhaul-INSTALL.txt'):
         ET.SubElement(files, 'file', source='00 Core/'+name, destination=name, priority='0')
@@ -176,6 +179,7 @@ def module_config(dependencies, features, route_texts):
         'It adds no parked vehicles of its own. '
         'Choose your feature settings on the following grouped pages, or keep your current settings. '
         'When upgrading, replace your old FVO installation instead of enabling two copies.')
+    ET.SubElement(core, 'image', path=HEADER_PATH)
     ET.SubElement(ET.SubElement(core, 'typeDescriptor'), 'type', name='Required')
     # 0.9.0: City Traffic and City Placements are pre-ticked; the routes are chosen city by city on their own page.
     addons = ET.SubElement(ET.SubElement(groups, 'group', name='Optional addons', type='SelectAny'),
@@ -397,7 +401,10 @@ validation.
     version_attrs = {'MachineVersion': numeric.group(0)} if numeric else {}
     ET.SubElement(info, 'Version', version_attrs).text = version
     ET.SubElement(info, 'Description').text = 'Core, grouped gameplay feature choices, city traffic routes city by city, City Placements and an optional Parked Vehicles conversion patch.'
-    entries = {'fomod/ModuleConfig.xml': config, 'fomod/info.xml': xml_bytes(info),
+    header = Path(__file__).resolve().parents[1]/'docs/images/fomod-header.png'
+    if header.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError('FOMOD header image must be a PNG')
+    entries = {'fomod/ModuleConfig.xml': config, 'fomod/info.xml': xml_bytes(info), HEADER_IMAGE: header.read_bytes(),
                'fomod/features.json': (json.dumps(features,indent=2)+'\n').encode(),
                'README.txt': readme, '00 Core/Docs/FlyingVehicleOverhaul-INSTALL.txt': readme,
                '00 Core/'+DLL: inputs[DLL], '00 Core/'+PILOTS: inputs[PILOTS],

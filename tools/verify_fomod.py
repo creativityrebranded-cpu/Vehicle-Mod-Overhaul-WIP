@@ -57,6 +57,11 @@ def verify(path, schema=None):
         check(not any(d.get('file','').casefold() == 'starfield.esm' for d in root.findall('.//fileDependency')),
               'Implicit base-game master cannot reject core or disable addons')
         check(ET.fromstring(archive.read('fomod/info.xml')).findtext('Name') == 'Flying Vehicle Overhaul', 'Installer metadata')
+        images = [root.find('moduleImage')] + root.findall('.//plugin/image')
+        check(images[0] is not None and images[0].get('showImage') == 'true', 'Installer has a header image')
+        for image in images:
+            name = image.get('path').replace(chr(92), '/')
+            check(name in names and archive.read(name)[:8] == b'\x89PNG\r\n\x1a\n', 'Every installer image is a PNG in the archive: '+name)
         if schema:
             from lxml import etree
             tree = etree.parse(str(schema))
