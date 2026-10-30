@@ -304,12 +304,17 @@ namespace vehicle_probe
 			const auto base = game::Base();
 			const std::uintptr_t read = *reinterpret_cast<std::uintptr_t*>(r.instance + 0x28);
 			const std::uint32_t ownId = *reinterpret_cast<std::uint32_t*>(r.instance + 0x20);
-			if (!read) return false;
-			const std::uintptr_t body = reinterpret_cast<std::uintptr_t (*)(std::uintptr_t, std::uint32_t)>((*reinterpret_cast<void***>(read))[0x70 / 8])(read, ownId);
-			if (!body) return false;
-			const std::uintptr_t shape = *reinterpret_cast<std::uintptr_t*>(body + 0x78);
-			if (!shape) return false;
-			const float* bt = reinterpret_cast<const float*>(body + 0x30);
+			// The instance was asked for on another thread and its vehicle may have unloaded since: this memory can already be something else (most runs fault here, 0x1200000012 and
+			// -1 in the 2026-10-30 14:00 one). Never call through what is not a pointer to code.
+			if (!read || (read & 7)) return false;
+			{
+				void** vt = *reinterpret_cast<void***>(read);
+				if (!vt || !InImage(reinterpret_cast<std::uintptr_t>(vt)) || !InImage(reinterpret_cast<std::uintptr_t>(vt[0x70 / 8]))) return false;
+			}
+			const auto bodyOf = reinterpret_cast<std::uintptr_t (*)(std::uintptr_t, std::uint32_t)>((*reinterpret_cast<void***>(read))[0x70 / 8]);
+			const std::uintptr_t unlockedBody = bodyOf(read, ownId);
+			if (!unlockedBody) return false;
+			const float* bt = reinterpret_cast<const float*>(unlockedBody + 0x30);
 			const float start[3] = { bt[0], bt[1], bt[2] };
 			const float dl = std::sqrt(r.dir[0] * r.dir[0] + r.dir[1] * r.dir[1]);
 			if (!std::isfinite(start[0]) || !std::isfinite(start[1]) || !std::isfinite(start[2]) || !(dl > 1e-4f)) return false;
@@ -317,6 +322,11 @@ namespace vehicle_probe
 			const std::uintptr_t bs = RayWorld(tes, start);
 			if (!bs) return false;
 			LockWorld(bs);
+			// Body and shape again, now that the world cannot remove them during the cast.
+			const std::uintptr_t body = bodyOf(read, ownId);
+			if (!body) return false;
+			const std::uintptr_t shape = *reinterpret_cast<std::uintptr_t*>(body + 0x78);
+			if (!shape) return false;
 			// The hknpWorld is EMBEDDED in the bsWorld at +0x20: its address is `this` and the qword there is its VTABLE (the game's
 			// own FUN_14219AE90: plVar16 = bs + 0x20; (*plVar16 + 0x18) called with plVar16; FUN_140583CB0 the same). The first
 			// version loaded *(bs + 0x20) and used that vtable pointer as the object, so the first query called garbage: every

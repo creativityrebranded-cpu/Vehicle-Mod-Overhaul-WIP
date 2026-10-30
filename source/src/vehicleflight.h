@@ -24,7 +24,7 @@ namespace vehicleflight
     bool BirthControlReady(std::uint32_t vehicleId);
     bool PilotHolds(std::uint32_t vehicleId);
     bool PlayerDriving(std::uint32_t vehicle);
-	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera and HUD
+	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera, instrument and key set: physical flight with you at the wheel, you or the autopilot flying
 
 	// NPC pilots 1..3 (the "pursuit" side; pilot 0 is the player's escort autopilot): the same flight model, terrain
 	// assist and avoidance, flying `vehicle` to (x, y) and settling `stop` metres short. Called again while flying it

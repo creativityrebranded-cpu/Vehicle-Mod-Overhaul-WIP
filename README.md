@@ -153,7 +153,9 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 - **Arrivals:** traffic placed inside the game's loading screen, models from your whole load order, up to 256 vehicles (`FVO_NPCPilots.esm` has 256 slots).
 - **Pairs:** one health record per vehicle and driver; every pass asks it; recovery first, and replacement only under a cover or far and out of sight.
 - **Performance:** wheel dust no longer fills the persistent cell; a guard stops the local map crash it caused.
+- **Physical flight on autopilot:** the attitude instrument, camera roll-follow and VTOL keys now work during autopilot too.
 - **Removed:** rams, scheduled traffic, road-network traffic.
+- **Known issue:** shots at traffic may not register yet; a fix is in progress.
 
 ## What's new in 0.9.0
 

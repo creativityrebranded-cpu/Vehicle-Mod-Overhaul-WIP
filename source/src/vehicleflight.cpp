@@ -3116,7 +3116,7 @@ namespace vehicleflight
 
 	bool Active() { return g.active; }
 	bool PhysicalCameraActive(std::uintptr_t vehicle) {
-		return vehicle && g_sh.physOn.load(std::memory_order_acquire) && g_sh.physNeedsDriver.load() && g_sh.physInstance.load() &&
+		return vehicle && g_sh.physOn.load(std::memory_order_acquire) && g_sh.physInstance.load() &&
 			g_hoverVehicle.load()==vehicle && g_driverVehicle.load()==vehicle;
 	}
 
@@ -4617,7 +4617,7 @@ namespace vehicleflight
 			const bool bankTest = idx == 0 && BankTestFrame(vehicle, g.startedAt, keysOn, g.autopilot, above, freeRoll, firstPerson, bankTarget);
 			if (bankTest) { rollAimOn = true; rollAim = bankTarget; }
 			AskCorridors(idx, pos, (g.autopilot && apSteer && !g.apClimb) ? apBearing : (sp > 2.0 ? std::atan2(v[0], v[1]) : bodyHeading), std::max(sp, g.autopilot ? 10.0 : 0.0));
-			bool cameraActive=false;
+			bool attitudeActive=false;
 			double cameraPitch=0,cameraRoll=0;
 			{
 				std::lock_guard lk(g_sh.lock);
@@ -4670,11 +4670,11 @@ namespace vehicleflight
 				g_sh.groundOk = groundOk;
 				g_sh.airborne = groundOk && above > 1.5;
 				g_sh.cap = g.cap;
-				cameraActive=manualPhysical&&physical&&!g_sh.physicalFault;
+				attitudeActive=physical&&!g_sh.physicalFault;  // the autopilot too (2026-10-30, the user: everything of manual VTOL, the camera included)
 				cameraPitch=g_sh.bodyPitch; cameraRoll=g_sh.bodyRoll;
 			}
 			if (!idx) {
-				vehiclecamera::Publish(cameraActive?vehicle:0,cameraPitch,cameraRoll);
+				vehiclecamera::Publish(attitudeActive?vehicle:0,cameraPitch,cameraRoll);
 				vehiclecamera::LogStatus();
 			}
 

@@ -6,7 +6,9 @@
 - Traffic placed inside the loading screen; models from your whole load order; up to 256 vehicles.
 - Vehicle and driver handled as one pair: recovery first, replacement only under a cover or far and out of sight.
 - Wheel dust no longer fills the persistent cell (major stutters); guard against the local map crash it caused.
+- Physical flight: autopilot now has the attitude instrument, camera roll-follow and VTOL keys too.
 - Removed: rams, scheduled traffic, road-network traffic.
+- Known issue: shots at traffic may not register yet; a fix is in progress.
 
 0.9.0 — 28 October 2026
 

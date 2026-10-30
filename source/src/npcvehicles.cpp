@@ -5987,6 +5987,9 @@ namespace npcvehicles
 		static const std::uint8_t kSeatReleasePrologue[17] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x44, 0x88, 0x48, 0x20, 0x88, 0x50, 0x10, 0x55, 0x56, 0x57 };
 		static const std::uint8_t kSyncAttachPrologue[15] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x4C, 0x89, 0x44, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54 };
 		void* traced = nullptr;
+		// Trace only, and they run on the game's worker threads in the middle of its unloads, reading actors being taken apart. Off unless settings.ini [traffic] traceHooks=1 (2026-10-30 14:00 crash).
+		const bool traceHooks = GetPrivateProfileIntW(L"traffic", L"traceHooks", 0, fvopaths::Settings().c_str()) != 0;
+		if (traceHooks) {
 		const bool sitTrace = hook::Install(game::Base() + kSitStateFn, kSitStatePrologue, sizeof(kSitStatePrologue), reinterpret_cast<void*>(&SitStateDetour), &traced);
 		if (sitTrace) g_sitStateOriginal = reinterpret_cast<SitStateSet_t>(traced);
 		const bool releaseTrace = hook::Install(game::Base() + kSeatReleaseFn, kSeatReleasePrologue, sizeof(kSeatReleasePrologue), reinterpret_cast<void*>(&SeatReleaseDetour), &traced);
@@ -6001,6 +6004,7 @@ namespace npcvehicles
 		const bool demoteTrace = hook::Install(game::Base() + 0x018E17D0, kActorDemotePrologue, sizeof(kActorDemotePrologue), reinterpret_cast<void*>(&ActorDemoteDetour), &traced);
 		if (demoteTrace) g_actorDemoteOriginal = reinterpret_cast<ActorDemote_t>(traced);
 		logger::Write("NPC vehicles: model trace hooks: model setter %d, demotion %d", modelTrace ? 1 : 0, demoteTrace ? 1 : 0);
+		}
 		static const std::uint8_t kActorCellCheckPrologue[14] = { 0x48, 0x83, 0xEC, 0x38, 0x4C, 0x8B, 0x89, 0xB0, 0x00, 0x00, 0x00, 0x4C, 0x8B, 0xD1 };
 		// Off unless settings.ini [traffic] driverPass=1 (2026-10-30 13:38 run: the game froze 2 min 46 s in, as a city loaded, with 45 models kept this way; the run without it did
 		// not. A model kept through an unload leaves a driver listed in an unloaded cell; when that cell comes back, the game may wait on it. Not proven, no stack was caught.)

@@ -1,12 +1,17 @@
 #include "crash.h"
 
+#include "fvopaths.h"
 #include "log.h"
 
 #include <Windows.h>
+#include <DbgHelp.h>
 
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+
+#pragma comment(lib, "shell32")
+#pragma comment(lib, "ole32")
 
 namespace crash
 {
@@ -59,6 +64,41 @@ namespace crash
 		}
 
 		thread_local bool t_unhandled = false;  // called from the unhandled filter: a real crash, reported wherever it is
+
+		// The crash dump (2026-10-30 14:00 crash: a bad object in the game's own cache, nothing of ours on the stack, and the log cannot show what the other threads were doing).
+		// Written by its own thread, ready before any crash: the faulting thread may hold the heap's lock, and the writer allocates. One file, overwritten, so the last fault is what stays.
+		decltype(&MiniDumpWriteDump) g_writeDump = nullptr;
+		HANDLE g_dumpAsk = nullptr, g_dumpDone = nullptr;
+		MINIDUMP_EXCEPTION_INFORMATION g_dumpInfo{};
+		BOOL g_dumpWritten = FALSE;
+		std::wstring g_dumpPath;
+
+		DWORD WINAPI DumpThread(void*)
+		{
+			for (;;) {
+				if (WaitForSingleObject(g_dumpAsk, INFINITE) != WAIT_OBJECT_0) return 0;
+				g_dumpWritten = FALSE;
+				const HANDLE file = CreateFileW(g_dumpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+				if (file != INVALID_HANDLE_VALUE) {
+					const auto kind = static_cast<MINIDUMP_TYPE>(MiniDumpWithDataSegs | MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules | MiniDumpWithProcessThreadData);
+					g_dumpWritten = g_writeDump(GetCurrentProcess(), GetCurrentProcessId(), file, kind, &g_dumpInfo, nullptr, nullptr);
+					CloseHandle(file);
+				}
+				SetEvent(g_dumpDone);
+			}
+		}
+
+		void WriteDump(EXCEPTION_POINTERS* info)
+		{
+			if (!g_writeDump || !g_dumpAsk || !g_dumpDone) return;
+			g_dumpInfo.ThreadId = GetCurrentThreadId();
+			g_dumpInfo.ExceptionPointers = info;
+			g_dumpInfo.ClientPointers = FALSE;
+			ResetEvent(g_dumpDone);
+			SetEvent(g_dumpAsk);
+			const bool done = WaitForSingleObject(g_dumpDone, 120000) == WAIT_OBJECT_0;
+			logger::WriteUnlocked("  crash dump: %s", done && g_dumpWritten ? "written (last-crash.dmp next to settings.ini)" : "could not be written");
+		}
 
 		LONG CALLBACK Handler(EXCEPTION_POINTERS* info)
 		{
@@ -154,6 +194,7 @@ namespace crash
 				DWORD64 establisher = 0;
 				RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, entry, &ctx, &handlerData, &establisher, nullptr);
 			}
+			WriteDump(info);
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 	}
@@ -265,6 +306,13 @@ namespace crash
 		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 			reinterpret_cast<LPCSTR>(&Install), &g_self);
 		if (HANDLE t = CreateThread(nullptr, 0, FreezeWatch, nullptr, 0, nullptr)) CloseHandle(t);
+		if (const HMODULE help = LoadLibraryW(L"dbghelp.dll")) {
+			g_dumpPath = fvopaths::File(L"last-crash.dmp");
+			g_writeDump = reinterpret_cast<decltype(&MiniDumpWriteDump)>(GetProcAddress(help, "MiniDumpWriteDump"));
+			g_dumpAsk = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			g_dumpDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			if (g_writeDump && g_dumpAsk && g_dumpDone) { if (HANDLE t = CreateThread(nullptr, 0, DumpThread, nullptr, 0, nullptr)) CloseHandle(t); else g_writeDump = nullptr; }
+		}
 		AddVectoredExceptionHandler(1, Handler);
 		g_previous = SetUnhandledExceptionFilter(Unhandled);
 		// A normal exit (ExitProcess) runs this; a crash or a killed process does not: the log then tells the two apart.
