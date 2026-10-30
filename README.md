@@ -90,7 +90,7 @@ this installer layout.
 
 1. Install SFSE for Steam Starfield 1.16.244.
 2. Install the FOMOD ZIP through Vortex or Mod Organizer 2. The core DLL and
-   `FVO_NPCPilots.esm` always install. City Traffic and City Placements start ticked.
+   `FVO_NPCPilots.esm` always install. The Traffic Addon and City Placements start ticked.
 3. Choose the city traffic routes, whether traffic starts already flying, and route
    beacons. Select the **Parked Vehicles conversion patch** independently, with all its
    required masters active. Unavailable choices list their dependencies in the installer.
@@ -148,7 +148,7 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 ## What's new in 1.0 (Traffic Addon 0.1)
 
 - **Traffic Manager:** press F7 on the local map to create and edit traffic routes; traffic is generated along them, and autopilot near a traffic zone follows the same path. A first-time message explains it.
-- **Traffic Addon 0.1:** traffic decisions moved into `FVO_Traffic.dll`, which replaces `FVO_CityPlacements.dll`.
+- **Traffic Addon 0.1:** its own optional download, `FlyingVehicleOverhaul-TrafficAddon-0.1.zip`. Traffic decisions moved into `FVO_Traffic.dll`, which replaces `FVO_CityPlacements.dll`. Without it F7 still opens, but no traffic flies the routes.
 - **Real traffic:** shoot, board or steal; a vehicle you take leaves traffic.
 - **Arrivals:** traffic placed inside the game's loading screen, models from your whole load order, up to 256 vehicles (`FVO_NPCPilots.esm` has 256 slots).
 - **Pairs:** one health record per vehicle and driver; every pass asks it; recovery first, and replacement only under a cover or far and out of sight.

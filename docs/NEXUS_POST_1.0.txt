@@ -8,7 +8,7 @@ TRAFFIC MANAGER
 Open your local map and press F7 to manage traffic routes for that planet. The routes you create decide where vehicles fly, and traffic is generated along them. Autopilot near a traffic zone follows the same path. A short message explains this the first time you open the local map in a playthrough. It is stored in your save, so a new game or character sees it again.
 
 TRAFFIC ADDON 0.1
-All traffic decisions now live in their own plugin, FVO_Traffic.dll, which replaces FVO_CityPlacements.dll. Never keep both. City Placements is now only FVO_CityPlacements.esm.
+Traffic now has its own optional download, FlyingVehicleOverhaul-TrafficAddon-0.1.zip. Its plugin, FVO_Traffic.dll, replaces FVO_CityPlacements.dll. Never keep both. Without the addon F7 still opens, but no traffic flies the routes. City Placements is now only FVO_CityPlacements.esm, in the ExtraVehicles ZIP.
 
 REAL TRAFFIC
 Vehicles and their drivers are fully simulated rather than scenery. You can shoot at them, board them, or pull the driver out and take the vehicle, and a vehicle you take is yours: traffic lets go of it and fills its route position with another. Drivers who are attacked or caught in a fight react, and hostile drivers attack you.
@@ -29,7 +29,7 @@ REMOVED
 Rams, scheduled traffic and the road-network (GHN) traffic.
 
 INSTALL / UPDATE
-Use FlyingVehicleOverhaul-1.0.zip plus any addon ZIPs (the Traffic Addon and City Placements are in FlyingVehicleOverhaul-1.0-ExtraVehicles.zip), or the FOMOD instead. Replace your previous FVO installation and do not keep two copies of the DLL. Delete SFSE/Plugins/FVO_CityPlacements.dll and FVO_CityTraffic.esm if you have them. Requires Steam Starfield 1.16.244 and its SFSE.
+Use FlyingVehicleOverhaul-1.0.zip plus any optional ZIPs (FlyingVehicleOverhaul-TrafficAddon-0.1.zip for traffic, FlyingVehicleOverhaul-1.0-ExtraVehicles.zip for City Placements), or the FOMOD instead. Replace your previous FVO installation and do not keep two copies of the DLL. Delete SFSE/Plugins/FVO_CityPlacements.dll and FVO_CityTraffic.esm if you have them. Requires Steam Starfield 1.16.244 and its SFSE.
 
 KNOWN ISSUES
 - Some vehicles drop to the ground when the game builds their physics. The mod puts them back or brings the driver to them, and you may see this close up.

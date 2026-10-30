@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import re
 import zipfile
-from package_fomod import build, write_zip, DLL, PILOTS, PATCH, CITY, CITY_DLL, ROUTE_GUIDE, ROUTE_FILES, TRAFFIC_DIR
+from package_fomod import build, write_zip, DLL, PILOTS, PATCH, CITY, CITY_DLL, ROUTE_GUIDE, ROUTE_FILES, TRAFFIC_DIR, TRAFFIC_ADDON_VERSION
 
 
 def version_folder(release_root,version):
@@ -33,9 +33,12 @@ This main ZIP contains the core DLL and NPC pilot packages. It adds no
 parked vehicles of its own.
 
 Use either this main package OR the all-in-one {prefix}-FOMOD.zip. The FOMOD
-includes the same files, optional City Placements and Parked Vehicles conversion, and grouped
-feature configuration. It is an
+includes the same files, the optional Traffic Addon, City Placements and Parked Vehicles
+conversion, and grouped feature configuration. It is an
 alternative install method, not another required package.
+
+The Traffic Manager (F7 on the local map) needs the optional Traffic Addon to generate
+traffic: without it F7 still opens, but no traffic flies the routes.
 
 Without a FOMOD feature profile, the main package uses existing settings or
 the built-in defaults. Change features in Gameplay Options or settings.ini:
@@ -57,15 +60,23 @@ Do not install source ZIPs into the game.
     # 0.8.5: the optional addons as their own ZIPs too (same names as the 0.8 page), built from the same FOMOD payload.
     extra_guide=f'''Flying Vehicle Overhaul {version} - Extra Vehicles addon (optional)
 
-Two separate parts; install either or both into Starfield/Data with the main package:
+City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities. Copy it into
+Starfield/Data with the main package and enable it in your plugin list after its masters.
+The traffic that flies over the cities is now its own optional download, the Traffic Addon.
+'''.encode()
+    traffic_guide=f'''Flying Vehicle Overhaul - Traffic Addon {TRAFFIC_ADDON_VERSION} (optional, works with FVO {version})
 
-1. City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities.
-   Enable it in your plugin list after its masters.
-2. City traffic: SFSE/Plugins/FVO_Traffic.dll and SFSE/Plugins/FVO_Traffic/:
+Generates air traffic along routes. Copy this archive's contents into Starfield/Data with
+the main package. Needs no ESM; it uses whatever parked vehicles are there.
+
+Press F7 on the local map to open the Traffic Manager and make your own routes.
+Autopilot near a traffic zone follows the same path.
+
+SFSE/Plugins/FVO_Traffic.dll and SFSE/Plugins/FVO_Traffic/:
    route files for New Atlantis (NewAtlantis.ini, the ring, with its cold-start spots in
    NewAtlantis-ColdStart.ini; NewAtlantis-3D.ini, the district loop), Akila City,
    Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso and Red Mile,
-   and HOW-TO-MAKE-ROUTES.txt. Needs no ESM; it uses whatever parked vehicles are there.
+   and HOW-TO-MAKE-ROUTES.txt.
    Every .ini in FVO_Traffic is a route file you can edit, add or delete (delete a
    city's file to leave it without route traffic).
 
@@ -74,8 +85,6 @@ seated drivers, made once per save). Set start_on_route = 0 in a file for traffi
 comes only from parked vehicles. Route beacons: "Show traffic routes" in the game's
 settings menu. The FOMOD installer offers all of this as choices.
 
-Leave out the part you do not want: delete the ESM (or keep it disabled) for traffic
-only, or delete the DLL and the FVO_Traffic folder for placements only.
 Remove the old FVO_CityTraffic.esm if present, and SFSE/Plugins/FVO_CityPlacements.dll
 (FVO_Traffic.dll replaces it; never both).
 '''.encode()
@@ -88,18 +97,21 @@ Vehicles - Real.esm patch.
 '''.encode()
     with zipfile.ZipFile(fomod) as z:
         extra_entries={CITY:z.read('10 City Placements/'+CITY),
-                       CITY_DLL:z.read('11 Route Traffic/'+CITY_DLL),
-                       **{name:z.read('11 Route Traffic/Flying/'+name[len(TRAFFIC_DIR):]) for name in ROUTE_FILES},
-                       ROUTE_GUIDE:z.read('11 Route Traffic/'+ROUTE_GUIDE),
                        'Docs/FlyingVehicleOverhaul-ExtraVehicles.txt':extra_guide}
+        traffic_entries={CITY_DLL:z.read('11 Route Traffic/'+CITY_DLL),
+                         **{name:z.read('11 Route Traffic/Flying/'+name[len(TRAFFIC_DIR):]) for name in ROUTE_FILES},
+                         ROUTE_GUIDE:z.read('11 Route Traffic/'+ROUTE_GUIDE),
+                         'Docs/FlyingVehicleOverhaul-TrafficAddon.txt':traffic_guide}
         patch_entries={PATCH:z.read('20 Parked Vehicles Patch/'+PATCH),
                        'Docs/FlyingVehicleOverhaul-ParkedVehiclesPatch.txt':patch_guide}
     extra=output/(prefix+'-ExtraVehicles.zip')
     write_zip(extra,extra_entries)
+    traffic=output/f'FlyingVehicleOverhaul-TrafficAddon-{TRAFFIC_ADDON_VERSION}.zip'
+    write_zip(traffic,traffic_entries)
     patch=output/(prefix+'-ParkedVehiclesPatch.zip')
     write_zip(patch,patch_entries)
     source=output/(prefix+'-source.zip')
-    paths={'main':main,'extra':extra,'patch':patch,'fomod':fomod,'source':source}
+    paths={'main':main,'traffic':traffic,'extra':extra,'patch':patch,'fomod':fomod,'source':source}
     bundle={'version':version,'dll_sha256':manifest['dll_sha256'],'artifacts':{
         role:{'file':file.name,'sha256':hashlib.sha256(file.read_bytes()).hexdigest(),'size':file.stat().st_size}
         for role,file in paths.items()}}
@@ -112,17 +124,17 @@ Vehicles - Real.esm patch.
 Choose one installation method:
 
 1. Separate ZIPs: {main.name} (required), plus optional
-   {extra.name} (City Placements ESM and/or city traffic DLL + route files for
-   eleven routes; use either or both) and {patch.name} (needs Parked Vehicles).
+   {traffic.name} (Traffic Addon {TRAFFIC_ADDON_VERSION}: traffic DLL + route files for eleven routes),
+   {extra.name} (City Placements ESM) and {patch.name} (needs Parked Vehicles).
 
 2. Installer: {fomod.name}
-   Use Vortex/MO2 for grouped feature settings, city traffic route by route, City Placements and the patch.
+   Use Vortex/MO2 for grouped feature settings, the Traffic Addon route by route, City Placements and the patch.
    This replaces the separate ZIPs.
 
 Source for developers: {source.name}
 Do not install the source archive into the game.
 
-All five ZIPs belong to version {version}. Hashes are in SHA256SUMS.txt;
+All six ZIPs belong to version {version}. Hashes are in SHA256SUMS.txt;
 artifact identities are in release-bundle.json. Automated installer/build
 validation does not establish live gameplay performance.
 ''')

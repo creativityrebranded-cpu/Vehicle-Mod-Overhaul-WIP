@@ -80,7 +80,7 @@ def verify(path, schema=None):
         check(len(addon_groups) == 2 and addon_groups[0].get('name') == 'Optional addons' and addon_groups[1].get('name') == 'Routes',
               'One addon group and one route group')
         addon_plugins = addon_groups[0].findall('plugins/plugin')
-        check([p.get('name') for p in addon_plugins] == ['City Traffic', 'City Placements', 'Parked Vehicles conversion patch'],
+        check([p.get('name') for p in addon_plugins] == ['Traffic Addon', 'City Placements', 'Parked Vehicles conversion patch'],
               'Addon option names (0.9.0)')
         traffic, city, patch = addon_plugins
         check(optional == [city, patch], 'Only placements and the patch carry master gates')

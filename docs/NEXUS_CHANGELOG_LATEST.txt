@@ -1,7 +1,7 @@
 1.0 (Traffic Addon 0.1) — 30 October 2026
 
 - Traffic Manager: press F7 on the local map to create and edit traffic routes; traffic is generated along them; autopilot near a traffic zone follows the same path.
-- Traffic Addon 0.1: FVO_Traffic.dll replaces FVO_CityPlacements.dll.
+- Traffic Addon 0.1, its own optional file: FVO_Traffic.dll replaces FVO_CityPlacements.dll. The ExtraVehicles ZIP is now City Placements only.
 - Real traffic: shoot, board or steal; a vehicle you take leaves traffic.
 - Traffic placed inside the loading screen; models from your whole load order; up to 256 vehicles.
 - Vehicle and driver handled as one pair: recovery first, replacement only under a cover or far and out of sight.

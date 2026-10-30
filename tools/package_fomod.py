@@ -12,6 +12,7 @@ DLL = 'SFSE/Plugins/FlyingVehicleOverhaul.dll'
 PILOTS = 'FVO_NPCPilots.esm'
 PATCH = 'FVO_ParkedVehiclesPatch.esm'
 CITY = 'FVO_CityPlacements.esm'
+TRAFFIC_ADDON_VERSION = '0.1'  # its own version and its own optional ZIP (2026-10-30, the user)
 CITY_DLL = 'SFSE/Plugins/FVO_Traffic.dll'  # FVO Traffic (was FVO_CityPlacements.dll before 2026-10-29)
 OLD_CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'  # never install both
 CITY_TRAFFIC = 'SFSE/Plugins/FVO_Traffic/NewAtlantis.ini'
@@ -182,15 +183,16 @@ def module_config(dependencies, features, route_texts):
         'When upgrading, replace your old FVO installation instead of enabling two copies.')
     ET.SubElement(core, 'image', path=HEADER_PATH)
     ET.SubElement(ET.SubElement(core, 'typeDescriptor'), 'type', name='Required')
-    # 0.9.0: City Traffic and City Placements are pre-ticked; the routes are chosen city by city on their own page.
+    # 0.9.0: the Traffic Addon and City Placements are pre-ticked; the routes are chosen city by city on their own page.
     addons = ET.SubElement(ET.SubElement(groups, 'group', name='Optional addons', type='SelectAny'),
                            'plugins', order='Explicit')
-    traffic = ET.SubElement(addons, 'plugin', name='City Traffic')
+    traffic = ET.SubElement(addons, 'plugin', name='Traffic Addon')
     ET.SubElement(traffic, 'description').text = (
-        'Traffic that flies routes over the cities, from plain text files in SFSE/Plugins/FVO_Traffic. Choose the cities on '
-        'the next page. Includes HOW-TO-MAKE-ROUTES.txt for writing your own. Uses any parked vehicles (vanilla, Carfield, '
-        'Parked Vehicles or City Placements). Needs only the core. Replaces the 0.8 FVO_CityTraffic.esm (remove it if '
-        'another mod entry still supplies it).')
+        f'Traffic Addon {TRAFFIC_ADDON_VERSION}: generates air traffic along routes. Choose the included cities on the next page, or '
+        'make your own: press F7 on the local map to open the Traffic Manager. Autopilot near a traffic zone follows the same path. '
+        'Uses any parked vehicles (vanilla, Carfield, Parked Vehicles or City Placements). Needs only the core. Without this addon '
+        'F7 still opens, but no traffic flies the routes. Replaces FVO_CityPlacements.dll and the 0.8 FVO_CityTraffic.esm: remove '
+        'them if another mod entry still supplies them.')
     files = ET.SubElement(traffic, 'files')
     for name in (CITY_DLL, ROUTE_GUIDE):
         ET.SubElement(files, 'file', source='11 Route Traffic/'+name, destination=name, priority='0')
@@ -343,8 +345,11 @@ def build(data_dir, source_dir, sfse_dir, output, version, schema=None, test_res
 
 Use Vortex or Mod Organizer 2 to install the FOMOD ZIP and follow its installer.
 Core always installs: FlyingVehicleOverhaul.dll, FVO_NPCPilots.esm and this guide.
-Optional addons (City Traffic and City Placements are ticked by default):
-- City Traffic: SFSE/Plugins/FVO_Traffic.dll and route files in
+Optional addons (the Traffic Addon and City Placements are ticked by default):
+- Traffic Addon {TRAFFIC_ADDON_VERSION}: generates air traffic along routes. Press F7 on the local map to
+  open the Traffic Manager and make your own; autopilot near a traffic zone follows
+  the same path. Without this addon F7 still opens, but no traffic flies the routes.
+  SFSE/Plugins/FVO_Traffic.dll and route files in
   SFSE/Plugins/FVO_Traffic, chosen city by city: New Atlantis (ring and district
   loop), Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead,
   Paradiso and Red Mile. HOW-TO-MAKE-ROUTES.txt explains writing your own; every
@@ -387,7 +392,7 @@ different mod or manual install. Reinstall this package to change its choices.
 Removing old plugins can cause missing-plugin warnings in saves that used them.
 
 Manual install: copy only the contents of '00 Core' into Starfield/Data.
-For city traffic, copy '11 Route Traffic/SFSE' into Data, then the route files you want
+For the Traffic Addon, copy '11 Route Traffic/SFSE' into Data, then the route files you want
 from '11 Route Traffic/Flying' (traffic already flying) or '11 Route Traffic/Empty'
 (starts empty) into Data/SFSE/Plugins/FVO_Traffic.
 For City Placements, also copy '10 City Placements' contents into Data
@@ -405,7 +410,7 @@ validation.
     numeric = re.match(r'\d+(?:\.\d+){1,3}', version)
     version_attrs = {'MachineVersion': numeric.group(0)} if numeric else {}
     ET.SubElement(info, 'Version', version_attrs).text = version
-    ET.SubElement(info, 'Description').text = 'Core, grouped gameplay feature choices, city traffic routes city by city, City Placements and an optional Parked Vehicles conversion patch.'
+    ET.SubElement(info, 'Description').text = 'Core, grouped gameplay feature choices, the Traffic Addon with routes city by city, City Placements and an optional Parked Vehicles conversion patch.'
     header = Path(__file__).resolve().parents[1]/'docs/images/fomod-header.png'
     if header.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n':
         raise ValueError('FOMOD header image must be a PNG')

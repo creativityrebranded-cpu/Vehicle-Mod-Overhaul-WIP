@@ -48,16 +48,17 @@ Requirements
 Downloads and included files
 
 * FlyingVehicleOverhaul-1.0.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
-* FlyingVehicleOverhaul-1.0-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds parked vehicles in nine cities; FVO_Traffic.dll with the route files in FVO_Traffic (all eleven routes, traffic already flying) and the route guide adds city traffic. Use either or both. Includes its guide.
+* FlyingVehicleOverhaul-TrafficAddon-0.1.zip — optional, new: FVO_Traffic.dll with the route files in FVO_Traffic (all eleven routes, traffic already flying) and the route guide. Generates air traffic along routes. Press F7 on the local map to open the Traffic Manager and make your own; autopilot near a traffic zone follows the same path. Without this addon F7 still opens, but no traffic flies the routes. Replaces FVO_CityPlacements.dll; never keep both.
+* FlyingVehicleOverhaul-1.0-ExtraVehicles.zip — optional: FVO_CityPlacements.esm adds parked vehicles in nine cities. Includes its guide.
 * FlyingVehicleOverhaul-1.0-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
-* FlyingVehicleOverhaul-1.0-FOMOD.zip — all-in-one alternative for Vortex/MO2: the main files, City Traffic with its routes chosen city by city, traffic already flying or starting empty, route beacons on or off, City Placements and the patch, with dependency checks and grouped feature setup. City Traffic and City Placements start ticked. Use this instead of the separate ZIPs.
+* FlyingVehicleOverhaul-1.0-FOMOD.zip — all-in-one alternative for Vortex/MO2: the main files, the Traffic Addon with its routes chosen city by city, traffic already flying or starting empty, route beacons on or off, City Placements and the patch, with dependency checks and grouped feature setup. The Traffic Addon and City Placements start ticked. Use this instead of the separate ZIPs.
 
 Installation and updating
 
 * Mod manager: install the FOMOD, or install the main ZIP plus whichever optional addon ZIPs you want.
 * Manual: extract the main ZIP and wanted addon ZIPs into Starfield\Data. DLLs belong in Data\SFSE\Plugins. Do not extract the entire FOMOD archive into Data.
 * Enable plugins: FVO_NPCPilots.esm and whichever optional ESMs you installed. City traffic needs no ESM. Launch through SFSE; restart after replacing a DLL.
-* Updating: replace the previous FVO installation. Remove SeamlessVehicle.dll and FVO_CityTraffic.esm if present; two core DLLs load both copies. An unchecked addon does not remove a copy installed elsewhere.
+* Updating: replace the previous FVO installation. Remove SeamlessVehicle.dll, FVO_CityPlacements.dll and FVO_CityTraffic.esm if present; two core DLLs load both copies. An unchecked addon does not remove a copy installed elsewhere.
 
 Settings and defaults
 

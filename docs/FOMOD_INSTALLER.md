@@ -40,7 +40,7 @@ Packaging requires a source and DLL with the feature-import bridge; it refuses
 an older DLL that would silently ignore the new installer choices.
 
 - Required core: `FlyingVehicleOverhaul.dll`, `FVO_NPCPilots.esm`, install guide.
-- Optional, ticked (0.9.0): City Traffic (`FVO_CityPlacements.dll`, `HOW-TO-MAKE-ROUTES.txt`).
+- Optional, ticked: Traffic Addon (`FVO_Traffic.dll`, `HOW-TO-MAKE-ROUTES.txt`).
   Its pages: **City traffic routes** (one choice per route, all ticked: New Atlantis ring and
   district loop, Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead,
   Paradiso, Red Mile), **Traffic options** (traffic already flying, or starts empty: the same
