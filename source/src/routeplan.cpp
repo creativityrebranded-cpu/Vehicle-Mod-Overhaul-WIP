@@ -1,4 +1,5 @@
 #include "routeplan.h"
+#include "fvolimits.h"
 
 #include "log.h"
 #include "vehicleworld.h"
@@ -13,7 +14,7 @@ namespace routeplan
 {
 	namespace
 	{
-		constexpr int kPilots = 8;
+		constexpr int kPilots = 1 + fvolimits::kVehicles;  // pilots 0 (yours) .. kVehicles
 		constexpr float kHorizon = 10.0f, kStep = 0.5f;     // s
 		constexpr float kMargin = 0.5f, kMarginZ = 2.5f;    // m clearance around the boxes (the radii are circles around the boxes)
 		constexpr float kRange = 600.0f;                    // m: vehicles farther than this are ignored

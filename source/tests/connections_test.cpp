@@ -18,7 +18,7 @@ int main(){
     check(bool(range.At(0))&&range.At(0).local==0x900&&range.At(2).local==0x902,"resource ranges work independently of the shipped plugin name");
     check(!range.At(3)&&!runtimeforms::Range{"Other.esm",0xFFFFFF,2}.At(0),"range boundaries and overflow cannot create unrelated identities");
     check(!runtimeforms::Key{nullptr,1}&&!runtimeforms::Key{"",1}&&!runtimeforms::Key{"Other.esm",0}&&!runtimeforms::Key{"Other.esm",0x1000000},"malformed stable keys fail empty");
-    check(pilotlayout::kSlots==6&&pilotlayout::kBoardPackages.At(5).local==0x806&&!pilotlayout::kBoardPackages.At(6),"native quest capacity is explicit without guessing load-order bits");
+    check(pilotlayout::kSlots==fvolimits::kVehicles&&pilotlayout::kBoardPackagesRest.At(0).local==0xB00&&pilotlayout::kBoardPackagesRest.At(std::size_t(pilotlayout::kSlots-65)).local==std::uint32_t(0xB00+pilotlayout::kSlots-65)&&!pilotlayout::kBoardPackagesRest.At(std::size_t(pilotlayout::kSlots-64))&&pilotlayout::kBoardPackages.At(5).local==0x806&&pilotlayout::kBoardPackages.At(11).local==0x80C&&!pilotlayout::kBoardPackages.At(12)&&pilotlayout::kBoardPackagesMore.At(0).local==0x900&&pilotlayout::kBoardPackagesMore.At(51).local==0x933&&!pilotlayout::kBoardPackagesMore.At(52),"native quest capacity is explicit without guessing load-order bits (the shared vehicle limit, 2026-10-29)");
     auto other=cityprofile::kNewAtlantis;other.name="Other City";other.plugin="OtherTraffic.esm";other.placementWorldPrefix="OtherPlanet";
     other.ring={"OtherWorld",200,300,50,100};other.frame={10,20,30};
     const std::array profiles{cityprofile::kNewAtlantis,other};

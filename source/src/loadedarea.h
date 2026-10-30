@@ -27,4 +27,7 @@ namespace loadedarea
 	bool Install();  // startup
 	void Tick();     // main thread, every frame
 	bool IsWall(std::uint32_t bodyId);  // one of the six wall bodies of the current box (any thread)
+	// Main thread: something moved an FVO-flown vehicle by (dx, dy, dz) without its driver (the game's vehicle build drops a
+	// vehicle onto ground within ~45 m): its job's driver, if seated in it, is moved by the same amount. True when moved.
+	bool CarryDriverOf(std::uint32_t vehicleId, float dx, float dy, float dz);
 }

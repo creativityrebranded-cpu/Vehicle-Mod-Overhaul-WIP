@@ -11,7 +11,8 @@
 #include <algorithm>
 namespace {int mode=0;std::array<prefetch::RayHit,62> hits;std::array<bool,62> have{};}
 namespace game {std::uintptr_t Base(){return 0;}}
-namespace navmap {Sample At(double,double,double){Sample s;s.known=true;return s;}void NoteGround(double,double,double){}}
+namespace cellbake {bool Ground(double,double,double&){return false;}}
+namespace navmap {Sample At(double,double,double){Sample s;s.known=true;return s;}void NoteGround(double,double,double){}void Column(double x,double y,const double* zs,int n,Sample* out){for(int k=0;k<n;++k)out[k]=At(x,y,zs[k]);}}
 namespace world {
 bool Vehicles(Snapshot& s){s={};s.count=1;s.v[0].formId=1;s.v[0].pos[2]=2.5;s.v[0].half[0]=2;s.v[0].half[1]=3;s.v[0].half[2]=1.2f;return true;}
 }

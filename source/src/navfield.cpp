@@ -135,12 +135,19 @@ void Service(double milliseconds){
    auto&r=*work[slot];const auto&f=r.field;
    if(r.copied==r.solid.size()&&searching>=0)continue;  // copied, waiting for the worker: nothing to do now
    progressed=true;
-   const auto end=std::min(r.copied+std::size_t(256),r.solid.size());
-   for(;r.copied<end;++r.copied){const int k=int(r.copied),h=k/Plane,i=k%N,j=(k%Plane)/N;
-    const auto m=navmap::At((f.ox+i+0.5)*Cell,(f.oy+j+0.5)*Cell,f.bottom+h*2);
-    r.solid[k]=m.blocked||(f.objects&&m.objBlocked)||(m.haveGround&&m.ground+2.5>f.bottom+h*2);
-    r.known[k]=m.known;r.weight[k]=float(1+(!m.known?0.5:0)+std::min(m.contacts,10)*0.25);
+   // Whole columns (2026-10-29 audit): one nav map lookup answers all Samples heights of a column (navmap::Column), instead of one
+   // lookup per height. `copied` still counts samples (a multiple of Samples); 8 columns a step = 264 samples, as the old 256.
+   double zs[Samples];navmap::Sample col[Samples];
+   for(int h=0;h<Samples;++h)zs[h]=f.bottom+h*2;
+   const std::size_t endColumn=std::min(r.copied/Samples+std::size_t(8),std::size_t(Plane));
+   for(std::size_t c=r.copied/Samples;c<endColumn;++c){const int i=int(c%N),j=int(c/N);
+    navmap::Column((f.ox+i+0.5)*Cell,(f.oy+j+0.5)*Cell,zs,Samples,col);
+    for(int h=0;h<Samples;++h){const auto&m=col[h];const int k=h*Plane+j*N+i;
+     r.solid[k]=m.blocked||(f.objects&&m.objBlocked)||(m.haveGround&&m.ground+2.5>f.bottom+h*2);
+     r.known[k]=m.known;r.weight[k]=float(1+(!m.known?0.5:0)+std::min(m.contacts,10)*0.25);
+    }
    }
+   r.copied=endColumn*Samples;
    if(r.copied==r.solid.size()&&searching<0){searching=slot;Raster ready=std::move(r);search=std::async(std::launch::async,[r=std::move(ready)]()mutable{return Build(std::move(r));});}
    if(std::chrono::steady_clock::now()>=until)return;
   }

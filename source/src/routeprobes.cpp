@@ -150,6 +150,20 @@ namespace routeprobes
 			return base;
 		}
 		std::wstring Wide(const std::string& s) { return std::wstring(s.begin(), s.end()); }
+		// A remembered probe id is ours only while it is a reference of our probe model (or the old beacon). Ids are kept across
+		// saves (routeprobes.ini), and in another save the game gives the same id to anything else (2026-10-29: two crashes,
+		// FF02350A was an actor being deleted; we hid it as a "probe", the game's queued disable then ran on the freed actor).
+		// Anything else is never shown, hidden or moved: its id is just forgotten.
+		bool Ours(uptr ref)
+		{
+			if (!ref) return false;
+			__try {
+				const uptr b = At<uptr>(ref, kBaseForm);
+				return b && (b == ProbeBase() || b == Ptr(addr::kBeaconBaseObject));
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		uptr OurProbe(std::uint32_t id) { const uptr r = Lookup(id); return Ours(r) ? r : 0; }
 		void LoadIds(const std::string& world)
 		{
 			g_ids.clear();
@@ -165,7 +179,7 @@ namespace routeprobes
 				std::string text;
 				for (const wchar_t* c = old.data(); *c; ++c) text.push_back(char(*c));
 				std::size_t at = 0; unsigned id = 0; int used = 0, n = 0;
-				while (std::sscanf(text.c_str() + at, "%x%n", &id, &used) == 1) { if (const uptr r = Lookup(id)) { Show(r, false); ++n; } at += used; }
+				while (std::sscanf(text.c_str() + at, "%x%n", &id, &used) == 1) { if (const uptr r = OurProbe(id)) { Show(r, false); ++n; } at += used; }
 				WritePrivateProfileStringW(L"probes", Wide(world).c_str(), L"", Ini().c_str());
 				WritePrivateProfileStringW(L"style", Wide(world).c_str(), want, Ini().c_str());
 				if (n) logger::Write("Route markers: %d probe(s) of the old look hidden for %s; new ones are made", n, world.c_str());
@@ -189,7 +203,7 @@ namespace routeprobes
 		}
 		void HideAll()
 		{
-			for (const auto id : g_ids) if (const uptr ref = Lookup(id)) Show(ref, false);
+			for (const auto id : g_ids) if (const uptr ref = OurProbe(id)) Show(ref, false);
 			if (g_unsaved) SaveIds();
 			if (g_shown) logger::Write("Route markers: %zu probes hidden (%s)", g_ids.size(), g_world.c_str());
 			g_shown = false;
@@ -236,10 +250,14 @@ namespace routeprobes
 		const int end = g_cursor + kPerFrame;
 		for (; g_cursor < end && g_cursor < int(std::max(g_now.size(), g_ids.size())); ++g_cursor) {
 			const int i = g_cursor;
-			if (i >= int(g_now.size())) { if (const uptr ref = Lookup(g_ids[i])) Show(ref, false); continue; }  // more probes than points
+			if (i >= int(g_now.size())) { if (const uptr ref = OurProbe(g_ids[i])) Show(ref, false); continue; }  // more probes than points
 			if (i >= int(g_ids.size())) g_ids.push_back(0);
 			uptr ref = Lookup(g_ids[i]);
-			if (ref && base && At<uptr>(ref, kBaseForm) != base) { Show(ref, false); ref = 0; }  // something else in this save, or the old look
+			if (ref && !Ours(ref)) {  // something else has this id in this save: not ours, never touched; a new probe is made
+				logger::Write("Route markers: remembered probe %08X is another object in this save; left alone and forgotten", g_ids[i]);
+				ref = 0;
+			}
+			else if (ref && base && At<uptr>(ref, kBaseForm) != base) { Show(ref, false); ref = 0; }  // ours, the old look: hidden
 			float pos[3] = { g_now[i].x, g_now[i].y, g_now[i].z };
 			if (!ref) {
 				g_ids[i] = Place(base, cell, ws, pos, g_now[i].scale);

@@ -7,10 +7,11 @@
 // then the native persistent setter FUN_140b36c40), the same state a Creation Kit "Is Full LOD" reference has.
 // Released again (the flags it set are cleared, nothing else) after 10 s out of view, or when it comes back inside
 // the loaded area so the mod's cell scans find it again. Only the real vehicle models are drawn: no dots, no proxies.
-// Logs\FlyingVehicleOverhaul\settings.ini [view]: keepInSight=1 (0 = off), keepCone=60 (half-angle, degrees), keepMax=48.
+// Logs\FlyingVehicleOverhaul\settings.ini [view]: keepInSight=1 (0 = off), keepCone=60 (half-angle, degrees), keepMax=16 (was 48 before the 2026-10-29 perf redesign).
 // kept-vehicles.txt in the same folder lists what is held, so a save made while held is cleaned up after the next load.
 namespace vehiclekeep
 {
 	void Tick();   // main thread
+	bool InCameraView(double x, double y, double z);  // inside the camera's view cone now; true when the camera cannot be read
 	void Reset();  // a save load: forget held refs (the journal releases leftovers once the world settles)
 }

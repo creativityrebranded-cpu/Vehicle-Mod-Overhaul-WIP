@@ -1,0 +1,83 @@
+#include "trafficpair.h"
+#include "bodyowner.h"
+#include <cstdio>
+#include <limits>
+int main(){int checks=0,failed=0;auto check=[&](bool ok,const char* why){++checks;if(!ok){++failed;std::printf("FAIL %s\n",why);}};
+    for(unsigned gen=0;gen<256;++gen)check(!trafficpair::Body((gen<<24)|0xffffff),"every invalid body generation is rejected");
+    check(!trafficpair::Body(0)&&trafficpair::Body(0x0200402e),"unset body rejected, real generation/index accepted");
+    check(!trafficpair::ReadyAt(true,false,true,1,0),"invisible driver is not seated proof");
+    check(!trafficpair::ReadyAt(true,true,true,0,0),"logical vehicle link without pose cannot depart");
+    check(!trafficpair::ReadyAt(true,true,true,3,30),"detached airborne actor cannot depart");
+    check(!trafficpair::ReadyAt(true,true,true,3,std::numeric_limits<double>::quiet_NaN()),"invalid transform rejects departure");
+    check(trafficpair::ReadyAt(true,true,true,3,2),"loaded attached sitting pair may depart");
+    check(!trafficpair::ReadyAt(true,true,true,1,0.5)&&!trafficpair::ReadyAt(true,true,true,2,0.5),"wants to sit / waiting for the sit animation is not sitting");
+    check(trafficpair::MayHold(true,16,16)&&!trafficpair::MayHold(false,16,16),"occupied traffic does not lose retention to decoration budget");
+    int calls=0;std::uintptr_t vtable=0x1100,fn=0x1800;
+    auto read=[&](std::uintptr_t p){return p==5?vtable:fn;};
+    auto native=[](std::uintptr_t p){return p>=0x1000&&p<0x2000;};
+    auto invoke=[&](std::uintptr_t,std::uintptr_t){++calls;return std::uintptr_t(42);};
+    auto r=bodyowner::Lookup(5,read,native,invoke);check(r.object==42&&!r.invalid&&calls==1,"normal body owner contract preserved");
+    vtable=~std::uintptr_t(0);r=bodyowner::Lookup(5,read,native,invoke);check(!r.object&&r.invalid&&calls==1,"reported freed vtable never invoked");
+    vtable=0x1f80;r=bodyowner::Lookup(5,read,native,invoke);check(r.invalid&&calls==1,"truncated vtable rejected before slot read");
+    vtable=0x1100;fn=0x10080;r=bodyowner::Lookup(5,read,native,invoke);check(r.invalid&&calls==1,"earlier non-native method pointer rejected");
+    r=bodyowner::Lookup(0,read,native,invoke);check(!r.object&&!r.invalid&&calls==1,"ownerless native bodies stay valid null queries");
+    check(trafficpair::NeedsSnap(true,true,0,1.5),"linked at the seat but sit state 0: snap it (the creation link never sits a driver)");
+    check(!trafficpair::NeedsSnap(true,true,3,1.5),"sitting: never snapped again");
+    check(!trafficpair::NeedsSnap(true,true,0,36.6)&&!trafficpair::NeedsSnap(true,false,0,1.0),"far away or no driver model: no snap");
+    using trafficpair::Bad;using trafficpair::JudgePair;
+    check(JudgePair(true,true,false,true,2.2,true,false)==Bad::None,"seated at its seat with a pilot: healthy");
+    check(JudgePair(true,true,false,true,1.0,false,true)==Bad::None,"parked on the ground without a pilot: healthy");
+    check(JudgePair(false,true,false,false,50,false,false)==Bad::None&&JudgePair(true,false,false,false,50,false,false)==Bad::None,"a model missing: not judged");
+    check(JudgePair(false,false,true,true,0,true,true)==Bad::DriverDead,"a dead driver is bad even unloaded");
+    check(JudgePair(true,true,false,false,1.0,true,false)==Bad::DriverOut,"out of the vehicle");
+    check(JudgePair(true,true,false,true,15,true,false)==Bad::DriverFar,"listed aboard but left behind");
+    check(JudgePair(true,true,false,true,std::numeric_limits<double>::quiet_NaN(),true,false)==Bad::DriverFar,"invalid position counts as far");
+    check(JudgePair(true,true,false,true,1.0,false,false)==Bad::NoPilotInAir,"seated in the air with no pilot");
+    check(trafficpair::JudgeShown(true,true,7.9,3,false)==trafficpair::Seen::Seated,"sitting in a long vehicle, 7.9 m from its centre: seated");
+    check(trafficpair::JudgeShown(true,true,7.9,0,false)==trafficpair::Seen::Apart&&trafficpair::JudgeShown(true,true,9,3,false)==trafficpair::Seen::Apart,"not sitting, or beyond any seat: away");
+    using trafficpair::FlyWithoutDriverModel;using trafficpair::LandForMissingModel;
+    check(FlyWithoutDriverModel(true,true,false,true,190),"far, following, aboard, driver model out of the cells: flies on");
+    check(!FlyWithoutDriverModel(true,true,false,true,179)&&!FlyWithoutDriverModel(false,true,false,true,190),"near, or still boarding: does not");
+    check(!FlyWithoutDriverModel(true,false,false,true,190)&&!FlyWithoutDriverModel(true,true,true,true,190)&&!FlyWithoutDriverModel(true,true,false,false,190),"no vehicle model, driver model present, or not aboard: does not");
+    check(LandForMissingModel(true,false,4001,100),"near, 4 s with no driver model: lands");
+    check(!LandForMissingModel(true,false,4000,100)&&!LandForMissingModel(true,false,60000,190)&&!LandForMissingModel(false,false,60000,100)&&!LandForMissingModel(true,true,60000,100),"too soon, far, no vehicle model, or the driver is there: does not");
+    using trafficpair::DriverNeedsPassMark;using trafficpair::DriverSkipsCellCheck;
+    check(DriverNeedsPassMark(true,true,true,true,false),"a driver on a job, vehicle held with a model: gets the marker");
+    check(!DriverNeedsPassMark(false,true,true,true,false)&&!DriverNeedsPassMark(true,false,true,true,false),"anyone else, or the vehicle is not held: the game's rules stand");
+    check(!DriverNeedsPassMark(true,true,false,true,false)&&!DriverNeedsPassMark(true,true,true,false,false)&&!DriverNeedsPassMark(true,true,true,true,true),"a model missing, or already marked: nothing");
+    check(DriverSkipsCellCheck(true,true,true,true,300),"marked, far, vehicle held with a model: the actor's cell check is skipped");
+    check(!DriverSkipsCellCheck(true,true,true,true,179),"near the player the cell check runs, so the driver goes back to a loaded cell");
+    check(!DriverSkipsCellCheck(true,true,true,false,300),"no marker: the unload would take the model anyway, so the game's check runs");
+    check(!DriverSkipsCellCheck(true,true,false,true,300)&&!DriverSkipsCellCheck(true,false,true,true,300)&&!DriverSkipsCellCheck(false,true,true,true,300),"otherwise the game's cell check runs");
+    {using trafficpair::NextHealth;using trafficpair::PairHealth;using trafficpair::Seen;using trafficpair::MayHoldFar;using trafficpair::KeepsDriverPass;
+     check(NextHealth(Seen::Seated,0,30000)==PairHealth::Healthy&&NextHealth(Seen::Out,0,30000)==PairHealth::Healthy,"seated, or got out on the ground: healthy");
+     check(NextHealth(Seen::Apart,1000,30000)==PairHealth::Recovering&&NextHealth(Seen::Seating,29999,30000)==PairHealth::Recovering&&NextHealth(Seen::Alone,0,30000)==PairHealth::Recovering,"not seated yet: recovering");
+     check(NextHealth(Seen::Apart,30000,30000)==PairHealth::Broken&&NextHealth(Seen::Air,99999,30000)==PairHealth::Broken,"past the limit, not seated: broken");
+     check(NextHealth(Seen::Seated,99999,30000)==PairHealth::Healthy,"seated again: healthy again");
+     check(MayHoldFar(PairHealth::Healthy)&&MayHoldFar(PairHealth::Unproven)&&!MayHoldFar(PairHealth::Recovering)&&!MayHoldFar(PairHealth::Broken),"far pass: healthy and unproven only");
+     check(KeepsDriverPass(PairHealth::Healthy)&&KeepsDriverPass(PairHealth::Recovering)&&!KeepsDriverPass(PairHealth::Broken),"driver pass: all but broken (a repair needs full simulation)");}
+    {using namespace trafficpair;
+     check(RecoverLimit(0)==kRecoverMaxMs,"no repair seen yet: the most time");
+     check(RecoverLimit(10000)==kRecoverMinMs,"quick repairs: never under the floor");
+     check(RecoverLimit(40000)==60000,"1.5 times the longest recent repair");
+     check(RecoverLimit(100000)==kRecoverMaxMs,"never over the top");
+     check(NoticeFar(7.2,190)>410&&NoticeFar(7.2,190)<411,"a 7 m vehicle: about 410 m");
+     check(NoticeFar(kDriverSize,190)==190,"a driver: the loaded edge decides");
+     check(NoticeFar(1.8,300)==300,"a bigger loaded area pushes it out");
+     check(NeedsBringing(0,5)&&!NeedsBringing(0,3)&&NeedsBringing(3,28.7)&&!NeedsBringing(3,7.9),"not sitting: past a snap's reach; sitting: past any seat");
+     check(!NeedsBringing(3,std::numeric_limits<double>::quiet_NaN()),"no reading: left");
+     check(PutBackAfterBuild(62.3f,15.0f,0)&&PutBackAfterBuild(62.3f,15.0f,5),"gone down: put back");
+     check(!PutBackAfterBuild(62.3f,15.0f,6),"after six tries it is left to the driver going to it");
+     check(!PutBackAfterBuild(62.3f,61.0f,0)&&!PutBackAfterBuild(62.3f,70.0f,0),"a small settle or a rise: left");}
+    using trafficpair::Floating;using trafficpair::Seen;using trafficpair::JudgeShown;using trafficpair::HideShown;
+    check(Floating(true,false,0)&&Floating(true,true,36)&&Floating(true,true,std::numeric_limits<double>::quiet_NaN()),"a driver model with no vehicle model, or away from it, is floating");
+    check(!Floating(false,false,50)&&!Floating(true,true,2),"no driver model, or at the seat: not floating");
+    check(JudgeShown(true,false,0,3,false)==Seen::Alone,"linked, vehicle model missing: alone, even at sit state 3");
+    check(JudgeShown(true,true,36,3,false)==Seen::Apart,"linked, far from the vehicle: apart");
+    check(JudgeShown(true,true,1,3,false)==Seen::Seated&&JudgeShown(true,true,1,1,false)==Seen::Seating,"at the seat: sitting or not");
+    check(JudgeShown(false,true,50,0,false)==Seen::Out&&JudgeShown(false,true,50,0,true)==Seen::Air,"no link: on the ground is ordinary, high up is not");
+    check(HideShown(Seen::Alone,true,false,15000)&&HideShown(Seen::Apart,true,false,16000),"traffic driver, no job, 15 s with no vehicle: hidden");
+    check(!HideShown(Seen::Alone,true,false,14999)&&!HideShown(Seen::Alone,true,true,60000)&&!HideShown(Seen::Alone,false,false,60000),"too soon, a pilot owns them, or not made by traffic: left alone");
+    check(!HideShown(Seen::Out,true,false,60000)&&!HideShown(Seen::Air,true,false,60000)&&!HideShown(Seen::Seating,true,false,60000),"got out, or at the seat: never hidden");
+    std::printf("trafficpair/owner: %d checks, %d failures\n",checks,failed);return failed?1:0;
+}

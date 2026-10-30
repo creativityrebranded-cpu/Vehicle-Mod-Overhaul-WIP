@@ -9,6 +9,8 @@
 #include "vehicleflight.h"
 #include "framework.h"
 #include "npcvehicles.h"
+#include "trafficpair.h"
+#include "trafficpool.h"
 
 #include <Windows.h>
 
@@ -179,7 +181,7 @@ namespace vehiclekeep
 			const auto& ini = fvopaths::Settings();
 			const bool enabled = GetPrivateProfileIntW(L"view", L"keepInSight", 1, ini.c_str()) != 0;
 			const float cone = std::clamp(float(GetPrivateProfileIntW(L"view", L"keepCone", 60, ini.c_str())), 5.0f, 89.0f);
-			const unsigned max = std::clamp(GetPrivateProfileIntW(L"view", L"keepMax", 48, ini.c_str()), 1u, 256u);
+			const unsigned max = std::clamp(GetPrivateProfileIntW(L"view", L"keepMax", 16, ini.c_str()), 1u, 256u);
 			if (enabled != g_enabled || cone != g_coneDeg || max != g_max)
 				logger::Write("Keep in sight: %s, view cone %.0f deg, at most %u vehicles (settings.ini [view])", enabled ? "on" : "off", cone, max);
 			g_enabled = enabled; g_coneDeg = cone; g_max = max;
@@ -218,6 +220,15 @@ namespace vehiclekeep
 			for (const auto& [id, t] : g_candidates) ids.push_back(id);
 			for (const auto& [id, h] : g_held) if (!g_candidates.count(id)) ids.push_back(id);
 
+			// 2026-10-29 (the user: stutter and freezes around New Atlantis): each hold or release moves a reference into or out of
+			// the world's persistent cell, and a batch of them in one frame cost 13-21 ms (7 holds at once at 13:06:26). One change per
+			// evaluation (250 ms); the rest wait for the next one.
+			int changes = 0;
+			std::size_t decorative=0;
+			for(const auto& entry:g_held)if(!npcvehicles::UsesVehicle(entry.first)&&!npcvehicles::VehicleDriverId(entry.first))++decorative;
+			std::unordered_map<std::uint32_t,bool> occupied;
+			for(const auto id:ids)occupied[id]=npcvehicles::UsesVehicle(id);
+			std::stable_sort(ids.begin(),ids.end(),[&](auto a,auto b){return occupied[a]>occupied[b];});
 			for (const auto id : ids) {
 				RefView v;
 				const uptr ref = Resolve(id, v);
@@ -235,22 +246,28 @@ namespace vehiclekeep
 				// 2026-10-24 (23:11 run): releasing a vehicle hands it back to its cell, which reloads it and drops whoever sits in
 				// it. A vehicle with a driver, or one of the scheduled-traffic vehicles, is held regardless of view past the edge
 				// and never released for distance or view while that lasts.
-				const bool busy = npcvehicles::VehicleDriverId(id) != 0;
+				const bool busy = occupied[id] || npcvehicles::VehicleDriverId(id) != 0;
 				if (held) {
 					Held& h = g_held[id];
 					if (v.world != pv.world) { Release(id, "other world", dPlayer); continue; }
+					// The pair health record: a broken pair loses the far pass where nobody can see it go, and its model unloads; the removal rule can then take it.
+					if (!changes && !inSight && trafficpair::PairHealth(trafficpool::PairHealth(id)) == trafficpair::PairHealth::Broken && dPlayer >= edge && trafficpool::WellHiddenFar(id, dPlayer)) { Release(id, "its pair is broken", dPlayer); ++changes; continue; }
 					if (inSight || busy) h.seen = now;
 					if (busy && id != own) { if (dPlayer > h.maxDist) h.maxDist = dPlayer; if (dPlayer > edge + 150.0 && v.has3D) h.had3DFar = true; continue; }
 					if (dPlayer > h.maxDist) h.maxDist = dPlayer;
 					if (dPlayer > edge + 150.0 && v.has3D) h.had3DFar = true;
-					if (id == own) Release(id, "player's own vehicle", dPlayer);
-					else if (dPlayer < edge - 50.0) Release(id, "back inside the loaded area", dPlayer);
-					else if (now - h.seen > kReleaseOutOfSightMs) Release(id, "out of sight", dPlayer);
+					if (id == own) { Release(id, "player's own vehicle", dPlayer); ++changes; }
+					else if (changes) continue;
+					else if (dPlayer < edge - 50.0) { Release(id, "back inside the loaded area", dPlayer); ++changes; }
+					else if (now - h.seen > kReleaseOutOfSightMs) { Release(id, "out of sight", dPlayer); ++changes; }
 					continue;
 				}
 				if (now - g_candidates[id] > kForgetMs) { g_candidates.erase(id); continue; }
-				if (!(inSight || busy) || dPlayer < edge || id == own || v.world != pv.world || g_native.count(id) || g_held.size() >= g_max) continue;
+				if (!(inSight || busy) || dPlayer < edge || id == own || v.world != pv.world || g_native.count(id) || !trafficpair::MayHold(busy,decorative,g_max)) continue;
+				if (!trafficpair::MayHoldFar(trafficpair::PairHealth(trafficpool::PairHealth(id)))) continue;  // the pair health record: no far pass until it is seated
 				if (v.flags & kFullLodFlag) { g_native[id] = true; continue; }  // its plugin made it Full LOD: not ours
+				if (changes) continue;
+				++changes;
 				if (!CallSetLod(ref, 1)) continue;
 				RefView after;
 				if (!ReadRef(ref, after) || !(after.flags & kFullLodFlag)) {
@@ -264,6 +281,7 @@ namespace vehiclekeep
 				h.since = h.seen = now;
 				h.maxDist = dPlayer;
 				g_held[id] = h;
+				if(!busy)++decorative;
 				logger::Write("Keep in sight: holding %08X at %.0f m (visibility hold estimate %.0f m)%s, 3D %s, flags 0x%X -> 0x%X",
 					id, dPlayer, edge, inSight ? "" : " (occupied / traffic, out of view)", after.has3D ? "loaded" : "none", v.flags, after.flags);
 				WriteJournal();
@@ -287,7 +305,8 @@ namespace vehiclekeep
 	void Tick()
 	{
 		const ULONGLONG now = GetTickCount64();
-		if (!g_readAt || now - g_readAt >= 5000) { g_readAt = now; ReadSettings(); }
+		static fvopaths::Watch watch;  // re-read only when settings.ini changed (2026-10-29 audit)
+		if (watch.Changed(fvopaths::Settings())) { g_readAt = now; ReadSettings(); }
 		if (!g_resetAt) g_resetAt = now;
 		if (now - g_resetAt < kSettleMs) return;  // let a load settle before touching references
 		if (g_journalPending) { g_journalPending = false; CleanJournal(); }
@@ -298,6 +317,13 @@ namespace vehiclekeep
 		Evaluate(now);
 	}
 
+	bool InCameraView(double x, double y, double z)
+	{
+		float o[3], f[3];
+		if (!CameraView(o, f)) return true;
+		const double cx = x - o[0], cy = y - o[1], cz = z - o[2], d = std::sqrt(cx * cx + cy * cy + cz * cz);
+		return d <= 1.0 || (cx * f[0] + cy * f[1] + cz * f[2]) / d >= std::cos(double(g_coneDeg) * 3.14159265358979 / 180.0);
+	}
 	void Reset()
 	{
 		// The held refs belong to the save being left; the loaded save decides their state, and the journal (still listing

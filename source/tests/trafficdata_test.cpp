@@ -9,6 +9,15 @@ static void Check(bool ok, const char* what) { if (!ok) { ++g_fail; std::printf(
 int main(int argc, char** argv)
 {
     using namespace trafficdata;
+    {
+        Data d;
+        Read("[route.night]\nworld=city\ntype=path\npoints=0 0 100,100 0 110\nwindows=1080 360 2,360 1080 4\n"
+             "[route.day]\nworld=city\ntype=path\npoints=0 0 100,100 0 110\ndensity=3\n"
+             "[route.bad]\nworld=city\ntype=path\npoints=0 0 100,100 0 110\nwindows=100 200 1,150 250 2\n", "schedule.ini",d);
+        Check(d.routes.size()==2 && d.problems.size()==1,"invalid schedule skips only invalid route");
+        Check(!d.routes[0].schedule.allDay && routeschedule::Evaluate(d.routes[0].schedule,true,0).vehicles==2,"scheduled route wraps midnight");
+        Check(d.routes[1].schedule.allDay && d.routes[1].schedule.allDayVehicles==3,"all-day density loaded");
+    }
     if (argc > 1) {  // trafficdata_test FILE.ini ...: read real traffic files and list what was understood and what was skipped
         Data d;
         for (int i = 1; i < argc; ++i) { std::ifstream f(argv[i]); std::stringstream t; t << f.rdbuf(); Read(t.str(), argv[i], d); }

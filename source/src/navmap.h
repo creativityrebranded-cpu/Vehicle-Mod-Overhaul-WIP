@@ -49,6 +49,9 @@ namespace navmap
 		float blockedZ = 0;     // the height of the remembered solid hit (valid when blocked): a hillside hit sits at the ground, a wall above it
 	};
 	Sample At(double x, double y, double z);
+	// The same answers for n heights of one column: one cell lookup instead of n (2026-10-29 audit: the flight field asked each of its
+	// 33 heights separately, ~515 000 lookups a field).
+	void Column(double x, double y, const double* zs, int n, Sample* out);
 
 	enum class Verdict : std::uint8_t { Unknown, Clear, Blocked };
 	// Sweeps a vehicle (half-width `halfWidth`) from p along d (horizontal metres dx, dy). A surface ahead blocks it when

@@ -61,7 +61,7 @@ Two separate parts; install either or both into Starfield/Data with the main pac
 
 1. City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities.
    Enable it in your plugin list after its masters.
-2. City traffic: SFSE/Plugins/FVO_CityPlacements.dll and SFSE/Plugins/FVO_Traffic/:
+2. City traffic: SFSE/Plugins/FVO_Traffic.dll and SFSE/Plugins/FVO_Traffic/:
    route files for New Atlantis (NewAtlantis.ini, the ring, with its cold-start spots in
    NewAtlantis-ColdStart.ini; NewAtlantis-3D.ini, the district loop), Akila City,
    Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso and Red Mile,
@@ -76,7 +76,8 @@ settings menu. The FOMOD installer offers all of this as choices.
 
 Leave out the part you do not want: delete the ESM (or keep it disabled) for traffic
 only, or delete the DLL and the FVO_Traffic folder for placements only.
-Remove the old FVO_CityTraffic.esm if present.
+Remove the old FVO_CityTraffic.esm if present, and SFSE/Plugins/FVO_CityPlacements.dll
+(FVO_Traffic.dll replaces it; never both).
 '''.encode()
     patch_guide=f'''Flying Vehicle Overhaul {version} - Parked Vehicles conversion patch (optional)
 

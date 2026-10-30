@@ -1,4 +1,5 @@
 #include "groundnav.h"
+#include "fvolimits.h"
 #include "environment.h"
 #include "features.h"
 #include "log.h"
@@ -20,7 +21,7 @@ namespace groundnav
 	{
 		using groundplan::kCell;
 		using groundplan::Mode;
-		constexpr int kPilots = 8;               // vehicleflight pilots 0 (your vehicle) .. 6
+		constexpr int kPilots = 1 + fvolimits::kVehicles;  // vehicleflight pilots 0 (your vehicle) .. kVehicles
 		constexpr int kN = 141;                  // grid cells per side (564 m)
 		constexpr int kGatherPerFrame = 3000;    // cells filled per frame on the main thread
 		constexpr ULONGLONG kMinReplanMs = 1500, kMaxPlanAgeMs = 8000, kSeenMs = 600;

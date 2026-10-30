@@ -18,4 +18,11 @@ namespace inputgate
     // Ordered fresh native button presses; low bit pad, upper bits sequence.
     std::uint64_t LastDevicePress();
 	unsigned TakeBlockedCount();             // events blocked since the last call (for the log)
+	// The map route editor (routeedit.cpp, 2026-10-29, the user: "during f7 normal map interactions should be disallowed"):
+	// call every frame while it is open on the local map; for the next 300 ms the map gets no left mouse button and no keys
+	// but Tab / Esc (leave the map) and W A S D / arrows (pan). The wheel, right and middle buttons still move the camera.
+	// The editor reads the keyboard and mouse itself (GetAsyncKeyState), so it is not affected.
+	void HoldMapForEditor();
+	// While the traffic model restart's loading panel is up: the same, and Tab / Esc as well (the map cannot be left).
+	void HoldMapAll();
 }

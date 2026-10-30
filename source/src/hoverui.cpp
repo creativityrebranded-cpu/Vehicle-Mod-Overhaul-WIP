@@ -1,4 +1,5 @@
 #include "hoverui.h"
+#include "trafficpool.h"
 #include "passenger.h"
 #include "bindings.h"
 #include "hudprompts.h"
@@ -16,6 +17,7 @@
 #include "scannercontext.h"
 #include "vehiclecamera.h"
 #include "cameraroll.h"
+#include "routeedit.h"
 
 #include "fvopaths.h"
 
@@ -1052,6 +1054,7 @@ namespace hoverui
 		constexpr unsigned kControlBase = kSettingBase + 0x100;
 		constexpr unsigned kRestoreControls = kControlBase + unsigned(bindings::Action::Count);
 		constexpr unsigned kFeatureHeader = kSettingBase + 0x200, kControlsHeader = kFeatureHeader + 1;
+		constexpr unsigned kReloadTraffic = kFeatureHeader + 2;  // "Reload traffic files" (FVO Traffic reads them on demand)
 		constexpr std::uint32_t kRvaLinkDisp = 0x04C6F0C0, kRvaLinkFn = 0x0152CE10;
 		constexpr int kCheckBox = 3;                          // SettingsOptionListEntry.SDT_CHECKBOX
 		constexpr const char* kCategoryName = "Flying Vehicle Overhaul";
@@ -1111,7 +1114,7 @@ namespace hoverui
 		bool OurSetting(double id)
 		{
 			return (id>=kSettingBase&&id<kSettingBase+unsigned(features::Id::Count)) ||
-				(id>=kControlBase&&id<=kRestoreControls) || id==kFeatureHeader || id==kControlsHeader;
+				(id>=kControlBase&&id<=kRestoreControls) || id==kFeatureHeader || id==kControlsHeader || id==kReloadTraffic;
 		}
 		void NeutralPeoData(uptr movie,const Value& entry)
 		{
@@ -1165,6 +1168,10 @@ namespace hoverui
 				Invoke(*out, "push", push, 1);
 				Release(e);
 			}
+			// FVO Traffic reads its route files once at start; this re-reads them after hand edits (2026-10-29, the user: "an update button
+			// in the menu whenever we need it updated"). The map route editor's own saves reload by themselves.
+			if (trafficpool::AddonAttached())
+				TextOption(movie,*out,kReloadTraffic,4,"Reload traffic files","Re-reads the route files in Data\\SFSE\\Plugins\\FVO_Traffic after you edit them. Changes made in the map route editor apply by themselves.");
 			// The controls live on the game's Controls page when its hooks are in (controlspage.h); these rows are the fallback.
 			if(g_controlsAvailable&&!controlspage::Installed()){
 				TextOption(movie,*out,kControlsHeader,5,"Vehicle controls","Select an action, then press its new key or controller button.",false);
@@ -1516,6 +1523,11 @@ namespace hoverui
 		void LinkDetour(void* self,Value* ev)
 		{
 			double id=-1;
+			if(EventNumber(ev,"uSettingID",id)&&unsigned(id)==kReloadTraffic){
+				trafficpool::ReloadFiles();
+				notify::Show("Traffic files: reloading");
+				return;
+			}
 			if(EventNumber(ev,"uSettingID",id)&&id>=kControlBase&&id<=kRestoreControls){
 				if(id==kRestoreControls)bindings::ResetAll();
 				else bindings::BeginCapture(bindings::Action(int(id-kControlBase)));
@@ -2579,6 +2591,8 @@ namespace hoverui
 			// The pause / main menu: the settings panel's category (g_set.failed: the hooks are missing).
 			const uptr sm = g_setMenu.load();
 			if (sm && movie == g_setMovie.load() && !g_set.failed) SettingsWork(sm, movie);
+			// The local map's traffic route editor (its own star map movie only).
+			routeedit::Advance(movie);
 			return r;
 		}
 
@@ -2602,7 +2616,9 @@ namespace hoverui
 				std::lock_guard lk(g_scanLock);
 				g_placeName.clear(); g_placeAt = 0;
 			}
+			routeedit::MovieClosing(movie);
 			void* r = g_movieDtorOriginal(movie, flags);
+			routeedit::MovieGone(movie);  // only after the destructor has unlinked the editor's values
 			for(auto& view:g_routeViews) if(view.movie==movie) view=RouteView{};
             for(auto& view:g_commandViews)if(view.movie==movie)view=CommandView{};
 			// After the movie unlinked its values (they live in our memory): forget them, never release.
@@ -2866,6 +2882,8 @@ namespace hoverui
 
 	void EditTick(bool focused)
 	{
+		// F7 on the local map belongs to the traffic route editor (routeedit.cpp); drain the HUD editor's key meanwhile.
+		if (routeedit::MapOpen(1000)) { bindings::Triggered(bindings::Action::HudEdit); return; }
 		static bool down[14] = {};
 		static ULONGLONG repeatAt[14] = {};
 		// 10..13: + / - on the main row and the number pad (the size, while editing).

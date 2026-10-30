@@ -1,8 +1,8 @@
-# Flying Vehicle Overhaul (WIP)
+# Flying Vehicle Overhaul
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current packaged version: **0.9.0** (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current packaged version: **1.0**, with Traffic Addon 0.1, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -82,7 +82,7 @@ before installing or upgrading.
 
 ## Installation
 
-Release 0.9.0 is organized in a version folder with a main ZIP, separate optional
+Release 1.0 is organized in a version folder with a main ZIP, separate optional
 Extra Vehicles and Parked Vehicles patch ZIPs, and an alternative all-in-one
 FOMOD ZIP. Matching source and hashes are alongside them. See
 [release packaging](docs/RELEASE_PACKAGING.md). Published 0.73.0 archives predate
@@ -145,6 +145,16 @@ Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation 
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
 
+## What's new in 1.0 (Traffic Addon 0.1)
+
+- **Traffic Manager:** press F7 on the local map to create and edit traffic routes; traffic is generated along them, and autopilot near a traffic zone follows the same path. A first-time message explains it.
+- **Traffic Addon 0.1:** traffic decisions moved into `FVO_Traffic.dll`, which replaces `FVO_CityPlacements.dll`.
+- **Real traffic:** shoot, board or steal; a vehicle you take leaves traffic.
+- **Arrivals:** traffic placed inside the game's loading screen, models from your whole load order, up to 256 vehicles (`FVO_NPCPilots.esm` has 256 slots).
+- **Pairs:** one health record per vehicle and driver; every pass asks it; recovery first, and replacement only under a cover or far and out of sight.
+- **Performance:** wheel dust no longer fills the persistent cell; a guard stops the local map crash it caused.
+- **Removed:** rams, scheduled traffic, road-network traffic.
+
 ## What's new in 0.9.0
 
 - **City traffic in ten cities:** eleven routes (New Atlantis slanted ring and district loop, Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso, Red Mile), chosen city by city in the installer.
@@ -168,7 +178,7 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 - **Route making:** traffic flies routes in plain `.ini` files in `Data\SFSE\Plugins\FVO_Traffic` (rings, open or looping paths, exits, landing places, per-world rules). `HOW-TO-MAKE-ROUTES.txt` in that folder explains every line; "Show traffic routes" draws them with probes.
 - **Installer:** the same options and pages as 0.8 (updates keep choices); New Atlantis City Traffic installs the route traffic, New Atlantis City Placements the parked vehicles.
 
-Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_0.9.0.txt](docs/NEXUS_POST_0.9.0.txt).
+Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_1.0.txt](docs/NEXUS_POST_1.0.txt).
 
 ## What's new in 0.73.0
 

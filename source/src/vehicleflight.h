@@ -20,6 +20,9 @@ namespace vehicleflight
 	void Tick();     // per frame, main thread (frame task)
 	void LoadReset(); // discard hover/body state before a different save replaces the rover
 	bool Active();
+    bool RouteTripActive(std::uint32_t vehicleId);
+    bool BirthControlReady(std::uint32_t vehicleId);
+    bool PilotHolds(std::uint32_t vehicleId);
     bool PlayerDriving(std::uint32_t vehicle);
 	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera and HUD
 
@@ -33,6 +36,8 @@ namespace vehicleflight
 	// The same from a profile's goal (vcontract::Goal): the nav settings and the target in one call. The one drive call for goal-driven pilots.
 	bool PilotFly(int pilot, std::uintptr_t vehicle, const vcontract::Goal& goal, unsigned timeoutMs = 0, bool keepGoing = true);
 	bool PilotActive(int pilot);
+	// A traffic pilot held still far from the player (1 km or more; it flies on within 900 m): its job and trip wait, not stuck.
+	bool PilotHeldFar(int pilot);
 	// Height of `vehicle` over the ground this pilot last read (0 = the player's rover); NaN when not known.
 	double PilotAboveGround(int pilot, std::uintptr_t vehicle);
 	struct PhysicsStatus { bool bound = false, live = false; std::uint64_t serial = 0; };

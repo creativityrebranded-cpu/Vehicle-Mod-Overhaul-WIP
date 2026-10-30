@@ -585,7 +585,7 @@ namespace vehiclehits
 			shot.shooterVeh=VehicleOf(shot.shooter);shot.attackerId=ShooterActorId(shot.shooter);shot.side=ShooterSide(shot);
 			shot.weaponId=impact.weapon;shot.weaponDamage=impact.damage;
 			const world::VehicleInfo* struck=nullptr;double nearest=1e30;
-			for(unsigned k=0;k<snap.count&&k<64;++k) {
+			for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k) {
 				const auto& v=snap.v[k];if(!interactionlogic::OtherVehicle(v.formId,shot.shooter,shot.shooterVeh))continue;
 				float center[3];const double age=now>=impact.at?std::min(double(now-impact.at)/1000.0,0.1):0;
 				for(int axis=0;axis<3;++axis)center[axis]=v.center[axis]-float(v.vel[axis]*age);
@@ -625,7 +625,7 @@ namespace vehiclehits
 				for (int k = 0; k < 3; ++k) b[k] = float(pr.o[k] + pr.d[k] * reach);
 				const world::VehicleInfo* struck = nullptr;
 				double nearest = 2;
-				for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+				for (std::uint32_t k = 0; k < snap.count && k < world::kMaxVehicles; ++k) {
 					const auto& v = snap.v[k];
 					if (!interactionlogic::OtherVehicle(v.formId, pr.shooter, pr.shooterVeh)) continue;
 					double t = 0;
@@ -653,7 +653,7 @@ namespace vehiclehits
 					for (int k = 0; k < 3; ++k) b[k] = float(pr.p[k] + pr.v[k] * dt);
 				}
 				const world::VehicleInfo* struck=nullptr;double nearest=2;
-				for(std::uint32_t k=0;k<snap.count&&k<64;++k){const auto&v=snap.v[k];
+				for(std::uint32_t k=0;k<snap.count&&k<world::kMaxVehicles;++k){const auto&v=snap.v[k];
 					if(!interactionlogic::OtherVehicle(v.formId,pr.shooter,pr.shooterVeh))continue;
 					double t=0;if(interactionlogic::HullHit(v.center,v.rot,v.half,pr.seen?pr.p:pr.o,b,t)&&t<nearest){nearest=t;struck=&v;}
 				}
@@ -677,7 +677,7 @@ namespace vehiclehits
 					const double dt = (now - pr.seenAt) / 1000.0;
 					for (int k = 0; k < 3; ++k) pr.v[k] = float((cur[k] - pr.p[k]) / dt);
                     float relative[3]{pr.v[0],pr.v[1],pr.v[2]};
-                    if(haveVehicles)for(unsigned k=0;k<snap.count&&k<64;++k)if(snap.v[k].formId==pr.shooter||snap.v[k].formId==pr.shooterVeh)for(int axis=0;axis<3;++axis)relative[axis]-=snap.v[k].vel[axis];
+                    if(haveVehicles)for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].formId==pr.shooter||snap.v[k].formId==pr.shooterVeh)for(int axis=0;axis<3;++axis)relative[axis]-=snap.v[k].vel[axis];
                     const double speed=std::hypot(std::hypot(relative[0],relative[1]),relative[2]);
                     if(std::isfinite(speed)&&speed>1&&speed<100000){ballistic.data.speed=ballistic.data.observedSpeed?0.75*ballistic.data.speed+0.25*speed:speed;ballistic.data.observedSpeed=true;}
 				}
@@ -685,7 +685,7 @@ namespace vehiclehits
 				pr.seen = true;
 				pr.seenAt = now;
 				++pr.frames;
-				if (haveVehicles) for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+				if (haveVehicles) for (std::uint32_t k = 0; k < snap.count && k < world::kMaxVehicles; ++k) {
 					const auto& v = snap.v[k];
 					if (!interactionlogic::OtherVehicle(v.formId, pr.shooter, pr.shooterVeh)) continue;
 					const float dd = std::sqrt((cur[0] - v.center[0]) * (cur[0] - v.center[0]) + (cur[1] - v.center[1]) * (cur[1] - v.center[1]) + (cur[2] - v.center[2]) * (cur[2] - v.center[2]));
@@ -698,7 +698,7 @@ namespace vehiclehits
 				if (pr.side == 1 && pr.closestId && pr.closest < 40.0f && (missLogs < 15 || logger::Verbose())) {
 					++missLogs;
 					const world::VehicleInfo* nearVeh = nullptr;
-					for (std::uint32_t k = 0; haveVehicles && k < snap.count && k < 64; ++k) if (snap.v[k].formId == pr.closestId) nearVeh = &snap.v[k];
+					for (std::uint32_t k = 0; haveVehicles && k < snap.count && k < world::kMaxVehicles; ++k) if (snap.v[k].formId == pr.closestId) nearVeh = &snap.v[k];
 					logger::Write("Vehicle hits: a shot from %08X ended (%u positions read%s): nearest vehicle %08X, %.1f m from its centre (its half size %.1f x %.1f x %.1f)%s",
 						pr.shooter, pr.frames, pr.seen ? "" : ", none", pr.closestId, pr.closest, nearVeh ? nearVeh->half[0] : 0.0f, nearVeh ? nearVeh->half[1] : 0.0f,
 						nearVeh ? nearVeh->half[2] : 0.0f, alive ? "" : " (the projectile is gone)");
@@ -890,7 +890,7 @@ namespace vehiclehits
 			if (player && haveVehicles && ViewRay(player, o, d)) {
 				double best = kAimRange;
 				const std::uint32_t own = vehicleflight::OwnRoverId();
-				for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+				for (std::uint32_t k = 0; k < snap.count && k < world::kMaxVehicles; ++k) {
 					const auto& v = snap.v[k];
 					if (v.formId == own || v.who == world::VehicleInfo::Who::Player) continue;
 					const double c[3] = { v.pos[0] - o[0], v.pos[1] - o[1], v.pos[2] + v.half[2] - o[2] };
@@ -914,7 +914,7 @@ namespace vehiclehits
 			// The game's own pick (you aim at the driver themselves): the bar under it is that driver's vehicle's.
 			if (!barVehicle) {
 				const std::uint32_t cross = CrosshairTarget();
-				for (std::uint32_t k = 0; cross && haveVehicles && k < snap.count && k < 64; ++k)
+				for (std::uint32_t k = 0; cross && haveVehicles && k < snap.count && k < world::kMaxVehicles; ++k)
 					if (snap.v[k].who != world::VehicleInfo::Who::Player && npcvehicles::VehicleDriverId(snap.v[k].formId) == cross) { barVehicle = snap.v[k].formId; break; }
 			}
 			if (handle != g_driverHandle.load(std::memory_order_relaxed) || barVehicle != g_barVehicle) {
@@ -976,7 +976,7 @@ namespace vehiclehits
 		ReadIni();
 		static world::Snapshot snap;
 		if (!world::Vehicles(snap)) return;
-		for (std::uint32_t k = 0; k < snap.count && k < 64; ++k) {
+		for (std::uint32_t k = 0; k < snap.count && k < world::kMaxVehicles; ++k) {
 			if (snap.v[k].formId != vehicleFormId) continue;
 			AddDamage(snap.v[k], amount, by, side, GetTickCount64(), what);
 			return;

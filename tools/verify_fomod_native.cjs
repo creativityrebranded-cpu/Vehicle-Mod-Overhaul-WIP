@@ -69,7 +69,7 @@ engine.install(files,[],root,'',null,false,true).then(result=>{
   const copies=result.instructions.filter(x=>x.type==='copy');
   const normalize=x=>x.replaceAll('\\','/');
   const expected=['Docs/FlyingVehicleOverhaul-INSTALL.txt','FVO_NPCPilots.esm','SFSE/Plugins/FlyingVehicleOverhaul.dll',prefix+'mode.ini'];
-  if((mask&1) && cityUsable)expected.push('FVO_CityPlacements.esm','SFSE/Plugins/FVO_CityPlacements.dll');
+  if((mask&1) && cityUsable)expected.push('FVO_CityPlacements.esm','SFSE/Plugins/FVO_Traffic.dll');
   if((mask&2) && patchUsable)expected.push('FVO_ParkedVehiclesPatch.esm');
   if(mode==='configure')for(const f of features)expected.push(prefix+f.section+'.'+f.key+'.ini');
   assert.deepEqual(copies.map(x=>normalize(x.destination)).sort(),expected.sort());

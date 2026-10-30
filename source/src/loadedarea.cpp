@@ -1,13 +1,17 @@
 #include "loadedarea.h"
+#include "fvolimits.h"
 
 #include "features.h"
 #include "addresses.h"
 #include "game.h"
 #include "hook.h"
 #include "log.h"
+#include "mapguard.h"
 #include "npcvehicles.h"
 #include "vehiclediag.h"
 #include "vehicleflight.h"
+#include "vehicleworld.h"
+#include "bodyowner.h"
 
 #include <Windows.h>
 
@@ -31,6 +35,7 @@ namespace loadedarea
 
 		constexpr uptr kUpdate = 0x00D50650;      // LoadedAreaBound update
 		constexpr uptr kUpdateCall = 0x00578544;  // its only call (FUN_140578350)
+		constexpr uptr kOwnerCall = 0x00D52F63, kNativeOwner = 0x02389B40;
 		constexpr uptr kMoveBack = 0x00D500B0;    // move a body back inside the box
 		constexpr uptr kMoveBackCalls[] = { 0x00D5114C, 0x00D51841, 0x00D52F7F };  // touches, broad-phase set, after rebuild
 		constexpr uptr kFindRef = 0x00B3CF40;     // reference owning a 3D object
@@ -53,7 +58,9 @@ namespace loadedarea
 		constexpr uptr kRefFormId = 0x28;
 		constexpr std::uint32_t kNoBody = 0xFFFFFFFF;
 
-		constexpr int kMaxIds = 16, kMaxBodies = 256;  // a driver brings ~18 skeleton bodies
+		// One vehicle and one driver per pilot, plus your own vehicle; ~20 bodies each (a driver brings ~18 skeleton bodies). Was 16 ids
+		// (7 flown vehicles): with more traffic than that, the rest still hit the wall (2026-10-29 audit, the user: "match all sizes").
+		constexpr int kMaxIds = 2 * fvolimits::kVehicles + 1, kMaxBodies = 20 * (fvolimits::kVehicles + 1);
 		std::atomic<std::uint32_t> g_ids[kMaxIds];
 		std::atomic<int> g_idCount{ 0 };
 		std::atomic<std::uint32_t> g_bodies[kMaxBodies];
@@ -62,6 +69,7 @@ namespace loadedarea
 		std::atomic<uptr> g_world{ 0 }, g_bound{ 0 };
 		std::atomic<unsigned> g_persistBlocked{ 0 }, g_persistRestored{ 0 }, g_synced{ 0 };
 		std::atomic<unsigned> g_touches{ 0 }, g_moveBacks{ 0 }, g_pairs{ 0 }, g_rebuilds{ 0 };
+		std::atomic<unsigned> g_badOwners{0};
 		std::atomic<std::uint32_t> g_lastId{ 0 };
 
 		Update_t g_update = nullptr;
@@ -103,15 +111,36 @@ namespace loadedarea
 
 		// The form id of the reference owning a body, 0 when none. Main thread (the game's own LoadedAreaBound code uses
 		// the same walk there). Caller guards faults.
-		std::uint32_t OwnerOf(uptr world, std::uint32_t body)
+		// Inside Starfield.exe's image (2026-10-29 log: 3 faults executing 0x10080 here; a body's user was not an object with
+		// a game vtable, so its "slot 0x138" was garbage). Never call through a pointer that is not the game's own code.
+		bool InGame(uptr p)
 		{
+			static const uptr lo = game::Base();
+			static const uptr hi = [] {
+				const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(game::Base());
+				const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(game::Base() + dos->e_lfanew);
+				return game::Base() + nt->OptionalHeader.SizeOfImage;
+			}();
+			return p >= lo && p < hi;
+		}
+		uptr OwnerObject(uptr world, std::uint32_t body)
+		{
+			__try {
 			const uptr b = BodyAt(world, body);
 			const uptr user = b ? At<uptr>(b, kBodyUser) : 0;
 			if (!user) return 0;
-			const uptr collision = reinterpret_cast<uptr (*)(uptr)>(At<uptr>(At<uptr>(user, 0), 0x138))(user);
-			if (!collision) return 0;
-			const uptr object3D = At<uptr>(collision, 0x10);
-			if (!object3D) return 0;
+			const auto result=bodyowner::Lookup(user,[](uptr p){return At<uptr>(p,0);},&InGame,[](uptr fn,uptr object){
+				const auto collision=reinterpret_cast<uptr(*)(uptr)>(fn)(object);
+				return collision?At<uptr>(collision,0x10):uptr(0);
+			});
+			if(result.invalid)g_badOwners.fetch_add(1,std::memory_order_relaxed);
+			return result.object;
+			} __except(EXCEPTION_EXECUTE_HANDLER){g_badOwners.fetch_add(1,std::memory_order_relaxed);return 0;}
+		}
+		std::uint32_t OwnerOf(uptr world,std::uint32_t body)
+		{
+			const uptr object3D=OwnerObject(world,body);
+			if(!object3D)return 0;
 			const uptr ref = g_findRef(object3D, true);
 			return ref ? At<std::uint32_t>(ref, kRefFormId) : 0;
 		}
@@ -203,7 +232,7 @@ namespace loadedarea
 		void RefreshBodies()
 		{
 			const uptr world = g_world.load(std::memory_order_relaxed);
-			std::uint32_t found[kMaxBodies];
+			static std::uint32_t found[kMaxBodies];  // (static: ~20 KB)
 			int n = 0;
 			auto add = [&](std::uint32_t body) {
 				if (body == kNoBody || !body) return;
@@ -351,6 +380,19 @@ namespace loadedarea
 		// unloaded with the unloaded cell they flew into). Blocked for FVO's refs; the caller is logged so a run names it.
 		std::uint64_t Persist(uptr ref, char persistent, char arg)
 		{
+			// REV-8 wheel dust made persistent: counted, never refused. (2026-10-29 17:13-17:38 it was refused: all 22 368 refusals came
+			// from the save load (callers 14181684B / 14181C552, the load-game routine) restoring old puffs half-filed; the cleanup pass
+			// deleted them and the game crashed in its allocator 33 s later, Starfield.exe+0x22D25A8.) The cleanup pass removes them after
+			// the load as before; the first few made persistent during play are logged with their callers.
+			if (persistent && ref) {
+				uptr base = 0;
+				__try { base = At<uptr>(ref, 0x98); } __except (EXCEPTION_EXECUTE_HANDLER) { base = 0; }
+				if (base && mapguard::IsDustBase(base) && mapguard::NoteDustPersist()) {
+					char text[200] = {};
+					Callers(text, sizeof(text));
+					logger::Write("Map guard: wheel dust made persistent during play (allowed; the cleanup pass removes it); callers%s", text);
+				}
+			}
 			if (!persistent && ref && features::On(features::Id::WallPass)) {
 				std::uint32_t id = 0;
 				__try { id = At<std::uint32_t>(ref, kRefFormId); } __except (EXCEPTION_EXECUTE_HANDLER) { id = 0; }
@@ -402,7 +444,7 @@ namespace loadedarea
 				}
 				t.pos[0] = p[0]; t.pos[1] = p[1]; t.pos[2] = p[2]; t.at = now;
 				const bool inside = p[0] >= box[0] && p[0] <= box[3] && p[1] >= box[1] && p[1] <= box[4];
-				logger::Write("Loaded-area body: %08X chassis %08X at (%.1f, %.1f, %.1f) moving %.1f m/s, body flags %02X, %s the box (%.0f..%.0f, %.0f..%.0f, z %.0f..%.0f); ref at (%.1f, %.1f, %.1f) flags %08X, parent cell state %d; model at (%.1f, %.1f, %.1f)",
+				if (logger::Verbose()) logger::Write("Loaded-area body: %08X chassis %08X at (%.1f, %.1f, %.1f) moving %.1f m/s, body flags %02X, %s the box (%.0f..%.0f, %.0f..%.0f, z %.0f..%.0f); ref at (%.1f, %.1f, %.1f) flags %08X, parent cell state %d; model at (%.1f, %.1f, %.1f)",
 					id, chassis, p[0], p[1], p[2], speed, unsigned(At<std::uint8_t>(b, 0x54)), inside ? "inside" : "OUTSIDE", box[0], box[3], box[1], box[4], box[2], box[5],
 					rp ? rp[0] : 0.f, rp ? rp[1] : 0.f, rp ? rp[2] : 0.f, refFlags, cellState, node[0], node[1], node[2]);
 			} __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -457,7 +499,30 @@ namespace loadedarea
 		// game's own setter) and shifts the model's root node by the same amount. Inside the loaded area the game keeps them
 		// within 0.2 m, so this does nothing there. Rotation is left to the game.
 		std::unordered_map<std::uint32_t, ULONGLONG> g_syncLogged;
-		void SyncOne(std::uint32_t id, uptr world, ULONGLONG now)
+		std::atomic<unsigned> g_driverSynced{0};
+		// The driver gets the same pass (2026-10-30, the user: "FVO has a pass but those NPCs don't"). Past the loaded cells the game
+		// does not move a seated driver with its vehicle either: drivers stayed on the spot where their vehicle left the loaded area
+		// (06:42 run: one driver held (-759, 1454, -109) for a minute while its vehicle flew on) and floated there. A driver seated in
+		// the vehicle is shifted by the same amount as the vehicle, reference and model, so it keeps its place in the seat.
+		void CarryDriver(uptr vehicle, std::uint32_t driverId, float mx, float my, float mz)
+		{
+			if (!driverId) return;
+			const uptr d = g_lookup(driverId);
+			if (!d || At<std::uint32_t>(d, kRefFormId) != driverId || npcvehicles::VehicleOf(d) != vehicle) return;
+			const float* dp = reinterpret_cast<const float*>(d + off::kRefPosition);
+			float target[3] = { dp[0] + mx, dp[1] + my, dp[2] + mz };
+			if (!std::isfinite(target[0]) || !std::isfinite(target[1]) || !std::isfinite(target[2])) return;
+			// Direct write (2026-10-30 07:49 run: the game's position setter takes a seated actor out of its seat).
+			float* dpw = reinterpret_cast<float*>(d + off::kRefPosition); dpw[0] = target[0]; dpw[1] = target[1]; dpw[2] = target[2];
+			if (const uptr loaded = At<uptr>(d, off::kRefLoadedData)) if (const uptr root = At<uptr>(loaded, off::kLoadedData3D)) {
+				float* w = reinterpret_cast<float*>(root + off::kNodeWorldT);
+				float* l = reinterpret_cast<float*>(root + off::kNodeLocalT);
+				w[0] += mx; w[1] += my; w[2] += mz;
+				l[0] += mx; l[1] += my; l[2] += mz;
+			}
+			g_driverSynced.fetch_add(1, std::memory_order_relaxed);
+		}
+		void SyncOne(std::uint32_t id, std::uint32_t driverId, uptr world, ULONGLONG now)
 		{
 			const uptr component = vehiclediag::ComponentOf(id);
 			if (!component) return;
@@ -467,6 +532,12 @@ namespace loadedarea
 				if (!b) return;
 				uptr ref = g_lookup(id);
 				if (!ref || At<std::uint32_t>(ref, kRefFormId) != id) return;
+				// The last component can belong to a detached/replaced scene. Do not
+				// drag the live reference/model to an old falling physics body.
+				if(OwnerOf(world,At<std::uint32_t>(b,kBodyId))!=id)return;
+				std::uint32_t owned[16]{};const auto count=world::SceneBodies(ref,owned);
+				bool matches=false;for(unsigned i=0;i<count;++i)if(owned[i]==At<std::uint32_t>(b,kBodyId))matches=true;
+				if(!matches)return;
 				const float* p = reinterpret_cast<const float*>(b + kBodyPos);
 				float* rp = reinterpret_cast<float*>(ref + off::kRefPosition);
 				if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) return;
@@ -474,6 +545,7 @@ namespace loadedarea
 				if (dx * dx + dy * dy + dz * dz < 1.0f) return;
 				float target[3] = { p[0], p[1], p[2] };
 				reinterpret_cast<void (*)(uptr, float*)>(game::Base() + kSetRefPosition)(ref, target);
+				CarryDriver(ref, driverId, dx, dy, dz);
 				if (const uptr loaded = At<uptr>(ref, off::kRefLoadedData)) if (const uptr root = At<uptr>(loaded, off::kLoadedData3D)) {
 					float* w = reinterpret_cast<float*>(root + off::kNodeWorldT);
 					float* l = reinterpret_cast<float*>(root + off::kNodeLocalT);
@@ -489,13 +561,30 @@ namespace loadedarea
 				}
 			} __except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
-		void SyncHeld(ULONGLONG now)
+		void SyncHeld(const std::uint32_t* vehicles, const std::uint32_t* drivers, int jobs, ULONGLONG now)
 		{
 			const uptr world = g_world.load(std::memory_order_relaxed);
 			if (!world) return;
-			const int ids = g_idCount.load(std::memory_order_acquire);
-			for (int i = 0; i < ids; ++i) SyncOne(g_ids[i].load(std::memory_order_relaxed), world, now);
+			for (int i = 0; i < jobs; ++i) SyncOne(vehicles[i], drivers[i], world, now);
+			// The player's own vehicle while FVO flies it (no FVO driver: the player rides it).
+			if (const std::uint32_t own = vehicleflight::OwnRoverId(); own && vehicleflight::PilotActive(0)) SyncOne(own, 0, world, now);
 		}
+	}
+
+	bool CarryDriverOf(std::uint32_t vehicleId, float dx, float dy, float dz)
+	{
+		std::uint32_t vehicles[kMaxIds], drivers[kMaxIds];
+		const int jobs = npcvehicles::FlownVehicles(vehicles, drivers, (kMaxIds - 1) / 2);
+		std::uint32_t driverId = 0;
+		for (int i = 0; i < jobs; ++i) if (vehicles[i] == vehicleId) { driverId = drivers[i]; break; }
+		if (!driverId || !g_lookup) return false;
+		const unsigned before = g_driverSynced.load(std::memory_order_relaxed);
+		__try {
+			const uptr ref = g_lookup(vehicleId);
+			if (!ref || At<std::uint32_t>(ref, kRefFormId) != vehicleId) return false;
+			CarryDriver(ref, driverId, dx, dy, dz);
+		} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		return g_driverSynced.load(std::memory_order_relaxed) != before;
 	}
 
 	bool IsWall(std::uint32_t bodyId)
@@ -513,6 +602,11 @@ namespace loadedarea
 		g_findRef = reinterpret_cast<FindRef_t>(game::Base() + kFindRef);
 		g_lookup = reinterpret_cast<Lookup_t>(game::Base() + kLookup);
 		const bool update = hook::RedirectCall(game::Base() + kUpdateCall, reinterpret_cast<void*>(g_update), reinterpret_cast<void*>(&Update));
+		// Crash 18:06:24: this exact owner lookup dereferenced a freed object's
+		// vtable at +2389B78. Same null-owner contract, with body generation and
+		// native vtable validation; do not swallow an entire physics update.
+		const bool owner=hook::RedirectCall(game::Base()+kOwnerCall,reinterpret_cast<void*>(game::Base()+kNativeOwner),reinterpret_cast<void*>(&OwnerObject));
+		logger::Write("Loaded-area body owner validation %s",owner?"installed":"NOT installed (call differs)");
 		int backs = 0;
 		for (const uptr site : kMoveBackCalls)
 			if (hook::RedirectCall(game::Base() + site, reinterpret_cast<void*>(g_moveBack), reinterpret_cast<void*>(&MoveBack))) ++backs;
@@ -543,8 +637,10 @@ namespace loadedarea
 	void Tick()
 	{
 		const ULONGLONG now = GetTickCount64();
+		static ULONGLONG ownerReport=0;
+		if(now-ownerReport>10000){ownerReport=now;const auto bad=g_badOwners.exchange(0);if(bad)logger::Write("Loaded-area owner guard: %u invalid/detached owner pointer(s) rejected",bad);}
 		std::uint32_t vehicles[kMaxIds], drivers[kMaxIds];
-		const int jobs = npcvehicles::FlownVehicles(vehicles, drivers, kMaxIds / 2 - 1);
+		const int jobs = npcvehicles::FlownVehicles(vehicles, drivers, (kMaxIds - 1) / 2);
 		int n = 0;
 		for (int i = 0; i < jobs; ++i) {
 			g_ids[n++].store(vehicles[i], std::memory_order_relaxed);
@@ -559,7 +655,7 @@ namespace loadedarea
 		if (now - bodiesAt >= 250) { bodiesAt = now; RefreshBodies(); }
 		WatchDrivers(drivers, jobs, now);
 		if (features::On(features::Id::WallPass)) KeepPersistent(now);
-		if (features::On(features::Id::WallPass)) SyncHeld(now);
+		if (features::On(features::Id::WallPass)) SyncHeld(vehicles, drivers, jobs, now);
 		static ULONGLONG bodyLogAt = 0;
 		if (now - bodyLogAt >= 5000) { bodyLogAt = now; LogBodies(now); }
 
@@ -568,8 +664,8 @@ namespace loadedarea
 		const unsigned t = g_touches.load(), b = g_moveBacks.load(), p = g_pairs.load(), r = g_rebuilds.load(), k = g_persistBlocked.load() + g_persistRestored.load() + g_synced.load() / 50;
 		if ((t != lt || b != lb || p != lp || r != lr || k != lk) && now - logAt >= 5000) {
 			logAt = now;
-			logger::Write("Loaded-area wall: FVO pass so far: %u wall collision pair(s) dropped, %u side-wall touch(es), %u move-back(s) skipped; %u box rebuild(s); %u un-persist(s) blocked, %u persistent flag(s) restored; %u position sync(s) past the loaded cells; %d id(s), %d bod(ies) listed",
-				p, t, b, r, g_persistBlocked.load(), g_persistRestored.load(), g_synced.load(), n, g_bodyCount.load());
+			logger::Write("Loaded-area wall: FVO pass so far: %u wall collision pair(s) dropped, %u side-wall touch(es), %u move-back(s) skipped; %u box rebuild(s); %u un-persist(s) blocked, %u persistent flag(s) restored; %u position sync(s) past the loaded cells (%u seated driver(s) carried along); %d id(s), %d bod(ies) listed",
+				p, t, b, r, g_persistBlocked.load(), g_persistRestored.load(), g_synced.load(), g_driverSynced.load(), n, g_bodyCount.load());
 			lt = t; lb = b; lp = p; lr = r; lk = k;
 		}
 	}

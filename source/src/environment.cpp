@@ -1,4 +1,5 @@
 #include "environment.h"
+#include "cellbake.h"
 #include "sitelogic.h"
 #include "addresses.h"
 #include "game.h"
@@ -33,7 +34,7 @@ bool Ray(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t
  Query q;q.key=key;q.mask=mask;q.asked=now;std::copy(from,from+3,q.from);std::copy(to,to+3,q.to);queries.push_back(q);return false;
 }
 world::VehicleInfo Vehicle(std::uint32_t id){
- world::Snapshot s;if(world::Vehicles(s))for(unsigned i=0;i<s.count&&i<64;++i)if(s.v[i].formId==id)return s.v[i];
+ static thread_local world::Snapshot s;if(world::Vehicles(s))for(unsigned i=0;i<s.count&&i<world::kMaxVehicles;++i)if(s.v[i].formId==id)return s.v[i];
  world::VehicleInfo result;
  __try {
   const auto ref=reinterpret_cast<std::uintptr_t(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(id);
@@ -85,6 +86,11 @@ bool GroundAt(std::uint32_t self,double x,double y,double top,double bottom,Grou
   if(!out.water)navmap::NoteGround(hit.x,hit.y,hit.z);}
  return true;
 }
+bool RayHit(const float from[3],const float to[3],double&x,double&y,double&z,bool&hit){
+ prefetch::RayHit h;if(!Ray(0,from,to,0x22806,h,3000))return false;
+ hit=h.hit&&std::isfinite(h.x)&&std::isfinite(h.y)&&std::isfinite(h.z);if(hit){x=h.x;y=h.y;z=h.z;}
+ return true;
+}
 unsigned Pending(){unsigned n=0;for(const auto&q:queries)if(!q.inFlight&&!q.done)++n;return n;}
 void Tick(){
  const auto now=GetTickCount64();
@@ -102,8 +108,8 @@ void Tick(){
   it->inFlight=true;prefetch::RequestRay(Slots[s],f.from,f.to,it->mask);
  }
 }
-Site CheckSite(std::uint32_t self,double x,double y,double z,double yaw){
- Site out;const auto v=Vehicle(self);if(!v.formId){out.reason="Vehicle bounds unavailable";return out;}
+static Site CheckFootprint(std::uint32_t self,const world::VehicleInfo& v,double x,double y,double z,double yaw,bool boarding){
+ Site out;if(!v.formId){out.reason="Vehicle bounds unavailable";return out;}
  const double w=std::max(double(v.half[0])+0.5,1.5),l=std::max(double(v.half[1])+0.5,2.0);
  const double rx=std::cos(yaw),ry=-std::sin(yaw),fx=std::sin(yaw),fy=std::cos(yaw);
  std::array<double,9> heights;int index=0;bool pending=false;
@@ -135,9 +141,10 @@ Site CheckSite(std::uint32_t self,double x,double y,double z,double yaw){
   }
  }
  if(pending)return out;
- world::Snapshot all;if(!world::Vehicles(all))return out;
- for(unsigned i=0;i<all.count&&i<64;++i){const auto&o=all.v[i];if(o.formId&&o.formId!=self&&std::fabs(o.pos[2]-out.ground)<6&&
+ static thread_local world::Snapshot all;if(!world::Vehicles(all))return out;
+ for(unsigned i=0;i<all.count&&i<world::kMaxVehicles;++i){const auto&o=all.v[i];if(o.formId&&o.formId!=self&&std::fabs(o.pos[2]-out.ground)<6&&
   std::hypot(o.pos[0]-x,o.pos[1]-y)<std::hypot(w,l)+std::hypot(o.half[0],o.half[1])+1){out.verdict=Verdict::Unsafe;out.reason="Another vehicle occupies the site";return out;}}
+ if(!boarding){out.verdict=Verdict::Safe;out.reason="Validated dry spawn footprint and headroom";return out;}
  // Both sides are tested; a missing side is not silently replaced with an unsafe position.
  for(int side:{-1,1}){
   const double sx=x+rx*(w+1.5)*side,sy=y+ry*(w+1.5)*side;
@@ -154,6 +161,99 @@ Site CheckSite(std::uint32_t self,double x,double y,double z,double yaw){
   if(clear&&(!path.hit||path.formId==self)){out.verdict=Verdict::Safe;out.x=sx;out.y=sy;out.z=floor.z+0.1;out.reason="Validated footprint and boarding side";return out;}
  }
  out.verdict=Verdict::Unsafe;out.reason="No usable boarding side";return out;
+}
+Site CheckSite(std::uint32_t self,double x,double y,double z,double yaw){return CheckFootprint(self,Vehicle(self),x,y,z,yaw,true);}
+Site SpawnSite(std::uint32_t base,double x,double y,double z,double yaw){
+ world::VehicleInfo v{};double bottom=0;
+ __try {
+  const auto form=reinterpret_cast<std::uintptr_t(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(base);
+  if(!form)return {};
+  for(int i=0;i<3;++i){const auto lo=*reinterpret_cast<float*>(form+0x50+i*4),hi=*reinterpret_cast<float*>(form+0x5C+i*4);
+   if(!std::isfinite(lo)||!std::isfinite(hi)||hi<=lo||hi-lo>40||std::max(std::fabs(lo),std::fabs(hi))>40)return {};
+   // Conservative around the reference origin even for asymmetric model bounds.
+   // Spawn clearance needs the full vertical extent above support, not half-height.
+   v.half[i]=i==2?hi-lo:std::max(std::fabs(lo),std::fabs(hi));if(i==2)bottom=lo;
+  }
+  v.formId=base;
+ }__except(EXCEPTION_EXECUTE_HANDLER){return {};}
+ auto site=CheckFootprint(0,v,x,y,z,yaw,false);
+ // The reference origin is not necessarily the bottom of the hull.
+ site.z=site.ground-bottom+0.1;return site;
+}
+Site AirSite(std::uint32_t base,double x,double y,double z,double yaw){
+ Site out;out.x=x;out.y=y;out.z=z;
+ double half[3]{};
+ __try {
+  const auto form=reinterpret_cast<std::uintptr_t(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(base);
+  if(!form)return out;
+  // A model without stored bounds (most mod vehicles) gets a generous default envelope rather than skipping the checks.
+  bool known=true;double read[3]{};
+  for(int i=0;i<3;++i){const double lo=*reinterpret_cast<float*>(form+0x50+i*4),hi=*reinterpret_cast<float*>(form+0x5C+i*4);
+   if(!std::isfinite(lo)||!std::isfinite(hi)||hi<=lo||hi-lo>40||std::max(std::fabs(lo),std::fabs(hi))>40){known=false;break;}
+   read[i]=std::max(std::fabs(lo),std::fabs(hi))+2;
+  }
+  const double fallback[3]={4.5,6.0,3.5};
+  for(int i=0;i<3;++i)half[i]=known?read[i]:fallback[i];
+ }__except(EXCEPTION_EXECUTE_HANDLER){return out;}
+ // Ground guard (2026-10-29 late, the user: "guards that don't accept spawns like that"): 43 traffic vehicles were placed
+ // 50-130 m underground on routes drawn below the terrain; with nothing mapped there the envelope test passed them, and many
+ // fell through the world. The terrain there (the cell's baked grid, else the nav map's top surface) must be below the hull;
+ // with neither known, the authored lane height is trusted.
+ {
+  double ground=0;bool known=cellbake::Ground(x,y,ground)&&std::isfinite(ground);
+  if(!known){const auto top=navmap::At(x,y,z+1000);if(top.haveGround&&std::isfinite(top.ground)){ground=top.ground;known=true;}}
+  if(known&&z-half[2]<ground+1){out.verdict=Verdict::Unsafe;out.reason="Spawn spot is under the ground";out.ground=ground;return out;}
+  // Unknown ground is not refused (2026-10-29 23:01 run: New Atlantis lanes at -100 m, ~60 m over its -160 m ground, were all
+  // deferred by a 0 floor while the ground was still unloaded). The vehicle stays frozen until its pilot holds it.
+ }
+ bool pending=false;
+ // Check the envelope, including its interior, with vertical and horizontal
+ // cross-sections. This is admission at authored flight height, not ground support.
+ const double rx=std::cos(yaw),ry=-std::sin(yaw),fx=std::sin(yaw),fy=std::cos(yaw);
+ for(int j=-1;j<=1;++j)for(int i=-1;i<=1;++i){
+  const double px=x+rx*half[0]*i+fx*half[1]*j,py=y+ry*half[0]*i+fy*half[1]*j;
+  const float a[]={float(px),float(py),float(z-half[2])},b[]={float(px),float(py),float(z+half[2])};prefetch::RayHit hit;
+  const auto mapped=navmap::At(px,py,z);
+  if(mapped.blocked||mapped.objBlocked||(mapped.haveGround&&mapped.ground>=z-half[2])){out.verdict=Verdict::Unsafe;out.reason="Flight envelope intersects mapped solid";return out;}
+  if(!Ray(0,a,b,Solid,hit)){pending=true;continue;}
+  if(hit.hit){out.verdict=Verdict::Unsafe;out.reason="Flight envelope intersects collision";return out;}
+ }
+ for(int k=-1;k<=1;++k)for(int j=-1;j<=1;++j){
+  const float a[]={float(x-rx*half[0]+fx*half[1]*j),float(y-ry*half[0]+fy*half[1]*j),float(z+k*half[2])};
+  const float b[]={float(x+rx*half[0]+fx*half[1]*j),float(y+ry*half[0]+fy*half[1]*j),a[2]};prefetch::RayHit hit;
+  if(!Ray(0,a,b,Solid,hit)){pending=true;continue;}
+  if(hit.hit){out.verdict=Verdict::Unsafe;out.reason="Flight envelope cross-section blocked";return out;}
+ }
+ if(pending)return out;
+ out.verdict=Verdict::Safe;out.reason="Validated flight envelope";return out;
+}
+Site MappedSite(std::uint32_t base,double x,double y,double z,double yaw){
+ Site out;out.x=x;out.y=y;out.z=z;
+ double half[3]={4.5,6.0,3.5};
+ __try {
+  const auto form=reinterpret_cast<std::uintptr_t(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(base);
+  if(form){bool known=true;double read[3]{};
+   for(int i=0;i<3;++i){const double lo=*reinterpret_cast<float*>(form+0x50+i*4),hi=*reinterpret_cast<float*>(form+0x5C+i*4);
+    if(!std::isfinite(lo)||!std::isfinite(hi)||hi<=lo||hi-lo>40||std::max(std::fabs(lo),std::fabs(hi))>40){known=false;break;}
+    read[i]=std::max(std::fabs(lo),std::fabs(hi))+1;}
+   if(known)for(int i=0;i<3;++i)half[i]=read[i];}
+ }__except(EXCEPTION_EXECUTE_HANDLER){}
+ double ground=0;
+ if(cellbake::Ground(x,y,ground)&&std::isfinite(ground)&&z-half[2]<ground+0.5){out.verdict=Verdict::Unsafe;out.reason="under the ground";out.ground=ground;return out;}
+ const double rx=std::cos(yaw),ry=-std::sin(yaw),fx=std::sin(yaw),fy=std::cos(yaw);
+ int mapped=0;
+ for(int j=-1;j<=1;++j)for(int i=-1;i<=1;++i){
+  const double px=x+rx*half[0]*i+fx*half[1]*j,py=y+ry*half[0]*i+fy*half[1]*j;
+  for(const double dz:{-half[2]*0.5,0.0,half[2]*0.5}){
+   const auto m=navmap::At(px,py,z+dz);
+   if(!m.known)continue;
+   ++mapped;
+   if((m.blocked||m.objBlocked)&&!m.objOverruled){out.verdict=Verdict::Unsafe;out.reason="inside a building or other solid";return out;}
+   if(m.haveGround&&m.ground>=z-half[2]){out.verdict=Verdict::Unsafe;out.reason="ground or a floor inside the hull";return out;}
+  }
+ }
+ if(mapped<9)return out;  // too little mapped there yet: pending
+ out.verdict=Verdict::Safe;out.reason="clear on the nav map";return out;
 }
 Site BoardingSite(std::uintptr_t ref){
  if(!ref)return {};const auto id=*reinterpret_cast<std::uint32_t*>(ref+off::kFormId);const auto v=Vehicle(id);

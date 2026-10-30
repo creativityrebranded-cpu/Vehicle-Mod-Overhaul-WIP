@@ -1,7 +1,7 @@
 Update/Installation Notice:
 If you're using an older version and updating, delete all the older files and replace with the newer files. FVO is also now compatible with mod managers.
 
-Flying Vehicle Overhaul 0.9 — Early WIP
+Flying Vehicle Overhaul 1.0, with Traffic Addon 0.1
 Hover vehicles with gears, terrain following and autopilot. Summon your vehicle, have it follow or cover you, send it along scanner routes, ride with NPC drivers, or let city traffic fly routes you write in simple text files. NPCs can use compatible vehicles for travel and combat.
 What it does
 
@@ -47,10 +47,10 @@ Requirements
 
 Downloads and included files
 
-* FlyingVehicleOverhaul-0.9.0.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
-* FlyingVehicleOverhaul-0.9.0-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds parked vehicles in nine cities; FVO_CityPlacements.dll with the route files in FVO_Traffic (all eleven routes, traffic already flying) and the route guide adds city traffic. Use either or both. Includes its guide.
-* FlyingVehicleOverhaul-0.9.0-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
-* FlyingVehicleOverhaul-0.9.0-FOMOD.zip — all-in-one alternative for Vortex/MO2: the main files, City Traffic with its routes chosen city by city, traffic already flying or starting empty, route beacons on or off, City Placements and the patch, with dependency checks and grouped feature setup. City Traffic and City Placements start ticked. Use this instead of the separate ZIPs.
+* FlyingVehicleOverhaul-1.0.zip — main: FlyingVehicleOverhaul.dll provides flight, navigation, NPC vehicle systems, seats, damage, controls, settings and HUD. FVO_NPCPilots.esm supplies NPC walking and boarding packages. Includes an installation guide.
+* FlyingVehicleOverhaul-1.0-ExtraVehicles.zip — optional, two separate parts: FVO_CityPlacements.esm adds parked vehicles in nine cities; FVO_Traffic.dll with the route files in FVO_Traffic (all eleven routes, traffic already flying) and the route guide adds city traffic. Use either or both. Includes its guide.
+* FlyingVehicleOverhaul-1.0-ParkedVehiclesPatch.zip — optional: FVO_ParkedVehiclesPatch.esm converts the Parked Vehicles mod's static props into drivable vehicles. Requires that mod and all masters listed in the included guide; load after them. Not with the older Vehicles - Real.esm patch.
+* FlyingVehicleOverhaul-1.0-FOMOD.zip — all-in-one alternative for Vortex/MO2: the main files, City Traffic with its routes chosen city by city, traffic already flying or starting empty, route beacons on or off, City Placements and the patch, with dependency checks and grouped feature setup. City Traffic and City Placements start ticked. Use this instead of the separate ZIPs.
 
 Installation and updating
 
@@ -95,7 +95,7 @@ HUD editor
 
 Status and known issues
 
-* Early WIP: hover flight, summon/follow, passenger seats, pulling a driver out, city traffic, vehicle health and wreck exits have been seen working in game. Parking descent and follower seating still need gameplay testing.
+* Prerelease: the newest traffic fixes are still being tested in game. Hover flight, summon/follow, passenger seats, pulling a driver out, city traffic, vehicle health and wreck exits have been seen working in game. Parking descent and follower seating still need gameplay testing.
 * Traffic: some NPCs give up walking to their vehicle. Far beyond the loaded area there is no ground, so traffic out there stays on its lanes. Pulling out a neutral driver counts as theft and can turn nearby NPCs hostile.
 * Performance: Jemison CPU/FPS drops were reported with 0.73.0; the cause remains unisolated. Extra live vehicles can increase CPU/physics load. Compare with optional addons disabled when reporting performance.
 

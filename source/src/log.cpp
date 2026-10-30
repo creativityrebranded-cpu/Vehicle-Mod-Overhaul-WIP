@@ -55,14 +55,10 @@ namespace logger
 
 	bool Verbose()
 	{
-		static std::atomic<ULONGLONG> lastRead{0};
 		static std::atomic<bool> value{false};
-		const ULONGLONG now = GetTickCount64();
-        auto previous=lastRead.load(std::memory_order_relaxed);
-        if((!previous||(now>=previous&&now-previous>=5000))&&lastRead.compare_exchange_strong(previous,now)) {
-            const auto& ini=fvopaths::Settings();
-            if(!ini.empty())value.store(GetPrivateProfileIntW(L"log",L"verbose",0,ini.c_str())!=0,std::memory_order_relaxed);
-        }
+        static fvopaths::Watch watch;  // re-read only when settings.ini changed (2026-10-29 audit)
+        const auto& ini=fvopaths::Settings();
+        if(watch.Changed(ini)&&!ini.empty())value.store(GetPrivateProfileIntW(L"log",L"verbose",0,ini.c_str())!=0,std::memory_order_relaxed);
 		return value.load(std::memory_order_relaxed);
 	}
 

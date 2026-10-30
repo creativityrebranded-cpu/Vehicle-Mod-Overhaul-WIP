@@ -3,20 +3,22 @@
 #include "framepacing.h"
 #include "updateschedule.h"
 #include "resources.h"
-#include "airtraffic.h"
 #include "context.h"
 #include "core_api.h"
 #include "crash.h"
 #include "flighttune.h"
 #include "game.h"
 #include "hoverui.h"
+#include "routeedit.h"
+#include "mapguard.h"
+#include "cellbake.h"
+#include "disableguard.h"
 #include "realvehicles.h"
 #include "runtimecells.h"
 #include "ringroad.h"
 #include "trafficpool.h"
+#include "trafficarrival.h"
 #include "routeprobes.h"
-#include "citytraffic.h"
-#include "citystartup.h"
 #include "log.h"
 #include "modscene.h"
 #include "navmap.h"
@@ -36,6 +38,7 @@
 #include "vehiclediag.h"
 #include "native_movement_probe.h"
 #include "mappoints.h"
+#include "secretunpause.h"
 #include "vehicleworld.h"
 #include "vehiclehits.h"
 #include "navseed.h"
@@ -86,6 +89,7 @@ namespace
     std::uintptr_t LoadGameDetour(std::uintptr_t a, std::uintptr_t b, std::uint64_t c, std::uint64_t d)
     {
         g_loadBegan = GetTickCount64();
+        trafficarrival::Reset();
         logger::Write("Save load: the game's load routine started; FVO world actions paused until it finishes");
         const auto r = g_loadGameOriginal(a, b, c, d);
         g_loadDone = GetTickCount64();
@@ -117,6 +121,47 @@ namespace
         logger::Write("Save load: no PostLoadGame %.0f s after PreLoadGame; FVO world actions resume anyway", kLoadTimeoutMs / 1000.0);
         return false;
     }
+    // The game's loading screen (2026-10-29, read in 1.16): BeginLoadingScreen 14057F020 is the only writer of 1 to this byte,
+    // EndLoadingScreen 14057F430 the only writer of 0, just before it closes the screen (after its wait for the world).
+    // Arrival traffic is placed while it is up; FVO never holds the screen open.
+    constexpr std::uint32_t kLoadingScreenFlag = 0x05E60AFA;
+    bool LoadingScreenUp()
+    {
+        __try { return *reinterpret_cast<volatile std::uint8_t*>(game::Base() + kLoadingScreenFlag) != 0; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    // The arrival window: the loading screen is up, the save (if any) has been read and the planet manager has the world.
+    bool ArrivalWindow(bool worldReady)
+    {
+        const ULONGLONG now = GetTickCount64(), began = g_loadBegan.load(), done = g_loadDone.load();
+        const bool screen = LoadingScreenUp(), readingSave = began && done < began && now - began < kLoadTimeoutMs;
+        const bool window = screen && !readingSave && worldReady;
+        static bool wasScreen = false, wasWindow = false;
+        static ULONGLONG screenAt = 0, windowAt = 0, windowMs = 0;
+        static std::uint32_t seedAtOpen = 0;
+        if (screen && !wasScreen) {
+            screenAt = now; windowMs = 0; int a = 0, b = 0; trafficpool::ArrivalChecks(a, b, true);
+            seedAtOpen = navseed::CompletedPasses(); trafficarrival::seeded = false;
+            logger::Write("Loading screen: up%s", readingSave ? " (a save is being read)" : "");
+        }
+        if (window && !wasWindow) {
+            windowAt = now;
+            logger::Write("Loading screen: world ready behind it %.1f s after it opened; arrival traffic is placed until it closes", (now - screenAt) / 1000.0);
+        }
+        if (!window && wasWindow) windowMs += now - windowAt;
+        if (!screen && wasScreen) {
+            int rays = 0, mapOnly = 0; trafficpool::ArrivalChecks(rays, mapOnly, false);
+            logger::Write("Loading screen: closed after %.1f s (arrival window %.1f s); arrival traffic %d of %d route positions placed or held (%d ray-checked, %d nav-map only)",
+                (now - screenAt) / 1000.0, windowMs / 1000.0, trafficarrival::ready.load(), trafficarrival::expected.load(), rays, mapOnly);
+        }
+        if (window && !trafficarrival::seeded && navseed::CompletedPasses() > seedAtOpen) {
+            trafficarrival::seeded = true;
+            logger::Write("Loading screen: nav map seeded behind it %.1f s after it opened; arrival traffic placement begins", (now - screenAt) / 1000.0);
+        }
+        wasScreen = screen; wasWindow = window;
+        trafficarrival::Window(window);
+        return window;
+    }
     std::atomic_flag g_inCallback=ATOMIC_FLAG_INIT;
     framepacing::Window g_pacing;
     updateschedule::Gate g_schedule;
@@ -126,6 +171,8 @@ namespace
 
 	void Reset()
 	{
+        trafficpool::WorldActionsAllowed(false);
+        secretunpause::Reset();
         g_worldReady=false;g_pacing={};g_schedule.Reset();g_scheduleBegan=g_scheduleWork=0;ResetCostWindow();
         runtimecells::Reset();
 		bindings::ResetRuntime();
@@ -134,11 +181,10 @@ namespace
 		shipmodel::Reset();
 		vehicle_probe::Reset();
 		realvehicles::Reset();
+		vehiclediag::Reset();
 		ringroad::Reset();
 		routeprobes::Reset();
 		trafficpool::Reset();
-		citytraffic::Reset();
-        airtraffic::Reset();
         pilotquest::Reset();
 		npcvehicles::Reset();
 		passenger::Reset();
@@ -152,6 +198,7 @@ namespace
 		world::Reset();
 		vehiclehits::Reset();
 		navseed::Reset();
+		cellbake::Reset();
 		navmap::Reset();
 		navfield::Reset();
 		groundnav::Reset();
@@ -178,20 +225,21 @@ namespace
         features::Tick();bindings::Tick();
         vehicleflight::BeginFrame(); // decision owners must renew their commands in this frame
         npcvehicles::BeginFrame();
+        crash::Beat();
         world::Publish();mark(0);
         vehiclehits::Tick();mark(1);
         // Per-part timing (the stutter pass, 2026-10-27): a spike line names the slowest part of "map+navigation" and "other".
         const char* slowName[2]={"",""};double slowMs[2]={0,0};
         auto part=[&](int bucket,const char* name,auto&& fn){LARGE_INTEGER a{},b{};QueryPerformanceCounter(&a);fn();QueryPerformanceCounter(&b);
             const double ms=1000.0*double(b.QuadPart-a.QuadPart)/frequency.QuadPart;if(ms>slowMs[bucket]){slowMs[bucket]=ms;slowName[bucket]=name;}};
-        part(0,"collision-box scan",[]{navseed::Tick();});part(0,"lane planner",[]{routeplan::Frame();});part(0,"flight field",[]{navfield::Service();});
+        part(0,"cell bake",[]{cellbake::Tick(Loading(GetTickCount64()));});part(0,"collision-box scan",[]{navseed::Tick();});part(0,"lane planner",[]{routeplan::Frame();});part(0,"flight field",[]{navfield::Service();});
         part(0,"ground planner",[]{groundnav::Service();});part(0,"surface checks",[]{environment::Tick();});part(0,"nav map",[]{navmap::Tick();});mark(2);
         profiles::Tick();context::Tick();mark(3);
         npcvehicles::Tick();passenger::Tick();mark(4);
         // (The native movement-controller probe did its job, 2026-10-27: every vehicle has a controller. Off: it took an engine lock every 5 s.)
         vehicleflight::Tick();vehiclediag::Tick();loadedarea::Tick();mark(5);
         part(1,"ship vehicle",[]{shipvehicle::Tick();});part(1,"vehicle registry",[]{realvehicles::Tick();});part(1,"ring road",[]{ringroad::Tick();});part(1,"route markers",[]{routeprobes::Tick();});part(1,"traffic pool",[]{trafficpool::Tick();});
-        part(1,"city traffic",[]{citytraffic::Tick();});part(1,"air traffic",[]{airtraffic::Tick();});part(1,"scanner target",[]{scantarget::Tick();});
+        part(1,"scanner target",[]{scantarget::Tick();});
         part(1,"traffic destinations",[]{traffic::Tick();});part(1,"view distance",[]{viewdist::Tick();});part(1,"keep in sight",[]{vehiclekeep::Tick();});
         part(1,"log writer",[]{logger::Service();});mark(6);
         bindings::EndUpdate();
@@ -211,8 +259,8 @@ namespace
         static const double ticksPerMs=[] {LARGE_INTEGER f{};QueryPerformanceFrequency(&f);return double(f.QuadPart)/1000.0;}();
         LARGE_INTEGER start{},end{};QueryPerformanceCounter(&start);const double now=double(start.QuadPart)/ticksPerMs;
         g_pacing.Begin(now); // all raw callbacks, including rejected duplicate polls
+        const auto state = game::ReadPlanetState();
         if(g_standalone) {
-			const auto state = game::ReadPlanetState();
 			// Reset only for a real world replacement (manager state 0/1: a load or a landing). State 3/4 is the routine
 			// terrain re-centre every ~250 m of travel; resetting there switched hover off (SeamlessWatch csv 2026-10-17:
 			// states 3 occur with the loading screen off, loads show 0/1 with it on; 19 resets matched the shifts in the log).
@@ -222,16 +270,30 @@ namespace
 			}
 			if (state.haveManager && state.managerState == 2) g_worldReady = true;
         }
+        if(state.haveManager&&state.managerState==2)g_worldReady=true;
+        else if(!state.haveManager||state.managerState==0||state.managerState==1)g_worldReady=false;
         const auto pulse=g_standalone?vehicle_probe::UpdateSerial():g_coreUpdates.Serial();
         auto work=g_schedule.Poll(now,pulse);
-        if(work==updateschedule::Work::Full&&Loading(GetTickCount64()))work=updateschedule::Work::Housekeeping;  // a save is still loading
+        const bool loading=Loading(GetTickCount64());
+        trafficpool::WorldActionsAllowed(!loading&&g_worldReady);
+        const bool arrival=ArrivalWindow(g_worldReady);
+        if(arrival&&loading&&work!=updateschedule::Work::Skip){
+            // The save settle runs no full update. Only the vehicle list (reads) and the traffic addon (arrival placement
+            // behind the loading screen) run here; flight, AI and everything else wait for gameplay as before.
+            world::Publish();navseed::Tick();trafficpool::Tick();  // the nav map is seeded before anything is placed
+        }
+        if(work==updateschedule::Work::Full&&loading)work=updateschedule::Work::Housekeeping;  // a save is still loading
         if(work==updateschedule::Work::Full)Update();
         else if(work==updateschedule::Work::Housekeeping) {
             // UI bindings/settings and logs keep working while simulation is
             // paused. Never enumerate the scene or queue placement/AI work here.
             features::Tick();bindings::Tick(false);logger::Service();
+            if(!loading&&g_worldReady)trafficpool::RushTick(); // never mutate a world during a save load
         }
         if(work!=updateschedule::Work::Skip) {
+            mapguard::Tick(Loading(GetTickCount64()));  // the persistent cell report and the wheel dust cleanup
+            secretunpause::Tick();  // Start/Swap's running world: back to paused on combat, a closed map or the time cap
+            routeedit::GroundTick();  // the editor's ground asks (new points sit 2 m over what is under the cursor), paused or not
             if(!g_scheduleBegan)g_scheduleBegan=now;
             if(now-g_scheduleBegan>=10000) {
                 const auto counts=g_schedule.TakeCounts();const auto elapsed=now-g_scheduleBegan;
@@ -275,7 +337,7 @@ namespace
 
     void InstallFeatureSystems() {
         world::SetServices({realvehicles::ForEachLoadedStep,vehicleflight::OwnRoverId,npcvehicles::VehicleDriverId,npcvehicles::UsesVehicle});
-        hoverui::Install();inputgate::Install();mappoints::Install();loadedarea::Install();
+        hoverui::Install();routeedit::Install();mapguard::Install();disableguard::Install();inputgate::Install();mappoints::Install();loadedarea::Install();
         npcvehicles::Install();profiles::Install();vehicleaim::Install();
         vehiclediag::Install();vehiclehits::InstallEnemyBar();flighttune::Load();
     }
@@ -375,7 +437,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Write("Flying Vehicle Overhaul (FVO) 0.9.0 loaded; core optional");
+	logger::Write("Flying Vehicle Overhaul (FVO) 1.0 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

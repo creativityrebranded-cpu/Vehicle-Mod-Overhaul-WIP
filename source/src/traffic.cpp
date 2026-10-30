@@ -257,6 +257,9 @@ namespace traffic
 		const ULONGLONG now = GetTickCount64();
 		if (now - g_last < 5000) return;
 		g_last = now;
+		// 2026-10-29 audit: ProbeBody only writes verbose log lines (it read every loaded actor's AI path every 5 s, ~2 ms, and kept
+		// nothing; DestinationOf reads one actor's path when someone needs it). Off unless the detailed log is on.
+		if (!logger::Verbose()) return;
 		__try {
 			ProbeBody();
 		}

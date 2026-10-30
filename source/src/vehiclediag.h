@@ -13,4 +13,12 @@ namespace vehiclediag
 	void NoteStep(std::uintptr_t instance);  // from the physics step hook, every call (any owner)
 	void Tick();                             // main thread, once per frame
 	std::uintptr_t ComponentOf(std::uint32_t formId);  // the VehicleRuntimeComponent last updated for this vehicle form id, or 0
+	// A save load: forget every component pointer of the old game (they may be freed) and the per-vehicle repair state.
+	void Reset();
+    void StageBirth(std::uint32_t formId); // creation callback, before the chassis can attach
+    bool ReleaseBirth(std::uint32_t formId); // once its flight controller is armed and the game has built its physics vehicle
+    bool Built(std::uint32_t formId); // the game built its physics vehicle (instance) since the last reset
+    void DropBirthHold(std::uint32_t formId); // hidden/replaced/deleted: forget the hold, motion untouched
+    bool BirthStageAvailable();
+    int StagedLoaded(); // staged chassis that have physics (loaded) and still wait for their autopilot
 }

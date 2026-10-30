@@ -2,6 +2,26 @@
 #include <cstdint>
 
 namespace boardinggate {
+enum class PassengerAction { Wait, Start, Complete, Cancel };
+struct PassengerAttempt {
+    std::uint64_t at = 0;
+    bool asked = false;
+    PassengerAction Step(std::uint64_t now, bool complete, bool invalid, bool transitioning) {
+        if (complete) return PassengerAction::Complete;
+        if (invalid || now < at || now - at >= 10000) return PassengerAction::Cancel;
+        // Give the native Activate handler a frame to start; never build a second interaction over it.
+        if (transitioning) asked = true;
+        if (asked || now - at < 150) return PassengerAction::Wait;
+        asked = true;
+        return PassengerAction::Start;
+    }
+};
+inline std::uintptr_t PassengerKeyword(std::uintptr_t vehicle, bool asDriver,
+    std::uintptr_t pinnedVehicle, std::uintptr_t pinnedKeyword,
+    std::uintptr_t facingVehicle, std::uintptr_t facingKeyword) {
+    if (asDriver || !vehicle) return 0;
+    return vehicle == pinnedVehicle ? pinnedKeyword : vehicle == facingVehicle ? facingKeyword : 0;
+}
 enum class Refusal { None, Reserved, Occupied, Wrecked };
 inline Refusal BeforeEntry(bool player, bool vehicle, bool reserved, bool occupied, bool wrecked) {
     if (!player || !vehicle) return Refusal::None;

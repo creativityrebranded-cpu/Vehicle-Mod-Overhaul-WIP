@@ -13,6 +13,8 @@
 // its actual actor into the player-only completion hook, so NPC completions never clear the player's seating state.
 namespace npcvehicles
 {
+    // Queue the game's animated passenger entry; true means accepted, completion is logged later.
+    bool RequestPassengerBoard(std::uintptr_t player, std::uintptr_t vehicle);
     // Dedicated timetable owns decisions; normal combat/escort AI must not touch this leased job.
     int ClaimScheduled(std::uintptr_t actor,std::uintptr_t vehicle);
     void ReleaseScheduled(int pilot,std::uint32_t expectedVehicle);
@@ -23,6 +25,8 @@ namespace npcvehicles
 	void Tick();   // main thread, every frame
 	void Reset();  // a save load
 	bool UsesVehicle(std::uint32_t vehicleId);  // an NPC job is boarding / driving it
+	// The player out of a wreck the gentle way: the game's animated get-out, else its get-up (vtable +0xB30). True when asked.
+	bool BeginPlayerExit();
 	// Every vehicle an NPC job has (not idle) and its NPC (form ids); returns how many were written. Main thread.
 	int FlownVehicles(std::uint32_t* vehicles, std::uint32_t* drivers, int max);
 	// The pilot (1..) whose NPC drives this vehicle (a job following), else 0.
@@ -47,7 +51,6 @@ namespace npcvehicles
 	bool SeatNow(std::uintptr_t actor, std::uintptr_t vehicle);
     // Once-only initialization of an authored air-traffic actor/vehicle pair.
     // Uses the native snap interaction; not a pedestrian entry-site request.
-    bool AssembleTrafficOccupant(std::uintptr_t actor,std::uintptr_t vehicle);
     // Scheduled traffic only: put the leased driver back in after a vehicle reload dropped it. True when seated after.
     bool ReseatScheduled(int pilot,std::uintptr_t actor,std::uintptr_t vehicle);
     // Inside create-reference only (the "on created" hook): seat a just-created actor before it joins the world.
@@ -55,6 +58,8 @@ namespace npcvehicles
     int SeatNewborn(std::uintptr_t actor,std::uintptr_t vehicle);
     int SitState(std::uintptr_t actor);   // 0 not sitting, -1 unreadable, else the game's sit state
     int SnapNow(std::uintptr_t actor,std::uintptr_t vehicle);  // instant seat on a loaded actor (also when already linked)
+	// A driver not sitting, too far for a snap, written straight to the vehicle: from there the snap can seat them. True: moved.
+	bool BringToVehicle(std::uintptr_t actor,std::uintptr_t vehicle);
     bool ResumeSavedSeat(std::uintptr_t actor,std::uintptr_t vehicle); // reuse saved interaction; never build another
 	std::uintptr_t VehicleOf(std::uintptr_t actor);  // the vehicle the actor sits in, 0 when none
 	// ---- For the context engine (context.cpp): main thread only.
@@ -124,6 +129,16 @@ namespace npcvehicles
 	bool StartScripted(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);
 	// The same for a driver already sitting in the vehicle (the cold-start pool): no walk, no boarding; the job takes it aboard.
 	bool StartScriptedSeated(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);
+	// Pre-armed traffic pilot: bound in the same call as the vehicle's creation (no readiness waits); flies once the model exists.
+	bool TrafficPilotFree();
+	// The base form lists a driver's seat (seat 0 in its seat list, with a keyword): a driver can be seated in it (2026-10-30).
+	bool BaseHasDriverSeat(std::uintptr_t baseForm);
+	bool StartTrafficArmed(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);
+	// Why StartScriptedSeated would refuse now ("" = it would not): asked BEFORE a trip is claimed, so a refused start never
+	// takes a traffic slot (2026-10-29 log: one pool vehicle claimed and dropped a trip every 2 s for 80 s).
+	const char* ScriptedRefusal(std::uintptr_t actor, std::uintptr_t vehicle);
+	// Ends the NPC job driving this vehicle (the traffic model restart); the driver stays aboard. False: no job had it.
+	bool EndJobOf(std::uint32_t vehicleId, const char* why);
 	// Recall: every escort drops its fight for `ms` and comes back into formation.
 	void Recall(unsigned ms);
 	// The player's stance (the stance key, 2026-10-21): it sets the Combat and Weapons classes of the player's own vehicle and every follower's

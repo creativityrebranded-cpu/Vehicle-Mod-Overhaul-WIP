@@ -29,6 +29,17 @@ namespace pilotquest
 		constexpr std::uint32_t kVanillaQuest = 0x001D307E; // SQ_Passengers: gives the QUST form type byte
 		constexpr std::uint32_t kVanillaPack = 0x001C9CDA;  // DefaultPassengerShipInCombatPackage: the PACK form type byte
 		constexpr int kSlots = pilotlayout::kSlots;
+		// Alias ids (make_pilots_esm.py, 2026-10-29): slots 0..5 keep the first layout (pilot 0..5, vehicle 6..11) so saves made with
+		// the 6-slot plugin keep their fills; slots 6..11 have pilot aliases 12..17 and vehicle aliases 18..23.
+		// Four blocks (slot first, count), each its pilot aliases then its vehicle aliases: 0..5 (0..5, 6..11), 6..11 (12..17, 18..23),
+		// 12..63 (24..75, 76..127), 64.. (128.., then its vehicle aliases); make_pilots_esm.py's BLOCKS. Older saves keep their fills.
+		constexpr int kBlockFirst[4] = { 0, 6, 12, 64 }, kBlockCount[4] = { 6, 6, 52, kSlots - 64 };
+		constexpr int BlockBase(int b) { int base = 0; for (int i = 0; i < b; ++i) base += 2 * kBlockCount[i]; return base; }
+		constexpr int BlockOf(int slot) { return slot < 6 ? 0 : slot < 12 ? 1 : slot < 64 ? 2 : 3; }
+		constexpr int PilotAlias(int slot) { return BlockBase(BlockOf(slot)) + (slot - kBlockFirst[BlockOf(slot)]); }
+		constexpr int VehicleAlias(int slot) { return BlockBase(BlockOf(slot)) + kBlockCount[BlockOf(slot)] + (slot - kBlockFirst[BlockOf(slot)]); }
+		static_assert(PilotAlias(5) == 5 && VehicleAlias(5) == 11 && PilotAlias(6) == 12 && VehicleAlias(6) == 18 && PilotAlias(12) == 24 &&
+			VehicleAlias(12) == 76 && VehicleAlias(63) == 127 && PilotAlias(64) == 128 && VehicleAlias(kSlots - 1) == 2 * kSlots - 1);
 
 		uptr g_quest = 0, g_actQuest = 0;  // g_actQuest: the second quest, whose pilot alias carries the ACTIVATE package
 		std::uint32_t g_questId=0;bool g_missingReported=false;
@@ -125,12 +136,12 @@ namespace pilotquest
 			logger::Write("Pilot quest: assign refused: %s", g_quest ? "the quest is not running" : "FVO_NPCPilots.esm is not loaded");
 			return false;
 		}
-		Clear(slot);
-		Clear(kSlots + slot);
-		const bool v = Force(kSlots + slot, vehicle);  // the vehicle first: the package's target
-		const bool p = Force(slot, npc);
-		logger::Write("Pilot quest: slot %d: vehicle alias %d <- %08X (%s), pilot alias %d <- %08X (%s)", slot, kSlots + slot, At<std::uint32_t>(vehicle, off::kFormId), v ? "ok" : "FAULT",
-			slot, At<std::uint32_t>(npc, off::kFormId), p ? "ok" : "FAULT");
+		Clear(PilotAlias(slot));
+		Clear(VehicleAlias(slot));
+		const bool v = Force(VehicleAlias(slot), vehicle);  // the vehicle first: the package's target
+		const bool p = Force(PilotAlias(slot), npc);
+		logger::Write("Pilot quest: slot %d: vehicle alias %d <- %08X (%s), pilot alias %d <- %08X (%s)", slot, VehicleAlias(slot), At<std::uint32_t>(vehicle, off::kFormId), v ? "ok" : "FAULT",
+			PilotAlias(slot), At<std::uint32_t>(npc, off::kFormId), p ? "ok" : "FAULT");
 		if (!v || !p) return false;
 		__try {
 			EngineFn<void (*)(uptr, int, int)>(kEvaluate)(npc, 1, 0);
@@ -156,7 +167,7 @@ namespace pilotquest
 			const uptr npc = g_diag.npc;
 			const std::uint32_t npcId = At<std::uint32_t>(npc, off::kFormId);
 			// What the pilot alias object holds: any qword in its first 0x80 bytes equal to the actor, or its form id.
-			const std::uint32_t idx = EngineFn<std::uint32_t (*)(uptr, std::uint32_t)>(kAliasIndex)(g_quest, std::uint32_t(g_diag.slot));
+			const std::uint32_t idx = EngineFn<std::uint32_t (*)(uptr, std::uint32_t)>(kAliasIndex)(g_quest, std::uint32_t(PilotAlias(g_diag.slot)));
 			uptr alias = 0;
 			if (idx != 0xFFFFFFFFu) alias = reinterpret_cast<uptr*>(At<uptr>(g_quest, 0x90))[idx];
 			char hits[160] = "";
@@ -176,7 +187,7 @@ namespace pilotquest
 			const bool pkgOk = Readable(pkg, 0x40);
 			logger::Write("Pilot quest: slot %d diagnose: alias object %p (index %d) holds the NPC at:%s; NPC %08X runs package %08X type %d (ours are %08X..%08X); quest running %d",
 				g_diag.slot, reinterpret_cast<void*>(alias), int(idx), hits[0] ? hits : " NOWHERE", npcId, pkgOk ? At<std::uint32_t>(pkg, 0x28) : 0,
-				pkgOk ? int(At<std::int8_t>(pkg, 0x3C)) : -1, runtimeforms::Resolve(pilotlayout::kBoardPackages.At(0)), runtimeforms::Resolve(pilotlayout::kBoardPackages.At(std::size_t(kSlots-1))),
+				pkgOk ? int(At<std::int8_t>(pkg, 0x3C)) : -1, runtimeforms::Resolve(pilotlayout::kBoardPackages.At(0)), runtimeforms::Resolve(pilotlayout::kBoardPackagesRest.At(std::size_t(kSlots-65))),
 				(At<std::uint8_t>(g_quest, 0x114) & 1) ? 1 : 0);
 		}
 	}
@@ -204,8 +215,8 @@ namespace pilotquest
 	bool Retarget(int slot, uptr ref, uptr npc)
 	{
 		if (slot < 0 || slot >= kSlots || !g_quest || !ref) return false;
-		const bool ok = Force(kSlots + slot, ref);
-		logger::Write("Pilot quest: slot %d: vehicle alias %d retargeted to %08X (%s)", slot, kSlots + slot, At<std::uint32_t>(ref, off::kFormId), ok ? "ok" : "FAULT");
+		const bool ok = Force(VehicleAlias(slot), ref);
+		logger::Write("Pilot quest: slot %d: vehicle alias %d retargeted to %08X (%s)", slot, VehicleAlias(slot), At<std::uint32_t>(ref, off::kFormId), ok ? "ok" : "FAULT");
 		__try {
 			EngineFn<void (*)(uptr, int, int)>(kEvaluate)(npc, 1, 0);
 		}
@@ -221,12 +232,12 @@ namespace pilotquest
 			logger::Write("Pilot quest: the Activate quest %s", g_actQuest ? "is not running" : "is not in the plugin (regenerate FVO_NPCPilots.esm)");
 			return false;
 		}
-		ClearIn(g_actQuest, slot);
-		ClearIn(g_actQuest, kSlots + slot);
-		const bool v = ForceIn(g_actQuest, kSlots + slot, vehicle);
-		const bool p = ForceIn(g_actQuest, slot, npc);
-		logger::Write("Pilot quest: ACTIVATE slot %d: vehicle alias %d <- %08X (%s), pilot alias %d <- %08X (%s)", slot, kSlots + slot, At<std::uint32_t>(vehicle, off::kFormId), v ? "ok" : "FAULT",
-			slot, At<std::uint32_t>(npc, off::kFormId), p ? "ok" : "FAULT");
+		ClearIn(g_actQuest, PilotAlias(slot));
+		ClearIn(g_actQuest, VehicleAlias(slot));
+		const bool v = ForceIn(g_actQuest, VehicleAlias(slot), vehicle);
+		const bool p = ForceIn(g_actQuest, PilotAlias(slot), npc);
+		logger::Write("Pilot quest: ACTIVATE slot %d: vehicle alias %d <- %08X (%s), pilot alias %d <- %08X (%s)", slot, VehicleAlias(slot), At<std::uint32_t>(vehicle, off::kFormId), v ? "ok" : "FAULT",
+			PilotAlias(slot), At<std::uint32_t>(npc, off::kFormId), p ? "ok" : "FAULT");
 		if (!v || !p) return false;
 		__try {
 			EngineFn<void (*)(uptr, int, int)>(kEvaluate)(npc, 1, 0);
@@ -239,10 +250,10 @@ namespace pilotquest
 	void Release(int slot)
 	{
 		if (slot < 0 || slot >= kSlots || !g_quest) return;
-		Clear(slot);
-		Clear(kSlots + slot);
-		ClearIn(g_actQuest, slot);
-		ClearIn(g_actQuest, kSlots + slot);
+		Clear(PilotAlias(slot));
+		Clear(VehicleAlias(slot));
+		ClearIn(g_actQuest, PilotAlias(slot));
+		ClearIn(g_actQuest, VehicleAlias(slot));
 		logger::Write("Pilot quest: slot %d released", slot);
 	}
     bool RouteTraffic(int slot,uptr npc,uptr marker) {

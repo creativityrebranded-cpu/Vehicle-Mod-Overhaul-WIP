@@ -1,6 +1,8 @@
 #pragma once
 #include <Windows.h>
 #include <ShlObj.h>
+#include <atomic>
+#include <cstdint>
 #include <string>
 
 // Flying Vehicle Overhaul (FVO) files (0.73.0, the user: every name says FVO). Settings, HUD layout, bindings and the
@@ -34,4 +36,25 @@ namespace fvopaths
 		static const std::wstring ini = File(L"settings.ini");
 		return ini;
 	}
+
+	// Has a file changed since this watcher last looked? Its write time and size, checked at most every 5 s; true on the first call
+	// (2026-10-29 audit: modules re-read their ini keys every 5 s whether or not anything had changed, each read opening and parsing
+	// the file in a OneDrive folder). Readers keep the same 5 s pickup of hand edits and settings-menu changes. Any thread.
+	struct Watch
+	{
+		std::atomic<ULONGLONG> at{ 0 };
+		std::atomic<std::uint64_t> seen{ ~0ull };
+		bool Changed(const std::wstring& path)
+		{
+			const ULONGLONG now = GetTickCount64();
+			ULONGLONG prev = at.load();
+			if (prev && now - prev < 5000) return false;
+			if (!at.compare_exchange_strong(prev, now)) return false;
+			WIN32_FILE_ATTRIBUTE_DATA a{};
+			std::uint64_t stamp = 0;
+			if (!path.empty() && GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a))
+				stamp = ((std::uint64_t(a.ftLastWriteTime.dwHighDateTime) << 32) | a.ftLastWriteTime.dwLowDateTime) ^ (std::uint64_t(a.nFileSizeLow) << 1) ^ 1;
+			return seen.exchange(stamp) != stamp;
+		}
+	};
 }

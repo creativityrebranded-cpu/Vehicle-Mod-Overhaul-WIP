@@ -173,7 +173,7 @@ namespace profiles
 		constexpr double kFollowLead = 1.5;       // s: the follow point leads a moving target by its velocity
 		constexpr double kAttackRadius = 30.0;    // m: the pursuit orbit around the player
 		constexpr double kAttackAbove = 6.0;      // m: attackers fly this far over the player's height
-		constexpr int kTracks = 8;                // pilots 1..6 (index = pilot)
+		constexpr int kTracks = 80;               // pilots 1..64 (index = pilot)
 		struct Track
 		{
 			double tx = 0, ty = 0, tvx = 0, tvy = 0;  // the followed target's last position and smoothed velocity
@@ -338,7 +338,7 @@ namespace profiles
 		{
 			g_npcIndex = (g_npcIndex + 1) % int(sizeof(kNpcCycle) / sizeof(kNpcCycle[0]));
 			const auto* p = kNpcCycle[g_npcIndex];
-			world::Snapshot snap;
+			static thread_local world::Snapshot snap;
 			int n = 0;
 			if (world::Vehicles(snap)) {
 				for (std::uint32_t i = 0; i < snap.count; ++i) {
@@ -381,7 +381,7 @@ namespace profiles
 			}
 			g_remoteIndex = (g_remoteIndex + 1) % int(sizeof(kRemoteCycle) / sizeof(kRemoteCycle[0]));
 			const auto* p = kRemoteCycle[g_remoteIndex];
-			world::Snapshot snap;
+			static thread_local world::Snapshot snap;
 			double hx = 0, hy = 0;
 			if (world::Vehicles(snap)) {
 				for (std::uint32_t i = 0; i < snap.count; ++i) {

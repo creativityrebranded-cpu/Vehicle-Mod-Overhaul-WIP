@@ -28,6 +28,16 @@ namespace inputgate
         std::array<std::atomic<bool>,256> g_keys{};
         std::array<std::array<std::uint8_t,256>,3> g_owner{}; // input queue is serialized by the game's queue lock
         std::atomic<std::uint64_t> g_devicePress{0};
+        std::atomic<ULONGLONG> g_mapEditUntil{0}, g_mapAllUntil{0};
+        // The map's camera keys and the ways out stay with the map while the route editor holds it.
+        bool MapKeyAllowed(std::uint32_t vk)
+        {
+            switch(vk){
+            case VK_TAB: case VK_ESCAPE: case 'W': case 'A': case 'S': case 'D':
+            case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT: return true;
+            default: return false;
+            }
+        }
 
 		bool IsBlocked(std::uint32_t code, std::uint32_t bits)
 		{
@@ -45,6 +55,12 @@ namespace inputgate
                 const auto device=*reinterpret_cast<std::uint8_t*>(event+8);
                 const auto code=*reinterpret_cast<std::uint32_t*>(event+0x30);
                 if(device>2)return;
+                if(GetTickCount64()<g_mapEditUntil.load(std::memory_order_relaxed)){
+                    // keyboard (0): all but the camera keys and the exits; mouse (1): the left button only
+                    const bool all=GetTickCount64()<g_mapAllUntil.load(std::memory_order_relaxed);
+                    const bool hold=(device==0&&(all||!MapKeyAllowed(code)))||(device==1&&code==0);
+                    if(hold){if(!*reason){*reason=kBlockedReason;g_count.fetch_add(1,std::memory_order_relaxed);}return;}
+                }
                 std::uint32_t index=code;
                 bool requested=false;
                 if(device==kGamepad){
@@ -109,4 +125,6 @@ namespace inputgate
         }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
     }
 	unsigned TakeBlockedCount() { return g_count.exchange(0, std::memory_order_relaxed); }
+	void HoldMapForEditor() { g_mapEditUntil.store(GetTickCount64() + 300, std::memory_order_relaxed); }
+	void HoldMapAll() { const auto t = GetTickCount64() + 300; g_mapEditUntil.store(t, std::memory_order_relaxed); g_mapAllUntil.store(t, std::memory_order_relaxed); }
 }

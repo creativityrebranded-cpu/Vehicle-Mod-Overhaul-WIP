@@ -2,7 +2,6 @@
 #include "runtimeforms.h"
 #include "runtimecells.h"
 #include "parkedlayout.h"
-#include "citytraffic.h"
 #include "features.h"
 
 #include "addresses.h"
@@ -31,6 +30,8 @@
 #include <unordered_set>
 #include <vector>
 #include <cstdio>
+#include <atomic>
+#include <thread>
 
 // Engine pieces (1.16.244, from the decompile):
 //  - Reference: OBJ_REFR at +0x80 (rotation +0x80, position +0x8C, base object +0x98), parent cell +0xB0, extra data
@@ -485,21 +486,29 @@ namespace realvehicles
 			}
 		}
 
+		// Written off the main thread (2026-10-29 audit): the 30 s save wrote the whole registry with the game waiting on the disk (and
+		// asked Windows for the Documents folder it never used). Same file, from a copy of the rows; one write at a time (a save still
+		// running skips this one and the next 30 s takes it).
+		std::atomic<bool> g_saving{ false };
 		void SaveRegistry()
 		{
-			PWSTR docs = nullptr;
-			if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) return;
+			if (g_saving.exchange(true)) { g.dirty = true; return; }
 			std::wstring path = fvopaths::Dir();
-			CoTaskMemFree(docs);
-			CreateDirectoryW(path.c_str(), nullptr);
-			path += L"\\vehicles.tsv";
-			FILE* f = nullptr;
-			if (_wfopen_s(&f, path.c_str(), L"w") != 0 || !f) return;
-			std::fprintf(f, "id\tbase\towner\tworldspace\tx\ty\tz\tstate\tmoves\n");
-			for (const auto& [id, r] : g.registry) {
-				std::fprintf(f, "%08X\t%08X\t%08X\t%08X\t%.1f\t%.1f\t%.1f\t%s\t%u\n", r.id, r.base, r.owner, r.worldspace, r.x, r.y, r.z, r.state, r.moves);
-			}
-			std::fclose(f);
+			std::vector<Record> rows;
+			rows.reserve(g.registry.size());
+			for (const auto& [id, r] : g.registry) rows.push_back(r);
+			std::thread([path = std::move(path), rows = std::move(rows)]() mutable {
+				CreateDirectoryW(path.c_str(), nullptr);
+				path += L"\\vehicles.tsv";
+				FILE* f = nullptr;
+				if (_wfopen_s(&f, path.c_str(), L"w") == 0 && f) {
+					std::fprintf(f, "id\tbase\towner\tworldspace\tx\ty\tz\tstate\tmoves\n");
+					for (const auto& r : rows)
+						std::fprintf(f, "%08X\t%08X\t%08X\t%08X\t%.1f\t%.1f\t%.1f\t%s\t%u\n", r.id, r.base, r.owner, r.worldspace, r.x, r.y, r.z, r.state, r.moves);
+					std::fclose(f);
+				}
+				g_saving.store(false);
+			}).detach();
 		}
 
 		// Co-located parked vehicles (2026-10-17 20:58: REV-8 FF013B99 from Vehicles - Real.esm and V-47 FF019056 from the
@@ -698,18 +707,11 @@ namespace realvehicles
 
 	bool RecordingPlacements()
 	{
-		static ULONGLONG checked=0;static bool enabled=false,told=false;
-		const auto now=GetTickCount64();if(checked&&now-checked<1000)return enabled;checked=now;
-		wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
-		std::wstring flag=exe;const auto slash=flag.find_last_of(L"\\/");if(slash==std::wstring::npos)return false;
-		flag.resize(slash+1);flag+=L"Data\\SFSE\\Plugins\\";
-		const bool flagged=GetFileAttributesW((flag+L"FlyingVehicleOverhaul.placement-recording").c_str())!=INVALID_FILE_ATTRIBUTES||
-			GetFileAttributesW((flag+L"SeamlessVehicle.placement-recording").c_str())!=INVALID_FILE_ATTRIBUTES;  // the pre-0.73.0 name still counts
-		// The spot recorder was the user's build tool (removed 2026-10-28): neither the flag file nor the setting turns it on.
-		(void)flagged;
-		const bool active=false;
-		if(!told||enabled!=active){enabled=active;told=true;logger::Write("Placement recorder: %s; scanner taps %s",enabled?"ON":"off",enabled?"save native vehicle parking positions":"use normal controls");}
-		return enabled;
+		// The spot recorder was the user's build tool (removed 2026-10-28): always off. (2026-10-29 audit: it still looked up the exe
+		// path and two flag files on disk once a second for input, the scanner and the registry, and ignored the answer.)
+		static bool told=false;
+		if(!told){told=true;logger::Write("Placement recorder: off; scanner taps use normal controls");}
+		return false;
 	}
 
 	bool RecordPlacement(double x,double y,double z,double yaw,bool estimated,const char* label)

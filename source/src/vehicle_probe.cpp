@@ -18,6 +18,7 @@
 #include <cmath>
 #include <algorithm>
 #include <mutex>
+#include <vector>
 
 #pragma comment(lib, "Synchronization.lib")
 
@@ -68,9 +69,14 @@ namespace vehicle_probe
 			std::uint64_t mask = 0;
 			bool haveResult = false;
 			prefetch::RayHit hit;
-			unsigned age = 0;
+			unsigned resultTick = 0;  // g_rayTick when the result arrived (age = g_rayTick - resultTick)
 		};
 		RayProbe g_rays[prefetch::kRaySlots];
+		// Queued slots (2026-10-29 audit): the service used to copy the whole table onto the stack and age every slot on every game update
+		// (about 470 KB a call with 256 pilots). Now a request lists its slot once, the service takes only those (in slot order, as
+		// before), and a result's age is the service count since it arrived: the same number the old per-slot increment reached.
+		std::vector<int> g_rayPending, g_sweepPending;
+		unsigned g_rayTick = 0, g_sweepTick = 0;
 
 		// Is `p` inside the game's own image (a plausible vtable or function address)?
 		bool InImage(std::uintptr_t p)
@@ -276,7 +282,7 @@ namespace vehicle_probe
 			std::uint64_t mask = 0;
 			bool haveResult = false;
 			prefetch::SweepHit hit;
-			unsigned age = 0;
+			unsigned resultTick = 0;  // g_sweepTick when the result arrived
 		};
 		SweepReq g_sweeps[prefetch::kSweepSlots];
 		unsigned g_sweepLogged = 0;
@@ -401,20 +407,24 @@ namespace vehicle_probe
 
 		void ServiceSweeps(std::uintptr_t tes)
 		{
-			SweepReq work[prefetch::kSweepSlots];
+			static thread_local std::vector<std::pair<int, SweepReq>> work;
+			work.clear();
+			unsigned tick = 0;
 			{
 				std::lock_guard lk(g_lock);
-				for (int i = 0; i < prefetch::kSweepSlots; ++i) {
-					work[i] = g_sweeps[i];
+				tick = ++g_sweepTick;
+				std::sort(g_sweepPending.begin(), g_sweepPending.end());
+				for (const int i : g_sweepPending) {
+					if (!g_sweeps[i].requested) continue;
+					work.push_back({ i, g_sweeps[i] });
 					g_sweeps[i].requested = false;
-					if (g_sweeps[i].haveResult) ++g_sweeps[i].age;
 				}
+				g_sweepPending.clear();
 			}
 			if (g_sweepBackoff.Blocked() || g_rayBackoff.faults > 0 || !navmap::RaysEnabled()) return;  // (the sweep follows the rays: it starts only once a ray has gone through unharmed)
-			for (int i = 0; i < prefetch::kSweepSlots; ++i) {
-				if (!work[i].requested) continue;
+			for (const auto& [i, w] : work) {
 				prefetch::SweepHit hit;
-				const int r = CastShapeGuarded(tes, &work[i], &hit);
+				const int r = CastShapeGuarded(tes, &w, &hit);
 				if (r < 0) {
 					g_sweepBackoff.Fault("hull sweep");
 					return;
@@ -423,13 +433,13 @@ namespace vehicle_probe
 				if (g_sweepLogged < 8) {
 					++g_sweepLogged;
 					if (logger::Verbose()) logger::Write("Prefetch: hull sweep #%u (slot %d, %.0f m): %s%s, %d hit(s) kept, %d left out (own body / ground below), %u us",
-						g_sweepLogged, i, work[i].range, hit.hit ? "nearest " : "clear", hit.hit ? "" : "", hit.kept, hit.skipped, hit.micros);
+						g_sweepLogged, i, w.range, hit.hit ? "nearest " : "clear", hit.hit ? "" : "", hit.kept, hit.skipped, hit.micros);
 					if (hit.hit && logger::Verbose()) logger::Write("Prefetch:   hit at %.1f m, layer %u, body %u, (%.1f, %.1f, %.1f)", hit.distance, hit.layer, hit.bodyId, hit.x, hit.y, hit.z);
 				}
 				std::lock_guard lk(g_lock);
 				g_sweeps[i].hit = hit;
 				g_sweeps[i].haveResult = true;
-				g_sweeps[i].age = 0;
+				g_sweeps[i].resultTick = tick;
 			}
 		}
 
@@ -450,34 +460,160 @@ namespace vehicle_probe
 
 		void ServiceRays(std::uintptr_t tes)
 		{
-			RayProbe work[prefetch::kRaySlots];
+			static thread_local std::vector<std::pair<int, RayProbe>> work;
+			work.clear();
+			unsigned tick = 0;
 			{
 				std::lock_guard lk(g_lock);
-				for (int i = 0; i < prefetch::kRaySlots; ++i) {
-					work[i] = g_rays[i];
+				tick = ++g_rayTick;  // (results age even while the queries are paused)
+				std::sort(g_rayPending.begin(), g_rayPending.end());
+				for (const int i : g_rayPending) {
+					if (!g_rays[i].requested) continue;
+					work.push_back({ i, g_rays[i] });
 					g_rays[i].requested = false;
-					if (g_rays[i].haveResult) ++g_rays[i].age;  // (results age even while the queries are paused)
 				}
+				g_rayPending.clear();
 			}
 			if (g_rayBackoff.Blocked() || !navmap::RaysEnabled()) return;
-			for (int i = 0; i < prefetch::kRaySlots; ++i) {
-				if (!work[i].requested) continue;
+			for (const auto& [i, w] : work) {
 				prefetch::RayHit hit;
-				const int r = CastRayGuarded(tes, &work[i], &hit);
+				const int r = CastRayGuarded(tes, &w, &hit);
 				if (r < 0) {
 					g_rayBackoff.Fault("forward ray");
 					return;
 				}
 				if (r == 0) continue;
 				for (int j = 0; j < 3; ++j) {
-					hit.from[j] = work[i].from[j];
-					hit.to[j] = work[i].to[j];
+					hit.from[j] = w.from[j];
+					hit.to[j] = w.to[j];
 				}
 				std::lock_guard lk(g_lock);
 				g_rays[i].hit = hit;
 				g_rays[i].haveResult = true;
-				g_rays[i].age = 0;
+				g_rays[i].resultTick = tick;
 			}
+		}
+
+		// ---- Solid-object box query (cellbake, 2026-10-29) ----
+		// hknpBSWorld::QueryAabb = FUN_142362680(bsWorld, &query, &collector) -> hknpWorld::queryAabb FUN_1430CC2B0(bsWorld + 0x20, ...),
+		// laid out as the game's own caller FUN_141B19990 builds it: query +0 the world object's vfunc +0x18 result, +8 its vfunc +0x10
+		// result, +0x10 (u16) 0xFFFF, +0x14 0, +0x18 0, +0x20 (u16) 1, +0x22 (u8) 0xFB, +0x30 box min, +0x40 box max; collector an
+		// hknpAllHitsCollector as the ray's (10 inline hits; Havok grows the array on its heap past that, and the game frees it with
+		// FUN_142E90220(*0x14586C920, array, 0x70, capacity & 0x3FFFFFFF) when the capacity's sign bit is clear). Hits: 0x70 bytes,
+		// query type +0x68 (5 = AABB), body id +0x48. A body's reference as the game resolves it after the query (outside the lock):
+		// FUN_142389B40(bsWorld, body id) -> FUN_140B3CF40(that, 1) -> the reference; the game adds 0x80000200001 to its count word
+		// (+8) and releases it with FUN_140384600. (The 2026-10-18 crashes came from releasing without that add.)
+		constexpr std::uint32_t kRvaQueryAabb = 0x02362680, kRvaBodyObject = 0x02389B40, kRvaObjectRef = 0x00B3CF40, kRvaHavokFree = 0x02E90220,
+			kRvaHavokHeap = 0x0586C920;
+		constexpr int kMaxSolids = 4096;
+		struct SolidReq { bool requested = false, done = false, ok = false; float mn[3] = {}, mx[3] = {}; std::vector<std::uint32_t> ids; };
+		SolidReq g_solidReq;
+		Backoff g_solidBackoff;
+		struct alignas(16) BoxFrame
+		{
+			alignas(16) std::uint8_t query[0x60];
+			alignas(16) std::uint8_t collector[0x50];
+			alignas(16) std::uint8_t hits[0x490];
+		};
+		BoxFrame g_boxFrame;
+		std::uint32_t g_solidIds[kMaxSolids];
+		// Under the world lock: the query only. Returns the number of hits; the hit array (maybe Havok's heap) in *array, its capacity word in *cap.
+		int QueryBoxNow(std::uintptr_t bs, const float* mn, const float* mx, std::uint8_t** array, std::uint32_t* cap)
+		{
+			BoxFrame& fr = g_boxFrame;
+			const auto base = game::Base();
+			const std::uintptr_t inner = bs + 0x20;
+			void** vt = *reinterpret_cast<void***>(inner);
+			if (!vt || !InImage(reinterpret_cast<std::uintptr_t>(vt)) || !InImage(reinterpret_cast<std::uintptr_t>(vt[2])) || !InImage(reinterpret_cast<std::uintptr_t>(vt[3]))) return -1;
+			F<std::uint64_t>(fr.query, 0) = reinterpret_cast<std::uint64_t (*)(std::uintptr_t)>(vt[3])(inner);
+			F<std::uint64_t>(fr.query, 8) = reinterpret_cast<std::uint64_t (*)(std::uintptr_t)>(vt[2])(inner);
+			F<std::uint16_t>(fr.query, 0x10) = 0xFFFF;
+			F<std::uint16_t>(fr.query, 0x20) = 1;
+			F<std::uint8_t>(fr.query, 0x22) = 0xFB;
+			for (int i = 0; i < 3; ++i) { F<float>(fr.query, 0x30 + 4 * i) = mn[i]; F<float>(fr.query, 0x40 + 4 * i) = mx[i]; }
+			F<std::uintptr_t>(fr.collector, 0) = base + kRvaHitsVtbl;
+			F<std::uint8_t>(fr.collector, 8) = 0x40;
+			std::memcpy(fr.collector + 0x10, reinterpret_cast<const void*>(base + kRvaCollectorInit), 16);
+			F<std::uintptr_t>(fr.collector, 0x30) = reinterpret_cast<std::uintptr_t>(fr.hits);
+			F<std::uint32_t>(fr.collector, 0x3C) = 0x8000000A;
+			reinterpret_cast<void (*)(std::uintptr_t, void*, void*)>(base + kRvaQueryAabb)(bs, fr.query, fr.collector);
+			*array = F<std::uint8_t*>(fr.collector, 0x30);
+			*cap = F<std::uint32_t>(fr.collector, 0x3C);
+			return F<std::int32_t>(fr.collector, 0xC);
+		}
+		// Outside the lock, as the game does: a hit body's reference form id (its count raised, then released).
+		std::uint32_t BodyRefId(std::uintptr_t bs, std::uint32_t body)
+		{
+			const auto base = game::Base();
+			const std::uintptr_t obj = reinterpret_cast<std::uintptr_t (*)(std::uintptr_t, std::uint32_t)>(base + kRvaBodyObject)(bs, body);
+			if (!obj) return 0;
+			const std::uintptr_t ref = reinterpret_cast<std::uintptr_t (*)(std::uintptr_t, int)>(base + kRvaObjectRef)(obj, 1);
+			if (!ref) return 0;
+			InterlockedExchangeAdd64(reinterpret_cast<volatile LONG64*>(ref + 8), 0x80000200001LL);
+			const std::uint32_t id = *reinterpret_cast<std::uint32_t*>(ref + 0x28);
+			reinterpret_cast<void (*)(std::uintptr_t)>(base + kRvaRelease)(ref);
+			return id;
+		}
+		void FreeHits(std::uint8_t* array, std::uint32_t cap)
+		{
+			if (!array || array == g_boxFrame.hits || static_cast<std::int32_t>(cap) < 0) return;  // the inline buffer (not owned)
+			const auto base = game::Base();
+			reinterpret_cast<void (*)(std::uintptr_t, void*, int, std::uint32_t)>(base + kRvaHavokFree)(*reinterpret_cast<std::uintptr_t*>(base + kRvaHavokHeap), array, 0x70, cap & 0x3FFFFFFF);
+		}
+		// Plain data only (a __try function). Returns -1 a fault, 0 no world, else 1 + the number of form ids written to g_solidIds.
+		int SolidQueryGuarded(std::uintptr_t tes, const float* mn, const float* mx)
+		{
+			int n = -1;
+			std::uint8_t* array = nullptr;
+			std::uint32_t cap = 0;
+			std::uintptr_t bs = 0;
+			crash::Crumb("solid box query begin", 0);
+			__try {
+				const float mid[3] = { 0.5f * (mn[0] + mx[0]), 0.5f * (mn[1] + mx[1]), 0.5f * (mn[2] + mx[2]) };
+				bs = RayWorld(tes, mid);
+				if (bs) {
+					std::memset(&g_boxFrame, 0, sizeof g_boxFrame);
+					LockWorld(bs);
+					n = QueryBoxNow(bs, mn, mx, &array, &cap);
+				}
+				else n = -3;
+			}
+			__except (CaptureFault(GetExceptionInformation())) { n = -2; }
+			UnlockWorld();
+			if (n == -2) return -1;
+			if (n < 0) return 0;
+			int count = 0;
+			__try {
+				for (int i = 0; i < n && count < kMaxSolids; ++i) {
+					std::uint8_t* h = array + std::size_t(i) * 0x70;
+					if (F<std::int32_t>(h, 0x68) != 5) continue;
+					const std::uint32_t id = BodyRefId(bs, F<std::uint32_t>(h, 0x48));
+					if (id) g_solidIds[count++] = id;
+				}
+			}
+			__except (CaptureFault(GetExceptionInformation())) { FreeHits(array, cap); return -1; }
+			FreeHits(array, cap);
+			return 1 + count;
+		}
+		void ServiceSolid(std::uintptr_t tes)
+		{
+			float mn[3], mx[3];
+			{
+				std::lock_guard lk(g_lock);
+				if (!g_solidReq.requested) return;
+				g_solidReq.requested = false;
+				for (int i = 0; i < 3; ++i) { mn[i] = g_solidReq.mn[i]; mx[i] = g_solidReq.mx[i]; }
+			}
+			int r = 0;
+			if (!g_solidBackoff.Blocked()) {
+				r = SolidQueryGuarded(tes, mn, mx);
+				if (r < 0) g_solidBackoff.Fault("solid box query");
+			}
+			std::lock_guard lk(g_lock);
+			g_solidReq.ids.clear();
+			if (r > 0) g_solidReq.ids.assign(g_solidIds, g_solidIds + (r - 1));
+			g_solidReq.ok = r > 0;
+			g_solidReq.done = true;
 		}
 
 		using Update = void (*)(std::uintptr_t, std::uintptr_t);
@@ -503,6 +639,7 @@ namespace vehicle_probe
 			if (!tes) return;
 			ServiceRays(tes);
 			ServiceSweeps(tes);
+			ServiceSolid(tes);
 			const auto ray = reinterpret_cast<float (*)(std::uintptr_t, const float*, std::uint32_t, float, float)>(base + addr::kGroundRayCast);
 			for (int i = 0; i < prefetch::kSlotCount; ++i) {
 				Probe work;
@@ -578,6 +715,7 @@ namespace vehicle_probe
 		g_probes = {};
 		for (auto& r : g_rays) r = RayProbe{};
 		for (auto& s : g_sweeps) s = SweepReq{};
+		g_rayPending.clear(); g_sweepPending.clear();
 	}
 
 	void RequestSweep(int slot, std::uintptr_t instance, float dirX, float dirY, float range, std::uint64_t mask)
@@ -585,6 +723,7 @@ namespace vehicle_probe
 		if (slot < 0 || slot >= prefetch::kSweepSlots) return;
 		std::lock_guard lk(g_lock);
 		auto& s = g_sweeps[slot];
+		if (!s.requested) g_sweepPending.push_back(slot);
 		s.requested = true;
 		s.instance = instance;
 		s.dir[0] = dirX; s.dir[1] = dirY;
@@ -599,8 +738,45 @@ namespace vehicle_probe
 		const auto& s = g_sweeps[slot];
 		if (!s.haveResult) return false;
 		out = s.hit;
-		age = s.age;
+		age = g_sweepTick - s.resultTick;
 		return true;
+	}
+
+	bool RequestSolids(const float mn[3], const float mx[3])
+	{
+		std::lock_guard lk(g_lock);
+		if (g_solidReq.requested) return false;  // one at a time
+		g_solidReq.requested = true; g_solidReq.done = false;
+		for (int i = 0; i < 3; ++i) { g_solidReq.mn[i] = mn[i]; g_solidReq.mx[i] = mx[i]; }
+		return true;
+	}
+	bool TakeSolids(std::vector<std::uint32_t>& ids, bool& ok)
+	{
+		std::lock_guard lk(g_lock);
+		if (!g_solidReq.done) return false;
+		g_solidReq.done = false;
+		ids.swap(g_solidReq.ids);
+		g_solidReq.ids.clear();
+		ok = g_solidReq.ok;
+		return true;
+	}
+
+	// One ray now, on the calling (main) thread (2026-10-29 late: the route editor on the local map, which pauses the game, so the
+	// queued rays above are never serviced and new points kept a guessed height). Same query, same physics world read lock and
+	// fault guard as the queued path; refused while that path is backed off after a fault. 1 = answered, 0 = no world, -1 = fault.
+	int CastNow(const float from[3], const float to[3], std::uint64_t mask, prefetch::RayHit& out)
+	{
+		out = prefetch::RayHit{};
+		if (g_rayBackoff.Blocked() || !navmap::RaysEnabled()) return 0;
+		const auto tes = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kTESPtr);
+		if (!tes) return 0;
+		RayProbe r;
+		for (int i = 0; i < 3; ++i) { r.from[i] = from[i]; r.to[i] = to[i]; }
+		r.mask = mask;
+		const int result = CastRayGuarded(tes, &r, &out);
+		if (result < 0) { g_rayBackoff.Fault("editor ray"); return -1; }
+		if (result == 1) for (int j = 0; j < 3; ++j) { out.from[j] = from[j]; out.to[j] = to[j]; }
+		return result;
 	}
 
 	void RequestRay(int slot, const float from[3], const float to[3], std::uint64_t mask)
@@ -608,6 +784,7 @@ namespace vehicle_probe
 		if (slot < 0 || slot >= prefetch::kRaySlots) return;
 		std::lock_guard lk(g_lock);
 		auto& r = g_rays[slot];
+		if (!r.requested) g_rayPending.push_back(slot);
 		r.requested = true;
 		for (int i = 0; i < 3; ++i) { r.from[i] = from[i]; r.to[i] = to[i]; }
 		r.mask = mask;
@@ -620,7 +797,7 @@ namespace vehicle_probe
 		const auto& r = g_rays[slot];
 		if (!r.haveResult) return false;
 		out = r.hit;
-		age = r.age;
+		age = g_rayTick - r.resultTick;
 		return true;
 	}
 }

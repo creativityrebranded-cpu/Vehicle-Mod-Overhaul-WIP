@@ -1,4 +1,5 @@
 #pragma once
+#include "fvolimits.h"
 
 #include <cstdint>
 
@@ -25,12 +26,14 @@ namespace prefetch
 		// Core: buried-player rescue (floor below / surface above).
 		kSlotRescue0 = kSlotCheck0 + kSlotCheckCount,
 		// SeamlessVehicle: NPC pilots 1..3, 16 each (7 model samples, then 9 avoidance corridors).
-		kSlotPilot0 = kSlotRescue0 + 2, kSlotPilotEach = 16, kSlotPilotCount = 6,
+		kSlotPilot0 = kSlotRescue0 + 2, kSlotPilotEach = 16, kSlotPilotCount = fvolimits::kVehicles,  // one per NPC pilot (fvolimits.h)
 		// SeamlessVehicle: the ground under the player (the rover's follow-from-below).
 		kSlotFollow = kSlotPilot0 + kSlotPilotEach * kSlotPilotCount,
 		// SeamlessVehicle: the flight-level probes beside the terrain probes ahead (pilots 0..6, 16 each: 7 model samples, then 9 corridors).
-		kSlotLow0 = kSlotFollow + 1, kSlotLowEach = 16, kSlotLowCount = 7,
-		kSlotCount = kSlotLow0 + kSlotLowEach * kSlotLowCount };
+		kSlotLow0 = kSlotFollow + 1, kSlotLowEach = 16, kSlotLowCount = 1 + kSlotPilotCount,
+		// cellbake (2026-10-29): the terrain grid of each newly loaded cell, two banks of 16 (a bank's old answers are two rounds old).
+		kSlotBake0 = kSlotLow0 + kSlotLowEach * kSlotLowCount, kSlotBakeCount = 32,
+		kSlotCount = kSlotBake0 + kSlotBakeCount };
 
 	// Also service probes when the engine updates the loaded grid around this reference (the flown ship).
 	void SetProbeAnchor(std::uintptr_t ref);
@@ -50,7 +53,14 @@ namespace prefetch
 	// (64-bit, bit n = layer n). Queued and run like the ground probes; the nearest hit comes back next frame.
 	// 0..20: pilot * 3 + corridor (pilots 0..6, straight / left / right); 24..44: pilot * 3 + k, the sweep rays that feed the nav map;
 	// 48..61: pilot * 2 + k, the ceiling rays (straight up, up and ahead).
-	enum { kRayAirTraffic0=62,kRayAirTrafficCount=16,kRaySlots=kRayAirTraffic0+kRayAirTrafficCount };
+	// Pilots 7..12 (2026-10-29: 12 NPC pilots): 8 rays each after the air traffic's (3 corridors, 2 ceiling, 3 sweep); pilots 0..6 keep the
+	// ranges above (slots 21..23 and 45..47 between them belong to scantarget and environment).
+	enum { kRayAirTraffic0=62,kRayAirTrafficCount=16,kRayExtra0=kRayAirTraffic0+kRayAirTrafficCount,kRayExtraEach=8,kRayPilots=1+kSlotPilotCount,
+		kRaySlots=kRayExtra0+kRayExtraEach*(kRayPilots-7) };
+	constexpr int CorridorRay(int pilot, int c) { return pilot < 7 ? pilot * 3 + c : kRayExtra0 + (pilot - 7) * kRayExtraEach + c; }
+	constexpr int CeilingRay(int pilot, int k) { return pilot < 7 ? 48 + pilot * 2 + k : kRayExtra0 + (pilot - 7) * kRayExtraEach + 3 + k; }
+	constexpr int SweepRay(int pilot, int k) { return pilot < 7 ? 24 + pilot * 3 + k : kRayExtra0 + (pilot - 7) * kRayExtraEach + 5 + k; }
+	static_assert(CorridorRay(6, 2) == 20 && SweepRay(6, 2) == 44 && CeilingRay(6, 1) == 61 && SweepRay(kRayPilots - 1, 2) == kRaySlots - 1);
 	struct RayHit
 	{
 		bool hit = false;
@@ -71,7 +81,7 @@ namespace prefetch
 	// notes/VEHICLE_SHAPE_CAST_RESEARCH_20261017.md). One slot per pilot (0..6). The cast starts at the physics body of
 	// `instance` (the hknpBSVehicleInstance the physics step runs on) and runs `range` metres along (dirX, dirY). Hits on
 	// the vehicle's own body, and terrain / ground not above its origin + 0.5 m, are left out (ground is the height probes' job).
-	enum { kSweepSlots = 8 };
+	enum { kSweepSlots = 1 + kSlotPilotCount };  // one hull sweep per pilot (0 = the player's own vehicle)
 	struct SweepHit
 	{
 		bool hit = false;

@@ -222,13 +222,11 @@ namespace navmap
 		}
 	}
 
-	Sample At(double x, double y, double z)
+	namespace
 	{
+		Sample AtCell(const Cell* c, bool seeded, double z, ULONGLONG now)
+		{
 		Sample s;
-		const ULONGLONG now = GetTickCount64();
-		// Inside the area the object scan covered: known (no object here = open), whatever the probes saw.
-		const bool seeded = g_seedAt && now - g_seedAt < kObjLifeMs && std::hypot(x - g_seedX, y - g_seedY) < g_seedR;
-		const Cell* c = Find(x, y);
 		if (!c) {
 			s.known = seeded;
 			return s;
@@ -257,6 +255,23 @@ namespace navmap
 		}
 		s.known = s.haveGround || s.blocked || s.objBlocked || s.free || s.contacts > 0 || seeded;
 		return s;
+		}
+	}
+
+	Sample At(double x, double y, double z)
+	{
+		const ULONGLONG now = GetTickCount64();
+		// Inside the area the object scan covered: known (no object here = open), whatever the probes saw.
+		const bool seeded = g_seedAt && now - g_seedAt < kObjLifeMs && std::hypot(x - g_seedX, y - g_seedY) < g_seedR;
+		return AtCell(Find(x, y), seeded, z, now);
+	}
+
+	void Column(double x, double y, const double* zs, int n, Sample* out)
+	{
+		const ULONGLONG now = GetTickCount64();
+		const bool seeded = g_seedAt && now - g_seedAt < kObjLifeMs && std::hypot(x - g_seedX, y - g_seedY) < g_seedR;
+		const Cell* c = Find(x, y);
+		for (int k = 0; k < n; ++k) out[k] = AtCell(c, seeded, zs[k], now);
 	}
 
 	Verdict PathClear(const float p[3], double dx, double dy, double halfWidth, double clearance, double climbRate, double speed,
@@ -357,7 +372,9 @@ namespace navmap
 	bool SamplerEnabled()
 	{
 		const ULONGLONG now = GetTickCount64();
-		if (now - g_samplerRead >= 5000) {
+		static const std::wstring nav = fvopaths::File(L"nav.ini");
+		static fvopaths::Watch watch;  // re-read only when nav.ini changed (2026-10-29 audit)
+		if (watch.Changed(nav)) {
 			g_samplerRead = now;
 			ReadIni();
 		}
@@ -399,13 +416,25 @@ namespace navmap
 	void Tick()
 	{
 		const ULONGLONG now = GetTickCount64();
+		// Expiry, spread over the frames (2026-10-29 audit): the whole table (up to 60 000 cells) was walked in one frame every 5 s.
+		// Now a slice of its buckets each frame, a full round about every 5 s: each cell is still checked once per ~5 s, as before.
+		{
+			static std::size_t bucket = 0;
+			static std::vector<std::uint64_t> gone;
+			const std::size_t n = g_cells.bucket_count();
+			const std::size_t step = std::max<std::size_t>(1, n / 300);
+			gone.clear();
+			for (std::size_t k = 0; k < step; ++k, ++bucket) {
+				if (bucket >= n) bucket = 0;
+				for (auto it = g_cells.begin(bucket); it != g_cells.end(bucket); ++it) {
+					const bool floorKept = Valid(it->second.floor) && now - it->second.floorAt < kFloorLifeMs;
+					if (now - it->second.seen > (floorKept ? kFloorLifeMs : kCellLifeMs)) gone.push_back(it->first);
+				}
+			}
+			for (const auto key : gone) g_cells.erase(key);
+		}
 		if (now - g_lastTick >= 5000) {
 			g_lastTick = now;
-			for (auto it = g_cells.begin(); it != g_cells.end();) {
-				const bool floorKept = Valid(it->second.floor) && now - it->second.floorAt < kFloorLifeMs;
-				if (now - it->second.seen > (floorKept ? kFloorLifeMs : kCellLifeMs)) it = g_cells.erase(it);
-				else ++it;
-			}
 			if (g_cells.size() > kMaxCells) {  // the oldest quarter goes
 				std::vector<ULONGLONG> ages;
 				ages.reserve(g_cells.size());
@@ -422,6 +451,7 @@ namespace navmap
 			g_lastLog = now;
 			const unsigned notes = g_n.ground + g_n.rays + g_n.contacts + g_n.sampUsed + g_n.sampFallback + g_n.sweeps;
 			if (notes == 0) return;
+			if (!logger::Verbose()) { g_n = Counters{}; return; }  // the counts below are for the detailed log only (2026-10-29 audit)
 			unsigned ground = 0, floors = 0, blocked = 0, freeCells = 0;
 			for (const auto& [k, c] : g_cells) {
 				if (Valid(c.ground)) ++ground;

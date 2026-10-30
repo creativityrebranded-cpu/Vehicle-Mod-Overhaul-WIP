@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyingVehicleOverhaul VERSION 0.9.0 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,6 +25,26 @@ add_executable(trafficdata_test tests/trafficdata_test.cpp)
 target_include_directories(trafficdata_test PRIVATE src)
 add_executable(trafficroute_test tests/trafficroute_test.cpp)
 target_include_directories(trafficroute_test PRIVATE src)
+add_executable(trafficarrival_test tests/trafficarrival_test.cpp)
+target_include_directories(trafficarrival_test PRIVATE src)
+add_executable(routeeditor_test tests/routeeditor_test.cpp)
+target_include_directories(routeeditor_test PRIVATE src)
+add_executable(routeschedule_test tests/routeschedule_test.cpp)
+target_include_directories(routeschedule_test PRIVATE src)
+add_executable(surfaceprojection_test tests/surfaceprojection_test.cpp)
+target_include_directories(surfaceprojection_test PRIVATE src)
+add_executable(routemap_test tests/routemap_test.cpp)
+target_include_directories(routemap_test PRIVATE src)
+add_executable(routefiles_test tests/routefiles_test.cpp)
+target_include_directories(routefiles_test PRIVATE src)
+add_executable(trafficlinks_test tests/trafficlinks_test.cpp)
+target_include_directories(trafficlinks_test PRIVATE src)
+add_executable(strokefont_test tests/strokefont_test.cpp)
+target_include_directories(strokefont_test PRIVATE src)
+add_executable(routeshare_test tests/routeshare_test.cpp)
+target_include_directories(routeshare_test PRIVATE src)
+add_executable(cellbake_test tests/cellbake_test.cpp)
+target_include_directories(cellbake_test PRIVATE src)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 if(NOT MSVC)
     message(FATAL_ERROR "SeamlessPlanets builds with MSVC (Visual Studio 2022 Build Tools).")
@@ -60,18 +80,28 @@ target_link_libraries(SeamlessPlanets PRIVATE sp_common Synchronization)
 
 add_library(FlyingVehicleOverhaul SHARED
     src/native_movement_controller.cpp src/native_movement_engine.cpp src/native_movement_probe.cpp
-    src/main_vehicle.cpp src/resources.cpp src/airtraffic.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/trafficpool.cpp src/citytraffic.cpp src/citystartup.cpp src/cityfiles.cpp src/crash.cpp
-    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp
+    src/main_vehicle.cpp src/resources.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/api_traffic.cpp src/crash.cpp
+    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/secretunpause.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp src/routeedit.cpp src/disableguard.cpp src/mapguard.cpp src/cellbake.cpp
     src/vehicleflight.cpp src/vehiclecamera.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(FlyingVehicleOverhaul)
 target_compile_definitions(FlyingVehicleOverhaul PRIVATE SP_FEATURE_VEHICLE)
 target_link_libraries(FlyingVehicleOverhaul PRIVATE sp_common Synchronization Dxgi)
 
-# FVO City Placements addon (2026-10-27): the ring ambient traffic beside FVO_CityPlacements.esm; talks to core through fvo_addon_api.h.
-add_library(FVO_CityPlacements SHARED src/main_cityplacements.cpp)
-sp_options(FVO_CityPlacements)
-target_link_libraries(FVO_CityPlacements PRIVATE Shell32 Ole32)
+# FVO Traffic addon (2026-10-29, was FVO City Placements): all traffic decisions; talks to core through src/traffic/traffic_api.h
+# (API v2) and fvo_addon_api.h. FVO Placements is only FVO_CityPlacements.esm now. See notes/TRAFFIC_ADDON_PROPOSAL_20261029.md.
+add_library(FVO_Traffic SHARED src/traffic/traffic_main.cpp src/traffic/generator.cpp src/traffic/everyday.cpp)
+sp_options(FVO_Traffic)
+target_link_libraries(FVO_Traffic PRIVATE Shell32 Ole32)
+
+add_executable(trafficcycle_test tests/trafficcycle_test.cpp src/traffic/generator.cpp src/traffic/everyday.cpp)
+sp_options(trafficcycle_test)
+target_link_libraries(trafficcycle_test PRIVATE Shell32 Ole32)
+add_executable(trafficpair_test tests/trafficpair_test.cpp)
+sp_options(trafficpair_test)
+add_executable(traffic_generator_test tests/traffic_generator_test.cpp)
+sp_options(traffic_generator_test)
+target_link_libraries(traffic_generator_test PRIVATE Shell32 Ole32)
 
 # Gravspace was deleted 2026-10-22 (source in disabled_gravspace_20261022/Source). Gravlanes was deleted 2026-10-24 at the user's request.
 
@@ -146,12 +176,6 @@ add_executable(ringlogic_test tests/ringlogic_test.cpp)
 sp_options(ringlogic_test)
 add_executable(ringschedule_test tests/ringschedule_test.cpp)
 sp_options(ringschedule_test)
-add_executable(citybuild_test tests/citybuild_test.cpp)
-sp_options(citybuild_test)
-add_executable(citybuild_dryrun tests/citybuild_dryrun.cpp src/cityfiles.cpp)
-sp_options(citybuild_dryrun)
-add_executable(cityfiles_test tests/cityfiles_test.cpp src/cityfiles.cpp)
-sp_options(cityfiles_test)
 add_executable(listenerboot_test tests/listenerboot_test.cpp)
 sp_options(listenerboot_test)
 add_executable(framework_test tests/framework_test.cpp)
@@ -169,8 +193,6 @@ sp_options(connections_test)
 add_executable(npcactivity_test tests/npcactivity_test.cpp)
 sp_options(npcactivity_test)
 
-add_executable(airtraffic_test tests/airtraffic_test.cpp)
-sp_options(airtraffic_test)
 add_executable(trafficschedule_test tests/trafficschedule_test.cpp)
 sp_options(trafficschedule_test)
 

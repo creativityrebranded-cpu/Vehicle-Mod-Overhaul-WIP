@@ -47,6 +47,7 @@ namespace passenger
 		bool g_arrived = false;
 		ULONGLONG g_nearSince = 0, g_downAt = 0;
 		bool g_wheelAsked = false;
+		bool g_exitPending = false;  // the player asked to get out while the vehicle moved: retried until it is at rest
 		struct Wheel
 		{
 			int stage = 0;                                     // 1 seat the player as driver, 2 seat the NPC as passenger
@@ -129,6 +130,17 @@ namespace passenger
 			return 0;
 		}
 
+		// The driver's seat keyword (seat 0), 0 when unreadable.
+		uptr DriverSeat(uptr vehicle)
+		{
+			__try {
+				const uptr base = At<uptr>(vehicle, 0x98);
+				const uptr arr = At<uptr>(base, 0x278);
+				return arr && At<std::uint32_t>(base, 0x270) ? At<uptr>(arr, 0x10) : 0;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+
 		// A vehicle within kReach that an NPC job is flying (nearest).
 		uptr NpcVehicleNear(uptr player)
 		{
@@ -145,8 +157,8 @@ namespace passenger
 			return best;
 		}
 
-		// Seats the player in the vehicle's companion seat: the game's interaction build, the seat set before it completes.
-		int SeatPlayer(uptr player, uptr vehicle, uptr seatKw)
+		// Seats the NPC after a take-wheel swap in the vehicle's companion seat: the game's interaction build, the seat set before it completes.
+		int SeatCompanionForNpc(uptr player, uptr vehicle, uptr seatKw)
 		{
             if(environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe)return 0;
 			uptr link = 0;
@@ -178,8 +190,8 @@ namespace passenger
 			}
 		}
 
-		// Sets the player 3.5 m to the vehicle's left, facing its way.
-		bool PlaceBeside(uptr player, uptr vehicle)
+		// Sets the player at the vehicle's boarding site, facing its way; `roof`: on top of the vehicle instead (no free side).
+		bool PlaceBeside(uptr player, uptr vehicle, bool roof = false)
 		{
 			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
 			const double yaw = At<game::Vec3>(vehicle, off::kRefRotation).z;
@@ -187,12 +199,13 @@ namespace passenger
 			const uptr ws = cell ? At<uptr>(cell, off::kCellWorldspace) : 0;
 			if (!cell) return false;
 			const auto site=environment::BoardingSite(vehicle);
-            if(site.verdict!=environment::Verdict::Safe)return false;
+            if(!roof && site.verdict!=environment::Verdict::Safe)return false;
             float pos[3]={float(site.x),float(site.y),float(site.z)};
+            if (roof) { pos[0] = vp.x; pos[1] = vp.y; pos[2] = vp.z + 2.5f; }
             // 2026-10-28 (the user, out of the passenger seat 330 m up: "I ended up immediately on the floor, didn't even
             // fall"): the boarding site is on the ground. Well above it, the player is set 3.5 m to the vehicle's left at
             // its own height and falls from there.
-            if (vp.z - site.z > 6.0) {
+            if (!roof && vp.z - site.z > 6.0) {
                 pos[0] = float(vp.x - std::cos(yaw) * 3.5); pos[1] = float(vp.y + std::sin(yaw) * 3.5); pos[2] = vp.z;
             }
 			float rot[3] = { 0.0f, 0.0f, float(yaw) };
@@ -206,17 +219,33 @@ namespace passenger
 			}
 		}
 
-		void GetOut(uptr player, const char* why)
+		// `asked`: the player asked to get out (G, or the game's exit refused). 2026-10-29 12:30 run (the user: "lots of cant leave
+		// vehicle that it's obstructed and G isn't really doing anything"): traffic parks REV-8s in rows, so a full boarding site (a
+		// free side, no vehicle beside it) never came and G only said "Waiting". Asked for and at rest, the player is let out
+		// anyway: beside the vehicle when that side is free, else on its roof.
+		void GetOut(uptr player, const char* why, bool asked = false)
 		{
 			const std::uint32_t id = g_riding.load();
             const auto checked=RefById(id);
-            if(!checked || environment::BoardingSite(checked).verdict!=environment::Verdict::Safe){notify::Show("Waiting for a safe drop-off site");return;}
+            const bool safe = checked && environment::BoardingSite(checked).verdict==environment::Verdict::Safe;
+            const bool atRest = checked && environment::EntrySite(checked).verdict==environment::Verdict::Safe;
+            if(!safe && !(asked && atRest)){
+                if (asked && !g_exitPending) {  // moving: the driver's trip ends (it sets down), then out once at rest
+                    g_exitPending = true;
+                    const bool ended = npcvehicles::EndJobOf(id, "passenger getting out");
+                    logger::Write("Passenger: you asked to get out of %08X while it moves: %s; out once it is at rest", id, ended ? "its trip ended" : "no trip to end");
+                    notify::Show("Stopping to let you out");
+                }
+                else if (!asked) notify::Show("Waiting for a safe drop-off site");
+                return;
+            }
+            g_exitPending = false;
             vehicleflight::EndTargetSession(checked);
             g_riding.store(0);
 			const uptr vehicle = RefById(id);
 			const bool out = EndSeat(player);
-			const bool placed = vehicle && PlaceBeside(player, vehicle);
-			logger::Write("Passenger: out of %08X (%s) -> %s, %s", id, why, out ? "seat ended" : "seat end FAILED", placed ? "set beside it" : "not moved");
+			const bool placed = vehicle && PlaceBeside(player, vehicle, !safe);
+			logger::Write("Passenger: out of %08X (%s) -> %s, %s", id, why, out ? "seat ended" : "seat end FAILED", placed ? (safe ? "set beside it" : "no free side: set on its roof") : "not moved");
 			notify::Show("Passenger: out");
 		}
 
@@ -255,7 +284,7 @@ namespace passenger
 			const uptr npc = RefById(g_wheel.npc);
 			const uptr seat = PassengerSeat(vehicle);
 			if (npc && seat && !VehicleOf(npc)) {
-				const int r = SeatPlayer(npc, vehicle, seat);  // the same seat build, for the NPC
+				const int r = SeatCompanionForNpc(npc, vehicle, seat);  // the same seat build, for the NPC
 				logger::Write("Passenger: NPC %08X into the passenger seat of %08X -> %d (game says it is in %08X)", g_wheel.npc, g_wheel.vehicle, r,
 					VehicleOf(npc) ? At<std::uint32_t>(VehicleOf(npc), off::kFormId) : 0);
 			}
@@ -283,34 +312,9 @@ namespace passenger
 		// The companion seat of `vehicle` (any occupied vehicle: a gang driver, a job, a hijacker).
 		void BoardTo(uptr player, uptr vehicle)
 		{
-            if(environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe){notify::Show("Waiting for a safe boarding site");return;}
-			const std::uint32_t id = At<std::uint32_t>(vehicle, off::kFormId);
-			const uptr seat = PassengerSeat(vehicle);
-			if (!seat) {
-				notify::Show("That vehicle has no passenger seat");
-				logger::Write("Passenger: %08X has no seat after the driver's", id);
-				return;
-			}
-			g_riding = id;  // before seating: the player-seat hook and the flight code see a passenger from the first frame
-			const int r = SeatPlayer(player, vehicle, seat);
-			const uptr in = VehicleOf(player);
-			const std::intptr_t seatNow = SeatOf(player);
-			const auto pp = At<game::Vec3>(player, off::kRefPosition), vp = At<game::Vec3>(vehicle, off::kRefPosition);
-			logger::Write("Passenger: seat %08X in %08X -> %d; the game says you are in %08X, seat %08X (wanted %08X); you are %.1f m from it",
-				At<std::uint32_t>(seat, off::kFormId), id, r, in ? At<std::uint32_t>(in, off::kFormId) : 0,
-				seatNow > 0 ? At<std::uint32_t>(static_cast<uptr>(seatNow), off::kFormId) : 0, At<std::uint32_t>(seat, off::kFormId),
-				std::sqrt(double(pp.x - vp.x) * (pp.x - vp.x) + double(pp.y - vp.y) * (pp.y - vp.y) + double(pp.z - vp.z) * (pp.z - vp.z)));
-			if (r != 1 || in != vehicle) {
-				g_riding = 0;
-				if (in == vehicle) EndSeat(player);
-				notify::Show("Passenger: could not take the seat");
-				return;
-			}
-			g_lead = 50.0;
-			notify::Show("Passenger");
+			if (!npcvehicles::RequestPassengerBoard(player, vehicle)) notify::Show("Passenger: could not start boarding");
 		}
 	}
-
 	std::uint32_t RidingVehicle() { return g_riding.load(); }
 	std::uintptr_t PassengerSeatKeyword(std::uintptr_t vehicle) { return vehicle ? PassengerSeat(vehicle) : 0; }
 	bool FinishPassengerSeat(std::uintptr_t player, std::uintptr_t vehicle)
@@ -318,7 +322,7 @@ namespace passenger
 		const uptr seat = vehicle ? PassengerSeat(vehicle) : 0;
 		if (!player || !seat) return false;
 		const std::uint32_t id = At<std::uint32_t>(vehicle, off::kFormId);
-		g_riding = id;  // before seating, as in BoardTo
+		g_riding = id;  // the flight hooks must see a passenger during native seat completion
 		uptr link = 0;
 		__try {
 			EngineFn<void (*)(uptr, uptr, uptr*)>(kSeatLink)(player, vehicle, &link);
@@ -330,7 +334,8 @@ namespace passenger
 			}
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) { link = 0; }
-		if (!link || VehicleOf(player) != vehicle) { g_riding = 0; return false; }
+		if (!link || VehicleOf(player) != vehicle || SeatOf(player) != static_cast<std::intptr_t>(seat)) { g_riding = 0; return false; }
+		g_arrived = false; g_nearSince = 0;
 		g_lead = 50.0;
 		notify::Show("Passenger");
 		npcvehicles::AdoptDriver(vehicle);
@@ -339,9 +344,7 @@ namespace passenger
 
 	bool BoardVehicle(std::uintptr_t player, std::uintptr_t vehicle)
 	{
-		if (!player || !vehicle || VehicleOf(player) || environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe) return false;
-		BoardTo(player, vehicle);
-		return g_riding.load() == At<std::uint32_t>(vehicle, off::kFormId);
+		return npcvehicles::RequestPassengerBoard(player, vehicle);
 	}
 
 	void Steer(int pilot, std::uintptr_t vehicle)
@@ -427,12 +430,45 @@ namespace passenger
             if (rawG && gDown && !gHeld && now - gAt >= 500) { gHeld = true; rawWheel = true; }
             if (!rawG && gDown && !gHeld) rawExit = true;
             gDown = rawG;
+            // The game's own exit (E) refused in the passenger seat ("obstructed"): still seated 1.5 s after the key went up -> out
+            // our way, as with G.
+            static bool eDown = false;
+            static ULONGLONG eUpAt = 0;
+            static int exitKey = 0;
+            if (!exitKey) exitKey = controlmap::KeyFor("Vehicle", "VehicleExit", 'E');
+            const bool eNow = Focused() && (GetAsyncKeyState(exitKey) & 0x8000) != 0;
+            if (!eNow && eDown) eUpAt = now;
+            eDown = eNow;
+            const bool refused = eUpAt && now - eUpAt >= 1500;
+            if (refused) { eUpAt = 0; logger::Write("Passenger: the game's exit did not let you out of %08X in 1.5 s", riding); }
             if(wheel||rawWheel){StartWheel(player,vehicle);return;}
-            if(exit||rawExit){GetOut(player,"passenger exit command");return;}
+            if(exit||rawExit||refused){GetOut(player,refused?"the game's exit refused":"passenger exit command",true);return;}
+            if (g_exitPending) {
+                static ULONGLONG retryAt = 0;
+                if (now - retryAt >= 500) { retryAt = now; GetOut(player, "asked earlier, now at rest", true); }
+                return;
+            }
 			if (!npcvehicles::PilotFor(riding) && !npcvehicles::HasDriver(riding)) GetOut(player, "the driver left");
 			return;
 		}
 		g_arrived = false;
+		g_exitPending = false;
+		// Seated as a passenger by the game itself (its own get-in, our seat choice picking the passenger seat; 2026-10-29 12:30 run:
+		// in FF0247C6 that way, nothing here knew, so G did nothing): taken as riding from here on.
+		{
+			static ULONGLONG checkAt = 0;
+			if (now - checkAt >= 500) {
+				checkAt = now;
+				const uptr vehicle = VehicleOf(player);
+				const std::intptr_t seat = vehicle ? SeatOf(player) : 0;
+				if (vehicle && seat > 0 && seat != static_cast<std::intptr_t>(DriverSeat(vehicle))) {
+					g_riding = At<std::uint32_t>(vehicle, off::kFormId);
+					g_nearSince = 0; g_lead = 50.0;
+					logger::Write("Passenger: the game seated you in %08X's passenger seat; G gets you out from here", g_riding.load());
+					return;
+				}
+			}
+		}
 		if (press) Board(player);
 	}
 

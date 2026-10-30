@@ -2,6 +2,7 @@
 
 #include "addresses.h"
 #include "bodymass.h"
+#include "fvopaths.h"
 #include "game.h"
 #include "log.h"
 #include "runtimeforms.h"
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <mutex>
+#include <vector>
 
 namespace world
 {
@@ -64,11 +66,14 @@ namespace world
 			uptr root = 0;
 			std::uint32_t driverId = 0;
 			bool have = false;
+			float scale = 1;              // the 3D's scale at the last full sample
+			float costMs = 0.02f;         // this vehicle's measured full-sample cost (smoothed)
+			ULONGLONG sampledAt = 0;      // its last full sample (3D + bodies)
 		};
 		std::unordered_map<std::uint32_t, Cached> g_cache;
 		constexpr int kDriverCallsPerFrame = 3;
 		constexpr ULONGLONG kDriverActiveMs = 250, kDriverParkedMs = 1000;
-		std::uint32_t g_ids[64] = {};
+		std::uint32_t g_ids[kMaxVehicles] = {};
 		std::uint32_t g_idCount = 0;
 		std::uint64_t g_frame = 0;
 		bool g_toldBounds = false;
@@ -76,14 +81,14 @@ namespace world
 
 		// Bounded reference slices, including within a dense city cell, published
 		// to g_ids when it has passed every cell, instead of every cell of a city in one frame each second.
-		std::uint32_t g_sweepIds[64] = {};
+		std::uint32_t g_sweepIds[kMaxVehicles] = {};
 		std::uint32_t g_sweepCount = 0;
 		framework::ScanCursor g_sweepCursor;
 		void CollectSweep(uptr ref, void* ctx)
 		{
 			(void)ctx;
 			const auto id=At<std::uint32_t>(ref,off::kFormId);
-            if(g_sweepCount<64&&std::find(g_sweepIds,g_sweepIds+g_sweepCount,id)==g_sweepIds+g_sweepCount)
+            if(g_sweepCount<kMaxVehicles&&std::find(g_sweepIds,g_sweepIds+g_sweepCount,id)==g_sweepIds+g_sweepCount)
                 g_sweepIds[g_sweepCount++]=id;
 		}
 
@@ -211,7 +216,18 @@ namespace world
         void Write(const Snapshot& s)
 		{
             std::lock_guard lk(g_pubLock);
-            g_pub=s;
+            g_pub.frame=s.frame;g_pub.count=s.count;
+            std::copy(s.v,s.v+s.count,g_pub.v);  // only the listed vehicles (the array holds kMaxVehicles)
+		}
+		// The frame budget for re-reading idle vehicles' 3D and bodies (settings.ini [world] sampleBudgetMs, read every 5 s).
+		double SampleBudgetMs(ULONGLONG now)
+		{
+			static double ms=0.5;(void)now;
+			static fvopaths::Watch watch;  // re-read only when settings.ini changed
+			if(!watch.Changed(fvopaths::Settings()))return ms;
+			wchar_t text[32]{};GetPrivateProfileStringW(L"world",L"sampleBudgetMs",L"0.5",text,32,fvopaths::Settings().c_str());
+			const double v=_wtof(text);ms=std::isfinite(v)&&v>=0&&v<=20?v:0.5;
+			return ms;
 		}
 	}
 
@@ -243,22 +259,47 @@ namespace world
         // Player control must not wait for the first incremental city sweep.
         const auto remember=[&](std::uint32_t id){
             if(!id||std::find(g_ids,g_ids+g_idCount,id)!=g_ids+g_idCount)return;
-            if(g_idCount<64)g_ids[g_idCount++]=id;else g_ids[63]=id;
+            if(g_idCount<kMaxVehicles)g_ids[g_idCount++]=id;else g_ids[kMaxVehicles-1]=id;
         };
         remember(g_services.owned());
         if(driven)remember(At<std::uint32_t>(driven,off::kFormId));
         double sceneMs=0,massMs=0,driverMs=0,slowMs=0;std::uint32_t slowId=0;
         const auto milliseconds=[&](LARGE_INTEGER a,LARGE_INTEGER b){return 1000.0*double(b.QuadPart-a.QuadPart)/freq.QuadPart;};
+		// Cost-based sampling (2026-10-29, the user: "base it on the resource req of each"): every listed vehicle's position, velocity
+		// and occupants are read every frame (cheap). Its 3D rotation, scale and body ids (the scene walk) are re-read every frame
+		// when it is driven, in use, moving, new, or its 3D root changed (stale body ids broke the chassis binding before); an idle
+		// vehicle is re-read when its own measured cost still fits this frame's budget, oldest first (at least one a frame), and
+		// otherwise keeps its last reading, which holds while its 3D root is unchanged.
+		struct Order { std::uint32_t id; uptr r, root; bool required; ULONGLONG age; };
+		static std::vector<Order> order;
+		order.clear();
 		for (std::uint32_t i = 0; i < g_idCount; ++i) {
-			LARGE_INTEGER vehicleStart{},partStart{},partEnd{};QueryPerformanceCounter(&vehicleStart);
 			const std::uint32_t id = g_ids[i];
 			const uptr r = Lookup(id);
-			if (!r || (At<std::uint32_t>(r, 0x20) & 0x800) || !At<uptr>(r, off::kRefParentCell)) continue;
+			if (!r || (At<std::uint32_t>(r, 0x20) & 0x800) || !At<uptr>(r, off::kRefParentCell) || !At<uptr>(r, 0x98)) continue;
+			const auto c = g_cache.find(id);
+			const auto t = g_track.find(id);
+			const bool moving = t != g_track.end() && t->second.have && std::hypot(t->second.vel[0], t->second.vel[1]) > 0.3f;
+			const uptr root = Root(r);
+			const bool required = r == driven || id == g_services.owned() || g_services.inUse(id) || moving || c == g_cache.end() ||
+				!c->second.have || c->second.root != root;
+			order.push_back({ id, r, root, required, c == g_cache.end() ? 0 : c->second.sampledAt });
+		}
+		std::stable_partition(order.begin(), order.end(), [](const Order& o) { return o.required; });
+		const auto idle = std::find_if(order.begin(), order.end(), [](const Order& o) { return !o.required; });
+		std::stable_sort(idle, order.end(), [](const Order& a, const Order& b) { return a.age < b.age; });
+		double budget = SampleBudgetMs(now);
+		std::uint32_t fullIdle = 0, keptIdle = 0;
+		for (const auto& o : order) {
+			LARGE_INTEGER vehicleStart{},partStart{},partEnd{};QueryPerformanceCounter(&vehicleStart);
+			const std::uint32_t id = o.id;
+			const uptr r = o.r;
 			const uptr base = At<uptr>(r, 0x98);
-			if (!base) continue;
 			VehicleInfo& v = s.v[s.count];
 			Cached& cache = g_cache[id];
 			const bool usedNow = r == driven || id == g_services.owned() || g_services.inUse(id);
+			const bool full = o.required || fullIdle == 0 || cache.costMs <= budget;
+			if (!o.required) { if (full) ++fullIdle; else ++keptIdle; }
 			v = VehicleInfo{};
 			v.formId = id;
 			v.baseId = At<std::uint32_t>(base, off::kFormId);
@@ -274,12 +315,21 @@ namespace world
 			std::uint32_t body = 0;
 			QueryPerformanceCounter(&partStart);
 			uptr root = 0;
-			bool sceneOk = SceneLive(r, root, sceneRot, radius, sceneScale);
+			bool sceneOk = false;
+			if (!full) {
+				// Idle and over budget this frame: the last full sample's 3D reading (same 3D root, so the same bodies).
+				std::memcpy(v.rot, cache.info.rot, sizeof(v.rot));
+				std::memcpy(v.half, cache.info.half, sizeof(v.half));
+				std::memcpy(v.bodyIds, cache.info.bodyIds, sizeof(v.bodyIds));
+				v.bodyCount = cache.info.bodyCount; v.bodyId = cache.info.bodyId;
+				sceneScale = cache.scale;
+			}
+			else sceneOk = SceneLive(r, root, sceneRot, radius, sceneScale);
+			if (full) { cache.root = o.root; cache.scale = sceneOk ? sceneScale : 1.0f; cache.sampledAt = now; }
 			if (sceneOk) {
 				// The body walk runs on every full sample: body ids can change under the same 3D root (a new physics
 				// generation) and stale ids break the chassis binding. Parked vehicles only take a full sample once a second.
 				SceneBodiesOf(root, v.bodyIds, v.bodyCount);
-				cache.root = root;
 				body = v.bodyCount ? v.bodyIds[0] : 0;
 			}
 			if (sceneOk) {
@@ -292,6 +342,11 @@ namespace world
 				}
 			}
 			QueryPerformanceCounter(&partEnd);sceneMs+=milliseconds(partStart,partEnd);
+			if (full) {
+				const double cost = milliseconds(partStart, partEnd);
+				cache.costMs += float((cost - cache.costMs) * 0.25);  // this vehicle's resource need, smoothed
+				budget -= cost;
+			}
 			for(int axis=0;axis<3;++axis){v.center[axis]=v.pos[axis];for(int local=0;local<3;++local)v.center[axis]+=v.rot[local*3+axis]*localCentre[local]*sceneScale;}
             // Velocity: smoothed position difference (a jump over 50 m restarts it).
 			Track& t = g_track[id];
@@ -356,10 +411,21 @@ namespace world
             if(vehicleMs>slowMs){slowMs=vehicleMs;slowId=id;}
 			cache.info = v;
 			cache.have = true;
-			if (++s.count >= 64) break;
+			if (++s.count >= kMaxVehicles) break;
 		}
-		if (g_track.size() > 256) g_track.clear();
-		if (g_cache.size() > 256) g_cache.clear();
+		if (g_track.size() > 2 * kMaxVehicles) g_track.clear();
+		if (g_cache.size() > 2 * kMaxVehicles) g_cache.clear();
+		{
+			static ULONGLONG reportAt = 0;
+			static std::uint64_t frames = 0, idleFull = 0, idleKept = 0;
+			++frames; idleFull += fullIdle; idleKept += keptIdle;
+			if (!reportAt) reportAt = now;
+			if (now - reportAt >= 60000) {
+				logger::Write("Vehicle world (every 60 s): %u vehicles listed now (capacity %u); idle 3D re-reads %.1f a frame, %.1f kept from earlier a frame (budget %.2f ms)",
+					s.count, kMaxVehicles, double(idleFull) / double(frames), double(idleKept) / double(frames), SampleBudgetMs(now));
+				reportAt = now; frames = idleFull = idleKept = 0;
+			}
+		}
 		Write(s);
         LARGE_INTEGER finished{};QueryPerformanceCounter(&finished);
         const double scanMs=1000.0*double(scanEnd.QuadPart-scanStart.QuadPart)/scanFrequency.QuadPart;
@@ -385,7 +451,8 @@ namespace world
 	bool Vehicles(Snapshot& out)
 	{
         std::lock_guard lk(g_pubLock);
-        out=g_pub;
+        out.frame=g_pub.frame;out.count=g_pub.count;
+        std::copy(g_pub.v,g_pub.v+g_pub.count,out.v);  // only the listed vehicles
         return out.frame!=0;
 	}
 

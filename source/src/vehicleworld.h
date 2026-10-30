@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include "vehiclelinks.h"
+#include "fvolimits.h"
 
 // The world layer's vehicle list (notes/VEHICLE_ARCHITECTURE_PROPOSAL_20261017.md; header agreed with the flight
 // session 2026-10-17): every keyword-gated vehicle in the attached cells, published once per frame on the main thread
@@ -31,17 +32,21 @@ namespace world
 		std::uint32_t bodyId = 0;
 		std::uint32_t bodyCount=0,bodyIds[16]={}; // owned scene bodies; native vehicle callback identifies its chassis
 	};
+	// Capacity, not a policy (2026-10-29, the user: "raise the limit"; "base it on the resource req of each"): every loaded vehicle up
+	// to this many is listed; how often each one's 3D and bodies are re-read is decided per vehicle by its measured cost against a
+	// frame budget (vehicleworld.cpp Publish, settings.ini [world] sampleBudgetMs).
+	constexpr std::uint32_t kMaxVehicles = fvolimits::kVehicles;
 	struct Snapshot
 	{
 		std::uint64_t frame = 0;
 		std::uint32_t count = 0;
-		VehicleInfo v[64];
+		VehicleInfo v[kMaxVehicles];
 	};
 
 	// Main thread, once per frame (before vehicleflight::Tick).
 	void Publish();
     // Bounded scene ownership for a known reference, independent of the
-    // general 64-vehicle snapshot capacity. Main-thread only.
+    // general snapshot capacity. Main-thread only.
     unsigned SceneBodies(std::uintptr_t ref,std::uint32_t (&ids)[16]);
 	// A save load: forget everything.
 	void Reset();

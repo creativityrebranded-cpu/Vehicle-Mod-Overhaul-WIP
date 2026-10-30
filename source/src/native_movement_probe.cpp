@@ -122,12 +122,12 @@ namespace native_movement_probe
 		g_at = now;
 		if (!Verify()) return;
 		const uptr player = *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr);
-		world::Snapshot snap;
+		static thread_local world::Snapshot snap;
 		if (!player || !world::Vehicles(snap)) return;
 		const auto pp = *reinterpret_cast<const game::Vec3*>(player + off::kRefPosition);
 		auto dist = [&](const world::VehicleInfo& v) { return float(std::hypot(v.pos[0] - pp.x, v.pos[1] - pp.y)); };
 		std::vector<const world::VehicleInfo*> others;
-		for (std::uint32_t i = 0; i < snap.count && i < 64; ++i) {
+		for (std::uint32_t i = 0; i < snap.count && i < world::kMaxVehicles; ++i) {
 			const auto& v = snap.v[i];
 			if (!v.formId) continue;
 			if (v.who == world::VehicleInfo::Who::Player) Probe(v, "player vehicle", dist(v));

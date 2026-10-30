@@ -12,7 +12,8 @@ DLL = 'SFSE/Plugins/FlyingVehicleOverhaul.dll'
 PILOTS = 'FVO_NPCPilots.esm'
 PATCH = 'FVO_ParkedVehiclesPatch.esm'
 CITY = 'FVO_CityPlacements.esm'
-CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'
+CITY_DLL = 'SFSE/Plugins/FVO_Traffic.dll'  # FVO Traffic (was FVO_CityPlacements.dll before 2026-10-29)
+OLD_CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'  # never install both
 CITY_TRAFFIC = 'SFSE/Plugins/FVO_Traffic/NewAtlantis.ini'
 ROUTE_GUIDE = 'SFSE/Plugins/FVO_Traffic/HOW-TO-MAKE-ROUTES.txt'
 TRAFFIC_DIR = 'SFSE/Plugins/FVO_Traffic/'
@@ -58,7 +59,7 @@ def route_description(label, description, data):
     exits, places = text.count('[exit.'), text.count('[place.')
     return f'A traffic loop over {label} with {exits} exit(s) and {places} landing place(s).'
 # Superseded experimental city content must not overlap current placements.
-RETIRED = ('FVO_CityTraffic.esm',)
+RETIRED = ('FVO_CityTraffic.esm', OLD_CITY_DLL)
 # The base game is implicit in the Starfield install context. Managers need not
 # include its always-loaded master in their reported optional-plugin lists.
 IMPLICIT_MASTERS = {'starfield.esm'}
@@ -293,6 +294,9 @@ def write_zip(path, entries):
         for name, data in sorted(entries.items()):
             if PurePosixPath(name).is_absolute() or '..' in PurePosixPath(name).parts or '\\' in name:
                 raise ValueError('Unsafe archive path: '+name)
+            # 2026-10-29: the 0.8.6 Parked Vehicles Patch zip carried the whole FOMOD zip inside it and was quarantined on Nexus.
+            if name.lower().endswith(('.zip', '.7z', '.rar')):
+                raise ValueError('An archive inside a download: '+name)
             archive.writestr(name, data)
     with zipfile.ZipFile(temp) as archive:
         if archive.testzip() is not None:
@@ -319,7 +323,7 @@ def build(data_dir, source_dir, sfse_dir, output, version, schema=None, test_res
     if not requested or not binary_version or normalize(requested.group())!=normalize(binary_version.group(1).decode()):
         raise ValueError('Package version does not match the built DLL startup version; rebuild the correct source')
     if inputs[CITY_DLL][:2] != b'MZ':
-        raise ValueError('Expected the matching City Placements addon DLL')
+        raise ValueError('Expected the matching FVO Traffic addon DLL')
     features = feature_definitions(source_dir)
     dependencies = {name: masters(inputs[name]) for name in (PILOTS, PATCH, CITY)}
     if dependencies[PILOTS] != ['Starfield.esm']:
@@ -340,7 +344,7 @@ def build(data_dir, source_dir, sfse_dir, output, version, schema=None, test_res
 Use Vortex or Mod Organizer 2 to install the FOMOD ZIP and follow its installer.
 Core always installs: FlyingVehicleOverhaul.dll, FVO_NPCPilots.esm and this guide.
 Optional addons (City Traffic and City Placements are ticked by default):
-- City Traffic: SFSE/Plugins/FVO_CityPlacements.dll and route files in
+- City Traffic: SFSE/Plugins/FVO_Traffic.dll and route files in
   SFSE/Plugins/FVO_Traffic, chosen city by city: New Atlantis (ring and district
   loop), Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead,
   Paradiso and Red Mile. HOW-TO-MAKE-ROUTES.txt explains writing your own; every
@@ -349,6 +353,7 @@ Optional addons (City Traffic and City Placements are ticked by default):
 - City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities.
   Requires: {', '.join(dependencies[CITY])}. Enable it after its masters.
 Remove the old FVO_CityTraffic.esm and FlyingVehicleOverhaul - Placements.esm if present.
+Remove SFSE/Plugins/FVO_CityPlacements.dll if present: FVO_Traffic.dll replaces it (never both).
 Optional, unchecked: FVO_ParkedVehiclesPatch.esm converts Parked Vehicles'
 pack-in props into usable REV-8, Moon Jumper and Deimog vehicles, including its
 procedural placements. Duplicate decorative wheels and turrets are disabled.

@@ -46,6 +46,22 @@ int main() {
     int checks=0,failed=0;
     auto check=[&](bool ok,const char* name) { ++checks; if(!ok) { ++failed; std::printf("FAIL %s\n",name); } };
     using namespace boardinggate;
+    {
+        PassengerAttempt request{1000, false};
+        check(request.Step(1100,false,false,false)==PassengerAction::Wait,"tap lets native Activate run first");
+        check(request.Step(1150,false,false,true)==PassengerAction::Wait,"existing boarding animation is not duplicated");
+        check(request.Step(1500,false,false,false)==PassengerAction::Wait,"an observed native transition is never restarted");
+        check(request.Step(1800,true,false,false)==PassengerAction::Complete,"asynchronous seat completion succeeds");
+        request={2000,false};
+        check(request.Step(2150,false,false,false)==PassengerAction::Start,"custom tap starts native boarding when Activate did not");
+        check(request.Step(2300,false,false,false)==PassengerAction::Wait,"only one native request per tap");
+        check(request.Step(12000,false,false,false)==PassengerAction::Cancel,"uncompleted request times out");
+        request={3000,false};
+        check(request.Step(3150,false,true,false)==PassengerAction::Cancel,"lost or wrecked target cancels without entry");
+        check(PassengerKeyword(vehicle,false,vehicle,0xabc,0,0)==0xabc,"camera facing loss retains requested passenger seat");
+        check(PassengerKeyword(vehicle+1,false,vehicle,0xabc,vehicle+1,0xdef)==0xdef,"request cannot leak to another vehicle");
+        check(PassengerKeyword(vehicle,true,vehicle,0xabc,vehicle,0xabc)==0,"take-wheel explicitly overrides passenger request");
+    }
     check(BeforeEntry(true,true,true,false,false)==Refusal::Reserved,"NPC-reserved empty vehicle refuses before animation");
     check(BeforeEntry(true,true,false,true,false)==Refusal::Occupied,"occupied vehicle leaves native driver entry to passenger/take-wheel flow");
     check(BeforeEntry(true,true,false,false,true)==Refusal::Wrecked,"wrecked vehicle refuses before animation");

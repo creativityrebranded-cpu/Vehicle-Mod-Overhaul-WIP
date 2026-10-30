@@ -51,11 +51,15 @@ namespace navseed
 		bool g_inPass = false;
 		std::size_t g_pos = 0;
 		ULONGLONG g_passAt = 0, g_logAt = 0;
+		std::uint32_t g_completed = 0;
 		double g_cx = 0, g_cy = 0;
 		unsigned g_objects = 0, g_looked = 0, g_tooBig = 0;
 		std::unordered_set<std::uint32_t> g_vehicles;
 		struct Solid { std::uint32_t id = 0; std::int8_t solid = -1; };
 		std::unordered_map<uptr, Solid> g_solid;  // per reference: has a physics body (checked once)
+		// Named solid by the physics world's own box query (cellbake, 2026-10-29): the scene-graph body test below found no body on
+		// any of 11 999 references in New Atlantis (12:23 run, "0 solid objects"), so the physics world's answer decides first.
+		std::unordered_set<std::uint32_t> g_physSolid;
 
 		uptr VCall(uptr obj, std::uint32_t slot) { return reinterpret_cast<uptr (*)(uptr)>((*reinterpret_cast<void***>(obj))[slot / 8])(obj); }
 
@@ -79,14 +83,16 @@ namespace navseed
 			return false;
 		}
 
-		// Guarded: -1 fault / not loaded, 0 no body, 1 solid. Also the root's world bound sphere.
-		int ReadSolid(uptr ref, float* sphere)
+		// Guarded: -1 fault / not loaded, 0 no body, 1 solid. Also the root's world bound sphere. `known`: the physics world named it
+		// solid (only the sphere is read).
+		int ReadSolid(uptr ref, float* sphere, bool known = false)
 		{
 			__try {
 				const uptr loaded = At<uptr>(ref, off::kRefLoadedData);
 				const uptr root = loaded ? At<uptr>(loaded, off::kLoadedData3D) : 0;
 				if (!root) return -1;
 				for (int i = 0; i < 4; ++i) sphere[i] = At<float>(root, kWorldBound + 4 * i);
+				if (known) return 1;
 				int budget = 400;
 				return HasBody(root, 0, budget) ? 1 : 0;
 			}
@@ -109,7 +115,11 @@ namespace navseed
 			if (!base) return false;
 			float sphere[4] = {};
 			auto& sc = g_solid[r];
-			if (sc.id != id || sc.solid < 0) {
+			if (g_physSolid.count(id)) {
+				if (ReadSolid(r, sphere, true) < 0) return false;
+				sc.id = id; sc.solid = 1;
+			}
+			else if (sc.id != id || sc.solid < 0) {
 				const int v = ReadSolid(r, sphere);
 				sc.id = id;
 				sc.solid = std::int8_t(v);
@@ -186,6 +196,7 @@ namespace navseed
 		if (!g_inPass || g_pos >= g_ids.size()) {
 			if (g_inPass) {
 				navmap::NoteSeeded(g_cx, g_cy, kRadius);  // the pass is complete: the area is known
+				++g_completed;
 				if (now - g_logAt >= (logger::Verbose() ? 10000ull : 600000ull) || !g_logAt) {
 					g_logAt = now;
 					logger::Write("Nav seed: %u solid objects from %u references within %.0f m (%u too big for a box)", g_objects, g_looked, kRadius, g_tooBig);
@@ -205,7 +216,7 @@ namespace navseed
 			g_vehicles.clear();
 			static world::Snapshot snap;
 			if (world::Vehicles(snap)) {
-				for (std::uint32_t i = 0; i < snap.count && i < 64; ++i) g_vehicles.insert(snap.v[i].formId);
+				for (std::uint32_t i = 0; i < snap.count && i < world::kMaxVehicles; ++i) g_vehicles.insert(snap.v[i].formId);
 			}
 			if (g_solid.size() > 30000) g_solid.clear();
 		}
@@ -219,8 +230,17 @@ namespace navseed
 		}
 	}
 
+	std::uint32_t CompletedPasses() { return g_completed; }
+	void MarkSolid(const std::uint32_t* ids, std::size_t n)
+	{
+		for (std::size_t i = 0; i < n; ++i) g_physSolid.insert(ids[i]);
+		if (g_physSolid.size() > 200000) g_physSolid.clear();  // a long session over many worlds: start over
+	}
+
 	void Reset()
 	{
+		g_physSolid.clear();
+		g_completed = 0;
 		g_inPass = false;
 		g_pos = 0;
 		g_passAt = 0;

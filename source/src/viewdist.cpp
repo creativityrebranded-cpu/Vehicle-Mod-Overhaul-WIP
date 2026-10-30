@@ -1,6 +1,7 @@
 #include "viewdist.h"
 #include "game.h"
-#include "log.h"
+#include "log.h"
+
 #include "fvopaths.h"
 
 #include <Windows.h>
@@ -61,12 +62,11 @@ namespace viewdist
 	void Tick()
 	{
 		const ULONGLONG now = GetTickCount64();
-		if (!g_readAt || now - g_readAt >= 5000) {
+		static fvopaths::Watch watch;  // re-read only when settings.ini changed (2026-10-29 audit)
+		if (watch.Changed(fvopaths::Settings())) {
 			g_readAt = now;
-			PWSTR docs = nullptr;
-			if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
+			{
 				const std::wstring ini = fvopaths::Settings();
-				CoTaskMemFree(docs);
 				const float o = ReadFloat(ini, L"objectFade", kDefaultObjects), a = ReadFloat(ini, L"actorFade", 1.0f);
 				if (o != g_wantObjects || a != g_wantActors) {
 					logger::Write("View distance: objects x%.2f, actors x%.2f (settings.ini [view])", o, a);

@@ -298,6 +298,7 @@ namespace autodrive
 		const Other* others, int count, std::uint32_t ignoreYield, bool drive, double halfWidth = 1.25, double halfLength = 2.3)
 	{
 		Traffic t;
+		(void)ignoreYield; // retained for source compatibility; timeout never cancels collision safety
 		const double ux = std::sin(heading), uy = std::cos(heading);
 		const double v = std::max(speed, 3.0), svx = ux * v, svy = uy * v;
 		for (int i = 0; i < count; ++i) {
@@ -305,7 +306,9 @@ namespace autodrive
 			if (o.id == self) continue;
 			const double dx = o.x - x, dy = o.y - y;
 			const double d = std::hypot(dx, dy);
-			if (d > 50.0 || std::fabs(o.z - z) > (drive ? 4.0 : 6.0)) continue;
+			const double otherSpeed=std::hypot(o.vx,o.vy);
+            const double sensing=std::max(50.0,(v+otherSpeed)*3.0+radius+o.radius);
+            if (d > sensing || std::fabs(o.z - z) > (drive ? 4.0 : 6.0)) continue;
 			const double R = 0.8 * (radius + o.radius) + 1.0;
 			const bool stopped = std::hypot(o.vx, o.vy) < 0.6;
 			if (stopped) {
@@ -322,9 +325,11 @@ namespace autodrive
 			const double miss = std::hypot(dx + wx * tc, dy + wy * tc);
 			if (miss >= R) continue;
 			t.cost += 2.0 * (1.0 - tc / 4.0) + 0.5;
-			const bool theyGo = o.priority > priority || (o.priority == priority && o.id < self);
+			(void)priority; // collision safety applies to both priorities
 			const bool ahead = dx * ux + dy * uy > 0;
-			if (theyGo && ahead && tc < 3.0 && o.id != ignoreYield) {
+			// Right of way may choose who waits; it never permits either hull to
+            // continue into an imminent collision, even after a yield timeout.
+            if (ahead && tc < 3.0) {
 				const double cap = std::sqrt(2.0 * 5.0 * std::max(0.0, d - R));
 				if (cap < t.cap) { t.cap = cap; t.yieldTo = o.id; }
 			}
@@ -357,6 +362,10 @@ namespace autodrive
 		// Only wheels sit on the ground and need room to swing round; the hover turns on the spot.
 		bool onWheels = true;
 		bool contact = false;           // a side contact this frame
+		// Far from the player (2026-10-29 performance pass: 600 m and beyond): a hovering vehicle flies straight at its goal with no
+		// route search or heading fan (too far away to see); the full decision comes back on the first step without it.
+		bool straight = false;
+        bool strictTraffic = false; // ambient traffic never overrides a proven physical stop to force progress
 		std::uint32_t self = 0;
 		int priority = 60;
 		const Other* others = nullptr;
@@ -415,7 +424,7 @@ namespace autodrive
 			const bool insideBox = map(in.x, in.y, in.z).object;
 			auto view = [&](double x, double y, double z) {
 				Cell c = map(x, y, z);
-				if (c.object && insideBox && std::hypot(x - in.x, y - in.y) < 25.0) c.objectSoft = true;
+				if (!in.strictTraffic && c.object && insideBox && std::hypot(x - in.x, y - in.y) < 25.0) c.objectSoft = true;
 				for (const auto& b : bumps_) {
 					if (in.now < b.until && std::hypot(x - b.x, y - b.y) < 2.2) { c.object = true; c.known = true; break; }
 				}
@@ -449,7 +458,7 @@ namespace autodrive
 			out.mode = mode_;
 
 			const double top = std::min(mode_ == Mode::Drive ? in.limits.driveTop : in.limits.hoverTop, in.speedLimit > 0 ? in.speedLimit : 1e9);
-			out.climb = climb_;
+			out.climb = in.strictTraffic?std::min(climb_,std::max(0.0,in.ceiling-2)):climb_;
 			out.escapeLevel = level_;
 
 			if (arrived_ && !follow) {
@@ -471,19 +480,29 @@ namespace autodrive
 				commanded_ = 0;
 				return out;
 			}
+            auto escapeCap=[&](double bearing,double speed){
+                if(!in.strictTraffic)return speed;
+                const auto path=EvalPath(view,in.x,in.y,in.z,groundUnder,bearing,8.0,in.shape,in.limits,mode_,speed);
+                const auto traffic=TrafficFor(in.x,in.y,in.z,bearing,speed,Radius(in.shape),in.self,in.priority,in.others,in.otherCount,0,mode_==Mode::Drive,in.shape.halfWidth,in.shape.halfLength);
+                double free=std::min(path.free,traffic.free);
+                if(path.v==Verdict::Blocked||traffic.free<8.0)speed=std::min(speed,std::sqrt(2*in.limits.brake*std::max(0.0,free-in.shape.halfLength-1)));
+                return std::min(speed,traffic.cap);
+            };
 			if (in.now < turnUntil_) {
 				out.phase = Phase::Turn;
 				out.bearing = turnBearing_;
-				out.speed = 2.0;
+				out.speed=escapeCap(turnBearing_,2.0);
+                if(in.strictTraffic)out.brake=sp>out.speed;
 				out.why = "turning out";
-				commanded_ = 2.0;
+				commanded_ = out.speed;
 				return out;
 			}
 			if (in.now < reverseUntil_) {
 				out.phase = Phase::Reverse;
 				out.reverse = true;
 				out.bearing = reverseBearing_;
-				out.speed = 3.0;
+				out.speed=escapeCap(Wrap(in.heading+kPi),3.0);
+                if(in.strictTraffic)out.brake=sp>out.speed;
 				out.why = "backing out";
 				commanded_ = 3.0;
 				return out;
@@ -491,7 +510,7 @@ namespace autodrive
 
 			// ---- The coarse route (driving, goal over 16 m away): the fan aims at a point along it, not straight at the goal ----
 			double aim = toGoal;
-			if (mode_ == Mode::Drive && dist > 16.0) {
+			if (mode_ == Mode::Drive && dist > 16.0 && !in.straight) {
 				if ((in.now - route_.planAt > 1.5 || std::hypot(in.gx - route_.goalX, in.gy - route_.goalY) > 8.0) && in.now - LastRouteSearch() >= 0.03) {
 					LastRouteSearch() = in.now;
 					route_.planAt = in.now;
@@ -533,7 +552,22 @@ namespace autodrive
 			// ---- Heading: the cheapest usable direction in a fan round the aim (10 Hz, held otherwise) ----
 			const double range = std::clamp(std::max(sp, 4.0) * 2.5 + 10.0, 20.0, 60.0);
 			const double needFree = std::max(6.0, sp * sp / (2.0 * in.limits.brake) + in.shape.halfLength + 2.0);
-			if (in.now >= decideAt_ || !haveChoice_) {
+			const bool straight = in.straight && mode_ == Mode::Hover;
+			if (straight) {
+				decideAt_ = 0;  // the fan decides again on the first step without it
+				usable_ = blocked_ = 0; whyN_ = 0; boxed_ = creep_ = false; boxedSince_ = boxedSince0_ = 0;
+				chosen_ = aim; haveChoice_ = true;
+				// The one heading is still judged (map and traffic): the speed caps hold, and a path not clear tells the caller to go
+				// back to the full decision.
+				PathInfo p = EvalPath(view, in.x, in.y, in.z, groundUnder, aim, std::clamp(dist - in.stop + in.shape.halfLength, 4.0, range), in.shape, in.limits, mode_, sp);
+				const Traffic t = TrafficFor(in.x, in.y, in.z, aim, std::max(sp, 4.0), Radius(in.shape), in.self, in.priority, in.others, in.otherCount,
+					in.now < passUntil_ ? passId_ : 0, false, in.shape.halfWidth, in.shape.halfLength);
+				if (t.free < p.free) { p.free = t.free; p.v = Verdict::Blocked; p.why = "stopped vehicle"; }
+				if (p.v == Verdict::Blocked) ++blocked_; else ++usable_;
+				chosenPath_ = p;
+				chosenTraffic_ = t;
+			}
+			else if (in.now >= decideAt_ || !haveChoice_) {
 				decideAt_ = in.now + 0.1;
 				static constexpr double kOffsets[] = { 0, 15, -15, 30, -30, 45, -45, 60, -60, 80, -80, 100, -100, 125, -125, 150, -150, 180 };
 				double bestCost = 1e18, keptCost = 1e18, bestFree = -1, widest = aim;
@@ -588,7 +622,7 @@ namespace autodrive
 				// open than any heading; otherwise ease toward the most open heading rather than freeze.
 				const bool airAllowed = in.permit != Permit::DriveOnly && in.hoverPossible;
 				upWins_ = boxed_ && airAllowed && in.ceiling > std::max(4.0, creepFree_);
-				creep_ = boxed_ && !upWins_ && in.now - boxedSince0_ > 1.0 && creepFree_ > -1 &&
+				creep_ = boxed_ && !upWins_ && in.now - boxedSince0_ > 1.0 && (in.strictTraffic?creepFree_>in.shape.halfLength+2.5:creepFree_>-1) &&
 					(creepFree_ > in.shape.halfLength + 1.0 || in.now - lastContact_ > 2.0);
 				if (creep_) {
 					boxed_ = false;
@@ -642,7 +676,7 @@ namespace autodrive
 			}
 			out.bearing = chosen_;
 			out.path = chosenPath_;
-			out.climb = climb_;
+			out.climb = in.strictTraffic?std::min(climb_,std::max(0.0,in.ceiling-2)):climb_;
 			out.usable = usable_;
 			{
 				int best = -1;
@@ -669,7 +703,7 @@ namespace autodrive
 			if (p.v == Verdict::Blocked || p.v == Verdict::Caution) {
 				const double room = std::max(0.0, p.free - in.shape.halfLength - 1.0);
 				cap = std::min(cap, std::sqrt(2.0 * in.limits.brake * 0.5 * room));
-				if (p.v == Verdict::Caution) cap = std::max(cap, 3.0);
+				if (p.v == Verdict::Caution && !in.strictTraffic) cap = std::max(cap, 3.0);
 			}
 			else if (p.v == Verdict::Unknown) cap = std::min(cap, mode_ == Mode::Drive ? in.limits.unknownDrive : in.limits.unknownHover);
 			if (route_.ok && mode_ == Mode::Drive) cap = std::min(cap, std::max(routeCap_, 4.0));
@@ -679,13 +713,12 @@ namespace autodrive
 			// Yield to a moving vehicle with right of way, at most 3 s, then pass it.
 			if (chosenTraffic_.yieldTo && chosenTraffic_.cap < cap) {
 				if (chosenTraffic_.yieldTo != yieldId_) { yieldId_ = chosenTraffic_.yieldTo; yieldSince_ = in.now; }
-				if (in.now - yieldSince_ > 3.0) { passId_ = yieldId_; passUntil_ = in.now + 5.0; }
-				else { cap = chosenTraffic_.cap; out.phase = Phase::Yield; out.yieldTo = yieldId_; }
+					cap = chosenTraffic_.cap; out.phase = Phase::Yield; out.yieldTo = yieldId_;
 			}
 			else yieldId_ = 0;
 			double speed = std::min(want, cap);
 			const bool movingOn = !(arrived_ && follow && want < 0.5);
-			if (movingOn && out.phase != Phase::Yield && out.phase != Phase::Boxed && speed < 1.5 && dist > in.stop + 1.0) speed = 1.5;
+			if (movingOn && out.phase != Phase::Yield && out.phase != Phase::Boxed && speed < 1.5 && dist > in.stop + 1.0) speed = in.strictTraffic?std::min(1.5,cap):1.5;
 			if (out.phase == Phase::Boxed && mode_ == Mode::Hover) speed = 0.0;  // climb in place, then go on
 			if (creep_) speed = std::min(speed, 2.0);
 			out.speed = std::max(0.0, speed);
@@ -880,10 +913,10 @@ namespace autodrive
 				const double free = std::min(p.v == Verdict::Blocked ? p.free : 12.0, t.free) - 0.2 * std::fabs(deg) / 30.0;
 				if (free > bestFree) { bestFree = free; bestH = h; }
 			}
-			if (mode_ == Mode::Hover || !in.onWheels) {
+				if (mode_ == Mode::Hover || !in.onWheels) {
 				// A hover turns to an open heading. Negative thrust while turning
 				// toward the escape would instead carry it away from that escape.
-				if (bestFree >= 3.0 || in.now - lastContact_ > 1.0 || waits_ >= 2) {
+				if ((in.strictTraffic?bestFree>=std::max(3.0,in.shape.halfLength+1.0):(bestFree>=3.0||in.now-lastContact_>1.0||waits_>=2))) {
 					turnUntil_ = in.now + 2.5; turnBearing_ = bestH; waits_ = 0;
 				}
 				else { waitUntil_ = in.now + 1.5; ++waits_; }
@@ -902,7 +935,7 @@ namespace autodrive
 				waits_ = 0;
 				return;
 			}
-			if (bestFree >= 3.0 || in.now - lastContact_ > 1.0 || waits_ >= 2) { turnUntil_ = in.now + 2.5; turnBearing_ = bestH; waits_ = 0; }
+			if ((in.strictTraffic?bestFree>=std::max(3.0,in.shape.halfLength+1.0):(bestFree>=3.0||in.now-lastContact_>1.0||waits_>=2))) { turnUntil_ = in.now + 2.5; turnBearing_ = bestH; waits_ = 0; }
 			else { waitUntil_ = in.now + 1.5; ++waits_; }
 		}
 		void Watch(const Input& in, double sp, bool pause, Output& out)

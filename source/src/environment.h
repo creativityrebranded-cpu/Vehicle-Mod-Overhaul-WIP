@@ -4,6 +4,12 @@ namespace environment {
 enum class Verdict { Pending, Safe, Unsafe };
 struct Site {Verdict verdict=Verdict::Pending;double ground=0,x=0,y=0,z=0;bool supported=false;const char* reason="Checking ground";};
 Site CheckSite(std::uint32_t vehicle,double x,double y,double z,double yaw);
+// Before creation: validate dry support and headroom using the base's bounds.
+Site SpawnSite(std::uint32_t base,double x,double y,double z,double yaw);
+Site AirSite(std::uint32_t base,double x,double y,double z,double yaw);
+// The same envelope against the nav map and baked terrain only (no rays, so a vehicle standing there never hits itself).
+// Pending while nothing is mapped there yet.
+Site MappedSite(std::uint32_t base,double x,double y,double z,double yaw);
 Site BoardingSite(std::uintptr_t vehicle);
 // Entry only: Safe once the vehicle is at rest on or just above the ground (BoardingSite is for exits and drop-offs).
 Site EntrySite(std::uintptr_t vehicle);
@@ -19,6 +25,8 @@ Surface SurfaceAhead(std::uint32_t self,double x,double y,double z,double bearin
 // cached 30 s; ask again each frame until it comes (an unasked query is dropped after 2 s). Ground planner sensing (groundnav).
 struct Ground {bool hit=false,water=false;double z=0,nz=1;bool normalOk=false;};
 bool GroundAt(std::uint32_t self,double x,double y,double top,double bottom,Ground& out);
+// One ray from -> to (terrain, statics, water; the layers of GroundAt), main thread: false while pending, ask again each frame.
+bool RayHit(const float from[3],const float to[3],double&x,double&y,double&z,bool&hit);
 unsigned Pending(); // queries waiting for a ray slot (the ground sensing keeps its asks below a share of the queue)
 void Tick();void Reset();
 }

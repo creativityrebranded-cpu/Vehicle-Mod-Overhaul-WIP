@@ -6,6 +6,7 @@
 #include "log.h"
 #include "telemetry.h"
 
+#include <vector>
 #include <Windows.h>
 
 #include <algorithm>
@@ -47,39 +48,44 @@ namespace prefetch
 			float x = 0, y = 0, z = 0, above = 0, length = 0;
 			bool haveResult = false;
 			float ground = -3.4e38f;
-			unsigned age = 0;
+			unsigned resultTick = 0;  // g_probeTick when the result arrived (age = g_probeTick - resultTick)
 			std::uint32_t mask = 0;  // 0: kGroundLayers
 		};
 		std::mutex g_probeLock;
 		std::atomic<std::uintptr_t> g_probeAnchor{ 0 };
 		std::atomic<bool> g_leadSuppressed{ false };
 		Probe g_probes[kSlotCount];
+		// Queued slots (2026-10-29 audit): the service used to copy the whole table onto the stack and age every slot on every game update
+		// (about 470 KB a call with 256 pilots). Now a request lists its slot once, the service takes only those (in slot order, as
+		// before), and a result's age is the service count since it arrived: the same number the old per-slot increment reached.
+		std::vector<int> g_probePending;
+		unsigned g_probeTick = 0;
 
 		// Runs queued probes; called from inside the player's per-frame update (safe for physics queries).
 		void ServiceProbes(std::uintptr_t tes)
 		{
-			Probe work[kSlotCount];
+			static thread_local std::vector<std::pair<int, Probe>> work;
+			work.clear();
+			unsigned tick = 0;
 			{
 				std::lock_guard lk(g_probeLock);
-				for (int i = 0; i < kSlotCount; ++i) {
-					work[i] = g_probes[i];
+				tick = ++g_probeTick;
+				std::sort(g_probePending.begin(), g_probePending.end());
+				for (const int i : g_probePending) {
+					if (!g_probes[i].requested) continue;
+					work.push_back({ i, g_probes[i] });
 					g_probes[i].requested = false;
-					if (g_probes[i].haveResult) {
-						++g_probes[i].age;
-					}
 				}
+				g_probePending.clear();
 			}
-			for (int i = 0; i < kSlotCount; ++i) {
-				if (!work[i].requested) {
-					continue;
-				}
-				const float p[3] = { work[i].x, work[i].y, work[i].z };
+			for (const auto& [i, w] : work) {
+				const float p[3] = { w.x, w.y, w.z };
 				const float ground = reinterpret_cast<float (*)(std::uintptr_t, const float*, std::uint32_t, float, float)>(
-					game::Base() + addr::kGroundRayCast)(tes, p, work[i].mask ? work[i].mask : kGroundLayers, work[i].above, work[i].length);
+					game::Base() + addr::kGroundRayCast)(tes, p, w.mask ? w.mask : kGroundLayers, w.above, w.length);
 				std::lock_guard lk(g_probeLock);
 				g_probes[i].ground = ground;
 				g_probes[i].haveResult = true;
-				g_probes[i].age = 0;
+				g_probes[i].resultTick = tick;
 			}
 		}
 
@@ -221,6 +227,7 @@ namespace prefetch
 		}
 		std::lock_guard lk(g_probeLock);
 		auto& p = g_probes[slot];
+		if (!p.requested) g_probePending.push_back(slot);
 		p.requested = true;
 		p.x = x;
 		p.y = y;
@@ -248,7 +255,7 @@ namespace prefetch
 			return false;
 		}
 		ground = p.ground;
-		age = p.age;
+		age = g_probeTick - p.resultTick;
 		return true;
 	}
 
@@ -256,6 +263,7 @@ namespace prefetch
 	{
 		std::lock_guard lk(g_probeLock);
 		for (auto& p : g_probes) p = Probe{};
+		g_probePending.clear();
 	}
 
 	bool Install()

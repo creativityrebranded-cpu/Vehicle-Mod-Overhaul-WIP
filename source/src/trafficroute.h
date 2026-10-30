@@ -9,6 +9,7 @@
 //   Done    the caller lands and parks there.
 // Pure: tests/trafficroute_test.cpp.
 #include "trafficdata.h"
+#include "routecurve.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,8 +24,23 @@ constexpr double kLead = 70.0, kReach = 25.0, kClimbSlack = 8.0, kClimbLean = 20
 struct Line {
     bool closed = true;
     std::vector<Vec> lane[2];
+    std::vector<double> authored;
     int Count() const { return int(lane[0].size()); }
     double Span() const { return closed ? double(Count()) : double(Count() - 1); }  // u runs [0, Span)
+    double ToLine(double source) const {
+        if(authored.empty())return source;
+        const double span=closed?double(authored.size()):double(authored.size()-1);
+        source=std::clamp(source,0.0,span);const auto i=std::min(std::size_t(source),authored.size()-1);
+        const double end=i+1<authored.size()?authored[i+1]:Span();
+        return authored[i]+(end-authored[i])*(source-double(i));
+    }
+    double ToSource(double u) const {
+        if(authored.empty())return u;
+        u=std::clamp(u,0.0,Span());auto it=std::upper_bound(authored.begin(),authored.end(),u);
+        const auto i=it==authored.begin()?0:std::size_t(it-authored.begin()-1);
+        const double end=i+1<authored.size()?authored[i+1]:Span();
+        return double(i)+(end>authored[i]?(u-authored[i])/(end-authored[i]):0);
+    }
 };
 
 inline Line Build(const trafficdata::Route& r)
@@ -43,14 +59,15 @@ inline Line Build(const trafficdata::Route& r)
         return l;
     }
     l.closed = r.closed;
-    const auto& pts = r.points;
+    const auto curve=routecurve::Build(r.points,r.rounding,r.closed);l.authored=curve.authored;
+    const auto& pts = curve.points;
     const std::size_t n = pts.size();
     for (std::size_t i = 0; i < n; ++i) {
         const Vec& a = pts[i > 0 ? i - 1 : (l.closed ? n - 1 : i)];
         const Vec& b = pts[i + 1 < n ? i + 1 : (l.closed ? 0 : i)];
         double dx = b.x - a.x, dy = b.y - a.y;
-        const double n = std::hypot(dx, dy);
-        if (n > 1e-6) { dx /= n; dy /= n; }
+        const double run = std::hypot(dx, dy);
+        if (run > 1e-6) { dx /= run; dy /= run; }
         const double side = r.lanes > 1 ? r.width * 0.5 : 0.0;  // lane 0 on the right of travel (x right, y forward)
         l.lane[0].push_back({ pts[i].x + dy * side, pts[i].y - dx * side, pts[i].z });
         l.lane[1].push_back({ pts[i].x - dy * side, pts[i].y + dx * side, pts[i].z });
@@ -121,6 +138,39 @@ inline double Length(const Line& l)
     return s;
 }
 
+// Move by metres along the polyline, not a fraction of whichever segment the
+// vehicle currently occupies. Do not cut diagonally across sharp corners.
+inline double LeadU(const Line& l,int lane,double u,double metres,bool reverse=false){
+    const double dir=Direction(lane)*(reverse?-1:1);u=Wrap(l,u);
+    for(int step=0;step<l.Count()+1&&metres>0.001;++step){
+        double edge=dir>0?std::floor(u+1e-6)+1:std::ceil(u-1e-6)-1;
+        if(!l.closed)edge=std::clamp(edge,0.0,l.Span());
+        const Vec a=At(l,lane,u),b=At(l,lane,edge);
+        const double length=std::hypot(b.x-a.x,b.y-a.y,b.z-a.z);
+        if(length>=metres)return Wrap(l,u+(edge-u)*metres/length);
+        if(length<0.001&&edge==u)return u;
+        const Vec c=At(l,lane,edge+dir*0.01);
+        const double ax=b.x-a.x,ay=b.y-a.y,bx=c.x-b.x,by=c.y-b.y;
+        const double norms=std::hypot(ax,ay)*std::hypot(bx,by);
+        // Inside 4 m, lead just beyond the vertex so it can be traversed;
+        // otherwise target the corner, rather than a chord through a building.
+        if(norms>1e-6&&(ax*bx+ay*by)/norms<0.866&&length>4)return Wrap(l,edge);
+        metres-=length;u=Wrap(l,edge);
+    }
+    return u;
+}
+inline double DistanceAlong(const Line& l,int lane,double from,double to){
+    double remaining=Ahead(l,lane,from,to);if(!std::isfinite(remaining))return remaining;
+    double result=0;double u=Wrap(l,from);const double dir=Direction(lane);
+    for(int i=0;i<l.Count()+1&&remaining>1e-6;++i){
+        const double edge=dir>0?std::floor(u+1e-6)+1:std::ceil(u-1e-6)-1;
+        const double part=std::min(remaining,std::fabs(edge-u));
+        const auto a=At(l,lane,u),b=At(l,lane,u+dir*part);
+        result+=std::hypot(b.x-a.x,b.y-a.y,b.z-a.z);remaining-=part;u=Wrap(l,u+dir*part);
+    }
+    return result;
+}
+
 enum class Leg { Climb, Join, Follow, Leave, Done };
 inline const char* Name(Leg l)
 {
@@ -163,7 +213,13 @@ inline Trip StartTo(const Line& l, int lanes, Vec home, Vec dest, double exitU)
 inline Goal Step(const Line& l, Trip& t, double x, double y, double z)
 {
     Goal g;
-    const double joinU = Nearest(l, t.lane, x, y);
+    double joinU = Nearest(l, t.lane, x, y);
+    if(t.leg==Leg::Follow&&t.uKnown){
+        const auto old=At(l,t.lane,t.lastU);
+        const double direct=std::hypot(old.x-x,old.y-y,old.z-z),limit=std::max(20.0,2*direct+5);
+        const double along=std::min(DistanceAlong(l,t.lane,t.lastU,joinU),DistanceAlong(l,t.lane,joinU,t.lastU));
+        if(along>limit)joinU=t.lastU; // don't jump to another arm of a crossing route
+    }
     const Vec join = At(l, t.lane, joinU);
     if (t.leg == Leg::Climb) {
         if (z >= join.z - kClimbSlack) { t.leg = Leg::Join; }
@@ -184,18 +240,23 @@ inline Goal Step(const Line& l, Trip& t, double x, double y, double z)
     }
     if (t.leg == Leg::Follow) {
         const double u = joinU;
+        bool crossedTarget=false;
         if (t.uKnown) {
             double step = (u - t.lastU) * Direction(t.lane);
             if (l.closed) step = std::remainder(step, l.Span());
-            if (step > 0 && step < 3.0) t.travelled += step;  // forward progress only; a jump is not progress
+            if (step > 0 && DistanceAlong(l,t.lane,t.lastU,u)<150.0){
+                const double target=Ahead(l,t.lane,t.lastU,t.targetU);
+                crossedTarget=std::isfinite(target)&&target<=step+1e-6;
+                t.travelled+=step;
+            }
         }
         t.lastU = u; t.uKnown = true;
         const double left = Ahead(l, t.lane, u, t.targetU);
         const bool lapDone = !t.lap || !l.closed || t.travelled >= l.Span() * 0.9;
-        const bool there = lapDone && (left * SegmentLength(l, u) < kReach || (!l.closed && left == 0.0));
+        const bool there = lapDone && (crossedTarget || left * SegmentLength(l, u) < kReach || (!l.closed && left == 0.0));
         if (there) t.leg = Leg::Leave;
         else {
-            const double leadU = u + Direction(t.lane) * kLead / SegmentLength(l, u);
+            const double leadU = LeadU(l,t.lane,u,kLead);
             const Vec p = At(l, t.lane, leadU);
             g.x = p.x; g.y = p.y; g.z = p.z; g.passThrough = true;
             t.laneZ = p.z;

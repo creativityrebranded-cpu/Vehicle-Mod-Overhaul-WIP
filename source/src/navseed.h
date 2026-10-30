@@ -1,4 +1,6 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
 
 // The nav map seeded from the game's own collision objects (2026-10-20, the user: "can the game rather provide this global information
 // cheaply to the planners ... read the actual collision data and positions associated with them"). Every loaded reference within kRadius
@@ -11,4 +13,8 @@ namespace navseed
 {
 	void Tick();   // main thread, every frame (after world::Publish)
 	void Reset();  // a save load
+	// References the physics world's own box query named solid (cellbake): they skip the body test.
+	void MarkSolid(const std::uint32_t* ids, std::size_t n);
+	// Full passes finished since the last Reset (2026-10-30: arrival traffic waits for one finished after the loading screen opened).
+	std::uint32_t CompletedPasses();
 }

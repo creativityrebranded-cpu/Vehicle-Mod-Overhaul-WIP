@@ -1,3 +1,13 @@
+1.0 (Traffic Addon 0.1) — 30 October 2026
+
+- Traffic Manager: press F7 on the local map to create and edit traffic routes; traffic is generated along them; autopilot near a traffic zone follows the same path.
+- Traffic Addon 0.1: FVO_Traffic.dll replaces FVO_CityPlacements.dll.
+- Real traffic: shoot, board or steal; a vehicle you take leaves traffic.
+- Traffic placed inside the loading screen; models from your whole load order; up to 256 vehicles.
+- Vehicle and driver handled as one pair: recovery first, replacement only under a cover or far and out of sight.
+- Wheel dust no longer fills the persistent cell (major stutters); guard against the local map crash it caused.
+- Removed: rams, scheduled traffic, road-network traffic.
+
 0.9.0 — 28 October 2026
 
 - City traffic: eleven routes over ten cities (New Atlantis ring and district loop, Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso, Red Mile), with exits, landing places and rooftop clearance. The New Atlantis ring is slanted to clear the MAST.

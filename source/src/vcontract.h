@@ -34,6 +34,10 @@ namespace vcontract
 		bool landOnArrival = false;  // at a held goal: hover off and settle (parked) instead of hovering
 		// NPC vehicles: hover or drive on the ground by default (travelmode.h decides per moment from this and the reasons around it).
 		travelmode::Default travel = travelmode::Default::Auto;
+		// A traffic trip's flight leg (an addon goal with fly = 1): flying is preferred over the settlement and final-approach
+		// ground preferences (2026-10-29 log: New Atlantis traffic was held low as "settlement: on the ground", boxed in among
+		// buildings, 78 of 81 trips never finished). Landing at the end is the park step's, not this.
+		bool trafficLane = false;
 	};
 
 	// What a profile wants this frame.

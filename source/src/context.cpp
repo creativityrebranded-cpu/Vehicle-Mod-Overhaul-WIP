@@ -1,8 +1,8 @@
 #include "context.h"
+#include "fvolimits.h"
 #include "runtimeforms.h"
 #include "environment.h"
 #include "passenger.h"
-#include "citytraffic.h"
 #include "features.h"
 #include "addresses.h"
 #include "controlmap.h"
@@ -17,7 +17,7 @@
 #include "vehicleworld.h"
 #include "traffic.h"
 #include "mappoints.h"
-#include "trafficpick.h"
+#include "trafficpool.h"
 #include "fvo_addon_api.h"
 
 #include <Windows.h>
@@ -64,14 +64,15 @@ namespace context
 			if (!environment::GroundAt(id, p.x, p.y, p.z + 2.0, p.z - 60.0, g)) return true;
 			return !g.hit || p.z - g.z > 4.0;
 		}
-		bool TrafficSafe(uptr ref, std::uint32_t formId)
+		// Any vehicle, whatever mod or source it comes from (2026-10-29, the user: "every vehicle no matter the source or mod gets added
+		// to traffic"), as long as its 3D is loaded and it has a physics body FVO found (bodyId). The 2026-10-28 crashes were a modded
+		// vehicle with no physics; that, not where it came from, is what keeps a vehicle out.
+		bool TrafficSafe(uptr ref, std::uint32_t bodyId)
 		{
+			if (!bodyId) return false;
 			__try {
 				const uptr loaded = *reinterpret_cast<uptr*>(ref + off::kRefLoadedData);
-				if (!loaded || !*reinterpret_cast<uptr*>(loaded + 0x08)) return false;
-				const uptr base = *reinterpret_cast<uptr*>(ref + 0x98);
-				const std::uint32_t baseId = base ? *reinterpret_cast<std::uint32_t*>(base + off::kFormId) : 0;
-				return !((formId >> 24) == 0xFF && (baseId >> 24) != 0x00 && (baseId >> 24) != 0xFE);
+				return loaded && *reinterpret_cast<uptr*>(loaded + 0x08);
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
@@ -97,12 +98,11 @@ namespace context
 		{
 			const world::VehicleInfo* best = nullptr;
 			double bestD = range;
-			for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
+			for (std::uint32_t i = 0; i < g_snap.count && i < world::kMaxVehicles; ++i) {
 				const auto& v = g_snap.v[i];
 				if (!v.ref || v.who == world::VehicleInfo::Who::Player || v.who == world::VehicleInfo::Who::Npc) continue;
 				if (v.formId == vehicleflight::OwnRoverId()) continue;  // your own vehicle: the flight code never lets an NPC fly it
 				if (npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) || vehicleflight::AutopilotDisabled(v.formId)) continue;
-				if (citytraffic::IsTrafficVehicle(v.formId)) continue;  // the city traffic's own vehicles (FVO_CityTraffic.esm)
 				const double d = std::hypot(double(v.pos[0]) - p.x, double(v.pos[1]) - p.y);
 				if (d >= bestD) continue;
 				if (enemy && !npcvehicles::FighterMayTake(enemy, v.ref)) continue;  // their faction's own, unowned in their own camp, or unowned in the open
@@ -116,7 +116,7 @@ namespace context
 		{
 			const world::VehicleInfo* best = nullptr;
 			double bestD = kBoardRange;
-			for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
+			for (std::uint32_t i = 0; i < g_snap.count && i < world::kMaxVehicles; ++i) {
 				const auto& v = g_snap.v[i];
 				if (!v.ref || v.who != world::VehicleInfo::Who::Npc || v.formId == vehicleflight::OwnRoverId()) continue;
 				const double d = std::hypot(double(v.pos[0]) - p.x, double(v.pos[1]) - p.y);
@@ -134,9 +134,8 @@ namespace context
 		constexpr int kCivilMax = 4;  // 2026-10-27: everyday traffic (trafficpick.h) shares this cap; fights keep the other pilot slots
 		constexpr ULONGLONG kTrafficEveryMs = 15000;
 		ULONGLONG g_trafficAt = 0;
-		FvoTrafficOffer g_provider = nullptr;       // an addon's traffic provider (FVO_CityPlacements.dll: the ring traffic)
 		FvoTick_t g_addonTick = nullptr;            // an addon's main-thread tick (route markers)
-		std::unordered_map<std::uint32_t, double> g_trafficUsed;  // vehicle -> when it last started a traffic trip (s)
+		const std::vector<std::uintptr_t>* g_everydayActors = nullptr;  // this civil scan's calm actors, while the addon picks
 		constexpr double kShareNear = 15.0, kShareGoal = 100.0;
 		// Supply run: an owner by its parked vehicle, a settlement or outpost (the planet's map points) kSupplyMin..kSupplyMax away -> out, wait, back.
 		constexpr double kSupplyMin = 200.0, kSupplyMax = 1000.0;
@@ -208,72 +207,19 @@ namespace context
 				}
 			}
 
-			// Everyday traffic (trafficpick.h, 2026-10-27): a steady cadence of round trips from the parked vehicles near you.
+			// Everyday traffic (2026-10-27; moved into FVO_Traffic.dll 2026-10-29, stage 2 of notes/TRAFFIC_ADDON_PROPOSAL_20261029.md):
+			// on the same cadence and behind the same gates, the addon picks a free parked vehicle and a calm person near it
+			// (traffic/everyday.cpp) from the candidates core reports (EverydayVehicles / EverydayPeople) and starts the trip.
 			if (features::On(features::Id::Traffic) && now - g_trafficAt >= kTrafficEveryMs) {
 				g_trafficAt = now;
-				std::vector<trafficpick::Vehicle> tv;
-				std::vector<uptr> tvRef;
-				for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
-					const auto& v = g_snap.v[i];
-					if (!v.ref || v.who == world::VehicleInfo::Who::Player || v.who == world::VehicleInfo::Who::Npc) continue;
-					if (v.formId == vehicleflight::OwnRoverId() || npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) ||
-						vehicleflight::AutopilotDisabled(v.formId) || citytraffic::IsTrafficVehicle(v.formId)) continue;
-					// 2026-10-28 crashes (01:16, 01:44, both at Starfield.exe+0x1817391 in the game's AI): each time a runtime-spawned
-					// modded vehicle (a Star Wars pack balutar, base 0800080F, no physics) was nearby, and at 01:44 traffic had just sent
-					// an NPC to board it. Traffic takes only vehicles with their 3D loaded, and no runtime-spawned (FF) vehicle of
-					// a base from a full plugin other than Starfield.esm (vanilla and Vehicles.esm bases are 00 / FE).
-					if (!TrafficSafe(v.ref, v.formId)) continue;
-					tv.push_back({ v.formId, double(v.pos[0]), double(v.pos[1]), true });
-					tvRef.push_back(v.ref);
-				}
-				std::vector<trafficpick::Person> tp;
-				for (const uptr r : actors) {
-					if (!npcvehicles::ActorFree(r) || npcvehicles::HostileToPlayer(r)) continue;
-					const auto q = PosOf(r);
-					tp.push_back({ r, q.x, q.y, true });
-				}
-				std::vector<trafficpick::Place> places;
-				{
-					std::vector<mappoints::Point> pts;
-					const float p3[3] = { float(pp.x), float(pp.y), float(pp.z) };
-					if (mappoints::WorldPoints(p3, pts)) for (const auto& q : pts) places.push_back({ double(q.x), double(q.y) });
-				}
-				const double nowS = double(now) / 1000.0;
-				const auto pick = trafficpick::Choose(tv, tp, places, pp.x, pp.y, nowS, npcvehicles::CivilJobs(), g_trafficUsed);
-				if (pick.kind != trafficpick::Kind::None) {
-					const auto& v = tv[pick.vehicle];
-					const uptr driver = tp[pick.person].ref;
-					g_trafficUsed[v.id] = nowS;  // rests even when refused, so one bad pair is not retried every scan
-					const std::uint32_t did = *reinterpret_cast<std::uint32_t*>(driver + off::kFormId);
-					if (!npcvehicles::MayUse(driver, tvRef[pick.vehicle])) {
-						logger::Write("Traffic: NPC %08X may not use vehicle %08X; next scan", did, v.id);
-					}
-					else if (FvoTripClaim claim{}; g_provider && g_provider(v.x, v.y, 0.0, v.id, &claim) && claim.step) {
-						// An addon takes the pick as a scripted trip (FVO_CityPlacements.dll: the ring).
-						const bool ok = npcvehicles::StartScripted(driver, tvRef[pick.vehicle], claim);
-						logger::Write("Traffic: NPC %08X takes vehicle %08X on a %s -> %s", did, v.id, claim.name ? claim.name : "scripted trip", ok ? "driving" : "refused");
-						if (ok) return;
-					}
-					else if (pick.kind == trafficpick::Kind::RoundTrip) {
-						const bool ok = npcvehicles::StartSupply(driver, tvRef[pick.vehicle], pick.to.x, pick.to.y);
-						logger::Write("Traffic: NPC %08X takes vehicle %08X on a round trip, %.0f m out to (%.0f, %.0f) -> %s", did, v.id, pick.tripLength, pick.to.x, pick.to.y, ok ? "driving" : "refused");
-						if (ok) return;
-					}
-					else if (g_provider) {
-						// 2026-10-28 (the user: traffic should follow the ring they gave, not fly laps): with the ring addon loaded,
-						// a pick it declines (ring busy, departures spaced, out of reach) waits for the next scan instead.
-						logger::Write("Traffic: NPC %08X / vehicle %08X: the ring takes no more trips right now; no laps, next scan", did, v.id);
-					}
-					else {
-						const bool ok = npcvehicles::StartPatrol(driver, tvRef[pick.vehicle]);
-						logger::Write("Traffic: NPC %08X takes vehicle %08X on laps round its home (no settlement or outpost 200-1000 m away) -> %s", did, v.id, ok ? "driving" : "refused");
-						if (ok) return;
-					}
-				}
+				g_everydayActors = &actors;
+				const int started = trafficpool::Everyday();
+				g_everydayActors = nullptr;
+				if (started) return;
 			}
 
 			// Patrol.
-			for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
+			for (std::uint32_t i = 0; i < g_snap.count && i < world::kMaxVehicles; ++i) {
 				const auto& v = g_snap.v[i];
 				if (!v.ref || v.who == world::VehicleInfo::Who::Player || v.who == world::VehicleInfo::Who::Npc) continue;
 				if (v.formId == vehicleflight::OwnRoverId() || npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) || vehicleflight::AutopilotDisabled(v.formId)) continue;
@@ -310,7 +256,7 @@ namespace context
 					logger::Write("Context: patrol: NPC %08X by its vehicle %08X -> %s", *reinterpret_cast<std::uint32_t*>(r + off::kFormId), v.formId, ok ? "patrolling" : "refused");
 					if (ok && npcvehicles::HostileToPlayer(r)) {
 						// An enemy patrol: a second hostile vehicle close by with a hostile owner near it follows in convoy.
-						for (std::uint32_t k = 0; k < g_snap.count && k < 64; ++k) {
+						for (std::uint32_t k = 0; k < g_snap.count && k < world::kMaxVehicles; ++k) {
 							const auto& v2 = g_snap.v[k];
 							if (!v2.ref || v2.formId == v.formId || v2.who == world::VehicleInfo::Who::Player || v2.who == world::VehicleInfo::Who::Npc) continue;
 							if (npcvehicles::UsesVehicle(v2.formId) || npcvehicles::HasDriver(v2.formId) || vehicleflight::AutopilotDisabled(v2.formId)) continue;
@@ -337,7 +283,7 @@ namespace context
 		// Occupancy alone is not combat. Civil traffic yields only to a native fight.
 		bool VehicleFight(uptr player)
 		{
-			for (std::uint32_t i = 0; i < g_snap.count && i < 64; ++i) {
+			for (std::uint32_t i = 0; i < g_snap.count && i < world::kMaxVehicles; ++i) {
 				const auto driver=g_snap.v[i].driverId?reinterpret_cast<uptr(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(g_snap.v[i].driverId):0;
 				if(driver && npcvehicles::IsInCombat(driver))return true;
 			}
@@ -432,8 +378,8 @@ namespace context
 		// Rules 2 and 3 for every NPC vehicle job.
 		void JobRules(uptr player, ULONGLONG now)
 		{
-			npcvehicles::JobInfo jobs[8];
-			const int n = npcvehicles::Jobs(jobs, 8);
+			npcvehicles::JobInfo jobs[fvolimits::kVehicles];
+			const int n = npcvehicles::Jobs(jobs, fvolimits::kVehicles);
 			const bool playerFight = npcvehicles::IsInCombat(player);
 			for (int i = 0; i < n; ++i) {
 				const auto& j = jobs[i];
@@ -442,14 +388,19 @@ namespace context
 				if (want != g_pursuit.end() && want->second != j.pursuit && npcvehicles::SetVehicleProfile(j.vehicle, want->second))
 					logger::Write("Context: vehicle %08X -> %s", j.vehicle, want->second ? "pursuit" : "escort");
 				const world::VehicleInfo* vi = nullptr;
-				for (std::uint32_t k = 0; k < g_snap.count && k < 64; ++k) {
+				for (std::uint32_t k = 0; k < g_snap.count && k < world::kMaxVehicles; ++k) {
 					if (g_snap.v[k].formId == j.vehicle) vi = &g_snap.v[k];
 				}
 				const float speed = vi ? std::hypot(vi->vel[0], vi->vel[1]) : 99.0f;
 				// 2026-10-28 (03:25 run: "calm and parked" ordered the player and driver out 310 m up): never the vehicle the player
 				// rides as a passenger (they get out with their own key) and never one hovering well over the ground.
 				const bool riddenOrHigh = passenger::RidingVehicle() == j.vehicle || (vi && vi->ref && HighOverGround(j.vehicle, vi->ref));
-				const bool calm = !playerFight && !npcvehicles::IsInCombat(j.npc) && speed < kStillSpeed && !riddenOrHigh;
+				// 2026-10-29 (the user, from a tester's 0.60 report: a follower "exited the REV-8 without an intentional exit command";
+				// that exit started the stuck sitting pose and the crash after it): the player's followers stay aboard while parked; they
+				// get out when the player tells them, or when the vehicle is wrecked.
+				const std::uintptr_t npcRef = runtimeforms::Lookup(j.npc);
+				const bool follower = npcRef && npcvehicles::IsAlly(npcRef);
+				const bool calm = !follower && !playerFight && !npcvehicles::IsInCombat(j.npc) && speed < kStillSpeed && !riddenOrHigh;
 				if (!calm) { g_calmSince.erase(j.vehicle); continue; }
 				auto& since = g_calmSince[j.vehicle];
 				if (!since) since = now;
@@ -494,16 +445,38 @@ namespace context
 		g_triedAt.clear();
 		g_jobSeen.clear();
 		g_calmSince.clear();
-		g_tickAt = g_scanAt = g_civilAt = g_trafficAt = 0; g_civilTried.clear();g_patrolledAt.clear();g_lastPackage.clear();g_trafficUsed.clear();
+		g_tickAt = g_scanAt = g_civilAt = g_trafficAt = 0; g_civilTried.clear();g_patrolledAt.clear();g_lastPackage.clear();
 	}
-}
 
-// ---- Exports for FVO addons (fvo_addon_api.h) ----
-extern "C" __declspec(dllexport) int FVO_RegisterTrafficProvider(FvoTrafficOffer offer)
-{
-	context::g_provider = offer;
-	logger::Write("Traffic: addon traffic provider %s", offer ? "registered" : "removed");
-	return 1;
+	// Everyday traffic's candidates for FVO_Traffic.dll (the filters core used before the move, unchanged).
+	int EverydayVehicles(FvoTrafficVehicle* out, int max)
+	{
+		int n = 0;
+		for (std::uint32_t i = 0; i < g_snap.count && i < world::kMaxVehicles && n < max; ++i) {
+			const auto& v = g_snap.v[i];
+			if (!v.ref || v.who == world::VehicleInfo::Who::Player || v.who == world::VehicleInfo::Who::Npc) continue;
+			if (v.formId == vehicleflight::OwnRoverId() || npcvehicles::UsesVehicle(v.formId) || npcvehicles::HasDriver(v.formId) ||
+				vehicleflight::AutopilotDisabled(v.formId)) continue;
+			// 2026-10-28 crashes (01:16, 01:44, both at Starfield.exe+0x1817391 in the game's AI): each time a runtime-spawned
+			// modded vehicle with no physics (a Star Wars pack balutar, base 0800080F) was nearby, and at 01:44 traffic had just sent
+			// an NPC to board it. Traffic takes any vehicle with its 3D loaded and a physics body (TrafficSafe).
+			if (!TrafficSafe(v.ref, v.bodyId)) continue;
+			out[n++] = { v.formId, v.baseId, kFvoWhoParked, double(v.pos[0]), double(v.pos[1]), double(v.pos[2]), 1 };
+		}
+		return n;
+	}
+	int EverydayPeople(FvoTrafficPerson* out, int max)
+	{
+		if (!g_everydayActors) return 0;  // only during core's civil scan
+		int n = 0;
+		for (const uptr r : *g_everydayActors) {
+			if (n >= max) break;
+			if (!npcvehicles::ActorFree(r) || npcvehicles::HostileToPlayer(r)) continue;
+			const auto q = PosOf(r);
+			out[n++] = { *reinterpret_cast<std::uint32_t*>(r + off::kFormId), q.x, q.y };
+		}
+		return n;
+	}
 }
 extern "C" __declspec(dllexport) void FVO_Log(const char* line)
 {

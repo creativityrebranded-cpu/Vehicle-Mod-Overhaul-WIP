@@ -8,8 +8,14 @@
 //     A follower with no free vehicle near but a vehicle an NPC drives within 40 m with a free seat -> boards it as a passenger.
 //   calm (the player and the driver not in combat) and the vehicle nearly still for 60 s -> everyone gets out (UnloadVehicle).
 // Master switch: Logs\FlyingVehicleOverhaul\settings.ini [context] enabled=0 (re-read every 5 s).
+#include "traffic/traffic_api.h"
+
 namespace context
 {
 	void Tick();
 	void Reset();
+	// Everyday traffic's candidates for FVO_Traffic.dll (core API v2): free parked vehicles traffic may take, and the calm, free,
+	// non-hostile people of the current civil scan (empty outside it).
+	int EverydayVehicles(FvoTrafficVehicle* out, int max);
+	int EverydayPeople(FvoTrafficPerson* out, int max);
 }

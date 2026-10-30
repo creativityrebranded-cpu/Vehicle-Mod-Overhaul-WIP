@@ -21,6 +21,7 @@ Sample At(double x,double y,double z) {
  if(mode==8)s.known=false;
  return s;
 }
+void Column(double x,double y,const double* zs,int n,Sample* out){for(int k=0;k<n;++k)out[k]=At(x,y,zs[k]);}
 }
 int main() {
  int failures=0;

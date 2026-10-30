@@ -605,6 +605,17 @@ int main()
 		Check(out.mode==Mode::Hover && !out.reverse && out.phase!=Phase::Turn,
 			"takeoff discards the wheel escape and replans in the air");
 	}
+    { // A speed floor must never defeat a wall/traffic braking cap.
+        Pilot pilot;Input in;in.gy=100;in.z=10;in.above=10;in.groundOk=true;
+        in.permit=Permit::HoverOnly;in.onWheels=false;in.ceiling=0;in.strictTraffic=true;
+        auto blocked=[](double,double,double){Cell c;c.known=true;c.object=true;return c;};
+        Output out;for(int i=0;i<100;++i){in.now=1+i*0.1;out=pilot.Step(in,blocked);}
+        Check(out.speed==0,"proven blocked corridor never gets the minimum forward-speed override");
+        Other oncoming;oncoming.id=2;oncoming.z=10;oncoming.y=100;oncoming.vy=-30;
+        const auto t=TrafficFor(0,0,10,0,30,3,1,100,&oncoming,1,2,false);
+        Check(t.yieldTo==2&&t.cap<1e8,"imminent collision beyond old 50m limit is detected even with right of way / ignore timer");
+    }
 	std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
 	return g_failures ? 1 : 0;
 }
+
