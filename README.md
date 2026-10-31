@@ -638,3 +638,7 @@ they do not depend on Carfield or Parked Vehicles.
 - The original 32 dedicated traffic homes remain reserved for traffic. The immediate pool covers ordinary parked placements. Extra pending spots beyond the free pool wait for a game restart; the persistent parked/retired ID range has 1,536 slots.
 - A verified backup is required before plugin replacement; ID reservations commit first. Unreadable/malformed data or replacement failure leaves the original plugin usable. The log reports rebuild status and deferred pool work.
 - Keep citybuild-ids.tsv and citypool-ids.tsv in the settings folder. An isolated dry-run tool and mandatory reference fixture are included with the standalone source. Live pool placement, physics and save-load behavior still require in-game verification.
+
+## License
+
+This mod's own code and files are under the [MIT License](LICENSE). `source/third_party/sfse` keeps its own MIT notice. Starfield and its game content belong to Bethesda and are not covered by this license.
