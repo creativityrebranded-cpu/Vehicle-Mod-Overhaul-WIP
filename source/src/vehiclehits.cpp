@@ -576,7 +576,7 @@ namespace vehiclehits
 			impactCount=g_newImpactCount;std::copy(g_newImpacts,g_newImpacts+impactCount,impacts);g_newImpactCount=0;
 		}
 		static world::Snapshot snap;
-		const bool haveVehicles = world::Vehicles(snap);
+		const bool haveVehicles = world::VehiclesAndHeld(snap);  // the traffic a shot can reach, held vehicles too
 		EnemyBarTick(snap, haveVehicles);
 		for(int i=0;haveVehicles&&i<impactCount;++i) {
 			const auto& impact=impacts[i];const auto shooter=HandleRef(impact.shooterHandle);
@@ -721,6 +721,7 @@ namespace vehiclehits
 				vehicleflight::DisableAutopilot(d.id, unsigned(kWreckRenewMs + 5000), "wrecked");
 			}
 			const bool busy = npcvehicles::VehicleInCombat(d.id, d.lastDriver);
+			logger::Observe("health",d.id,unsigned(d.wrecked)|(std::uint64_t(d.hits)<<8)|(std::uint64_t(busy)<<48),"driver=%08X damage=%.2f limit=%.2f wrecked=%d combat=%d hits=%u attacker=%08X last_hit_tick=%llu",d.lastDriver,d.damage,limit,d.wrecked,busy,d.hits,d.lastShooter,static_cast<unsigned long long>(d.lastHit));
 			if (busy) d.quietSince = now;
 			const double dt = healthlogic::RepairSeconds(now, d.lastHeal, d.quietSince,
 				d.wrecked ? kWreckHealAfterMs : kHealAfterMs, busy);

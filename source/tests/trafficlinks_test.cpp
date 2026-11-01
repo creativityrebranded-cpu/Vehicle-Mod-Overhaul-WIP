@@ -57,6 +57,31 @@ int main()
         bool finite=curve.size()>4;for(const auto& p:curve)finite=finite&&std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z);
         check(finite&&curve.front().y<0&&curve.back().x>0,"rounded junction creates an approach, circular turn and departure");
     }
+    {   // junction types and the type a junction's shape suggests
+        trafficdata::Route main; main.name = "main"; main.ring = false; main.lanes = 1; main.closed = false;
+        main.points = { { 0, 0, 10 }, { 200, 0, 10 }, { 400, 0, 10 } };
+        trafficdata::Route branch; branch.name = "branch"; branch.ring = false; branch.lanes = 1; branch.closed = false;
+        branch.points = { { 200, 0, 10 }, { 200, 200, 10 }, { 200, 400, 10 } };
+        std::vector<const trafficdata::Route*> routes{ &main, &branch };
+        trafficdata::Link k; k.name = "k"; k.from = "main"; k.to = "branch"; k.at = 1;
+        auto count = [&](const char* type, const char* on) { k.type = type; return trafficlinks::Of({ k }, routes, on).size(); };
+        check(count("", "main") == 1 && count("", "branch") == 1, "an old link with no type works from both routes, as before");
+        check(count("exit", "main") == 1 && count("exit", "branch") == 0, "exit: only the first route turns");
+        check(count("merge", "main") == 0 && count("merge", "branch") == 1, "merge: only the second route turns");
+        check(count("crossing", "main") == 0 && count("crossing", "branch") == 0, "crossing: nobody turns");
+        const auto a = trafficroute::Build(main), b = trafficroute::Build(branch);
+        const double mid = a.ToLine(1);
+        check(trafficlinks::Suggested(a, 1, mid, b, 1, 0) == "exit", "a one-way branch starting on a route leaves it");
+        check(trafficlinks::Suggested(a, 1, mid, b, 1, b.Span()) == "merge", "a one-way branch ending on a route joins it");
+        check(trafficlinks::Suggested(a, 1, mid, b, 2, 0).empty(), "a two-way branch goes both ways");
+        check(trafficlinks::Suggested(a, 1, mid, b, 1, b.ToLine(1)) == "crossing", "two routes meeting mid-way at an angle cross");
+        trafficdata::Route beside = main; beside.points = { { 0, 5, 10 }, { 200, 5, 10 }, { 400, 5, 10 } };
+        const auto c = trafficroute::Build(beside);
+        check(trafficlinks::Suggested(a, 1, mid, c, 1, c.ToLine(1)).empty(), "side by side the same way: both ways");
+        trafficdata::Route opposite = beside; std::reverse(opposite.points.begin(), opposite.points.end());
+        const auto o = trafficroute::Build(opposite);
+        check(trafficlinks::Suggested(a, 1, mid, o, 1, o.ToLine(1)) == "crossing", "head on, one way each: they cross");
+    }
     std::printf("trafficlinks: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

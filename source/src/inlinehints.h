@@ -68,7 +68,7 @@ inline View Build(const Inputs& inputs,const Context& c){
         if(c.actor&&c.hostile&&(c.own||c.driving))add(A::GuardPoint,Element::Target,"Focus fire");
         if(c.hostile&&(c.own||c.driving||c.escorts))add(A::FocusTarget,Element::Target,"Focus fire");
     }
-    if(c.driving&&!c.scanner){if(c.flying)add(A::LiftDown,Element::Gear,"Descend");add(A::OwnProfile,Element::Auto,"Vehicle profile");}
+    if(c.driving&&!c.scanner){if(c.flying)add(A::LiftDown,Element::Gear,"Descend");add(A::OwnProfile,Element::Auto,"Vehicle profile");add(A::Cruise,Element::Auto,"Cruise");}
     if(c.route){if(c.retry)add(A::RetryTrip,Element::Route,"Retry trip");add(A::SkipStop,Element::Route,"Skip stop");}
     return view;
 }

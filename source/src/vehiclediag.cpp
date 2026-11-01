@@ -1,6 +1,7 @@
 #include "trafficpair.h"
 #include "trafficpool.h"
 #include "vehiclediag.h"
+#include "vehiclekeep.h"
 #include "loadedarea.h"
 #include "fvolimits.h"
 #include "placementenable.h"
@@ -8,10 +9,12 @@
 
 #include "addresses.h"
 #include "game.h"
+#include "lifecycle.h"
 #include "hook.h"
 #include "log.h"
 #include "listenerboot.h"
 #include "physicssetup.h"
+#include "birthholds.h"
 #include "vehicleflight.h"
 #include "vehiclehits.h"
 #include "vehicleworld.h"
@@ -177,6 +180,7 @@ namespace vehiclediag
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {}
 			g_pending.Add(id);
+			logger::Write("OBS system=chassis.pending vehicle=%08X event=add native_count=%llu shadow_count=%zu",id,static_cast<unsigned long long>(before),g_pending.Size());
 			if (before > 7) {
 				g_wipes.fetch_add(1, std::memory_order_relaxed);
 				if (g_pendingLogs.fetch_add(1, std::memory_order_relaxed) < 40)
@@ -189,6 +193,7 @@ namespace vehiclediag
 		void PendingRemoveDetour(std::uint64_t a1, std::int64_t* store, int id)
 		{
 			g_pending.Remove(static_cast<std::uint32_t>(id));
+			logger::Write("OBS system=chassis.pending vehicle=%08X event=remove shadow_count=%zu",static_cast<unsigned>(id),g_pending.Size());
 			g_pendingRemove(a1, store, id);
 		}
 
@@ -196,6 +201,7 @@ namespace vehiclediag
 		{
 			bool rescued = false;
 			const bool member = g_pending.Member(g_pendingHas(listener, id), static_cast<std::uint32_t>(id), rescued);
+			logger::Observe("chassis.attach-query",static_cast<unsigned>(id),unsigned(member)|(unsigned(rescued)<<1),"member=%d rescued=%d shadow_count=%zu",member,rescued,g_pending.Size());
 			if (rescued) {
 				g_rescues.fetch_add(1, std::memory_order_relaxed);
 				if (g_pendingLogs.fetch_add(1, std::memory_order_relaxed) < 120)
@@ -251,6 +257,7 @@ namespace vehiclediag
 		// flying them ("0 steps, body NOT BOUND"), the vehicle was then found on the ground and its driver stayed up at the lane.
 		// The other 28 were built while still held (the hold is put back right after the build below) and flew normally.
 		std::mutex g_builtLock;
+		birthholds::Table g_birthHolds;
 		std::unordered_map<std::uint32_t,ULONGLONG> g_built;
 		void NoteBuilt(std::uint32_t id) { std::lock_guard lock(g_builtLock); g_built[id] = GetTickCount64(); }
 		// The game's vehicle build puts a vehicle on the ground when there is ground within ~45 m under it (2026-10-30 06:54 run:
@@ -287,15 +294,19 @@ namespace vehiclediag
 			__try { id = At<std::uint32_t>(component, 0x0C); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 			float before[3] = {}, after[3] = {};
 			const bool hadPos = RefPosOf(id, before);
+			logger::Write("OBS system=chassis.build vehicle=%08X event=begin component=%p position_known=%d",id,reinterpret_cast<void*>(component),hadPos);
 			g_builder(component);
 			if (hadPos && RefPosOf(id, after)) NoteBuildMove(id, before, after);
-            ApplyBirthStage(id);
+            // The builder runs inside native worker locks. Reconcile the hold
+            // on the frame thread; do not enter reference/scene APIs here.
+            g_birthHolds.Dirty(id);
 			if (hadPos) WatchBuild(id, before);
 			uptr instance = 0;
 			__try { instance = At<uptr>(component, 0x10); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 			if (id && instance) NoteBuilt(id);
 			const BuildTrace t = t_build;
 			t_build = saved;
+			logger::Write("OBS system=chassis.build vehicle=%08X event=end instance=%p checked=%d rejected=%d body=%08X flags=%X converted=%d",id,reinterpret_cast<void*>(instance),t.checked,t.finalRejected,t.chassis.id,t.chassis.flags,t.converted);
 			if (g_buildLogs.fetch_add(1, std::memory_order_relaxed) >= 300) return;
 			if (!t.checked) {
 				logger::Write("Vehicle build: %08X -> instance %s; never reached the static check (no ref, 3D or physics object, or no chassis body found in its scene)",
@@ -360,23 +371,13 @@ namespace vehiclediag
         // traffic-scene-motion-enum-20261030): 1 = dynamic, 2 = keyframed (the lower Havok call underneath uses the reverse). The
         // traffic hold had them swapped: "hold" left a chassis dynamic (it fell, its driver left floating) and "release" froze it.
         constexpr std::uint32_t kSceneDynamic = 1, kSceneKeyframed = 2;
-        std::mutex g_birthLock;
-        std::unordered_map<std::uint32_t,uptr> g_stagedBirths;
-		uptr PhysicsOf(uptr ref);
+		birthholds::Object AcquirePhysics(uptr ref);
 		std::uint64_t SetMotionDetour(uptr phys, std::uint32_t motion, char a3, char a4, std::uint32_t a5)
 		{
-            // A held traffic chassis stays keyframed when the game asks to make it dynamic. Only that request is touched, and only
-            // after checking the physics object still belongs to the held vehicle (2026-10-30 04:52 crash: holds were matched by
-            // address alone; freed and reused objects of other things were forced keyframed and vehicle physics stopped).
-            if(motion==kSceneDynamic&&phys){
-                std::uint32_t heldId=0;
-                {std::lock_guard lock(g_birthLock);for(const auto& entry:g_stagedBirths)if(entry.second==phys){heldId=entry.first;break;}}
-                if(heldId){
-                    const auto ref=runtimeforms::LookupChecked(heldId);const uptr current=ref?PhysicsOf(ref):0;
-                    if(current==phys)motion=kSceneKeyframed;
-                    else {std::lock_guard lock(g_birthLock);if(auto it=g_stagedBirths.find(heldId);it!=g_stagedBirths.end()&&it->second==phys)it->second=current;}
-                }
-            }
+            // The table owns a reference to each identity: it cannot be freed
+            // and reused while held. No form lookup or scene getter in a worker
+            // callback that may already own the engine's scene/world locks.
+            if(motion==kSceneDynamic && g_birthHolds.Holds(reinterpret_cast<void*>(phys))) motion=kSceneKeyframed;
 			const std::uint32_t vehicle = KnownVehicle(phys);
 			const auto caller = reinterpret_cast<uptr>(_ReturnAddress()) - game::Base() + 0x140000000ull;
 			if (motion == 0 || motion == kSceneKeyframed) {  // freezes: static or keyframed
@@ -393,27 +394,66 @@ namespace vehiclediag
 			}
 			return g_setMotion(phys, motion, a3, a4, a5);
 		}
-		// The ref's physics object (ref vt +0x560, the call the vehicle exit uses), its reference given back at once.
-		uptr PhysicsOf(uptr ref)
+		// Match native vehicle exit FUN_14219C480: vt +0x560 returns an owning
+		// reference; release it AFTER use, and call vt +8 when the count reaches 0.
+		uptr AcquirePhysicsRaw(uptr ref)
 		{
+			if (!ref) return 0;
 			__try {
 				uptr out = 0;
 				reinterpret_cast<uptr* (*)(uptr, uptr*)>((*reinterpret_cast<void***>(ref))[0x560 / 8])(ref, &out);
-				if (out) _InterlockedDecrement(reinterpret_cast<volatile long*>(out + 8));  // the ref keeps its own reference
 				return out;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 		}
+		void ReleasePhysics(void* object)
+		{
+			const uptr p = reinterpret_cast<uptr>(object);
+			if (p && _InterlockedDecrement(reinterpret_cast<volatile long*>(p + 8)) == 0)
+				reinterpret_cast<void (*)(uptr)>((*reinterpret_cast<void***>(p))[1])(p);
+		}
+		birthholds::Object AcquirePhysics(uptr ref)
+		{
+			const auto p = AcquirePhysicsRaw(ref);
+			return p ? birthholds::Object(reinterpret_cast<void*>(p), ReleasePhysics) : birthholds::Object{};
+		}
+		bool SetSceneMotion(const birthholds::Object& object, std::uint32_t motion)
+		{
+			__try { return object && g_setMotion && g_setMotion(reinterpret_cast<uptr>(object.get()), motion, 1, 0, 1) != 0; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		// Where a held vehicle was born. The drop comes when its model loads, before the build (2026-10-31: FF100432 at z 29.4 by its build, born at 71.5, every run), so the position
+		// at the build was already low and nothing was put back. Straight down only: a spare relocated since has other x, y and keeps the position at the build.
+		std::unordered_map<std::uint32_t, std::array<float, 3>> g_birthAt;
 		void WatchBuild(std::uint32_t id, const float before[3]) {
-			bool held = false;
-			{ std::lock_guard lock(g_birthLock); held = g_stagedBirths.count(id) != 0; }
-			if (held) { std::lock_guard lock(g_builtLock); g_buildWatch.push_back({ id, { before[0], before[1], before[2] }, GetTickCount64(), 0, 0 }); }
+			const bool held = g_birthHolds.Get(id).has_value();
+			if (!held) return;
+			std::lock_guard lock(g_builtLock);
+			std::array<float, 3> from{ before[0], before[1], before[2] };
+			const auto born = g_birthAt.find(id);
+			const bool useBirth = born != g_birthAt.end() && std::hypot(born->second[0] - before[0], born->second[1] - before[1]) < 2.0f && born->second[2] - before[2] >= 2.0f;
+			if (useBirth) {
+				from = born->second;
+				logger::Write("OBS system=chassis.drop vehicle=%08X event=low_before_build birth_z=%.1f z=%.1f", id, born->second[2], before[2]);
+			}
+			g_buildWatch.push_back({ id, { from[0], from[1], from[2] }, GetTickCount64(), 0, 0 });
 		}
         void ApplyBirthStage(std::uint32_t id){
-            std::lock_guard lock(g_birthLock);auto it=g_stagedBirths.find(id);
-            if(it==g_stagedBirths.end()||!g_setMotion)return;
-            const auto ref=runtimeforms::LookupChecked(id);const auto physics=ref?PhysicsOf(ref):0;
-            if(physics){g_setMotion(physics,kSceneKeyframed,1,0,1);it->second=physics;}
+            if(!lifecycle::InService()){
+                lifecycle::Post("birth-hold:"+std::to_string(id),id,[=]()->lifecycle::Work {
+                    const auto owned=lifecycle::Keep(runtimeforms::LookupChecked(id),id);if(!owned)return {};
+                    return [owned,id]()->std::uint64_t {if(owned&&lifecycle::InService())ApplyBirthStage(id);return 1;};
+                });return;
+            }
+            const auto held = g_birthHolds.Get(id);
+            if(!held || held->releasing || !g_setMotion)return;
+            const auto physics=AcquirePhysics(runtimeforms::LookupChecked(id));
+            if(physics == held->object && held->applied)return;
+            if(!g_birthHolds.Publish(*held,physics) || !physics)return;
+            if(SetSceneMotion(physics,kSceneKeyframed)) {
+                g_birthHolds.Applied(*held,physics);
+                if(!held->object)logger::Write("Traffic birth hold: vehicle %08X frozen in native lifecycle service with owned physics",id);
+            }
         }
         // A held chassis is frozen the frame its physics object appears or is replaced (2026-10-30, 06:42 run): the hold was only
         // applied at creation (no physics yet), at the game's vehicle build and on motion requests for an object it already
@@ -421,13 +461,9 @@ namespace vehiclediag
         // under its driver. Main thread, once per frame; only entries whose physics object is new are touched.
         void HoldNewPhysics(){
             if(!g_setMotion)return;
-            std::lock_guard lock(g_birthLock);
-            for(auto& entry:g_stagedBirths){
-                const auto ref=runtimeforms::LookupChecked(entry.first);const auto physics=ref?PhysicsOf(ref):0;
-                if(!physics||physics==entry.second)continue;
-                g_setMotion(physics,kSceneKeyframed,1,0,1);
-                if(!entry.second)logger::Write("Traffic birth hold: vehicle %08X frozen the moment its physics appeared",entry.first);
-                entry.second=physics;
+            for(const auto& entry:g_birthHolds.All()){
+                const auto physics=AcquirePhysics(runtimeforms::LookupChecked(entry.id));
+                if(birthholds::NeedsApply(entry,physics.get())) ApplyBirthStage(entry.id);
             }
         }
 
@@ -762,14 +798,16 @@ namespace vehiclediag
 	}
 
     bool BirthStageAvailable(){return g_setMotion&&g_builder;}
-    int StagedLoaded(){std::lock_guard lock(g_birthLock);int n=0;for(const auto& entry:g_stagedBirths)if(entry.second)++n;return n;}
+    int StagedLoaded(){int n=0;for(const auto& entry:g_birthHolds.All())if(entry.object)++n;return n;}
     void StageBirth(std::uint32_t id){
-        if(!id)return;{std::lock_guard lock(g_birthLock);g_stagedBirths.emplace(id,0);}
+        if(!id)return;g_birthHolds.Add(id);
+        vehiclekeep::WantFromBirth(id);
+        {float at[3]={};if(RefPosOf(id,at)){std::lock_guard lock(g_builtLock);g_birthAt[id]={at[0],at[1],at[2]};}}
         ApplyBirthStage(id);
     }
     // A hidden, replaced or deleted traffic vehicle leaves the hold list at once, motion untouched (its physics object can be
     // freed and reused by something else).
-    void DropBirthHold(std::uint32_t id){if(!id)return;std::lock_guard lock(g_birthLock);g_stagedBirths.erase(id);}
+    void DropBirthHold(std::uint32_t id){g_birthHolds.Remove(id);std::lock_guard lock(g_builtLock);g_birthAt.erase(id);}
     static bool HasInstance(uptr component){if(!component)return false;__try{return At<uptr>(component,0x10)!=0;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}}
     // Built since the last reset, or (after a reset, for a vehicle that is not built again) its live component has an instance.
     bool Built(std::uint32_t id){
@@ -777,28 +815,40 @@ namespace vehiclediag
         return HasInstance(ComponentOf(id));
     }
     bool ReleaseBirth(std::uint32_t id){
-        if(!vehicleflight::BirthControlReady(id))return false;
-        if(!Built(id)){
+        const bool control=vehicleflight::BirthControlReady(id),built=control&&Built(id);
+        logger::Observe("chassis.birth-handoff",id,unsigned(control)|(unsigned(built)<<1),"controller_ready=%d built=%d build_checked=%d",control,built,control);
+        if(!control)return false;
+        if(!built){
             static std::unordered_map<std::uint32_t,ULONGLONG> waitLogged;const ULONGLONG now=GetTickCount64();
             auto& at=waitLogged[id];
             if(!at){at=now;logger::Write("Traffic birth hold: vehicle %08X stays frozen until the game builds its physics vehicle (released after the build)",id);}
             return false;
         }
-        std::lock_guard lock(g_birthLock);auto it=g_stagedBirths.find(id);
-        if(it==g_stagedBirths.end())return true;
-        const auto ref=runtimeforms::LookupChecked(id);const auto physics=ref?PhysicsOf(ref):0;
-        if(!physics||!g_setMotion)return false;
-        g_setMotion(physics,kSceneDynamic,1,0,1);g_stagedBirths.erase(it);return true;
+        const auto held=g_birthHolds.Get(id);
+        if(!held){lifecycle::Forget("birth-release:"+std::to_string(id));return true;}
+        const auto result=lifecycle::Poll("birth-release:"+std::to_string(id),id,[=]()->lifecycle::Work {
+            const auto owned=lifecycle::Keep(runtimeforms::LookupChecked(id),id);if(!owned)return {};
+            return [=]()->std::uint64_t {
+                if(!lifecycle::InService())return 0;
+                const auto physics=AcquirePhysics(reinterpret_cast<uptr>(owned.get()));
+                if(!physics||!g_setMotion||!g_birthHolds.BeginRelease(*held))return 0;
+                const bool released=SetSceneMotion(physics,kSceneDynamic);
+                g_birthHolds.FinishRelease(*held,released);return released?1:0;
+            };
+        });
+        return result&&*result;
     }
 	void Reset()
 	{
+		{
 		std::lock_guard lk(g_lock);
 		g_comps.clear();
 		g_retries.clear();
 		g_reloads.clear();
 		g_lastPos.clear();
-        {std::lock_guard lock(g_birthLock);g_stagedBirths.clear();}
-        {std::lock_guard lock(g_builtLock);g_built.clear();g_buildWatch.clear();}
+        }
+        g_birthHolds.Clear();
+        {std::lock_guard lock(g_builtLock);g_built.clear();g_buildWatch.clear();g_birthAt.clear();}
 	}
 
 	static float PlayerDistance(const float at[3])
@@ -820,8 +870,7 @@ namespace vehiclediag
 		std::vector<BuildWatch> keep;
 		for (auto& w : watched) {
 			float at[3] = {};
-			bool held = false;
-			{ std::lock_guard lock(g_birthLock); held = g_stagedBirths.count(w.id) != 0; }
+			const bool held = g_birthHolds.Get(w.id).has_value();
 			if (!held || !RefPosOf(w.id, at)) continue;  // hidden, released or gone
 			if (now - w.at >= trafficpair::kPutBackWatchMs) {
 				if (w.tries) logger::Write("Vehicle build: %08X after %d put-back(s): z %.1f, wanted %.1f: %s", w.id, w.tries, at[2], w.before[2], w.before[2] - at[2] < 2.0f ? "it stayed" : "it did not stay");
@@ -929,7 +978,8 @@ namespace vehiclediag
 			unsigned k = 0;
 			for (const auto* v : nearby) {
 				if (k >= std::size(g_known)) break;
-				g_known[k].phys.store(v->ref ? PhysicsOf(v->ref) : 0, std::memory_order_relaxed);
+				const auto physics = AcquirePhysics(v->ref);
+				g_known[k].phys.store(reinterpret_cast<uptr>(physics.get()), std::memory_order_relaxed);
 				g_known[k].id.store(v->formId, std::memory_order_relaxed);
 				++k;
 			}

@@ -10,7 +10,9 @@
 //    position (+0x8C): the map scene is in world coordinates.
 //  - The cursor (FUN_1416A8980): the global at 0x1461DE010 points to the cursor in pixels (+0x60, +0x64) and the screen
 //    size (+0x70, +0x74); x01 = x / width, y01 = 1 - y / height (FUN_142BE3800).
+#include <algorithm>
 #include <cmath>
+#include <vector>
 
 namespace routemap {
 struct Vec3 { double x = 0, y = 0, z = 0; };
@@ -48,6 +50,64 @@ inline bool ToStage(const Camera& c, Vec3 p, Vec2& out, bool* inside = nullptr)
 }
 inline Vec3 Cross(Vec3 a, Vec3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
 inline double Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+// ---- Marker shapes (2026-10-30, the user: each kind of placed thing has its own 3D look): convex solids in world coordinates ----
+using Face = std::vector<Vec3>;
+using Solid = std::vector<Face>;
+// A flat pad: its top at p.z, `half` metres each way, `thick` deep, turned `radians` clockwise from north.
+inline Solid Pad(Vec3 p, double half, double thick, double radians)
+{
+    const double ax = std::sin(radians), ay = std::cos(radians);
+    auto at = [&](double along, double across, double z) { return Vec3{ p.x + along * ax + across * ay, p.y + along * ay - across * ax, z }; };
+    const double t = p.z, b = p.z - thick;
+    const Vec3 c[4] = { at(half, half, t), at(half, -half, t), at(-half, -half, t), at(-half, half, t) };
+    const Vec3 d[4] = { at(half, half, b), at(half, -half, b), at(-half, -half, b), at(-half, half, b) };
+    Solid s{ { c[0], c[1], c[2], c[3] }, { d[3], d[2], d[1], d[0] } };
+    for (int i = 0; i < 4; ++i) s.push_back({ c[i], d[i], d[(i + 1) % 4], c[(i + 1) % 4] });
+    return s;
+}
+// A cone standing on its base: the base `below` metres under p.z, the point `height` metres above the base.
+inline Solid Cone(Vec3 p, double radius, double height, double below)
+{
+    constexpr int kSides = 10;
+    Solid s;
+    Face base;
+    const Vec3 tip{ p.x, p.y, p.z - below + height };
+    auto rim = [&](int i) { const double a = i * 6.283185307179586 / kSides; return Vec3{ p.x + radius * std::cos(a), p.y + radius * std::sin(a), p.z - below }; };
+    for (int i = 0; i < kSides; ++i) { base.push_back(rim(i)); s.push_back({ rim(i), rim(i + 1), tip }); }
+    s.push_back(base);
+    return s;
+}
+// A diamond: eight faces round p.
+inline Solid Diamond(Vec3 p, double r)
+{
+    const Vec3 top{ p.x, p.y, p.z + r * 1.25 }, low{ p.x, p.y, p.z - r * 1.25 };
+    const Vec3 m[4] = { { p.x + r, p.y, p.z }, { p.x, p.y + r, p.z }, { p.x - r, p.y, p.z }, { p.x, p.y - r, p.z } };
+    Solid s;
+    for (int i = 0; i < 4; ++i) { s.push_back({ m[i], m[(i + 1) % 4], top }); s.push_back({ m[i], m[(i + 1) % 4], low }); }
+    return s;
+}
+struct Lit { const Face* face = nullptr; double light = 0; };
+// The faces of a convex solid that face the eye, each with its light 0 .. 1 (lit from above and to one side).
+inline std::vector<Lit> Visible(const Solid& solid, Vec3 centre, Vec3 eye)
+{
+    std::vector<Lit> out;
+    const Vec3 sun{ -0.40, -0.30, 0.866 };
+    for (const auto& f : solid) {
+        if (f.size() < 3) continue;
+        Vec3 mid{};
+        for (const auto& v : f) { mid.x += v.x; mid.y += v.y; mid.z += v.z; }
+        const double n = double(f.size());
+        mid = { mid.x / n, mid.y / n, mid.z / n };
+        Vec3 normal = Cross({ f[1].x - f[0].x, f[1].y - f[0].y, f[1].z - f[0].z }, { f[2].x - f[0].x, f[2].y - f[0].y, f[2].z - f[0].z });
+        const double len = std::sqrt(Dot(normal, normal));
+        if (!(len > 1e-12)) continue;
+        normal = { normal.x / len, normal.y / len, normal.z / len };
+        if (Dot(normal, { mid.x - centre.x, mid.y - centre.y, mid.z - centre.z }) < 0) normal = { -normal.x, -normal.y, -normal.z };  // outward
+        if (Dot(normal, { eye.x - mid.x, eye.y - mid.y, eye.z - mid.z }) <= 0) continue;
+        out.push_back({ &f, 0.5 + 0.5 * Dot(normal, sun) });
+    }
+    return out;
+}
 // The line under a normalised screen point. On it row0 = xn * s * row3 and row1 = yn * s * row3, where s is the sign of
 // row3 in front of the camera (taken at the focus point, which the rig always keeps in view). Origin: the point of the
 // line nearest the eye; direction: away from the eye, toward the focus side.

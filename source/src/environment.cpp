@@ -1,4 +1,5 @@
 #include "environment.h"
+#include "log.h"
 #include "cellbake.h"
 #include "sitelogic.h"
 #include "addresses.h"
@@ -15,12 +16,16 @@
 #include <limits>
 namespace environment {
 namespace {
-constexpr int Slots[]={22,23,45,46,47};
+constexpr int E=prefetch::kRayEnvironment0;
+constexpr int Slots[]={22,23,45,46,47,E,E+1,E+2,E+3,E+4,E+5,E+6,E+7,E+8,E+9,E+10};
+constexpr int kFlights=int(std::size(Slots));
+static_assert(kFlights==5+prefetch::kRayEnvironmentCount);
 constexpr std::uint64_t Solid=0xA5C12671Eull;
-struct Query {std::uint64_t key=0,mask=0;float from[3]={},to[3]={};prefetch::RayHit hit;unsigned long long asked=0,done=0;bool inFlight=false;};
+constexpr unsigned long long kStartWindowMs=100;
+struct Query {std::uint64_t key=0,mask=0;float from[3]={},to[3]={};prefetch::RayHit hit;unsigned long long asked=0,done=0,refused=0;bool inFlight=false;};
 std::vector<Query> queries;
 struct Flight {std::uint64_t key=0;float from[3]={},to[3]={};unsigned long long at=0;};
-std::array<Flight,5> flights;
+std::array<Flight,kFlights> flights;
 std::uint64_t Key(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t mask){
  std::uint64_t h=owner^mask;
  for(const auto*p:{from,to})for(int i=0;i<3;++i){const auto v=std::int64_t(std::floor(p[i]*2));h^=std::uint64_t(v)+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);}
@@ -29,8 +34,10 @@ std::uint64_t Key(std::uint32_t owner,const float from[3],const float to[3],std:
 bool Same(const float a[3],const float b[3]){for(int i=0;i<3;++i)if(std::fabs(a[i]-b[i])>0.1)return false;return true;}
 bool Ray(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t mask,prefetch::RayHit&out,unsigned ttl=1000){
  const auto now=GetTickCount64(),key=Key(owner,from,to,mask);
- for(auto&q:queries)if(q.key==key){q.asked=now;if(q.done&&now-q.done<ttl){out=q.hit;return true;}return false;}
- if(queries.size()>=256)return false;
+ for(auto&q:queries)if(q.key==key){q.asked=now;if(q.done&&now-q.done<ttl){out=q.hit;
+  logger::Observe("sensing.ray",owner,1u+unsigned(out.hit),"reason=cached_result query=%llX hit=%d age_ms=%llu layer=%u body=%08X hit_pos=%.2f,%.2f,%.2f",static_cast<unsigned long long>(key),out.hit,static_cast<unsigned long long>(now-q.done),out.layer,out.bodyId,out.x,out.y,out.z);return true;}
+  logger::Observe("sensing.ray",owner,0,"reason=waiting query=%llX in_flight=%d from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f",static_cast<unsigned long long>(key),q.inFlight,from[0],from[1],from[2],to[0],to[1],to[2]);return false;}
+ if(queries.size()>=256){logger::Observe("sensing.ray",owner,3,"reason=query_cache_full cached=%zu query=%llX",queries.size(),static_cast<unsigned long long>(key));return false;}
  Query q;q.key=key;q.mask=mask;q.asked=now;std::copy(from,from+3,q.from);std::copy(to,to+3,q.to);queries.push_back(q);return false;
 }
 world::VehicleInfo Vehicle(std::uint32_t id){
@@ -94,16 +101,26 @@ bool RayHit(const float from[3],const float to[3],double&x,double&y,double&z,boo
 unsigned Pending(){unsigned n=0;for(const auto&q:queries)if(!q.inFlight&&!q.done)++n;return n;}
 void Tick(){
  const auto now=GetTickCount64();
- for(int s=0;s<5;++s){auto&f=flights[s];if(!f.key)continue;prefetch::RayHit hit;unsigned age=0;
+ static unsigned long long expired=0,started=0,refusedRays=0,answered=0,timedOut=0;
+ logger::Observe("sensing.queue",0,Pending(),"pending=%u cached=%zu active_slots=%zu expired=%llu started=%llu answered=%llu refused=%llu timed_out=%llu",Pending(),queries.size(),flights.size(),expired,started,answered,refusedRays,timedOut);
+ for(int s=0;s<kFlights;++s){auto&f=flights[s];if(!f.key)continue;prefetch::RayHit hit;unsigned age=0;
   const bool ready=prefetch::LatestRay(Slots[s],hit,age)&&age<10&&Same(f.from,hit.from)&&Same(f.to,hit.to);
-  if(!ready&&now-f.at<1000)continue;
-  for(auto&q:queries)if(q.key==f.key){q.inFlight=false;if(ready){q.hit=hit;q.done=now;}else q.asked=0;break;}f={};
+  // A ray from where no world is loaded gets no answer. Waiting out its second held every slot once traffic flew far (2026-10-31: about 20 starts a second).
+  const bool refused=!ready&&prefetch::RayRefused(Slots[s],f.from,f.to);
+  if(!ready&&!refused&&now-f.at<1000)continue;
+  if(ready)++answered;else if(refused)++refusedRays;else ++timedOut;
+  for(auto&q:queries)if(q.key==f.key){q.inFlight=false;if(ready){q.hit=hit;q.done=now;q.refused=0;}else if(refused)q.refused=now;else q.asked=0;break;}f={};
  }
+ // A finished query is kept 2 s as a cached answer. One never answered can only start within kStartWindowMs of being asked, so past that it
+ // only holds a table entry; a moving vehicle's key changes every 0.5 m and it would never be asked again (18:59 run: 4,516 refusals).
+ expired+=std::erase_if(queries,[&](const Query&q){return !q.inFlight&&!q.done&&!q.refused&&now-q.asked>=kStartWindowMs;});
  std::erase_if(queries,[&](const Query&q){return !q.inFlight&&now-q.asked>2000;});
- for(int s=0;s<5;++s)if(!flights[s].key){
-  auto it=queries.end();for(auto q=queries.begin();q!=queries.end();++q)if(!q->inFlight&&(!q->done||now-q->done>=150)&&now-q->asked<100&&
-   (it==queries.end()||q->done<it->done))it=q;
+ for(int s=0;s<kFlights;++s)if(!flights[s].key){
+  // Never answered first, and of those the latest asked: a moving vehicle has left its older queries behind. A refused one waits 2 s before it is tried again.
+  auto it=queries.end();for(auto q=queries.begin();q!=queries.end();++q)if(!q->inFlight&&(!q->done||now-q->done>=150)&&now-q->asked<kStartWindowMs&&(!q->refused||now-q->refused>=2000)&&
+   (it==queries.end()||q->done<it->done||(q->done==it->done&&q->asked>it->asked)))it=q;
   if(it==queries.end())break;
+  ++started;it->refused=0;
   auto&f=flights[s];f.key=it->key;f.at=now;std::copy(it->from,it->from+3,f.from);std::copy(it->to,it->to+3,f.to);
   it->inFlight=true;prefetch::RequestRay(Slots[s],f.from,f.to,it->mask);
  }

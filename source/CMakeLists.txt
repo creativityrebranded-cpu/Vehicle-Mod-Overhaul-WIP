@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.24)
 project(FlyingVehicleOverhaul VERSION 1.0.0 LANGUAGES CXX)
+add_executable(observations_test tests/observations_test.cpp)
+target_compile_features(observations_test PRIVATE cxx_std_20)
+target_include_directories(observations_test PRIVATE src)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,6 +15,8 @@ add_executable(native_movement_controller_test tests/native_movement_controller_
 target_include_directories(native_movement_controller_test PRIVATE src)
 add_executable(autodrive_test tests/autodrive_test.cpp)
 target_include_directories(autodrive_test PRIVATE src)
+add_executable(stucksense_test tests/stucksense_test.cpp)
+target_include_directories(stucksense_test PRIVATE src)
 add_executable(boardinggate_test tests/boardinggate_test.cpp src/hook.cpp)
 target_include_directories(boardinggate_test PRIVATE src)
 target_compile_definitions(boardinggate_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -57,6 +62,21 @@ function(sp_options target)
     target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8 /EHa)
 endfunction()
 
+add_executable(hangdump_test tests/hangdump_test.cpp)
+sp_options(hangdump_test)
+add_executable(stallcapture_test tests/stallcapture_test.cpp)
+sp_options(stallcapture_test)
+add_executable(allocator_dump_test tests/allocator_dump_test.cpp)
+sp_options(allocator_dump_test)
+target_link_libraries(allocator_dump_test PRIVATE dbghelp)
+add_executable(dump_threads tools/dump_threads.cpp)
+sp_options(dump_threads)
+add_executable(birthholds_test tests/birthholds_test.cpp)
+sp_options(birthholds_test)
+add_executable(lifecycle_test tests/lifecycle_test.cpp)
+sp_options(lifecycle_test)
+target_link_libraries(lifecycle_test PRIVATE Synchronization)
+
 add_library(sp_common STATIC
     src/game.cpp src/hook.cpp src/log.cpp src/notify.cpp src/telemetry.cpp
     src/anchor.cpp src/trace.cpp src/controlmap.cpp src/runtimeforms.cpp src/runtimecells.cpp)
@@ -79,6 +99,7 @@ target_link_libraries(SeamlessPlanets PRIVATE sp_common Synchronization)
 # when SeamlessPlanets is not installed. With the core present it uses its API.
 
 add_library(FlyingVehicleOverhaul SHARED
+    src/lifecycle.cpp
     src/native_movement_controller.cpp src/native_movement_engine.cpp src/native_movement_probe.cpp
     src/main_vehicle.cpp src/resources.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/api_traffic.cpp src/crash.cpp
     src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/secretunpause.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp src/routeedit.cpp src/disableguard.cpp src/mapguard.cpp src/cellbake.cpp
@@ -97,11 +118,16 @@ target_link_libraries(FVO_Traffic PRIVATE Shell32 Ole32)
 add_executable(trafficcycle_test tests/trafficcycle_test.cpp src/traffic/generator.cpp src/traffic/everyday.cpp)
 sp_options(trafficcycle_test)
 target_link_libraries(trafficcycle_test PRIVATE Shell32 Ole32)
+add_executable(trustzone_test tests/trustzone_test.cpp)
+sp_options(trustzone_test)
 add_executable(trafficpair_test tests/trafficpair_test.cpp)
 sp_options(trafficpair_test)
 add_executable(traffic_generator_test tests/traffic_generator_test.cpp)
 sp_options(traffic_generator_test)
 target_link_libraries(traffic_generator_test PRIVATE Shell32 Ole32)
+add_executable(traffic_lifecycle_test tests/traffic_lifecycle_test.cpp)
+sp_options(traffic_lifecycle_test)
+target_link_libraries(traffic_lifecycle_test PRIVATE Shell32 Ole32)
 
 # Gravspace was deleted 2026-10-22 (source in disabled_gravspace_20261022/Source). Gravlanes was deleted 2026-10-24 at the user's request.
 

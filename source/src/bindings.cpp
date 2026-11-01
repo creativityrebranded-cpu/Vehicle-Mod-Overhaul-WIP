@@ -488,6 +488,7 @@ namespace bindings
     bool Started(Action a){const auto i=std::size_t(a);std::lock_guard lk(g_lock);return g_allowed&&g_startEvents.Active(i);}
     bool Allowed(){std::lock_guard lk(g_lock);return g_allowed&&!g_suppressInput&&g_captureAction<0;}
 	bool PadConnected() { return g_connected.load(); }
+	void PadLeftStick(double& x, double& y) { PollPad(GetTickCount64()); std::lock_guard al(g_axesLock); x = g_axes.lx; y = g_axes.ly; }
 	std::uint32_t PadState() { PollPad(GetTickCount64()); return g_pad.load(std::memory_order_relaxed); }
 	bool UsingPad() { return PadInUse(); }
 	bool GameHeld(const char* context, const char* event, int fallbackVk)

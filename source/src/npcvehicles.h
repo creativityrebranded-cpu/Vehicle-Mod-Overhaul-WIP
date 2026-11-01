@@ -60,6 +60,13 @@ namespace npcvehicles
     int SnapNow(std::uintptr_t actor,std::uintptr_t vehicle);  // instant seat on a loaded actor (also when already linked)
 	// A driver not sitting, too far for a snap, written straight to the vehicle: from there the snap can seat them. True: moved.
 	bool BringToVehicle(std::uintptr_t actor,std::uintptr_t vehicle);
+	void HoldAtVehicle(std::uintptr_t actor,std::uintptr_t vehicle);  // a linked driver, not by the game's mover (FUN_142062F50 releases the seat): position written, model along with it
+	void ShrinkModel(std::uintptr_t actor,bool hide,float& saved);  // the 3D root scaled out of sight (saved: its scale), or back to saved. Done again for a model that was reloaded
+	void SetGuardIds(const std::uint32_t* ids,int count);  // main thread: the drivers whose new models are shrunk as they arrive
+	float AttachScale(std::uint32_t id);  // the scale such a model came with
+	bool ModelShrunk(std::uintptr_t actor);
+	double SeatDistance(std::uintptr_t actor,std::uintptr_t vehicle);  // models' distance when both are loaded: a flying driver's reference lags behind
+	bool DriverLeaving(std::uintptr_t actor);  // on the way out: an exit in progress, a pull-out standing up, or a job in a leaving phase
     bool ResumeSavedSeat(std::uintptr_t actor,std::uintptr_t vehicle); // reuse saved interaction; never build another
 	std::uintptr_t VehicleOf(std::uintptr_t actor);  // the vehicle the actor sits in, 0 when none
 	// ---- For the context engine (context.cpp): main thread only.

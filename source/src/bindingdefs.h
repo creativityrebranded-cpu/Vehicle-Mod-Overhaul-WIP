@@ -14,7 +14,7 @@ enum class Action {
     SavePlacement, DeletePlacement, SetSummonPoint,
     HudEdit, HudPrevious, HudNext, HudLeft, HudRight, HudUp, HudDown,
     HudSpacingLess, HudSpacingMore, HudGrow, HudShrink, HudReset, HudFast,
-    ShipPreview, NpcProfile, Count
+    ShipPreview, NpcProfile, Cruise, Count
 };
 enum class Layer { Gameplay, Target, Placement, Editor };
 struct Def {
@@ -78,6 +78,7 @@ inline constexpr Def kDefs[] = {
     {L"hud_fast", "default-key@editor, Pad:LS@editor", "HUD: larger movement step",nullptr,nullptr,0x11,Layer::Editor},
     {L"ship_preview", "default-key@vehicle, Pad:RS:hold@vehicle", "Toggle ship hull preview",nullptr,nullptr,0x77},
     {L"npc_profile", "default-key@foot|scanner, Pad:DRight:double@scanner", "Cycle escort NPC navigation profile",nullptr,nullptr,0x78},
+    {L"cruise", "default-key:double@vehicle, Pad:DLeft:double@vehicle", "Cruise: join traffic with no destination",nullptr,nullptr,'T'},
 };
 static_assert(std::size(kDefs)==std::size_t(Action::Count));
 inline bool LayersOverlap(Layer a,Layer b) {

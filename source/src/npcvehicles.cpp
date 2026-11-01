@@ -2,6 +2,7 @@
 #include "npcvehicles.h"
 #include "trafficpool.h"
 #include "trafficpair.h"
+#include "trafficdiagnostics.h"
 #include "fvolimits.h"
 #include "pilotlayout.h"
 #include "prefetch.h"
@@ -11,6 +12,7 @@
 #include "driverdiscovery.h"
 #include "boardinggate.h"
 #include "trafficcycle.h"
+#include "lifecycle.h"
 
 #include "addresses.h"
 #include "bindings.h"
@@ -185,7 +187,8 @@ namespace npcvehicles
 			int defMode = -1;                  // escort in a fight: 0 attack, 1 shield, 2 intercept, 3 overwatch
 			ULONGLONG exitWaitSince=0;
 			ULONGLONG no3DSince = 0;           // aboard but the vehicle has no 3D yet: the pilot waits for it (0 = not waiting)
-			int passTries = 0; bool passMarked = false;  // the driver's rule exemption (DriverPassTick)
+			int passTries = 0; bool passMarked = false; ULONGLONG passAt = 0, passLoadAt = 0;  // observed far-cell membership
+            bool questPending=false;
 			ULONGLONG flyOnSince = 0;  // flying with the driver's model out of the loaded cells (trafficpair::FlyWithoutDriverModel)
 			int flyOnPins = 0;
 			int order = 0;
@@ -200,6 +203,8 @@ namespace npcvehicles
 			ULONGLONG armedAt = 0;
 			bool coldStartLogged = false;
 			int reseats = 0; ULONGLONG reseatAt = 0;  // a cold-start driver knocked out of its seat on a trip: instant seats tried
+			ULONGLONG seatBrakeSince = 0;             // holding still while that driver is out of the seat (trafficpair::SeatBrake)
+			ULONGLONG cellBringAt = 0;                // last BringDriverIntoCell
 			int boardSnaps = 0; ULONGLONG seatWatchAt = 0, dropTraceUntil = 0; bool wasAboard = false;
 			bool haveSeatOff = false; float seatOff[3] = {}; float seatYaw = 0; unsigned seatHolds = 0;  // the driver's seat, vehicle frame                      // cold-start boarding snaps tried before the pilot takes the vehicle
 			int pins = 0; double pinMax = 0;          // an unloaded cold-start driver put back on its vehicle (drifted away while unloaded)
@@ -266,7 +271,7 @@ namespace npcvehicles
 		bool g_traceSeat = false;                  // log the seat check's helpers while one of OUR get-in calls runs
 		std::atomic<std::uint32_t> g_nativeExits[kJobs];
 		std::atomic<std::uint32_t> g_ignoredColdExit{ 0 };  // logged on the main thread
-		bool g_allowDismount = false;              // only our own Leave() takes a job's NPC out of its vehicle
+		thread_local bool g_allowDismount = false; // only our own Leave() takes a job's NPC out of its vehicle; per thread: the service and the controller both exit drivers, and the hook runs inside the call
 		// Vehicle weapon (the game's own path, 1.16.244): the player's VehicleHandler (PlayerControls, vtable
 		// 0x144C43E58) sets its input block at +0x80 (fire = +0x9F, from "VehicleFireWeapon"), and each frame
 		// FUN_1412BFEC0 hands it to the vehicle: FUN_1412C0550(*(FUN_1423FF640() + 0x8B0), &handler, &vehicleFormId) ->
@@ -373,7 +378,9 @@ namespace npcvehicles
 				return false;
 			}
 		}
-		int SnapSeat(uptr actor, uptr vehicle, int& seated)
+		bool EnsureSeatKeyword(uptr actor,uptr vehicle);
+        bool IsActorRef(uptr actor);
+		int SnapSeatNative(uptr actor, uptr vehicle, int& seated)
 		{
 			seated = -1;
 			uptr link = 0;
@@ -409,6 +416,23 @@ namespace npcvehicles
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				return -1;
 			}
+		}
+
+		int SnapSeat(uptr actor, uptr vehicle, int& seated)
+		{
+			if(!lifecycle::InService()) {
+				const unsigned id=At<unsigned>(actor,off::kFormId),vid=At<unsigned>(vehicle,off::kFormId);
+				const auto result=lifecycle::Poll("seat:"+std::to_string(id)+":"+std::to_string(vid),id,[=]()->lifecycle::Work {
+					const auto a=lifecycle::Keep(actor,id),v=lifecycle::Keep(vehicle,vid);if(!a||!v)return {};
+					return [=]()->std::uint64_t {
+						if(!lifecycle::InService())return 0;
+						const auto ar=reinterpret_cast<uptr>(a.get()),vr=reinterpret_cast<uptr>(v.get());
+						if(!IsActorRef(ar)||IsActorRef(vr))return 0;EnsureSeatKeyword(ar,vr);int done=0;SnapSeat(ar,vr,done);return done==1?1:0;
+					};
+				});
+				seated=result?int(*result):0;return seated;
+			}
+			return SnapSeatNative(actor,vehicle,seated);
 		}
 
         int InstantSeat(uptr actor,uptr vehicle,int& seated) {
@@ -496,7 +520,15 @@ namespace npcvehicles
 		// The seat keyword the seat check needs on the ACTOR (seat trace 11:11: without it FUN_1412B2C40 and FUN_1412B2A90 return null and the check refuses).
 		bool EnsureSeatKeyword(uptr actor, uptr vehicle)
 		{
+			if(!actor||!vehicle||!IsActorRef(actor)||IsActorRef(vehicle))return false;
 			if (CanMount(actor, vehicle)) return true;
+			if(!lifecycle::InService()){
+				const unsigned id=At<unsigned>(actor,off::kFormId),vid=At<unsigned>(vehicle,off::kFormId);
+				lifecycle::Post("seat-keyword:"+std::to_string(id),id,[=]()->lifecycle::Work {
+					const auto a=lifecycle::Keep(actor,id),v=lifecycle::Keep(vehicle,vid);if(!a||!v)return {};
+					return [=]()->std::uint64_t {return lifecycle::InService()&&EnsureSeatKeyword(reinterpret_cast<uptr>(a.get()),reinterpret_cast<uptr>(v.get()))?1:0;};
+				});return false;
+			}
 			const uptr kw = DriverSeatKeyword(vehicle);
 			const bool gave = kw && GiveKeyword(actor, kw);
 			logger::Write("NPC vehicles: NPC %08X lacks the vehicle's seat keyword; %s %08X", At<std::uint32_t>(actor, off::kFormId), gave ? "gave" : "could NOT give", kw ? At<std::uint32_t>(kw, off::kFormId) : 0);
@@ -775,7 +807,7 @@ namespace npcvehicles
 		}
 		// Moves an actor's reference and model root to `target` (world) and turns its reference to `yaw` (what the loaded-area
 		// sync does for vehicles). For a seated driver the game has stopped moving.
-		bool PlaceSeated(uptr actor, const float target[3], float yaw)
+		bool PlaceSeatedNative(uptr actor, const float target[3], float yaw)
 		{
 			__try {
 				const float* p = reinterpret_cast<const float*>(actor + off::kRefPosition);
@@ -794,6 +826,31 @@ namespace npcvehicles
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 		}
+
+		// Worked out in the service from where the vehicle is at that moment: a point taken by the controller is a frame behind a flying
+		// vehicle. Judged again there too: since it was asked, the driver may have got out, or the game may be carrying it again.
+		bool PlaceSeatedNow(uptr actor, uptr vehicle, const trafficpair::SeatPose& pose)
+		{
+			if (InVehicle(actor) != vehicle) return false;
+			if (pose.hold ? (ProcessLevel(actor) == 0 && CellAttached(actor)) : !trafficpair::NeedsBringing(SitState(actor), Dist3(actor, vehicle))) return false;
+			const auto v = At<game::Vec3>(vehicle, off::kRefPosition);
+			const float heading = At<game::Vec3>(vehicle, off::kRefRotation).z;
+			float target[3];trafficpair::SeatPoint(v.x, v.y, v.z, heading, pose, target);
+			return PlaceSeatedNative(actor, target, heading + pose.yaw);
+		}
+		bool PlaceSeated(uptr actor, uptr vehicle, const trafficpair::SeatPose& pose)
+		{
+			if(!lifecycle::InService()) {
+				const unsigned id=At<unsigned>(actor,off::kFormId),vid=At<unsigned>(vehicle,off::kFormId);
+				return lifecycle::Post("seat-pose:"+std::to_string(id),id,[=]()->lifecycle::Work {
+					const auto a=lifecycle::Keep(actor,id),v=lifecycle::Keep(vehicle,vid);if(!a||!v)return {};
+					return [=]()->std::uint64_t {
+						return lifecycle::InService()&&PlaceSeatedNow(reinterpret_cast<uptr>(a.get()),reinterpret_cast<uptr>(v.get()),pose)?1:0;
+					};
+				});
+			}
+			return PlaceSeatedNow(actor,vehicle,pose);
+		}
 		// Driver to vehicle for the seat check (2026-10-29 21:27 run: 44 of 91 traffic pilots were stopped as "knocked out" while
 		// the game still had the driver in the seat). A seated driver's model rides with the vehicle, but its reference position
 		// is only refreshed when the game processes that actor, so it lags behind a flying vehicle. Both models: their distance.
@@ -805,6 +862,43 @@ namespace npcvehicles
 				return std::sqrt(dx * dx + dy * dy + dz * dz);
 			}
 			return Dist3(actor, vehicle);
+		}
+		// A driver past the loaded area loses its model, its seat and its parent cell (2026-10-31: driver cell 00000000, level 3, sit 0). Nothing returns it in time near the player, so it is
+		// put in the player's cell at its vehicle, where it loads; the seat repair then seats it. It has no model here, so there is nothing to see move.
+		bool DriverCellMoveOn()
+		{
+			static const bool on = GetPrivateProfileIntW(L"traffic", L"driverCellMove", 0, fvopaths::Settings().c_str()) != 0;
+			return on;
+		}
+		bool MoveActorNow(uptr actor, uptr cell, uptr ws, float* pos, float* rot)
+		{
+			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
+			__try { EngineFn<void (*)(uptr, std::uint64_t*, uptr, uptr, float*, float*)>(addr::kMoveReference)(actor, &handle, cell, ws, pos, rot); return true; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		void BringDriverIntoCell(uptr npc, uptr vehicle)
+		{
+			const unsigned id = At<unsigned>(npc, off::kFormId), vid = At<unsigned>(vehicle, off::kFormId);
+			lifecycle::Post("driver-cell:" + std::to_string(id), id, [=]() -> lifecycle::Work {
+				const auto a = lifecycle::Keep(npc, id), v = lifecycle::Keep(vehicle, vid);
+				if (!a || !v) return {};
+				return [=]() -> std::uint64_t {
+					const uptr actor = reinterpret_cast<uptr>(a.get()), veh = reinterpret_cast<uptr>(v.get());
+					const uptr player = Ptr(addr::kPlayerCharacterPtr);
+					const uptr cell = player ? At<uptr>(player, off::kRefParentCell) : 0;
+					const uptr ws = cell ? At<uptr>(cell, off::kCellWorldspace) : 0;
+					const uptr before = At<uptr>(actor, off::kRefParentCell);
+					if (!lifecycle::InService() || !cell || !ws || Has3D(actor) || IsDead(actor)) {
+						logger::Write("OBS system=driver.cell vehicle=%08X driver=%08X event=refused player_cell=%p has_model=%d dead=%d", vid, id, reinterpret_cast<void*>(cell), Has3D(actor), IsDead(actor));
+						return 0;
+					}
+					const auto p = At<game::Vec3>(veh, off::kRefPosition);
+					float pos[3] = { p.x, p.y, p.z }, rot[3] = { 0.0f, 0.0f, At<game::Vec3>(veh, off::kRefRotation).z };
+					const bool ok = MoveActorNow(actor, cell, ws, pos, rot);
+					logger::Write("OBS system=driver.cell vehicle=%08X driver=%08X event=moved ok=%d had_cell=%d now_cell=%d level=%d aboard=%d pos=%.1f,%.1f,%.1f", vid, id, ok, before != 0, At<uptr>(actor, off::kRefParentCell) != 0, ProcessLevel(actor), InVehicle(actor) == veh, pos[0], pos[1], pos[2]);
+					return ok ? 1 : 0;
+				};
+			});
 		}
 		// Seated for the traffic seat check (2026-10-29 22:36 run: "aboard 1, sit 0, model distance 0.0 m" on 122 checks; the game
 		// reports sit state 0 until it next processes the actor, e.g. still behind the loading screen). A driver that is aboard and
@@ -878,9 +972,12 @@ namespace npcvehicles
             }
             j.resumeFoe=0;
         }
+        void LeaveFarCell(uptr actor);
         void Set(Job& j, Phase p)
 		{
+			logger::Write("OBS system=npc.assignment vehicle=%08X driver=%08X pilot=%d event=transition from=%s to=%s task=%d passenger=%d cold_start=%d",j.vehicle,j.npc,j.pilot,Name(j.phase),Name(p),j.task,j.passenger,j.coldStart);
 			logger::Write("NPC vehicles: [%d] %s -> %s (NPC %08X, vehicle %08X)", j.pilot, Name(j.phase), Name(p), j.npc, j.vehicle);
+			if (p == Phase::Idle) { if(j.coldStart)pilotquest::Release(j.pilot-1);lifecycle::Cancel(j.npc);lifecycle::Cancel(j.vehicle);j.passMarked = false; LeaveFarCell(RefById(j.npc)); }
 			if((p==Phase::Following||p==Phase::Idle)&&j.resumeFoe) ResumeCombat(j);
             vehicleflight::ClearPilotCommand(j.pilot);
             if (p != Phase::Boarding && j.combatReq) CombatBoardRelease(j.combatReq);
@@ -2509,33 +2606,90 @@ namespace npcvehicles
 			const float target[3] = { v.x + lx * c + ly * sn, v.y - lx * sn + ly * c, v.z + lz };
 			const float ex = d.x - target[0], ey = d.y - target[1], ez = d.z - target[2];
 			if (ex * ex + ey * ey + ez * ez < 0.0025f) return;
-			if (PlaceSeated(npc, target, h + j.seatYaw) && ++j.seatHolds == 1)
+			if (PlaceSeated(npc, vehicle, trafficpair::SeatPose{ lx, ly, lz, j.seatYaw, true }) && ++j.seatHolds == 1)
 				logger::Write("NPC vehicles: [%d] seat hold: driver %08X in %08X (sit %d) is not moved by the game (process level %d, %.1f m off its seat); FVO keeps it in the seat",
 					j.pilot, j.npc, j.vehicle, SitState(npc), level, std::sqrt(ex * ex + ey * ey + ez * ez));
 		}
 
+		// A traffic driver whose seat link dropped, kept at its seat, in the service (the vehicle's position at that moment). Only TaskTick's
+		// re-seat branch calls it, where a fight, a wreck or the player pulling the driver out has already been ruled out.
+		constexpr double kHoldReach = 15.0;
+		void HoldUnlinked(uptr npc, uptr vehicle)
+		{
+			const unsigned id = At<unsigned>(npc, off::kFormId), vid = At<unsigned>(vehicle, off::kFormId);
+			static std::atomic<unsigned> held{0};
+			lifecycle::Post("seat-hold:" + std::to_string(id), id, [=]() -> lifecycle::Work {
+				const auto a = lifecycle::Keep(npc, id), v = lifecycle::Keep(vehicle, vid);
+				if (!a || !v) return {};
+				return [=]() -> std::uint64_t {
+					if (!lifecycle::InService()) return 0;
+					const uptr actor = reinterpret_cast<uptr>(a.get()), veh = reinterpret_cast<uptr>(v.get());
+					// Eligibility can change while this command waits in the service queue.
+					if (IsDead(actor) || !Has3D(actor) || !Has3D(veh) || InVehicle(actor) || InCombat(actor) || vehiclehits::Wrecked(vid)) return 0;
+					const double d = Dist3(actor, veh);
+					if (!std::isfinite(d) || d > kHoldReach || !trafficpair::NeedsBringing(SitState(actor), d)) return 0;
+					const auto vp = At<game::Vec3>(veh, off::kRefPosition);
+					const float heading = At<game::Vec3>(veh, off::kRefRotation).z;
+					float target[3]; trafficpair::SeatPoint(vp.x, vp.y, vp.z, heading, trafficpair::SeatPose{}, target);
+					if (!PlaceSeatedNative(actor, target, heading)) return 0;
+					if (held.fetch_add(1) < 8) logger::Write("NPC vehicles: traffic driver %08X out of the seat of %08X with no seat link: held at the seat (%.1f m off) until it can be seated", id, vid, d);
+					return 1;
+				};
+			});
+		}
+
+		bool InstantExit(uptr npc, bool eject);
+		bool WarpExitController(uptr npc, float x, float y, float z);
+
 		// One frame of a civil task (a Following job with j.task set).
 		void TaskTick(Job& j, uptr npc, uptr vehicle, uptr player, bool aboard, ULONGLONG now)
 		{
+			const int observedSit=SitState(npc);const bool observedDriver3D=Has3D(npc),observedVehicle3D=Has3D(vehicle);
+			logger::Observe("driver.seat",j.vehicle,unsigned(aboard)|(std::uint64_t(unsigned(observedSit))<<1)|(std::uint64_t(observedDriver3D)<<8)|(std::uint64_t(observedVehicle3D)<<9),
+				"driver=%08X pilot=%d task=%d aboard=%d sit=%d driver_model=%d vehicle_model=%d separation=%.2f driver_cell_ready=%d vehicle_cell_ready=%d reseats=%d",
+				j.npc,j.pilot,j.task,aboard,observedSit,observedDriver3D,observedVehicle3D,Dist3(npc,vehicle),CellAttached(npc),CellAttached(vehicle),j.reseats);
+			logger::Observe("npc.behaviour",j.vehicle,unsigned(j.phase)|(std::uint64_t(j.foe)<<8),"driver=%08X pilot=%d task=%d phase=%s enemy=%08X combat_ai=%d retreating=%d cold_start=%d",j.npc,j.pilot,j.task,Name(j.phase),j.foe,j.aiOn,j.retreating,j.coldStart);
 			if (j.coldStart && j.task == 9) HoldInSeat(j, npc, vehicle, aboard);
 			// At reduced simulation (process level 1+) an aboard driver is held in its seat by HoldInSeat and is snapped only once the
 			// game fully simulates it again: a snap there does not stick and knocked drivers out (07:44 run).
 			const bool heldReduced = aboard && j.coldStart && j.task == 9 && ProcessLevel(npc) >= 1 && Has3D(npc) && Has3D(vehicle);
-			if (!heldReduced && !j.flyOnSince && !SeatedNow(npc, vehicle, aboard) && j.coldStart && j.task == 9 && npc && !IsDead(npc)) {
-				// Brake while repairing a detached driver. After five failed seats,
-				// descend through the existing stop path rather than hover forever.
-				vehicleflight::Command hold;hold.set=hold.kThrottle|hold.kStrafe|hold.kBrake|hold.kYaw;hold.brake=true;
-				vehicleflight::PilotCommand(j.pilot,hold);
-				if (j.reseats<5 && now - j.reseatAt >= 1000) {
+			// In a fight or from a wreck a driver out of the seat stays out (below); so does one the player pulled out, whose job has already ended.
+			const bool fightOut = !aboard && (vehiclehits::Wrecked(j.vehicle) || InCombat(npc) || (player && InCombat(player) && Dist(vehicle, player) < 120.0));
+			if (!heldReduced && !j.flyOnSince && !fightOut && !SeatedNow(npc, vehicle, aboard) && j.coldStart && j.task == 9 && npc && !IsDead(npc)) {
+				// Held at the vehicle, it flies on, and the model guard keeps it out of sight: nothing shows a repair. After five failed seats it descends through the existing stop path, and at rest the
+				// driver simply gets out beside it.
+				// Held at the vehicle every frame, linked or not (09:04 run, FF01F04E: brought once a second at most and only if still linked, it fell 60 m between tries, out of snap reach each time).
+				// PlaceSeated refuses a driver whose seat link has dropped (aboard 0), and that is what happens when a model reloads far away:
+				// 17:20 run, FF1001A6 came back 1.0 m from its vehicle, unlinked, and was 66 m away on the ground 3 s later. This branch has
+				// already excluded fights, wrecks and pull-outs, so an unlinked traffic driver is held at its seat too (HoldUnlinked), but only
+				// within kHoldReach: a driver already far off is never pulled back in sight; the pair check retires that pair.
+				if (Has3D(npc) && Has3D(vehicle) && trafficpair::NeedsBringing(SitState(npc), Dist3(npc, vehicle))) {
+					if (InVehicle(npc) == vehicle) PlaceSeated(npc, vehicle, {});
+					else if (Dist3(npc, vehicle) <= kHoldReach) HoldUnlinked(npc, vehicle);
+				}
+				// While the driver's or the vehicle's cell is still loading (state below 9) a seat never sticks (16:55 run: FF10E559 and its
+				// vehicle both in state 6, knocked out and seated again every second for over a minute, then out of the seat 46 m up). The
+				// hold above keeps it at the vehicle; tries wait, uncounted, until both cells are attached.
+				const bool cellsReady = CellAttached(npc) && CellAttached(vehicle);
+				if (!cellsReady && now - j.reseatAt >= 1000u) {
 					j.reseatAt = now;
-					++j.reseats;
-					if (BringToVehicle(npc, vehicle)) logger::Write("NPC vehicles: [%d] traffic driver %08X was away from vehicle %08X: brought to it", j.pilot, j.npc, j.vehicle);
+					static std::unordered_map<std::uint32_t, ULONGLONG> told;
+					ULONGLONG& at = told[j.npc];
+					if (now - at > 10000) { at = now; logger::Write("NPC vehicles: [%d] traffic driver %08X out of the seat of %08X while a cell is still loading: seat tries wait for it (none counted)", j.pilot, j.npc, j.vehicle); }
+				}
+				if (cellsReady && now - j.reseatAt >= (j.reseats < 5 ? 1000u : 5000u)) {  // past five it lands; slower tries go on, since at rest a seat often takes
+					j.reseatAt = now;
+					if (j.reseats < 5) ++j.reseats;
 					// Every input of the seat check, so a run shows which one failed (vehicle model, driver model, aboard, sit, distance).
 					const int sitBefore = SitState(npc);const double seatDist = SeatDist(npc, vehicle), refDist = Dist3(npc, vehicle);
 					// Only a driver at its vehicle is snapped in (2026-10-30, 06:42 run): a snap from tens of metres left drivers stuck in the
 					// getting-in state (sit 1) frozen in mid-air, or threw them to one far point. -3: too far, not snapped.
 					// A linked driver that is not sitting (sit state 0-2) at its vehicle gets the snap; a far one is not snapped (-3).
 					const int r = trafficpair::NeedsSnap(Has3D(vehicle), Has3D(npc), sitBefore, seatDist) ? SeatNewborn(npc, vehicle) : -3;
+					// A snap still in the queue answers 0 on this poll and 2 on the next: not a failed try (2026-10-31: 65 of 186 reports; five polls ended trips over about two real snaps).
+					const bool snapPending = r == 0 && lifecycle::Pending(j.npc, "seat");
+					if (snapPending && j.reseats > 0 && j.reseats < 5) --j.reseats;
+					logger::Observe("driver.seat", j.vehicle, 0x900u | unsigned(r + 8), "driver=%08X event=reseat result=%d pending=%d tries=%d sit=%d model_distance=%.1f reference_distance=%.1f", j.npc, r, snapPending, j.reseats, sitBefore, seatDist, refDist);
 					// Where each one is (2026-10-30: drivers 50-97 m from vehicles that had not moved; which one moved is unknown).
 					const auto dp = At<game::Vec3>(npc, off::kRefPosition), vp0 = At<game::Vec3>(vehicle, off::kRefPosition);
 					game::Vec3 dm{}, vm{};const bool dmOk = ScenePos(npc, dm), vmOk = ScenePos(vehicle, vm);
@@ -2545,7 +2699,28 @@ namespace npcvehicles
 						dp.x, dp.y, dp.z, dm.x, dm.y, dm.z, dmOk ? "" : " (no model)", vp0.x, vp0.y, vp0.z, vm.x, vm.y, vm.z, vmOk ? "" : " (no model)",
 						vehiclediag::Built(j.vehicle) ? 1 : 0, probe);
 				}
-				if(j.reseats>=5)vehicleflight::PilotStop(j.pilot,"traffic seat repair exhausted: land before repair");
+				if(j.reseats>=5){
+					if(vehicleflight::PilotActive(j.pilot))vehicleflight::PilotStop(j.pilot,"traffic seat repair exhausted: land before repair");
+					else{
+						// In the service, like every other change to a traffic pair: several pairs can reach this together. Id 0 so the end of the job
+						// below does not cancel it; that job's seat release queues after it, the order this always ran in.
+						const unsigned npcId=j.npc,vehicleId=j.vehicle;const int pilot=j.pilot;
+						const bool taken=lifecycle::Post("traffic-exit:"+std::to_string(npcId),0,[=]()->lifecycle::Work {
+							const auto a=lifecycle::Keep(npc,npcId),v=lifecycle::Keep(vehicle,vehicleId);if(!a||!v)return {};
+							return [=]()->std::uint64_t {
+								if(!lifecycle::InService())return 0;
+								const auto driver=reinterpret_cast<uptr>(a.get()),carrier=reinterpret_cast<uptr>(v.get());
+								if(InVehicle(driver)==carrier)InstantExit(driver,true);
+								const auto vr=At<game::Vec3>(carrier,off::kRefPosition);const double yaw=At<game::Vec3>(carrier,off::kRefRotation).z;
+								const bool placed=WarpExitController(driver,float(vr.x+std::cos(yaw)*3.0),float(vr.y-std::sin(yaw)*3.0),vr.z+0.5f);
+								logger::Write("NPC vehicles: [%d] traffic driver %08X would not take its seat in %08X: got out beside it at rest (%s)",pilot,npcId,vehicleId,placed?"placed":"place failed");
+								return 1;
+							};
+						});
+						if(!taken)return;  // table full: asked again next update
+						Set(j,Phase::Idle);
+					}
+				}
 				return;
 			}
 			if (aboard && j.reseats && now - j.reseatAt > 5000) j.reseats = 0;  // seated and settled: replenish retries
@@ -2558,6 +2733,7 @@ namespace npcvehicles
 				logger::Write("NPC vehicles: [%d] seat watch: driver %08X in %08X sit %d, model distance %.1f m, vehicle at (%.0f, %.0f, %.0f), vehicle built %d; %s; seat holds %u (offset %s)",
 					j.pilot, j.npc, j.vehicle, SitState(npc), SeatDist(npc, vehicle), vp1.x, vp1.y, vp1.z, vehiclediag::Built(j.vehicle) ? 1 : 0, probe, j.seatHolds, j.haveSeatOff ? "learned" : "not learned");
 			}
+			if (!aboard && j.flyOnSince && j.coldStart) return;  // no model, link dropped: kept on its vehicle (above) until it loads
 			if (!aboard) {
 				logger::Write("NPC vehicles: [%d] NPC %08X left the vehicle (task)", j.pilot, j.npc);
 				vehicleflight::PilotStop(j.pilot, "driver got out");
@@ -3354,7 +3530,9 @@ namespace npcvehicles
 			}
 			const bool aboard = InVehicle(npc) == vehicle;
 			const double modelsToPlayer = Dist(vehicle, player);
-			if(j.coldStart&&trafficpair::FlyWithoutDriverModel(j.phase==Phase::Following,Has3D(vehicle),Has3D(npc),aboard,modelsToPlayer)){
+			// With no model the driver's seat link can drop too (2026-10-31 09:04 run, FF01F027: that read as "got out", the job ended 322 m up and the driver was left hanging). Not aboard counts here:
+			// nobody can leave a seat with no model, so it stays on the vehicle and the repair seats it when it loads.
+			if(j.coldStart&&trafficpair::FlyWithoutDriverModel(j.phase==Phase::Following,Has3D(vehicle),Has3D(npc),true,modelsToPlayer)){
 				// Out of the loaded cells: only data until it comes back. Kept on its vehicle (see below), so it loads in its seat.
 				const double drift=Dist3(npc,vehicle);
 				if(drift>2.0&&std::isfinite(drift)&&PinToVehicle(npc,vehicle))++j.flyOnPins;
@@ -3383,12 +3561,29 @@ namespace npcvehicles
 				if(!Has3D(npc)){const double drift=Dist3(npc,vehicle);
 					if(drift>2.0&&std::isfinite(drift)&&PinToVehicle(npc,vehicle)){++j.pins;j.pinMax=std::max(j.pinMax,drift);
 						if(j.pins==1)logger::Write("NPC vehicles: [%d] unloaded traffic driver %08X had drifted %.1f m from vehicle %08X: kept on its vehicle until both load",j.pilot,j.npc,drift,j.vehicle);}}
+				// [traffic] driverCellMove, default off: the 20:47 run showed every move loses the seat link (aboard=0), the driver ends up about 95 m off and the vehicle lands.
+				if(DriverCellMoveOn()&&Has3D(vehicle)&&!Has3D(npc)&&modelsToPlayer<trafficpair::kDriverModelReach&&now-j.cellBringAt>=3000){j.cellBringAt=now;BringDriverIntoCell(npc,vehicle);}
 				if(trafficpair::LandForMissingModel(Has3D(vehicle),Has3D(npc),now-j.no3DSince,modelsToPlayer))vehicleflight::PilotStop(j.pilot,"traffic driver model missing: land before repair");
 				return;
 			}
 			if(j.coldStart&&j.no3DSince&&Has3D(vehicle)&&Has3D(npc)){j.no3DSince=0;
 				logger::Write("NPC vehicles: [%d] traffic pair 3D restored; validating seat (driver %.1f m from the vehicle; kept on it %d time(s) while unloaded, largest drift %.0f m)",
 					j.pilot,Dist3(npc,vehicle),j.pins,j.pinMax);j.pins=0;j.pinMax=0;}
+			// Both models here and the driver not sitting: hold still so the seat repair can reach. Bounded (trafficpair::SeatBrake).
+			if(j.coldStart&&j.phase==Phase::Following){
+				const int sit=SitState(npc);const double offSeat=Dist3(npc,vehicle);
+				const bool unseated=Has3D(vehicle)&&Has3D(npc)&&!trafficpair::Sitting(sit)&&std::isfinite(offSeat)&&offSeat<=kHoldReach;
+				const bool wasBraking=j.seatBrakeSince!=0;
+				const auto startedAt=j.seatBrakeSince;
+				if(trafficpair::SeatBrake(unseated,j.seatBrakeSince,now)){
+					vehicleflight::Command hold;hold.set=hold.kThrottle|hold.kStrafe|hold.kBrake|hold.kYaw;hold.brake=true;
+					vehicleflight::PilotCommand(j.pilot,hold);
+					j.watchAt=now;j.watchTickAt=now;
+					if(!wasBraking)logger::Write("OBS system=driver.seat vehicle=%08X driver=%08X event=seat_brake_start pilot=%d sit=%d off_seat=%.1f player=%.0f",j.vehicle,j.npc,j.pilot,sit,offSeat,modelsToPlayer);
+				}
+				else if(wasBraking&&!j.seatBrakeSince)logger::Write("OBS system=driver.seat vehicle=%08X driver=%08X event=seat_brake_end seated=%d sit=%d after_ms=%llu",j.vehicle,j.npc,trafficpair::Sitting(sit),sit,static_cast<unsigned long long>(now-startedAt));
+				else if(j.seatBrakeSince&&now-j.seatBrakeSince<trafficpair::kSeatBrakeMs+250)logger::Observe("driver.seat",j.vehicle,0xB00u,"driver=%08X event=seat_brake_gave_up sit=%d off_seat=%.1f",j.npc,sit,offSeat);
+			}
 			const double toPlayer = Dist(vehicle, player);
 			// Watchdog (2026-10-21, the user: "an NPC sat in the vehicle and did nothing"; log it instead of asking): an NPC aboard whose
 			// vehicle has not moved 2 m in kIdleAboardMs gets one line every kIdleAboardMs with what the job, the pilot and the vehicle say.
@@ -3423,8 +3618,14 @@ namespace npcvehicles
 			}
 			else j.watchAt = 0;
 			if (j.phase == Phase::Following) vehicleflight::WatchFlip(vehicle, "NPC vehicles");
+			logger::Observe("npc.job",j.vehicle,unsigned(j.phase)|(std::uint64_t(j.foe)<<8),"driver=%08X pilot=%d phase=%s task=%d enemy=%08X combat_ai=%d retreating=%d passenger=%d",j.npc,j.pilot,Name(j.phase),j.task,j.foe,j.aiOn,j.retreating,j.passenger);
 			switch (j.phase) {
 			case Phase::Boarding:
+                if(j.questPending){
+                    if(pilotquest::AssignTraffic(j.pilot-1,npc,vehicle))j.questPending=false;
+                    else if(lifecycle::Pending(j.npc,"pilot-assign"))return;
+                    else {EndJobOf(j.vehicle,"traffic pilot package assignment failed");return;}
+                }
                 // Boarding as a combat move: its state decides until the NPC is aboard, or it ends and the get-in package takes over.
                 if (j.combatReq) {
                     const int st = CombatBoardState(j.combatReq);
@@ -5334,10 +5535,8 @@ namespace npcvehicles
 
 		std::uint64_t DesiredLevelDetour(uptr actor)
 		{
-			if (actor && FullSimListed(At<std::uint32_t>(actor, off::kFormId)) && Has3D(actor)) {  // an unloaded driver stays with the game
-				if (g_desiredLevelOriginal(actor) != 0) g_fullSimKept.fetch_add(1, std::memory_order_relaxed);
-				return 0;
-			}
+			// Model retention is not permission to force walking/pathing/high
+			// process at arbitrary distance. Keep the engine's complete decision.
 			return g_desiredLevelOriginal(actor);
 		}
 
@@ -5424,32 +5623,160 @@ namespace npcvehicles
 		bool VehicleHeld(uptr vehicle) { __try { return vehicle && (At<std::uint32_t>(vehicle, 0x20) & kFullLodFlag) != 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
 		void ActorCellCheckDetour(uptr actor)
 		{
+			// 1418EBF00 -> 1418EBF90 maintains collision representation.
+			// Never skip it to retain a driver's model.
+			g_actorCellCheckOriginal(actor);
+		}
+		// Main thread. One per pass of the list: each makes a reference (2026-10-29: a batch of reference changes in one frame was a visible hitch).
+		// The model guard at the moment a model arrives (FUN_141948250, the actor's vt +0x538): a guarded driver's new model is shrunk before it is attached, so it is never drawn full size for a frame.
+		// Load3D (FUN_140B38A10) has already written the ref's scale; nothing writes the root's scale per frame. The guard shows it the next update if the driver sits. Any thread: exact ids in a plain table.
+		constexpr float kModelHidden = 0.001f;
+		constexpr std::uint32_t kGuardTable = 1024;
+		std::atomic<std::uint32_t> g_guardIds[kGuardTable] = {};
+		std::atomic<float> g_attachScale[kGuardTable] = {};
+		using ActorModelSet_t = void (*)(uptr, uptr, std::uint64_t, std::uint64_t);
+		ActorModelSet_t g_actorModelOriginal = nullptr;
+		void ShrinkArriving(uptr actor, uptr model)
+		{
+			__try {
+				const std::uint32_t id = At<std::uint32_t>(actor, off::kFormId);
+				const std::uint32_t slot = id & (kGuardTable - 1);
+				if (!id || g_guardIds[slot].load(std::memory_order_relaxed) != id) return;
+				float& scale = At<float>(model, 0x7C);
+				if (scale == kModelHidden) return;
+				g_attachScale[slot].store(scale > 0.0f ? scale : 1.0f, std::memory_order_relaxed);
+				scale = kModelHidden;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+		void ActorModelDetour(uptr actor, uptr model, std::uint64_t a, std::uint64_t b)
+		{
+			if (actor && model) ShrinkArriving(actor, model);
+			g_actorModelOriginal(actor, model, a, b);
+		}
+
+		// The driver pass (notes/driver-pass-20261031/TRACE.md): the game's own far-cell route for actors, the one flying actors use.
+		constexpr std::uint32_t kFarCellEnter = 0x00BB5180, kFarCellLeave = 0x00BB53C0;  // (world, ref)
+		constexpr std::uint32_t kFarCellFlag = 0x2000;  // set on a world's far cell where it is made (FUN_140BB5840)
+		bool InFarCell(uptr ref)
+		{
+			__try { const uptr cell = At<uptr>(ref, off::kRefParentCell); return cell && (At<std::uint32_t>(cell, 0x20) & kFarCellFlag) != 0; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		uptr WorldOf(uptr ref)
+		{
+			__try { const uptr cell = At<uptr>(ref, off::kRefParentCell); return cell ? At<uptr>(cell, off::kCellWorldspace) : 0; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+		// FUN_1418DB800, "too far" for an actor in a far cell: 11 callers, among them the move in, the loader and the process level. A passed driver is not too far while its vehicle has a model.
+		using FarTest_t = bool (*)(uptr);
+		FarTest_t g_farTestOriginal = nullptr;
+		bool FarTestDetour(uptr actor)
+		{
 			const std::uint32_t id = TraceId(actor);
 			if (id && (g_fullSimFilter[(id >> 6) & 63].load(std::memory_order_relaxed) >> (id & 63) & 1)) {
 				for (int i = 0; i < kJobs; ++i) {
 					if (g_fullSimIds[i].load(std::memory_order_relaxed) != id) continue;
 					const std::uint32_t vehicleId = g_fullSimVehicles[i].load(std::memory_order_relaxed);
 					const uptr vehicle = vehicleId ? runtimeforms::LookupChecked(vehicleId) : 0;
-					const uptr player = Ptr(addr::kPlayerCharacterPtr);
-					if (vehicle && player && trafficpair::DriverSkipsCellCheck(true, VehicleHeld(vehicle), Has3D(vehicle), g_fullSimMarked[i].load(std::memory_order_relaxed), Dist(actor, player))) {
-						g_passSkips.fetch_add(1, std::memory_order_relaxed);
-						return;
-					}
+					// The pass also covers arrival and seat repair: a driver without a
+					// model cannot already be sitting. Pair health revokes broken jobs.
+					if (vehicle && VehicleHeld(vehicle) &&
+						trafficpair::DriverCountsAsNear(true,InFarCell(actor)||g_fullSimMarked[i].load(std::memory_order_relaxed),Has3D(vehicle))) return false;
 					break;
 				}
 			}
-			g_actorCellCheckOriginal(actor);
+			return g_farTestOriginal(actor);
 		}
-		// Main thread. One per pass of the list: each makes a reference (2026-10-29: a batch of reference changes in one frame was a visible hitch).
+		// Out of the far cell when its job is over: someone standing around lives in an ordinary cell. The game's own exit: the mover then picks the grid cell at its position.
+		void LeaveFarCell(uptr actor)
+		{
+			if (!actor || !InFarCell(actor)) return;
+			if(!lifecycle::InService()) {
+				const unsigned id=TraceId(actor);
+				lifecycle::Post("far-leave:"+std::to_string(id),id,[=]()->lifecycle::Work {
+					const auto owned=lifecycle::Keep(actor,id);if(!owned)return {};
+					return [=]()->std::uint64_t {if(lifecycle::InService())LeaveFarCell(reinterpret_cast<uptr>(owned.get()));return 1;};
+				});return;
+			}
+			const uptr world = WorldOf(actor);
+			if (!world) return;
+			EngineFn<void (*)(uptr,uptr)>(kFarCellLeave)(world,actor);
+		}
 		void DriverPassTick(Job& j, uptr npc, uptr vehicle, ULONGLONG now)
 		{
-			static ULONGLONG lastMark = 0;
-			if (now - lastMark < 250 || j.passTries >= 3 || !g_actorCellCheckOriginal) return;
-			if (!trafficpair::DriverNeedsPassMark(true, VehicleHeld(vehicle), Has3D(vehicle), Has3D(npc), j.passMarked)) return;
-			lastMark = now; ++j.passTries;
-			j.passMarked = trafficpool::MarkDriverForFarPass(j.npc);
-			++(j.passMarked ? g_passMarked : g_passRefused);
-			logger::Write("NPC vehicles: [%d] driver pass: driver %08X of vehicle %08X (try %d): %s; model %d, sit %d, %.0f m from the vehicle", j.pilot, j.npc, j.vehicle, j.passTries, j.passMarked ? "exempt from the cell unload" : "NOT exempt", Has3D(npc) ? 1 : 0, SitState(npc), Dist3(npc, vehicle));
+			if (!g_farTestOriginal) return;
+			const bool held = VehicleHeld(vehicle), v3D = Has3D(vehicle), d3D = Has3D(npc);
+            const bool observed=InFarCell(npc);
+            if(observed&&!j.passMarked){++g_passMarked;j.passTries=0;logger::Write("NPC vehicles: driver pass completed for %08X / %08X",j.npc,j.vehicle);}
+            j.passMarked=observed;
+			if(d3D&&j.passLoadAt){
+				logger::Write("OBS system=driver.pass vehicle=%08X driver=%08X event=model_ready since_request_ms=%llu far=%d aboard=%d sit=%d",j.vehicle,j.npc,static_cast<unsigned long long>(now-j.passLoadAt),observed,InVehicle(npc)==vehicle,SitState(npc));
+				j.passLoadAt=0;
+			}
+            if (trafficpair::DriverDropsModel(j.passMarked, v3D, d3D)) {
+				// The native wrapper retains and dispatches model teardown. A
+				// direct vt+538 call from an SFSE worker violates that contract.
+				EngineFn<void(*)(uptr,uptr)>(0x018C1AD0)(Ptr(0x05E71728),npc);
+				return;
+			}
+			static ULONGLONG lastMove = 0;
+			if (trafficpair::DriverNeedsModelRequest(observed,held,v3D,d3D,At<std::uint8_t>(npc,0xD2)==1)) {
+				if (now-lastMove<250 || (j.passLoadAt && now-j.passLoadAt<3000)) return;
+				const unsigned actorId=j.npc,vehicleId=j.vehicle;
+				const bool posted=lifecycle::Post("driver-model:"+std::to_string(actorId),actorId,[=]()->lifecycle::Work {
+					const auto a=lifecycle::Keep(npc,actorId),v=lifecycle::Keep(vehicle,vehicleId);if(!a||!v)return {};
+					return [=]()->std::uint64_t {
+						if(!lifecycle::InService()||!FullSimListed(actorId))return 0;
+						const auto actor=reinterpret_cast<uptr>(a.get()),carrier=reinterpret_cast<uptr>(v.get());
+						bool assigned=false;
+						for(int i=0;i<kJobs;++i)if(g_fullSimIds[i].load()==actorId&&g_fullSimVehicles[i].load()==vehicleId)assigned=true;
+						if(!assigned||Dead(actor)||!InFarCell(carrier)||WorldOf(actor)!=WorldOf(carrier)||
+						   !trafficpair::DriverNeedsModelRequest(InFarCell(actor),VehicleHeld(carrier),Has3D(carrier),Has3D(actor),At<std::uint8_t>(actor,0xD2)==1))return 0;
+						// Actor vt+848 (1418DBA40): checks pending state, attached cell,
+						// load eligibility and queues through 14056EFA0. Call ONCE; the
+						// process-list caller restarts on true, which we must never do.
+						const uptr fn=At<uptr>(At<uptr>(actor,0),0x848);
+						if(fn!=game::Base()+0x018DBA40)return 0;
+						const bool requested=reinterpret_cast<bool(*)(uptr)>(fn)(actor);
+						logger::Write("OBS system=driver.pass vehicle=%08X driver=%08X event=model_request native=%d pending=%d model=%d aboard=%d sit=%d",vehicleId,actorId,requested,At<std::uint8_t>(actor,0xD2)==1,Has3D(actor),InVehicle(actor)==carrier,SitState(actor));
+						return requested?1:0;
+					};
+				});
+				if(posted)lastMove=j.passLoadAt=now;
+				return;
+			}
+			if(!trafficpair::DriverNeedsPass(true,held,v3D,j.passMarked)||!InFarCell(vehicle)||
+			   !trafficpair::DriverCanEnterPass(d3D,InVehicle(npc)==vehicle,SitState(npc),Dist3(npc,vehicle)))return;
+			if (now - lastMove < 250) return;  // like the vehicles' own holds: a move costs, one at a time
+			if (j.passTries >= 3) { if (now - j.passAt < 30000) return; j.passTries = 0; }
+			const uptr world = WorldOf(vehicle);
+			if (!world) return;
+			lastMove = j.passAt = now; ++j.passTries;
+			const unsigned actorId=j.npc,vehicleId=j.vehicle;
+			lifecycle::Post("far-enter:"+std::to_string(actorId),actorId,[=]()->lifecycle::Work {
+				const auto a=lifecycle::Keep(npc,actorId),v=lifecycle::Keep(vehicle,vehicleId);if(!a||!v)return {};
+				return [=]()->std::uint64_t {
+					if(!lifecycle::InService()||!FullSimListed(actorId))return 0;
+					const auto actor=reinterpret_cast<uptr>(a.get()),carrier=reinterpret_cast<uptr>(v.get());
+					bool assigned=false;
+					for(int i=0;i<kJobs;++i)if(g_fullSimIds[i].load()==actorId&&g_fullSimVehicles[i].load()==vehicleId)assigned=true;
+					if(!assigned||TraceId(carrier)!=vehicleId||Dead(actor)||!Has3D(carrier)||
+					   !trafficpair::DriverCanEnterPass(Has3D(actor),InVehicle(actor)==carrier,SitState(actor),Dist3(actor,carrier))||
+					   !VehicleHeld(carrier)||!InFarCell(carrier)||InFarCell(actor))return 0;
+					const auto ws=WorldOf(carrier);if(!ws)return 0;
+					const auto actorWorld=WorldOf(actor);if(actorWorld&&actorWorld!=ws)return 0;
+					// Only the atomic exemption table is touched here. Controller
+					// Job state is observed and updated on its next ordinary tick.
+					for(int i=0;i<kJobs;++i)if(g_fullSimIds[i].load()==actorId&&g_fullSimVehicles[i].load()==vehicleId)g_fullSimMarked[i].store(true);
+					EngineFn<void(*)(uptr,uptr)>(kFarCellEnter)(ws,actor);
+					const bool entered=InFarCell(actor);
+					for(int i=0;i<kJobs;++i)if(g_fullSimIds[i].load()==actorId&&g_fullSimVehicles[i].load()==vehicleId)g_fullSimMarked[i].store(entered);
+					logger::Write("OBS system=driver.pass vehicle=%08X driver=%08X event=entered far=%d model=%d aboard=%d sit=%d",vehicleId,actorId,entered,Has3D(actor),InVehicle(actor)==carrier,SitState(actor));
+					return InFarCell(actor)?1:0;
+				};
+			});
+			logger::Write("NPC vehicles: [%d] driver pass queued for %08X / %08X; awaiting native cell membership",j.pilot,j.npc,j.vehicle);
 		}
 
 		std::uint64_t SitStateDetour(uptr state, int value)
@@ -5496,7 +5823,6 @@ namespace npcvehicles
 		// old controller position came back; a smooth curve: a real fall).
 		void FullSimTick(ULONGLONG now)
 		{
-			if (!g_desiredLevelOriginal) return;
 			std::uint64_t filter[64] = {};
 			int listed = 0;
 			for (int i = 0; i < kJobs; ++i) {
@@ -5689,7 +6015,8 @@ namespace npcvehicles
 					// 2026-10-28 18:07 run: every cold-start driver's AI asked to dismount within seconds of each trip start (it was
 					// seated directly, not by the game's get-in, so its own package keeps wanting to walk). The game refused each exit,
 					// but turning the wish into an exit stopped the trip. On its scripted trip it is ignored; the game decides as before.
-					if (g_jobs[i].coldStart && g_jobs[i].task == 9) {
+					// Task 4 too: when a trip ends the vehicle flies down to park, and an exit there left a driver 193 m up (2026-11-01 01:37). It gets out once parked.
+					if (g_jobs[i].coldStart && (g_jobs[i].task == 9 || g_jobs[i].task == 4)) {
 						if (!g_jobs[i].coldStartLogged) { g_jobs[i].coldStartLogged = true; g_ignoredColdExit.store(id); }
 						// Refused while its autopilot flies it (07:16 run: a sitting driver stood up and fell out in mid-air). Only during
 						// the trip: when it ends the job leaves Following and the game decides as before.
@@ -5974,15 +6301,7 @@ namespace npcvehicles
 		else {
 			logger::Write("NPC vehicles: dismount hook FAILED (bytes differ)");
 		}
-		static const std::uint8_t kDesiredLevelPrologue[16] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57 };
-		void* desired = nullptr;
-		if (hook::Install(game::Base() + kDesiredLevelFn, kDesiredLevelPrologue, sizeof(kDesiredLevelPrologue), reinterpret_cast<void*>(&DesiredLevelDetour), &desired)) {
-			g_desiredLevelOriginal = reinterpret_cast<DesiredLevel_t>(desired);
-			logger::Write("NPC vehicles: process level hook installed (traffic drivers on a trip stay fully simulated)");
-		}
-		else {
-			logger::Write("NPC vehicles: process level hook FAILED (bytes differ)");
-		}
+		logger::Write("NPC vehicles: native process-level selection preserved (no forced high process)");
 		static const std::uint8_t kSitStatePrologue[16] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x40, 0xB7, 0x01 };
 		static const std::uint8_t kSeatReleasePrologue[17] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x44, 0x88, 0x48, 0x20, 0x88, 0x50, 0x10, 0x55, 0x56, 0x57 };
 		static const std::uint8_t kSyncAttachPrologue[15] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x4C, 0x89, 0x44, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54 };
@@ -6005,15 +6324,21 @@ namespace npcvehicles
 		if (demoteTrace) g_actorDemoteOriginal = reinterpret_cast<ActorDemote_t>(traced);
 		logger::Write("NPC vehicles: model trace hooks: model setter %d, demotion %d", modelTrace ? 1 : 0, demoteTrace ? 1 : 0);
 		}
-		static const std::uint8_t kActorCellCheckPrologue[14] = { 0x48, 0x83, 0xEC, 0x38, 0x4C, 0x8B, 0x89, 0xB0, 0x00, 0x00, 0x00, 0x4C, 0x8B, 0xD1 };
-		// Off unless settings.ini [traffic] driverPass=1 (2026-10-30 13:38 run: the game froze 2 min 46 s in, as a city loaded, with 45 models kept this way; the run without it did
-		// not. A model kept through an unload leaves a driver listed in an unloaded cell; when that cell comes back, the game may wait on it. Not proven, no stack was caught.)
-		if (GetPrivateProfileIntW(L"traffic", L"driverPass", 0, fvopaths::Settings().c_str())) {
-			const bool driverPass = hook::Install(game::Base() + 0x018EBF00, kActorCellCheckPrologue, sizeof(kActorCellCheckPrologue), reinterpret_cast<void*>(&ActorCellCheckDetour), &traced);
-			if (driverPass) g_actorCellCheckOriginal = reinterpret_cast<ActorCellCheck_t>(traced);
-			logger::Write("NPC vehicles: driver pass %s (a far driver on a job is exempt from the cell unload and the cell check)", driverPass ? "installed" : "FAILED (bytes differ)");
+		static const std::uint8_t kActorModelPrologue[16] = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x40 };
+		void* actorModel = nullptr;
+		if (trafficdiagnostics::ModelGuardEnabled()) {
+			if (hook::Install(game::Base() + 0x01948250, kActorModelPrologue, sizeof(kActorModelPrologue), reinterpret_cast<void*>(&ActorModelDetour), &actorModel)) g_actorModelOriginal = reinterpret_cast<ActorModelSet_t>(actorModel);
+			logger::Write("NPC vehicles: model guard at attach %s; per-frame guard on", g_actorModelOriginal ? "installed" : "FAILED (bytes differ)");
 		}
-		else logger::Write("NPC vehicles: driver pass off (settings.ini [traffic] driverPass=1 turns it on)");
+		else logger::Write("NPC vehicles: model guard OFF at attach and per frame (settings.ini [traffic] modelGuard=0; restart to change)");
+        // Preserve native 1418EBF00/1418EBF90 collision housekeeping.
+        if(GetPrivateProfileIntW(L"traffic",L"driverPass",0,fvopaths::Settings().c_str())){
+            static const std::uint8_t prologue[]={0x40,0x55,0x53,0x56,0x57,0x41,0x56,0x41,0x57,0x48,0x8B,0xEC,0x48,0x83,0xEC,0x48};
+            void* farOriginal=nullptr;
+            if(hook::Install(game::Base()+0x018DB800,prologue,sizeof(prologue),reinterpret_cast<void*>(&FarTestDetour),&farOriginal))g_farTestOriginal=reinterpret_cast<FarTest_t>(farOriginal);
+            logger::Write("NPC vehicles: driver pass %s; native cell/physics housekeeping preserved",g_farTestOriginal?"queued":"unavailable");
+        }else logger::Write("NPC vehicles: driver pass off (controlled allocator comparison retained)");
+
 		{
 			auto** slot = reinterpret_cast<void**>(game::Base() + kFireSinkSlot);
 			DWORD old = 0;
@@ -6499,9 +6824,10 @@ namespace npcvehicles
 			j.coldStart = true;
 			// The pilot quest's get-in package, as a walking driver gets: without a package that keeps it in, the citizen's own AI
 			// stood every cold-start driver up 6 s after it sat (2026-10-28 17:34 run, all three at once).
-			const bool pkg = pilotquest::Assign(j.pilot - 1, actor, vehicle);
-			if (!pkg) logger::Write("NPC vehicles: [%d] cold start: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)", j.pilot, npcId);
-			Set(j, Phase::Boarding);  // the next tick finds it aboard and hands it to the pilot
+			Set(j,Phase::Boarding);
+            const bool pkg=pilotquest::AssignTraffic(j.pilot-1,actor,vehicle);
+            j.questPending=!pkg&&lifecycle::Pending(npcId,"pilot-assign");
+			if (!pkg&&!j.questPending) logger::Write("NPC vehicles: [%d] cold start: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)", j.pilot, npcId);
 			logger::Write("NPC vehicles: [%d] %s: seated NPC %08X drives vehicle %08X (cold start)", j.pilot, claim.name ? claim.name : "scripted trip", npcId, vehId);
 			return true;
 		}
@@ -6526,7 +6852,7 @@ namespace npcvehicles
 	}
 	bool StartTrafficArmed(std::uintptr_t actor, std::uintptr_t vehicle, const FvoTripClaim& claim)
 	{
-		if (!actor || !vehicle || !claim.step || IsDead(actor)) return false;
+		if (!actor || !vehicle || !claim.step || !IsActorRef(actor) || IsActorRef(vehicle) || IsDead(actor)) return false;  // 2026-10-30 18:43 crash: a reused id
 		const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId), npcId = At<std::uint32_t>(actor, off::kFormId);
 		if (Busy(vehId) || Busy(npcId) || vehicleflight::AutopilotDisabled(vehId)) return false;
 		for (auto& j : g_jobs) {
@@ -6543,9 +6869,10 @@ namespace npcvehicles
 			j.trip = claim;
 			j.coldStart = true;
 			j.armed = true; j.armedAt = GetTickCount64();
-			const bool pkg = pilotquest::Assign(j.pilot - 1, actor, vehicle);
-			if (!pkg) logger::Write("NPC vehicles: [%d] pre-armed pilot: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)", j.pilot, npcId);
-			Set(j, Phase::Boarding);
+			Set(j,Phase::Boarding);
+            const bool pkg=pilotquest::AssignTraffic(j.pilot-1,actor,vehicle);
+            j.questPending=!pkg&&lifecycle::Pending(npcId,"pilot-assign");
+			if (!pkg&&!j.questPending) logger::Write("NPC vehicles: [%d] pre-armed pilot: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)", j.pilot, npcId);
 			logger::Write("NPC vehicles: [%d] %s: pre-armed pilot for vehicle %08X / driver %08X at its birth", j.pilot, claim.name ? claim.name : "traffic trip", vehId, npcId);
 			return true;
 		}
@@ -6588,22 +6915,71 @@ namespace npcvehicles
     // Only a driver at its vehicle (2026-10-30): a snap from far away left drivers frozen mid-air in the getting-in state.
     // The vehicle went away from a driver not yet in it (2026-10-30: it goes to the ground around its build, 16-47 m). Written directly: disabling and
     // enabling the driver instead left them far below (10:48 run, 7 of 9), and the game's setter takes an actor out of the furniture.
+    void HoldAtVehicle(std::uintptr_t actor,std::uintptr_t vehicle) {
+        if(!actor||!vehicle||IsDead(actor)||InVehicle(actor)!=vehicle)return;
+        if(!trafficpair::NeedsBringing(SitState(actor),Dist3(actor,vehicle)))return;
+        if(!Has3D(actor)){PinToVehicle(actor,vehicle);return;}
+        PlaceSeated(actor,vehicle,{});
+    }
+    void ShrinkModel(std::uintptr_t actor,bool hide,float& saved) {
+        // Local and world scale written directly, the way PlaceSeated writes a position; never an update call. A forced update on an actor from here races its animation on the worker threads,
+        // and both allocator crashes on 2026-10-31 (11:03, 11:23) had one running. The game did not carry the local scale to the world scale by itself (11:23 log).
+        __try {
+            const uptr loaded=actor?At<uptr>(actor,off::kRefLoadedData):0;
+            const uptr root=loaded?At<uptr>(loaded,off::kLoadedData3D):0;
+            if(!root)return;
+            float& scale=At<float>(root,0x7C);
+            if(hide&&scale!=kModelHidden)saved=scale>0.0f?scale:1.0f;
+            const float want=hide?kModelHidden:saved;
+            scale=want;
+            At<float>(root,0xBC)=want;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER){}
+    }
+    double SeatDistance(std::uintptr_t actor,std::uintptr_t vehicle) { return SeatDist(actor,vehicle); }
+    void SetGuardIds(const std::uint32_t* ids,int count) {
+        for(auto& s:g_guardIds)s.store(0,std::memory_order_relaxed);
+        for(int i=0;i<count;++i)g_guardIds[ids[i]&(kGuardTable-1)].store(ids[i],std::memory_order_relaxed);
+    }
+    float AttachScale(std::uint32_t id) { return g_attachScale[id&(kGuardTable-1)].load(std::memory_order_relaxed); }
+    bool ModelShrunk(std::uintptr_t actor) {
+        __try {
+            const uptr loaded=actor?At<uptr>(actor,off::kRefLoadedData):0;
+            const uptr root=loaded?At<uptr>(loaded,off::kLoadedData3D):0;
+            return root&&At<float>(root,0x7C)==kModelHidden;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
+    bool DriverLeaving(std::uintptr_t actor) {
+        if(!actor)return false;
+        std::uint32_t id=0;
+        __try{id=At<std::uint32_t>(actor,off::kFormId);}__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+        if(g_standNpc==id||ExitTaskFor(id))return true;
+        for(const auto& j:g_jobs)if(j.npc==id&&j.phase!=Phase::Idle&&j.phase!=Phase::Following&&j.phase!=Phase::Boarding)return true;
+        return false;
+    }
     bool BringToVehicle(std::uintptr_t actor,std::uintptr_t vehicle) {
         // Only while still listed in that vehicle. One who got out (pulled out by the player, a fight, a wreck) has no link and is a person in the world, never pulled back.
         if(!actor||!vehicle||!Has3D(actor)||!Has3D(vehicle)||IsDead(actor)||InVehicle(actor)!=vehicle)return false;
         if(!trafficpair::NeedsBringing(SitState(actor),Dist3(actor,vehicle)))return false;
-        const auto v=At<game::Vec3>(vehicle,off::kRefPosition);const float target[3]={v.x,v.y,v.z};
-        return PlaceSeated(actor,target,At<game::Vec3>(vehicle,off::kRefRotation).z);
+        return PlaceSeated(actor,vehicle,{});
     }
     int SnapNow(std::uintptr_t actor,std::uintptr_t vehicle) {
         if(!actor||!vehicle)return 0;
         const double d=SeatDist(actor,vehicle);
         const int sit=SitState(actor);
         if(InVehicle(actor)==vehicle&&trafficpair::Sitting(sit)&&std::isfinite(d)&&d<=8.0)return 2;  // sitting in it: never snapped again
+        // Sitting with a pilot flying it: the reference lags behind in flight (2026-11-01: "30 m away" once a second for 165 s, with the model 1 m from the seat).
+        if(InVehicle(actor)==vehicle&&trafficpair::Sitting(sit)&&vehicleflight::PilotHolds(At<std::uint32_t>(vehicle,off::kFormId)))return 2;
         if(!Has3D(actor)||!Has3D(vehicle))return 0;  // the snap needs both models (the driver's animation graph)
         if(InVehicle(actor)==vehicle&&ProcessLevel(actor)>=1)return 1;  // reduced simulation: held in its seat, snapped once fully simulated
         if(!trafficpair::NeedsSnap(true,true,sit,d)){
-            logger::Write("NPC vehicles: driver %08X is %.1f m from vehicle %08X: not snapped into the seat from there",At<std::uint32_t>(actor,off::kFormId),d,At<std::uint32_t>(vehicle,off::kFormId));
+            struct Told {ULONGLONG at=0;unsigned quiet=0;};static std::map<std::uint32_t,Told> told;
+            auto& t=told[At<std::uint32_t>(actor,off::kFormId)];const auto now=GetTickCount64();
+            if(!t.at||now-t.at>=10000){
+                logger::Write("NPC vehicles: driver %08X is %.1f m from vehicle %08X: not snapped into the seat from there (%u more in the last 10 s)",At<std::uint32_t>(actor,off::kFormId),d,At<std::uint32_t>(vehicle,off::kFormId),t.quiet);
+                t.at=now;t.quiet=0;
+            }else ++t.quiet;
             return -3;
         }
         return SeatNewborn(actor,vehicle);
@@ -7231,6 +7607,11 @@ void BeginFrame()
 		const auto owner=directOwner?directOwner:realvehicles::PlaceOwner(vehicle);
 		const auto actors=modscene::LoadedRefs(8000);uptr principal=CombatDriver(vehicle);int reacted=0,assisted=0;
 		if(!principal&&id==vehicleflight::OwnRoverId())principal=player;
+		// The job's driver even when the seat check fails (2026-10-30 log 08:18: a traffic vehicle hit while its driver was off the seat: "0 reacted", driver 00000000).
+		if(!principal)for(const auto& job:g_jobs)if(job.phase!=Phase::Idle&&!job.passenger&&job.vehicle==id) {
+			const auto occupant=RefById(job.npc);
+			if(occupant&&!Dead(occupant)&&!(PlayerTeam(occupant)&&PlayerTeam(shooter))){principal=occupant;break;}
+		}
 		if(!principal&&owner)for(const auto actor:actors) {
 			if(actor&&IsActorRef(actor)&&!Dead(actor)&&Dist(actor,vehicle)<=80.0&&At<uptr>(actor,0x98)==owner){principal=actor;break;}
 		}
@@ -7257,7 +7638,8 @@ void BeginFrame()
 		if(reportCrime) {
 			const auto p=At<game::Vec3>(vehicle,off::kRefPosition);WitnessCrash(p.x,p.y,p.z,"an attack on a vehicle");
 		}
-		logger::Write("Vehicle aggression: %08X attacked vehicle %08X; %d occupants/owners/allies reacted (%d faction allies); assault %s",shooterId,id,reacted,assisted,event.crimeRaised?"reported":"not applicable");
+		logger::Write("Vehicle aggression: %08X attacked vehicle %08X; %d occupants/owners/allies reacted (%d faction allies); assault %s; driver %08X (model %d, in combat %d)",shooterId,id,reacted,assisted,event.crimeRaised?"reported":"not applicable",
+			principal?At<std::uint32_t>(principal,off::kFormId):0,principal&&Has3D(principal)?1:0,principal&&InCombat(principal)?1:0);
 	}
 
 }

@@ -117,6 +117,50 @@ start_on_route = 3
         Read("[world.x]\nanchor = 0027D001 10 20\n", "x.ini", e);
         Check(e.anchors.empty() && e.problems.size() == 2, "a bad anchor is named and the world is skipped");
     }
+    {   // Traffic Manager V1: spaces, who parks, zones and city settings
+        Place row; row.at = { 100, 100, 5 }; row.layout = "row"; row.spaces = 3;
+        const auto sp = Spaces(row);
+        Check(sp.size() == 3 && std::fabs(sp[0].y - (100 - kSpaceGap)) < 1e-6 && sp[1].y == 100 && sp[0].z == 5, "a row of spaces runs along its turn, centred");
+        Place one; one.spaces = 9;
+        Check(Spaces(one).size() == 1, "a single space ignores the count");
+        Place bays; bays.layout = "bays"; bays.spaces = 6;
+        Check(Spaces(bays).size() == 6 && Spaces(bays)[0].x != Spaces(bays)[1].x, "bays stand in two rows");
+        Place ring; ring.layout = "ring"; ring.spaces = 8;
+        Check(Spaces(ring).size() == 8, "a ring has its spaces");
+        Place depot; depot.purpose = "depot";
+        Place taxi; taxi.purpose = "taxi";
+        Place stop;
+        Check(RouteMayPark(depot, "a", "cargo") && !RouteMayPark(stop, "a", "cargo"), "cargo lands at depots");
+        Check(RouteMayPark(taxi, "a", "taxi") && !RouteMayPark(depot, "a", "taxi"), "taxis land at taxi areas");
+        Check(!RouteMayPark(stop, "a", "patrol"), "patrols do not land at areas");
+        Check(RouteMayPark(stop, "a", "") && !RouteMayPark(depot, "a", ""), "civilians land anywhere but depots");
+        Place only; only.routes = { "a" };
+        Check(RouteMayPark(only, "a", "") && !RouteMayPark(only, "b", ""), "who parks limits it to its routes");
+        Data z;
+        Zone keep; keep.at = { 0, 0, 0 }; keep.radius = 100; keep.top = 90;
+        Zone slow; slow.at = { 1000, 0, 0 }; slow.radius = 100; slow.speed = 10; slow.slow = true;
+        z.zones = { keep, slow };
+        double gz = 20, speed = 30;
+        ApplyZones(z, "w", 50, 0, 60, 0, gz, speed, true);
+        Check(gz == 95 && speed == 30, "a keep-out zone lifts the goal above its top");
+        gz = 20; ApplyZones(z, "w", 50, 0, 60, 0, gz, speed, false);
+        Check(gz == 20, "landing is left alone");
+        gz = 20; ApplyZones(z, "w", 500, 0, 510, 0, gz, speed, true);
+        Check(gz == 20 && speed == 30, "outside the zones nothing changes");
+        ApplyZones(z, "w", 1000, 0, 1010, 0, gz, speed, true);
+        Check(speed == 10, "a slow zone limits the speed");
+        City c;
+        Check(Scaled(10, c) == 10, "default density keeps the count");
+        c.density = 50; Check(Scaled(10, c) == 5 && Scaled(1, c) == 1, "density scales, a route keeps at least one");
+        c.density = 200; Check(Scaled(10, c) == 20, "density may double");
+        c.density = 0; Check(Scaled(10, c) == 0, "density 0 flies nothing");
+        c.density = 100; c.on = false; Check(Scaled(10, c) == 0, "traffic off flies nothing");
+        Data d;
+        Read("[world.w]\nid = W\n[route.a]\nworld = w\ntype = path\npoints = 0 0 5, 100 0 5\nday = 0 closed, 600 rush\npeak = 8\n", "a.ini", d);
+        Check(d.routes.size() == 1 && !d.routes[0].schedule.allDay && routeschedule::Evaluate(d.routes[0].schedule, true, 800).vehicles == 8, "a day line makes the route's schedule");
+        Read("[route.b]\nworld = w\ntype = path\npoints = 0 0 5, 100 0 5\nday = 0 sleepy\n", "b.ini", d);
+        Check(d.routes.size() == 1 && !d.problems.empty(), "a bad day line is named and the route skipped");
+    }
     std::printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
     return g_fail ? 1 : 0;
 }

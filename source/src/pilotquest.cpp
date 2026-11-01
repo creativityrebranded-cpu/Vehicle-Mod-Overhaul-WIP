@@ -1,6 +1,7 @@
 #include "pilotquest.h"
 #include "runtimeforms.h"
 #include "pilotlayout.h"
+#include "lifecycle.h"
 
 #include "addresses.h"
 #include "game.h"
@@ -8,6 +9,7 @@
 
 #include <Windows.h>
 
+#include <set>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -26,6 +28,14 @@ namespace pilotquest
 		constexpr std::uint32_t kClearAlias = 0x00CFC590;   // FUN_140cfc590(quest, alias, 6, 0): ReferenceAlias.Clear
 		constexpr std::uint32_t kAliasIndex = 0x00CF72D0;   // FUN_140cf72d0(quest, aliasId) -> index into quest +0x90, -1 none
 		constexpr std::uint32_t kEvaluate = 0x01914750;     // FUN_141914750(actor, immediate, resetAI): console evp
+		// The package evaluation only works on actors (form type 'K'). 2026-10-30 18:43 crash: a driver id the game had reused for a plain
+		// reference reached it, and it read past that object. Anything else is refused here.
+		bool IsActorForm(uptr r)
+		{
+			__try { return r && At<std::uint8_t>(r, 0x2E) == 'K'; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		void Evaluate(uptr npc) { if (IsActorForm(npc)) EngineFn<void (*)(uptr, int, int)>(kEvaluate)(npc, 1, 0); }
 		constexpr std::uint32_t kVanillaQuest = 0x001D307E; // SQ_Passengers: gives the QUST form type byte
 		constexpr std::uint32_t kVanillaPack = 0x001C9CDA;  // DefaultPassengerShipInCombatPackage: the PACK form type byte
 		constexpr int kSlots = pilotlayout::kSlots;
@@ -41,6 +51,7 @@ namespace pilotquest
 		static_assert(PilotAlias(5) == 5 && VehicleAlias(5) == 11 && PilotAlias(6) == 12 && VehicleAlias(6) == 18 && PilotAlias(12) == 24 &&
 			VehicleAlias(12) == 76 && VehicleAlias(63) == 127 && PilotAlias(64) == 128 && VehicleAlias(kSlots - 1) == 2 * kSlots - 1);
 
+		std::set<int> g_unreleased;  // slots whose release found the request table full
 		uptr g_quest = 0, g_actQuest = 0;  // g_actQuest: the second quest, whose pilot alias carries the ACTIVATE package
 		std::uint32_t g_questId=0;bool g_missingReported=false;
 		ULONGLONG g_lastProbe = 0;
@@ -131,7 +142,7 @@ namespace pilotquest
 
 	bool Assign(int slot, uptr npc, uptr vehicle)
 	{
-		if (slot < 0 || slot >= kSlots || !npc || !vehicle) return false;
+		if (slot < 0 || slot >= kSlots || !npc || !vehicle || !IsActorForm(npc)) return false;
 		if (!Available()) {
 			logger::Write("Pilot quest: assign refused: %s", g_quest ? "the quest is not running" : "FVO_NPCPilots.esm is not loaded");
 			return false;
@@ -144,12 +155,36 @@ namespace pilotquest
 			PilotAlias(slot), At<std::uint32_t>(npc, off::kFormId), p ? "ok" : "FAULT");
 		if (!v || !p) return false;
 		__try {
-			EngineFn<void (*)(uptr, int, int)>(kEvaluate)(npc, 1, 0);
+			Evaluate(npc);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 		}
 		return true;
 	}
+
+    bool AssignTraffic(int slot,uptr npc,uptr vehicle){
+        if(slot<0||slot>=kSlots||!npc||!vehicle||!IsActorForm(npc))return false;
+        const unsigned id=At<unsigned>(npc,off::kFormId),vid=At<unsigned>(vehicle,off::kFormId);
+        g_unreleased.erase(slot);  // the assignment clears the slot first; a later retry would empty it again
+        const auto key="pilot-assign:"+std::to_string(slot)+":"+std::to_string(id)+":"+std::to_string(vid);
+        const auto result=lifecycle::Poll(key,id,[=]()->lifecycle::Work {
+            if(!Available())return {};
+            const unsigned questId=g_questId;
+            const auto actor=lifecycle::Keep(npc,id),carrier=lifecycle::Keep(vehicle,vid);
+            if(!actor||!carrier)return {};
+            return [=]()->std::uint64_t {
+                if(!lifecycle::InService())return 0;
+                const auto quest=runtimeforms::LookupChecked(questId);
+                if(!quest||!(At<unsigned char>(quest,0x114)&1))return 0;
+                const auto a=reinterpret_cast<uptr>(actor.get()),v=reinterpret_cast<uptr>(carrier.get());
+                if(!IsActorForm(a))return 0;
+                ClearIn(quest,PilotAlias(slot));ClearIn(quest,VehicleAlias(slot));
+                if(!ForceIn(quest,VehicleAlias(slot),v)||!ForceIn(quest,PilotAlias(slot),a))return 0;
+                Evaluate(a);return 1;
+            };
+        });
+        return result&&*result;
+    }
 
 	namespace
 	{
@@ -199,8 +234,10 @@ namespace pilotquest
 		g_diag.at = GetTickCount64() + delayMs;
 	}
 
+	static void RetryReleases() { const auto slots = g_unreleased; for (const int slot : slots) Release(slot); }
 	void Tick()
 	{
+		if (!g_unreleased.empty()) RetryReleases();
 		if (!g_diag.at || GetTickCount64() < g_diag.at) return;
 		g_diag.at = 0;
 		__try {
@@ -210,7 +247,7 @@ namespace pilotquest
 			logger::Write("Pilot quest: diagnose faulted");
 		}
 	}
-    void Reset(){g_quest=g_actQuest=0;g_questId=0;g_lastProbe=0;g_loggedRunning=false;g_missingReported=false;g_diag={};}
+    void Reset(){g_unreleased.clear();g_quest=g_actQuest=0;g_questId=0;g_lastProbe=0;g_loggedRunning=false;g_missingReported=false;g_diag={};}
 
 	bool Retarget(int slot, uptr ref, uptr npc)
 	{
@@ -218,7 +255,7 @@ namespace pilotquest
 		const bool ok = Force(VehicleAlias(slot), ref);
 		logger::Write("Pilot quest: slot %d: vehicle alias %d retargeted to %08X (%s)", slot, VehicleAlias(slot), At<std::uint32_t>(ref, off::kFormId), ok ? "ok" : "FAULT");
 		__try {
-			EngineFn<void (*)(uptr, int, int)>(kEvaluate)(npc, 1, 0);
+			Evaluate(npc);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 		}
@@ -240,7 +277,7 @@ namespace pilotquest
 			PilotAlias(slot), At<std::uint32_t>(npc, off::kFormId), p ? "ok" : "FAULT");
 		if (!v || !p) return false;
 		__try {
-			EngineFn<void (*)(uptr, int, int)>(kEvaluate)(npc, 1, 0);
+			Evaluate(npc);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER) {
 		}
@@ -250,6 +287,21 @@ namespace pilotquest
 	void Release(int slot)
 	{
 		if (slot < 0 || slot >= kSlots || !g_quest) return;
+		if(!lifecycle::InService()){
+			const unsigned questId=g_questId,actId=g_actQuest?At<unsigned>(g_actQuest,off::kFormId):0;
+			// Its own key each time: dropped as a repeat of one still queued, it would run before a new assignment of this slot instead of after it.
+			static unsigned serial=0;
+			const bool taken=lifecycle::Post("pilot-release:"+std::to_string(slot)+":"+std::to_string(++serial),0,[=]()->lifecycle::Work {
+				return [=]()->std::uint64_t {
+					if(!lifecycle::InService())return 0;
+					const auto q=runtimeforms::LookupChecked(questId),a=runtimeforms::LookupChecked(actId);
+					ClearIn(q,PilotAlias(slot));ClearIn(q,VehicleAlias(slot));
+					ClearIn(a,PilotAlias(slot));ClearIn(a,VehicleAlias(slot));return 1;
+				};
+			});
+			if(taken)g_unreleased.erase(slot);else g_unreleased.insert(slot);  // table full: Tick asks again
+			return;
+		}
 		Clear(PilotAlias(slot));
 		Clear(VehicleAlias(slot));
 		ClearIn(g_actQuest, PilotAlias(slot));
@@ -264,7 +316,7 @@ namespace pilotquest
             if(TypeOf(quest)!=TypeOf(Lookup(kVanillaQuest))||!(At<std::uint8_t>(quest,0x114)&1))return false;
             ClearIn(quest,slot);ClearIn(quest,18+slot);
             if(!ForceIn(quest,18+slot,marker)||!ForceIn(quest,slot,npc)){ClearIn(quest,slot);ClearIn(quest,18+slot);return false;}
-            EngineFn<void (*)(uptr,int,int)>(kEvaluate)(npc,1,0);return true;
+            Evaluate(npc);return true;
         } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
     }
     void ReleaseTraffic(int slot,uptr npc) {
@@ -272,7 +324,7 @@ namespace pilotquest
         const auto quest=runtimeforms::LookupChecked(runtimeforms::Resolve({"FVO_ScheduledTraffic.esm",0x800}));
         if(!quest)return;
         ClearIn(quest,slot);ClearIn(quest,18+slot);
-        if(npc) __try {EngineFn<void (*)(uptr,int,int)>(kEvaluate)(npc,1,0);} __except(EXCEPTION_EXECUTE_HANDLER){}
+        if(npc) __try {Evaluate(npc);} __except(EXCEPTION_EXECUTE_HANDLER){}
     }
 #ifdef SP_RUNTIME_PERF_TEST
     namespace testing {void Clock(ULONGLONG now){g_testNow=now;}}

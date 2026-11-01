@@ -7,6 +7,8 @@
 #include "log.h"
 #include "runtimeforms.h"
 #include "vehicleworld.h"
+#include "vehicleflight.h"
+#include "crash.h"
 
 #include <Windows.h>
 #include <intrin.h>
@@ -36,6 +38,67 @@ namespace mapguard
 		std::atomic<std::size_t> g_lastCount{ 0 }, g_worst{ 0 };
 		std::atomic<bool> g_reportNow{ false };
 
+        // Observations only: never write TES map centres, builder inputs or outputs.
+        std::atomic<unsigned long long> g_traceSequence{0},g_contextAt{0};
+        std::atomic<unsigned> g_contextVehicle{0};std::atomic<bool> g_contextFlight{false};
+        struct MapSnapshot {uptr tes=0,scene=0;int x=0,y=0,fallbackX=0,fallbackY=0;unsigned cell=0,world=0;game::Vec3 ref{},model{};bool ok=false,haveModel=false;};
+        void MapRead(MapSnapshot& out){
+            __try{
+                out.tes=*reinterpret_cast<uptr*>(game::Base()+0x05E716F8);
+                out.scene=*reinterpret_cast<uptr*>(game::Base()+0x05FD9C38);
+                if(out.tes){out.x=At<int>(out.tes,0x130);out.y=At<int>(out.tes,0x134);out.fallbackX=At<int>(out.tes,0xC4);out.fallbackY=At<int>(out.tes,0xC8);}
+                const auto player=*reinterpret_cast<uptr*>(game::Base()+addr::kPlayerCharacterPtr);
+                if(player){out.ref=At<game::Vec3>(player,off::kRefPosition);const auto ld=At<uptr>(player,off::kRefLoadedData),root=ld?At<uptr>(ld,off::kLoadedData3D):0;
+                    if(root){out.model=At<game::Vec3>(root,off::kNodeWorldT);out.haveModel=true;}
+                    const auto cell=At<uptr>(player,off::kRefParentCell),world=cell?At<uptr>(cell,off::kCellWorldspace):0;
+                    out.cell=cell?At<unsigned>(cell,off::kFormId):0;out.world=world?At<unsigned>(world,off::kFormId):0;
+                }out.ok=true;
+            }__except(EXCEPTION_EXECUTE_HANDLER){out.ok=false;}
+        }
+        unsigned long long TraceBegin(const char* stage,uptr a,uptr b=0,std::size_t count=0){
+            const auto sequence=++g_traceSequence;MapSnapshot m;MapRead(m);
+            const auto now=GetTickCount64(),context=g_contextAt.load();
+            crash::Action(stage,unsigned(sequence));
+            logger::Write("OBS system=map.trace event=begin call=%llu stage=%s a=%llX b=%llX count=%zu read_ok=%d scene=%llX tes=%llX centre=%d,%d fallback=%d,%d selected=%d,%d world=%08X cell=%08X player_ref=%.2f,%.2f,%.2f player_model=%.2f,%.2f,%.2f have_model=%d flight_cached=%d own_vehicle=%08X context_age_ms=%llu",
+                sequence,stage,static_cast<unsigned long long>(a),static_cast<unsigned long long>(b),count,m.ok,static_cast<unsigned long long>(m.scene),static_cast<unsigned long long>(m.tes),m.x,m.y,m.fallbackX,m.fallbackY,
+                m.x==0x7fffffff||m.y==0x7fffffff?m.fallbackX:m.x,m.x==0x7fffffff||m.y==0x7fffffff?m.fallbackY:m.y,m.world,m.cell,m.ref.x,m.ref.y,m.ref.z,m.model.x,m.model.y,m.model.z,m.haveModel,g_contextFlight.load(),g_contextVehicle.load(),context&&now>=context?now-context:0);
+            return sequence;
+        }
+        void TraceEnd(const char* stage,unsigned long long call,ULONGLONG began,unsigned long long result){
+            logger::Write("OBS system=map.trace event=returned call=%llu stage=%s elapsed_ms=%llu result=%llX",call,stage,GetTickCount64()-began,result);
+        }
+        using Task2=std::uint64_t(*)(uptr,uptr);using Task1=void(*)(uptr);using Proc=std::uint64_t(*)(uptr);
+        Task2 g_mapBounds=nullptr,g_mapTerrain=nullptr,g_mapModels=nullptr;Task1 g_mapCells=nullptr;Proc g_mapProc=nullptr;
+        std::uint64_t TraceBounds(uptr a,uptr b){const auto at=GetTickCount64(),id=TraceBegin("map.bounds",a,b);const auto r=g_mapBounds(a,b);TraceEnd("map.bounds",id,at,r);return r;}
+        std::uint64_t TraceTerrain(uptr a,uptr b){const auto at=GetTickCount64(),id=TraceBegin("map.terrain_setup",a,b);const auto r=g_mapTerrain(a,b);TraceEnd("map.terrain_setup",id,at,r);return r;}
+        std::uint64_t TraceModels(uptr a,uptr b){const auto at=GetTickCount64(),id=TraceBegin("map.models_collect",a,b);const auto r=g_mapModels(a,b);TraceEnd("map.models_collect",id,at,r);return r;}
+        void TraceCells(uptr a){const auto at=GetTickCount64(),id=TraceBegin("map.terrain_cells",a);g_mapCells(a);TraceEnd("map.terrain_cells",id,at,0);}
+        std::uint64_t TraceProc(uptr a){const auto at=GetTickCount64(),id=TraceBegin("map.procgen",a);const auto r=g_mapProc(a);TraceEnd("map.procgen",id,at,r);return r;}
+        using Region=void(*)(uptr,int,int,uptr,uptr);Region g_mapRegion=nullptr;
+        void ReadPair(uptr p,int& x,int& y){__try{if(p){x=At<int>(p,0);y=At<int>(p,4);}}__except(EXCEPTION_EXECUTE_HANDLER){x=y=0x7fffffff;}}
+        void TraceRegion(uptr a,int level,int margin,uptr begin,uptr end){
+            const auto at=GetTickCount64(),id=TraceBegin("map.clipmap_region",a,begin);int x=0,y=0;ReadPair(a,x,y);
+            g_mapRegion(a,level,margin,begin,end);int bx=0,by=0,ex=0,ey=0;ReadPair(begin,bx,by);ReadPair(end,ex,ey);
+            logger::Write("OBS system=map.trace event=region call=%llu level=%d margin=%d cells=%d,%d samples_begin=%d,%d samples_end=%d,%d",id,level,margin,x,y,bx,by,ex,ey);
+            TraceEnd("map.clipmap_region",id,at,0);
+        }
+        void InstallMapTrace(){
+            if(!GetPrivateProfileIntW(L"diagnostics",L"mapTrace",1,fvopaths::Settings().c_str())){logger::Write("Map trace: disabled by diagnostics/mapTrace");return;}
+            static const unsigned char bounds[]={0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x48,0x89,0x7C,0x24,0x18};
+            static const unsigned char terrain[]={0x48,0x89,0x5C,0x24,0x10,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57};
+            static const unsigned char models[]={0x48,0x8B,0xC4,0x48,0x89,0x58,0x08,0x55,0x56,0x57,0x41,0x56,0x41,0x57};
+            static const unsigned char region[]={0x48,0x8B,0xC4,0x48,0x89,0x58,0x10,0x48,0x89,0x68,0x18,0x48,0x89,0x70,0x20};
+            void* p=nullptr;unsigned installed=0;
+            if(hook::Install(game::Base()+0x01424EC0,bounds,sizeof(bounds),reinterpret_cast<void*>(&TraceBounds),&p)){g_mapBounds=reinterpret_cast<Task2>(p);++installed;}
+            if(hook::Install(game::Base()+0x014259A0,terrain,sizeof(terrain),reinterpret_cast<void*>(&TraceTerrain),&p)){g_mapTerrain=reinterpret_cast<Task2>(p);++installed;}
+            if(hook::Install(game::Base()+0x01426240,models,sizeof(models),reinterpret_cast<void*>(&TraceModels),&p)){g_mapModels=reinterpret_cast<Task2>(p);++installed;}
+            if(hook::Install(game::Base()+0x01427220,models,sizeof(models),reinterpret_cast<void*>(&TraceCells),&p)){g_mapCells=reinterpret_cast<Task1>(p);++installed;}
+            if(hook::Install(game::Base()+0x01429920,region,sizeof(region),reinterpret_cast<void*>(&TraceRegion),&p)){g_mapRegion=reinterpret_cast<Region>(p);++installed;}
+            g_mapProc=reinterpret_cast<Proc>(game::Base()+0x01429880);unsigned procSites=0;
+            for(const unsigned site:{0x01424EEA,0x0058D4A5})if(hook::RedirectCall(game::Base()+site,reinterpret_cast<void*>(game::Base()+0x01429880),reinterpret_cast<void*>(&TraceProc)))++procSites;
+            logger::Write("Map trace: map-stall-trace-20261101; native builders %u/5, procgen sites %u/2; observation only, TES centre and builder arguments unchanged",installed,procSites);
+        }
+
 		char RunDetour(uptr task)
 		{
 			auto* begin = reinterpret_cast<uptr*>(task + kVector);
@@ -45,12 +108,14 @@ namespace mapguard
 			g_lastCount = n;
 			if (n > g_worst.load()) g_worst = n;
 			if (n > 20000) g_reportNow = true;
-			if (n <= kMaxModels) return g_original(task);
+			const auto traceAt=GetTickCount64(),traceId=TraceBegin("map.models_build",task,0,n);
+            if (n <= kMaxModels){const char r=g_original(task);TraceEnd("map.models_build",traceId,traceAt,static_cast<unsigned char>(r));return r;}
 			logger::Write("Map guard: the local map's model build has %zu references (the game's node holds 65535): building the first %zu only",
 				n, kMaxModels);
 			*end = b + kMaxModels * kRefModelSize;  // the rest stay owned by the vector and are destroyed with it
 			const char r = g_original(task);
 			*end = e;
+            TraceEnd("map.models_build",traceId,traceAt,static_cast<unsigned char>(r));
 			return r;
 		}
 
@@ -352,6 +417,7 @@ namespace mapguard
 
 	bool Install()
 	{
+        InstallMapTrace();
 		auto** p = reinterpret_cast<void**>(game::Base() + kTaskVtbl) + kRunSlot;
 		if (reinterpret_cast<uptr>(*p) != game::Base() + kRunRva) {
 			logger::Write("Map guard: the local map's model build task is not the expected function; guard off");
@@ -377,6 +443,7 @@ namespace mapguard
 		static ULONGLONG at = 0;
 		const ULONGLONG now = GetTickCount64();
 		g_loadingNow.store(loading, std::memory_order_relaxed);
+        g_contextFlight=vehicleflight::Active();g_contextVehicle=vehicleflight::OwnRoverId();g_contextAt.store(now,std::memory_order_release);
 		if (loading) { g_passing = false; g_passAt = now; return; }  // never while a save loads
 		g_playTickAt.store(now, std::memory_order_relaxed);
 		ResolveDust();  // at once: the create-reference hook needs the dust bases from the first frame on

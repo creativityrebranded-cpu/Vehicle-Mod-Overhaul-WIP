@@ -17,6 +17,7 @@
 #include "runtimeforms.h"
 #include "runtimecells.h"
 #include "pilotquest.h"
+#include "lifecycle.h"
 #include <Windows.h>
 #include <algorithm>
 #include <array>
@@ -25,6 +26,17 @@
 #include <unordered_map>
 #include <string>
 #include <vector>
+
+// This suite measures read-only discovery/cache work. Native mutation adapters
+// must not run against its synthetic executable; the dispatcher/transport have
+// their own asynchronous ownership tests.
+namespace lifecycle {
+unsigned testMutationRequests=0;
+bool InService(){return false;}
+Reference Keep(std::uintptr_t,unsigned){return {};}
+std::optional<std::uint64_t> Poll(const std::string&,unsigned,const std::function<Work()>&){++testMutationRequests;return 0;}
+bool Post(const std::string&,unsigned,const std::function<Work()>&){++testMutationRequests;return true;}
+}
 
 namespace {
 std::uintptr_t g_base=0;
@@ -262,6 +274,10 @@ int main(){
     world::Publish();check(world::Vehicles(snapshot)&&!snapshot.v[0].baseBoundsValid,"production snapshot labels default bounds as unmeasured");
     g_sourceRef=reinterpret_cast<std::uintptr_t>(refs[1].data());world::SetServices({ScanVehicle,Owned,EmptyDriver,Unused});
     check(!world::Vehicles(snapshot),"reconnecting providers clears the old snapshot immediately");
+    world::SetServices({ScanVehicle,Owned,EmptyDriver,Unused,[](void (*visit)(std::uint32_t)){visit(1);visit(2);}});world::Publish();world::Publish();
+    check(world::Vehicles(snapshot)&&snapshot.count==1&&snapshot.v[0].formId==2,"a held vehicle stays out of the general list");
+    check(world::VehiclesAndHeld(snapshot)&&snapshot.count==2&&!snapshot.v[0].heldFar&&snapshot.v[1].formId==1&&snapshot.v[1].heldFar,"a held vehicle is listed for shots, and one found in the attached cells only once");
+    world::SetServices({ScanVehicle,Owned,EmptyDriver,Unused});
     world::Publish();check(world::Vehicles(snapshot)&&snapshot.count==1&&snapshot.v[0].formId==2&&snapshot.v[0].who==world::VehicleInfo::Who::Parked,"replacement provider does not inherit prior source identities or driver state");
     bodymass::observations.Observe(0x01000123,1400,GetTickCount64(),bodymass::observations.Epoch());
     std::array<char,0x160> root{},rootVtable{},collisionVtable{};std::array<char,0x20> loaded{},collision{};
@@ -279,5 +295,6 @@ int main(){
     world::Reset();check(bodymass::observations.Read(bodies,GetTickCount64())==0,"world reset drops physics observations from the old load");world::Publish();check(world::Vehicles(snapshot)&&snapshot.count==1&&snapshot.v[0].formId==2,"save reset retains service connections while clearing runtime state");
     world::SetServices({ScanVehicle});world::Publish();check(!world::Vehicles(snapshot),"incomplete service connections fail empty");
     runtimecells::Reset();VirtualFree(reinterpret_cast<void*>(g_base),0,MEM_RELEASE);
+    check(lifecycle::testMutationRequests==0,"read-only discovery does not submit lifecycle mutations");
     std::printf("runtimeperf: %d checks, %d failures\n",checks,failures);return failures?1:0;
 }

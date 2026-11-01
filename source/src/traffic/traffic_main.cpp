@@ -10,6 +10,7 @@
 // and home, or to a destination place via the exit nearest it. Core boards the driver and parks the vehicle at the end. Needs
 // core FlyingVehicleOverhaul.dll (fvo_addon_api.h); without it, this does nothing.
 #include "traffic_api.h"
+#include "observations.h"
 #include "fvolimits.h"
 #include "generator.h"
 #include "everyday.h"
@@ -26,6 +27,7 @@ constexpr unsigned kRuntime_1_16_244 = 0x01100F40;
 
 #include <Windows.h>
 #include <algorithm>
+#include <random>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -234,6 +236,12 @@ namespace
 		ULONGLONG seen = 0;
 		trafficroute::Leg logged = trafficroute::Leg::Climb;
 		std::string route, dest;
+		// Its landing area (2026-10-30, occupancy rules): the area and space it holds, waiting above a full area (queue), how long it stays parked.
+		std::string place;
+		int space = -1;
+		bool queue = false;
+		double stay = 0;
+		ULONGLONG stayUntil = 0;
 		double x = 0, y = 0, z = 0;      // where its vehicle was last step (the lane slot check)
 		bool holding = false;
 		// Junctions (2026-10-29): the route the trip belongs to, where it left that route for a branch, and the junctions of the
@@ -243,8 +251,22 @@ namespace
 		double leftU = 0, leftTravelled = 0, homeTarget = 0;
 		std::vector<trafficlinks::Junction> junctions;
 		std::uint64_t dice = 0;
+		double flown = 0;                // m flown since the trip began (a trip that ends without flying was no trip)
+		bool flownStart = false;
 	};
 	Slot g_slots[kSlots];
+	// Trips that end where they started (2026-10-30 18:42 run, Neon: vehicles at the end of the editor's 40-60 m feeder routes got a lap,
+	// were 'done' in the same step and got the same route back every 3 s, never moving). That route is skipped for that vehicle for
+	// kEmptyTripMs, so it takes another route in reach (or stays parked) instead of the same empty trip.
+	constexpr double kEmptyTripFlown = 30.0;
+	constexpr ULONGLONG kEmptyTripMs = 120000;
+	std::map<unsigned, std::pair<std::string, ULONGLONG>> g_emptyTrips;
+	bool EmptyHere(unsigned vehicle, const std::string& route)
+	{
+		if (!vehicle) return false;
+		const auto it = g_emptyTrips.find(vehicle);
+		return it != g_emptyTrips.end() && it->second.first == route && GetTickCount64() - it->second.second < kEmptyTripMs;
+	}
 	bool g_cycleSupported = false;
 	ULONGLONG g_lastStart = 0;
 	int g_nextLane = 0, g_nextPlace = 0;
@@ -286,6 +308,23 @@ namespace
 		return b;
 	}
 	bool EditorRoute(const trafficdata::Route& r) { return r.name.rfind("ed_", 0) == 0; }
+	// Vehicle rules (2026-10-30): a route's exclude list keeps those models off it. A vehicle of unknown base is let on.
+	bool Excluded(const trafficdata::Route& r, unsigned vehicleId)
+	{
+		if (!vehicleId || !g_baseOf) return false;
+		const unsigned base = g_baseOf(vehicleId);
+		return base && trafficdata::LeftOut(g_data.groups, r, base);  // its own list, its group's, all routes'
+	}
+	// City settings (2026-10-30, Traffic Manager V1): this world's traffic on or off, density, vehicle limit, original routes.
+	trafficdata::City CityNow()
+	{
+		if (g_data.cities.empty()) return {};
+		char world[201]{};
+		return g_worldName && g_worldName(world, sizeof world) ? trafficdata::CityOf(g_data, world) : trafficdata::City{};
+	}
+	bool CityFlies(const trafficdata::Route& r, const trafficdata::City& city) { return city.on && (city.originals || trafficdata::EditorFile(r.file)); }
+	// Cargo flies slower (route roles).
+	double RoleSpeed(const trafficdata::Route& r) { return r.role == "cargo" ? r.speed * 0.8 : r.speed; }
 	// `on` / `want`: the vehicles on the route now and its count now (the fair share's inputs, routeshare.h).
 	bool Room(const trafficdata::Route& r, const trafficdata::Traffic& rule, const Slot* except, bool pool, int* on = nullptr, int* want = nullptr)
 	{
@@ -293,21 +332,25 @@ namespace
 		const bool known = LocalMinute(minute);
 		const auto d = routeschedule::Evaluate(r.schedule, known, minute);
 		if (!d.known || !d.active) return false;
-		int onRoute = 0, ruled = 0;
+		const auto city = CityNow();
+		const int count = trafficdata::Scaled(d.vehicles, city);
+		if (!CityFlies(r, city) || count <= 0) return false;
+		int onRoute = 0, ruled = 0, all = 0;
 		for (const auto& o : g_slots) {
 			if (!o.used || &o == except || o.dest == "your marker") continue;  // the player's own Auto on a route is not traffic
+			++all;
 			if (o.route == r.name) ++onRoute;
 			if (o.route.rfind("ed_", 0) != 0 && o.dest != "your marker") ++ruled;
 		}
 		if (on) *on = onRoute;
-		if (want) *want = d.vehicles;
-		if (onRoute >= d.vehicles) return false;
+		if (want) *want = count;
+		if (onRoute >= count || all >= city.limit) return false;
 		return pool || EditorRoute(r) || ruled < rule.max;
 	}
 	bool Allowed(const trafficdata::Route& r, const trafficdata::Traffic& rule);
 	// The route a free vehicle at (x, y) takes: the least filled of those in reach with room (routeshare.h); null when none.
 	const trafficdata::Route* FairRoute(const char* world, const trafficdata::Traffic& rule, const Slot* except, bool pool, double x, double y,
-		const std::string& own, trafficroute::Line* lineOut = nullptr)
+		const std::string& own, trafficroute::Line* lineOut = nullptr, unsigned skipFor = 0)
 	{
 		std::vector<const trafficdata::Route*> routes;
 		std::vector<trafficroute::Line> lines;
@@ -315,6 +358,8 @@ namespace
 		for (const auto& r : g_data.routes) {
 			int on = 0, want = 0;
 			if (!trafficdata::SameWorld(g_data, r.world, world) || !(Allowed(r, rule) || r.name == own) || !Room(r, rule, except, pool, &on, &want)) continue;
+			if (EmptyHere(skipFor, r.name)) continue;  // its last trip here ended where it began
+			if (Excluded(r, skipFor)) continue;        // its model is left out of this route (vehicle rules)
 			auto l = trafficroute::Build(r);
 			const auto p = trafficroute::At(l, 0, trafficroute::Nearest(l, 0, x, y));
 			c.push_back({ on, want, r.name == own ? 0.0 : std::hypot(p.x - x, p.y - y), r.name == own });
@@ -376,7 +421,7 @@ namespace
 		else { t.travelled = 0; t.targetU = line.closed ? j.otherU : trafficlinks::LaneEnd(line, lane); }
 		Log("FVO traffic: %s lane %d: %s junction %s onto %s lane %d", s.route.c_str(), s.trip.lane, forced ? "end of branch, takes" : "turns at",
 			j.link.c_str(), q->name.c_str(), lane);
-		s.trip = t; s.line = line; s.route = q->name; s.speed = q->speed; s.logged = t.leg;
+		s.trip = t; s.line = line; s.route = q->name; s.speed = RoleSpeed(*q); s.logged = t.leg;
 		FindJunctions(s);
 		return true;
 	}
@@ -415,13 +460,103 @@ namespace
 		}
 	}
 
+	// Keep-out and slow zones on a flight goal. Only the lane itself is lifted: joining and landing keep their own heights.
+	void ZoneLimits(const Slot& s, double x, double y, FvoTripGoal* out, bool keepOut)
+	{
+		if (g_data.zones.empty()) return;
+		char world[201]{};
+		if (!g_worldName || !g_worldName(world, sizeof world)) return;
+		double z = out->z, speed = out->speed;
+		trafficdata::ApplyZones(g_data, world, x, y, out->x, out->y, z, speed, keepOut);
+		out->z = z; out->speed = float(speed);
+		(void)s;
+	}
+	// Crossings (junction type crossing): nobody turns; near the point the vehicle with the higher id slows for the other, so two can't wait on each other.
+	struct CrossPoint { std::string a, b; trafficdata::Vec at; };
+	std::vector<CrossPoint> g_crossings;
+	unsigned long long g_crossStamp = ~0ull;
+	std::string g_crossWorld;
+	void CrossLimit(const Slot& s, double x, double y, FvoTripGoal* out)
+	{
+		bool any = false;
+		for (const auto& k : g_data.links) if (k.type == "crossing") { any = true; break; }
+		if (!any) return;
+		char world[201]{};
+		if (!g_worldName || !g_worldName(world, sizeof world)) return;
+		if (g_crossStamp != g_stamp || g_crossWorld != world) {
+			g_crossStamp = g_stamp; g_crossWorld = world; g_crossings.clear();
+			const auto routes = WorldRoutes(world);
+			for (const auto& k : g_data.links) {
+				if (k.type != "crossing") continue;
+				const auto* a = trafficlinks::Find(routes, k.from);
+				if (!a || !trafficlinks::Find(routes, k.to)) continue;
+				g_crossings.push_back({ k.from, k.to, trafficroute::At(trafficroute::Build(*a), 0, trafficlinks::U(*a, k.at)) });
+			}
+		}
+		for (const auto& c : g_crossings) {
+			if (s.route != c.a && s.route != c.b) continue;
+			if (std::hypot(x - c.at.x, y - c.at.y) >= 60.0) continue;
+			const std::string& other = s.route == c.a ? c.b : c.a;
+			for (const auto& o : g_slots)
+				if (o.used && &o != &s && o.route == other && o.vehicleId && o.vehicleId < s.vehicleId && std::hypot(o.x - c.at.x, o.y - c.at.y) < 40.0) { out->speed = std::min(out->speed, 6.0f); break; }
+		}
+	}
+	// ---- Landing areas: a free space, or what its occupancy rules say to do when it is full ----
+	const trafficdata::Place* PlaceNamed(const std::string& name)
+	{
+		for (const auto& p : g_data.places) if (p.name == name) return &p;
+		return nullptr;
+	}
+	int FreeSpace(const trafficdata::Place& p, const Slot* me)
+	{
+		const int n = int(trafficdata::Spaces(p).size());
+		std::vector<bool> taken(std::size_t(n), false);
+		for (const auto& o : g_slots) if (o.used && &o != me && o.place == p.name && o.space >= 0 && o.space < n) taken[std::size_t(o.space)] = true;
+		for (int i = 0; i < n; ++i) if (!taken[std::size_t(i)]) return i;
+		return -1;
+	}
+	struct PlacePick { const trafficdata::Place* place = nullptr; int space = -1; bool queue = false; trafficdata::Vec at; };
+	PlacePick PickPlace(const char* world, const trafficdata::Route& route, double x, double y, const Slot* me)
+	{
+		PlacePick pick;
+		std::vector<const trafficdata::Place*> ok;
+		for (const auto& p : g_data.places)
+			if (trafficdata::SameWorld(g_data, p.world, world) && std::hypot(p.at.x - x, p.at.y - y) >= kMinTripDistance && trafficdata::RouteMayPark(p, route.name, route.role)) ok.push_back(&p);
+		if (ok.empty()) return pick;
+		const std::size_t first = std::size_t(g_nextPlace++);
+		for (std::size_t k = 0; k < ok.size(); ++k) {
+			const auto* p = ok[(first + k) % ok.size()];
+			const int space = FreeSpace(*p, me);
+			if (space >= 0) { pick.place = p; pick.space = space; pick.at = trafficdata::Spaces(*p)[std::size_t(space)]; return pick; }
+			if (p->full == "circle") return pick;  // another lap, then it looks again
+			if (p->full == "queue") { pick.place = p; pick.queue = true; pick.at = p->at; return pick; }
+			// "on": the next area
+		}
+		return pick;
+	}
+	double ExitU(const trafficdata::Route& r, const trafficroute::Line& line, double at);
+	// The exit toward a place: its own, else the route's exit nearest it, else the route point nearest it.
+	double ExitToward(const trafficdata::Route& route, const trafficroute::Line& line, const trafficdata::Place& place)
+	{
+		double exitU = trafficroute::Nearest(line, 0, place.at.x, place.at.y), exitD = 1e18;
+		for (const auto& e : g_data.exits) {
+			if (e.route != route.name) continue;
+			const double u = ExitU(route, line, e.at);
+			const auto p = trafficroute::At(line, 0, u);
+			const double d = e.name == place.exitName ? -1.0 : std::hypot(p.x - place.at.x, p.y - place.at.y);
+			if (d < exitD) { exitD = d; exitU = u; }
+		}
+		return exitU;
+	}
+	void TakePlace(Slot& s, const PlacePick& pick) { s.place = pick.place->name; s.space = pick.space; s.queue = pick.queue; s.stay = pick.place->stay; s.stayUntil = 0; s.dest = pick.place->name; }
+
 	bool TurnGoal(Slot& s, double x, double y, double z, FvoTripGoal* out)
 	{
         if(s.turn.empty())return false;
         while(s.turnAt<s.turn.size()&&std::hypot(std::hypot(s.turn[s.turnAt].x-x,s.turn[s.turnAt].y-y),s.turn[s.turnAt].z-z)<5)++s.turnAt;
         if(s.turnAt<s.turn.size()){
             const auto& goal=s.turn[std::min(s.turnAt+1,s.turn.size()-1)];
-            out->x=goal.x;out->y=goal.y;out->z=goal.z;out->stop=1;out->passThrough=1;out->fly=1;out->speed=float(std::min(15.0,s.speed));return true;
+            out->x=goal.x;out->y=goal.y;out->z=goal.z;out->stop=1;out->passThrough=1;out->fly=1;out->speed=float(std::min(15.0,s.speed));ZoneLimits(s,x,y,out,true);return true;
         }
         s.turn.clear();s.trip.uKnown=false;return false;
 	}
@@ -429,11 +564,15 @@ namespace
 	{
 		auto* s = static_cast<Slot*>(user);
 		s->seen = GetTickCount64();
+		if (s->flownStart) s->flown += std::hypot(std::hypot(x - s->x, y - s->y), z - s->z);
+		s->flownStart = true;
 		s->x = x; s->y = y; s->z = z;
         if(TurnGoal(*s,x,y,z,out))return 0;
 		// Check the slot before Step can promote Join to Follow inside kReach.
 		const auto before = s->trip;
 		auto g = trafficroute::Step(s->line, s->trip, x, y, z);
+        observations::Record(g_log,GetTickCount64(),"route.goal",s->vehicleId,unsigned(s->trip.leg)|(std::uint64_t(s->trip.lane)<<8)|(std::uint64_t(s->holding)<<16),
+            "route=%s lane=%d leg=%s holding=%d repeat=%d pos=%.2f,%.2f,%.2f goal=%.2f,%.2f,%.2f speed=%.2f flown=%.2f",s->route.c_str(),s->trip.lane,trafficroute::Name(s->trip.leg),s->holding,s->repeat,x,y,z,g.x,g.y,g.z,s->speed,s->flown);
 		if (before.leg == trafficroute::Leg::Join && s->trip.leg == trafficroute::Leg::Follow) {
 			const auto join = trafficroute::At(s->line, s->trip.lane, trafficroute::Nearest(s->line, s->trip.lane, x, y));
 			if (SlotTaken(*s, join)) s->trip = before;
@@ -458,7 +597,25 @@ namespace
 			s->logged = s->trip.leg;
 			Log("FVO traffic: %s lane %d trip%s%s: %s", s->route.c_str(), s->trip.lane, s->dest.empty() ? "" : " to ", s->dest.c_str(), trafficroute::Name(s->trip.leg));
 		}
+		if (s->trip.leg == trafficroute::Leg::Done && !s->trip.lap && s->queue) {
+			// Queue: it waits above the area until a space frees, then lands in it.
+			const auto* p = PlaceNamed(s->place);
+			const int space = p ? FreeSpace(*p, s) : -1;
+			if (p && space < 0) {
+				out->x = p->at.x; out->y = p->at.y; out->z = p->at.z + 25.0; out->stop = 3.0; out->passThrough = 0; out->fly = 1; out->speed = 8.0f;
+				return 0;
+			}
+			s->queue = false;
+			if (p) { s->space = space; s->trip.dest = trafficdata::Spaces(*p)[std::size_t(space)]; Log("FVO traffic: %s: a space freed at %s (space %d)", s->route.c_str(), p->name.c_str(), space + 1); }
+		}
 		if (s->trip.leg == trafficroute::Leg::Done) {
+			if (s->flown < kEmptyTripFlown && s->vehicleId) {
+				auto& e = g_emptyTrips[s->vehicleId];
+				if (e.first != s->route || GetTickCount64() - e.second >= kEmptyTripMs)
+					Log("FVO traffic: vehicle %08X: its trip on %s ended where it began (%.0f m flown; too short from here); that route is skipped for it for %d s",
+						s->vehicleId, s->route.c_str(), s->flown, int(kEmptyTripMs / 1000));
+				e = { s->route, GetTickCount64() };
+			}
 			s->used = s->repeat;
 			if (!s->trip.lap) { out->x = s->trip.dest.x; out->y = s->trip.dest.y; out->z = s->trip.dest.z; return s->repeat ? 4 : 2; }
 			return s->repeat ? 3 : 1;
@@ -467,6 +624,8 @@ namespace
 		out->passThrough = g.passThrough ? 1 : 0;
 		out->fly = 1;  // routes are flight lanes
 		out->speed = float(s->trip.leg == trafficroute::Leg::Follow ? s->speed : 15.0);
+		ZoneLimits(*s, x, y, out, s->trip.leg == trafficroute::Leg::Follow);
+		if (s->trip.leg == trafficroute::Leg::Follow) CrossLimit(*s, x, y, out);
 		return 0;
 	}
 
@@ -477,6 +636,12 @@ namespace
 		if (!s || !s->used || !s->repeat || s->trip.leg != trafficroute::Leg::Done) return 0;
 		s->seen = GetTickCount64();
 		s->x = x; s->y = y; s->z = z;
+		if (restart && s->stay > 0 && !s->place.empty()) {
+			// Occupancy rules: it stays parked in its space this long (counted from when it has landed).
+			const ULONGLONG now = GetTickCount64();
+			if (!s->stayUntil) s->stayUntil = now + ULONGLONG(s->stay * 1000.0);
+			if (now < s->stayUntil) return 0;
+		}
 		if (restart) {
 			// The landing is the safe moment to take up edits (2026-10-28, the map route editor): the route as the files say now,
 			// if it is still active and has room; else the nearest route that is; else the vehicle stays parked (return 0). The files
@@ -488,8 +653,8 @@ namespace
 			const std::string own = s->home.empty() ? s->route : s->home;  // a spur's vehicle flies home to its own route
 			if (!s->home.empty())
 				for (const auto& r : g_data.routes)
-					if (r.name == own && trafficdata::SameWorld(g_data, r.world, world) && Room(r, rule, s, false)) { route = &r; break; }
-			if (!route) route = FairRoute(world, rule, s, false, x, y, own);  // fair share; its own route on a tie
+					if (r.name == own && trafficdata::SameWorld(g_data, r.world, world) && Room(r, rule, s, false) && !EmptyHere(s->vehicleId, r.name) && !Excluded(r, s->vehicleId)) { route = &r; break; }
+			if (!route) route = FairRoute(world, rule, s, false, x, y, EmptyHere(s->vehicleId, own) ? std::string() : own, nullptr, s->vehicleId);  // fair share; its own route on a tie
 			{
 				if (!route) {
 					int minute = 0;
@@ -504,12 +669,22 @@ namespace
 						s->route.c_str(), route->name.c_str());
 			}
 			s->line = trafficroute::Build(*route);
-			s->speed = route->speed; s->route = route->name;
+			s->speed = RoleSpeed(*route); s->route = route->name;
 			const int lane = route->lanes > 1 ? std::clamp(s->trip.lane, 0, 1) : 0;
-			s->trip = trafficroute::StartLap(s->line, lane, {x, y, z});
-			s->logged = s->trip.leg; s->holding = false; s->dest.clear();
+			s->place.clear(); s->space = -1; s->queue = false; s->stay = 0; s->stayUntil = 0;
+			// Landing areas are used lap after lap, not only by a vehicle's first trip: places, or every other trip with mixed.
+			const bool toPlace = rule.trips == trafficdata::Trips::Places || (rule.trips == trafficdata::Trips::Mixed && (g_mixedPlace = !g_mixedPlace));
+			const auto pick = toPlace ? PickPlace(world, *route, x, y, s) : PlacePick{};
+			s->dest.clear();
+			if (pick.place) {
+				s->trip = trafficroute::StartTo(s->line, route->lanes, { x, y, z }, pick.at, ExitToward(*route, s->line, *pick.place));
+				TakePlace(*s, pick);
+			}
+			else s->trip = trafficroute::StartLap(s->line, lane, {x, y, z});
+			s->flown = 0; s->flownStart = true;
+			s->logged = s->trip.leg; s->holding = false;
 			s->home = s->route; FindJunctions(*s);
-			Log("FVO traffic: %s lane %d: landed dwell complete; starting another full lap (route as saved now)", s->route.c_str(), s->trip.lane);
+			Log("FVO traffic: %s lane %d: landed dwell complete; %s%s (route as saved now)", s->route.c_str(), s->trip.lane, pick.place ? "flying to " : "starting another full lap", pick.place ? pick.place->name.c_str() : "");
 		}
 		return 1;
 	}
@@ -642,6 +817,53 @@ namespace
 		return 1;
 	}
 
+	// Cruise: the player's vehicle takes a slot like traffic and flies a lap of a route picked at random, turning off at junctions as traffic does. No landing: at the end of the
+	// lap core asks for another.
+	std::string g_cruiseLast;
+	int PlanCruise(unsigned vehicleId, double x, double y, double z, FvoTripClaim* out)
+	{
+		Load();
+		char world[201]{};
+		if (!out || !g_worldName || !g_worldName(world, sizeof world)) return 0;
+		const auto rule = RuleFor(world);
+		const auto city = CityNow();
+		int minute = 0;
+		const bool clock = LocalMinute(minute);
+		std::vector<const trafficdata::Route*> routes;
+		std::vector<routeshare::CruiseOption> options;
+		for (const auto& r : g_data.routes) {
+			if (!trafficdata::SameWorld(g_data, r.world, world) || r.removed || !CityFlies(r, city) || EmptyHere(vehicleId, r.name)) continue;
+			const auto l = trafficroute::Build(r);
+			if (l.Count() < 2) continue;
+			const auto in = trafficroute::At(l, 0, trafficroute::Nearest(l, 0, x, y));
+			const auto d = routeschedule::Evaluate(r.schedule, clock, minute);
+			routes.push_back(&r);
+			options.push_back({ std::hypot(in.x - x, in.y - y), d.known && d.active, r.name == g_cruiseLast });
+		}
+		static std::mt19937 random{ std::random_device{}() };
+		const int k = routeshare::PickCruise(options, rule.reach, unsigned(random()));
+		if (k < 0) return 0;
+		int active = 0;
+		Slot* free = FreeSlot(active);
+		if (!free) return 0;
+		const auto& r = *routes[std::size_t(k)];
+		const auto line = trafficroute::Build(r);
+		Slot& s = *free;
+		s = Slot{};
+		s.used = true; s.vehicleId = vehicleId; s.seen = GetTickCount64(); s.line = line; s.speed = RoleSpeed(r); s.route = r.name; s.home = r.name;
+		s.dice = (std::uint64_t(vehicleId) << 20) ^ s.seen; FindJunctions(s);
+		s.trip = trafficroute::StartLap(line, r.lanes > 1 ? int(random() % 2) : 0, { x, y, z });
+		s.dest = "cruise";
+		s.logged = s.trip.leg;
+		s.x = x; s.y = y; s.z = z; s.flownStart = true;
+		g_cruiseLast = r.name;
+		Log("FVO traffic: your vehicle %08X cruises on route %s, lane %d (%.0f m to join; %zu route(s) to choose from)", vehicleId, r.name.c_str(), s.trip.lane, options[std::size_t(k)].dist, options.size());
+		out->step = &Step;
+		out->user = &s;
+		out->name = "cruise";
+		return 1;
+	}
+
 	int Begin(const trafficdata::Traffic& rule, const char* world, Slot* free, double x, double y, double z, unsigned vehicleId,
 		FvoTripClaim* out, bool pool,const std::string& initial,int initialLane)
 	{
@@ -656,14 +878,19 @@ namespace
 		const trafficdata::Route* route = nullptr;
 		trafficroute::Line line;
 		bool test = false;
-        if(!initial.empty()){
-            for(const auto& r:g_data.routes)if(r.name==initial&&trafficdata::SameWorld(g_data,r.world,world)&&Room(r,rule,nullptr,true)){
-                route=&r;line=trafficroute::Build(r);break;}
-            if(!route)return 0;
+        bool useInitial=!initial.empty()&&!EmptyHere(vehicleId,initial);
+        if(useInitial){
+            bool excluded=false;  // its model is left out of its first route (vehicle rules): it takes any other route instead
+            for(const auto& r:g_data.routes)if(r.name==initial&&trafficdata::SameWorld(g_data,r.world,world)){
+                if(Excluded(r,vehicleId)){excluded=true;break;}
+                if(Room(r,rule,nullptr,true)){route=&r;line=trafficroute::Build(r);}
+                break;}
+            if(excluded)useInitial=false;
+            else if(!route)return 0;
         }
 		for (const auto& r : g_data.routes) {
             if(route)break;
-			if (!r.test || !trafficdata::SameWorld(g_data, r.world, world)) continue;
+			if (!r.test || !trafficdata::SameWorld(g_data, r.world, world) || Excluded(r, vehicleId)) continue;
 			const std::string key = r.name + "@" + std::to_string(g_stamp);
 			if (g_testDone == key) continue;
 			const auto l = trafficroute::Build(r);
@@ -672,48 +899,34 @@ namespace
 			route = &r; line = l; test = true; g_testDone = key;
 			break;
 		}
-		if (!test&&initial.empty()) route = FairRoute(world, rule, nullptr, pool, x, y, std::string(), &line);  // fair share (routeshare.h)
+		if (!test&&!useInitial) route = FairRoute(world, rule, nullptr, pool, x, y, std::string(), &line, vehicleId);  // fair share (routeshare.h)
 		if (!route) return 0;
 		if (test) Log("FVO traffic: test route %s: vehicle %08X flies it once (asked for in the map route editor)", route->name.c_str(), vehicleId);
 		const trafficdata::Vec home{ x, y, z };
 		// Lap or a destination.
 		bool toPlace = rule.trips == trafficdata::Trips::Places || (rule.trips == trafficdata::Trips::Mixed && (g_mixedPlace = !g_mixedPlace));
-		const trafficdata::Place* place = nullptr;
-		if (toPlace) {
-			std::vector<const trafficdata::Place*> ok;
-			for (const auto& p : g_data.places)
-				if (trafficdata::SameWorld(g_data, p.world, world) && std::hypot(p.at.x - x, p.at.y - y) >= kMinTripDistance) ok.push_back(&p);
-			if (!ok.empty()) place = ok[std::size_t(g_nextPlace++) % ok.size()];
-		}
+		const auto pick = toPlace ? PickPlace(world, *route, x, y, nullptr) : PlacePick{};
+		const trafficdata::Place* place = pick.place;
 		Slot& s = *free;
 		s = Slot{};
-		s.used = true; s.vehicleId=vehicleId; s.seen = now; s.line = line; s.speed = route->speed; s.route = route->name;
+		s.used = true; s.vehicleId=vehicleId; s.seen = now; s.line = line; s.speed = RoleSpeed(*route); s.route = route->name;
 		s.home = route->name; s.dice = (std::uint64_t(vehicleId) << 20) ^ now; FindJunctions(s);
 		s.repeat = g_cycleSupported;
 		if (place) {
-			// The exit: the place's own, else this route's exit nearest the place, else the route point nearest it.
-			double exitU = trafficroute::Nearest(line, 0, place->at.x, place->at.y), exitD = 1e18;
-			for (const auto& e : g_data.exits) {
-				if (e.route != route->name) continue;
-				const double u = ExitU(*route, line, e.at);
-				const auto p = trafficroute::At(line, 0, u);
-				const double d = e.name == place->exitName ? -1.0 : std::hypot(p.x - place->at.x, p.y - place->at.y);
-				if (d < exitD) { exitD = d; exitU = u; }
-			}
-			s.trip = trafficroute::StartTo(line, route->lanes, home, place->at, exitU);
-			s.dest = place->name;
+			s.trip = trafficroute::StartTo(line, route->lanes, home, pick.at, ExitToward(*route, line, *place));
+			TakePlace(s, pick);
 		}
 		else {
 			s.trip = trafficroute::StartLap(line, route->lanes > 1 ? g_nextLane : 0, home);
 			g_nextLane ^= 1;
 		}
-        if(!initial.empty()){
+        if(useInitial){
             s.trip=trafficroute::StartLap(line,initialLane,home);s.trip.leg=trafficroute::Leg::Follow;
             s.trip.lastU=trafficroute::Nearest(line,initialLane,x,y);s.trip.uKnown=true;
-            s.dest.clear();
+            s.dest.clear();s.place.clear();s.space=-1;s.queue=false;s.stay=0;
         }
 		s.logged = s.trip.leg;
-		s.x = x; s.y = y; s.z = z;
+		s.x = x; s.y = y; s.z = z; s.flown = 0; s.flownStart = true;
 		if (!pool) g_lastStart = now;
 		Log("FVO traffic: vehicle %08X goes onto route %s, lane %d, %s%s", vehicleId, route->name.c_str(), s.trip.lane, place ? "to " : "a lap and home",
 			place ? place->name.c_str() : "");
@@ -728,28 +941,28 @@ namespace
     void SendPool(const char* world){
         if(!g_trafficApi)return;
         const auto rule=RuleFor(world);
+        const auto city=trafficdata::CityOf(g_data,world);
         std::vector<FvoPoolSpot> origins;std::vector<std::string> originNames;
-        for(const auto& s:g_data.spawns)if(trafficdata::SameWorld(g_data,s.world,world)){
-            origins.push_back({s.at.x,s.at.y,s.at.z,s.heading*3.14159265358979/180});originNames.push_back("spawn."+s.name);}
         for(const auto& p:g_data.places)if(trafficdata::SameWorld(g_data,p.world,world)){
             origins.push_back({p.at.x,p.at.y,p.at.z,0});originNames.push_back("place."+p.name);}
         int target=0;
-        for(const auto& r:g_data.routes)if(trafficdata::SameWorld(g_data,r.world,world)&&Allowed(r,rule)){
+        for(const auto& r:g_data.routes)if(trafficdata::SameWorld(g_data,r.world,world)&&Allowed(r,rule)&&CityFlies(r,city)){
             int peak=r.schedule.allDay?r.schedule.allDayVehicles:0;
             for(const auto& w:r.schedule.windows)peak=std::max(peak,w.vehicles);
-            target=std::min(fvolimits::kVehicles,target+std::max(0,peak));
+            target=std::min(fvolimits::kVehicles,target+std::max(0,trafficdata::Scaled(peak,city)));
         }
-        target=std::clamp(std::max(target,rule.startOnRoute),0,fvolimits::kVehicles);
+        target=std::clamp(std::max(target,city.on?rule.startOnRoute:0),0,std::min(fvolimits::kVehicles,city.limit));
         // An origin may dispatch several vehicles over time. They are not born
         // together there: the generator reserves the footprint until it clears.
         std::vector<FvoPoolSpot> spots;std::vector<std::string> names;std::vector<int> reuse;
         std::vector<std::vector<trafficinitial::Slot>> perRoute;int minute=0;const bool clock=LocalMinute(minute);g_initialClockPending=false;
-        for(const auto& r:g_data.routes)if(trafficdata::SameWorld(g_data,r.world,world)&&Allowed(r,rule)){
+        for(const auto& r:g_data.routes)if(trafficdata::SameWorld(g_data,r.world,world)&&Allowed(r,rule)&&CityFlies(r,city)){
             if(!clock&&!r.schedule.allDay)g_initialClockPending=true;
             const auto demand=routeschedule::Evaluate(r.schedule,clock,minute);
-            if(demand.known&&demand.active)perRoute.push_back(trafficinitial::Route(r,demand.vehicles));
+            if(demand.known&&demand.active)perRoute.push_back(trafficinitial::Route(r,trafficdata::Scaled(demand.vehicles,city)));
         }
         g_initialSlots=trafficinitial::Interleave(perRoute);
+        if(int(g_initialSlots.size())>city.limit)g_initialSlots.resize(std::size_t(std::max(0,city.limit)));
         target=std::max(target,int(g_initialSlots.size()));
         for(int i=0;i<target;++i){
             spots.push_back(origins.empty()?FvoPoolSpot{}:origins[std::size_t(i)%origins.size()]);
@@ -759,6 +972,21 @@ namespace
             spots.push_back({p.at.x,p.at.y,p.at.z,0});names.push_back("place."+p.name);reuse.push_back(1);}
         std::vector<const char*> ptrs;for(const auto& n:names)ptrs.push_back(n.c_str());
         generator::SetSpots(world,spots.data(),int(spots.size()),reuse.data(),ptrs.data(),&PoolTrip);
+        {std::vector<const char*> landingNames;for(const auto& n:originNames)landingNames.push_back(n.c_str());generator::SetLandingSpots(origins.data(),landingNames.data(),int(origins.size()));}
+        // Vehicle rules reach the models dealt out: a position on a route holds what that route allows; any other leaves from the ground and may take any route of
+        // this world, so only a model every one of them leaves out is barred. (2026-10-31: the deal ignored them, and a left-out model on a lane got no trip and stayed there.)
+        {
+            std::vector<unsigned> barred;bool first=true;
+            for(const auto& r:g_data.routes)if(trafficdata::SameWorld(g_data,r.world,world)&&Allowed(r,rule)&&CityFlies(r,city)){
+                if(first){barred=trafficdata::AllLeftOut(g_data.groups,r);first=false;continue;}
+                barred.erase(std::remove_if(barred.begin(),barred.end(),[&](unsigned id){return !trafficdata::LeftOut(g_data.groups,r,id);}),barred.end());
+            }
+            std::vector<std::vector<unsigned>> skip(spots.size(),barred);
+            int ruled=0;
+            for(std::size_t i=0;i<g_initialSlots.size()&&i<skip.size();++i)for(const auto& r:g_data.routes)if(r.name==g_initialSlots[i].route){skip[i]=trafficdata::AllLeftOut(g_data.groups,r);if(!skip[i].empty())++ruled;break;}
+            generator::SetModelRules(skip);
+            if(ruled||!barred.empty())Log("FVO traffic: %s: vehicle rules: %d route position(s) limited to their route's models; %zu model(s) left out of every route",world,ruled,barred.size());
+        }
         std::vector<FvoPoolSpot> initial;for(const auto& s:g_initialSlots)initial.push_back({s.at.x,s.at.y,s.at.z,s.heading});
         generator::SetInitialScene(initial.data(),int(initial.size()));
         generator::WaitForInitialClock(g_initialClockPending);
@@ -775,8 +1003,18 @@ namespace
     }
     std::string g_poolWorld;unsigned long long g_poolStamp=~0ull;
     std::atomic<bool> g_poolResend{false};
-    // Start/Swap (the editor's loading panel covers the map): re-read the files and re-plan every route position from the
-    // schedule as it is now, then the generator fills them under the panel, the same cold start as arriving in the city.
+    // Reset traffic: the cleared pairs' trips are over. The player's own Auto and any job still running keep theirs.
+    void ClearedTrips(){
+        int freed=0;
+        for(auto& s:g_slots){
+            if(!s.used||s.dest=="your marker"||s.dest=="cruise"||(s.vehicleId&&g_trafficApi&&g_trafficApi->usesVehicle(s.vehicleId)))continue;
+            s.used=false;++freed;
+        }
+        g_emptyTrips.clear();g_lastStart=0;
+        Log("FVO traffic: reset: %d trip(s) let go",freed);
+    }
+    // Reset traffic (the editor's X, its loading panel covers the map): re-read the files and re-plan every route position from the
+    // schedule as it is now, then the generator clears every pair and fills them under the panel, the same cold start as arriving in the city.
     void StartSwap(const FvoRushPlace* places,int count){RequestReload();g_poolResend=true;generator::Rush(places,count);}
     void PreparePool(){
         Load();char world[201]{};if(!g_worldName||!g_worldName(world,sizeof world))return;
@@ -868,15 +1106,16 @@ namespace
 		if (const auto api = reinterpret_cast<FvoTrafficApi_t>(GetProcAddress(core, "FVO_TrafficApi"))) {
 			static const FvoTrafficHooks hooks = { &TrafficTick, &TrafficHousekeeping, &ResetAll, &StartSwap, &generator::RushStatus, &everyday::Scan, &RequestReload };
 			g_trafficApi = api(kFvoTrafficApiVersion, &hooks);
-			if (g_trafficApi) { generator::Attach(g_trafficApi, g_log); everyday::Attach(g_trafficApi, g_log, &Offer); }
+			if (g_trafficApi) { generator::Attach(g_trafficApi, g_log); generator::SetClearedHook(&ClearedTrips); everyday::Attach(g_trafficApi, g_log, &Offer); }
 		}
 		if (!g_trafficApi) Log("FVO traffic: core offers no traffic API v%d (FlyingVehicleOverhaul.dll older or newer than FVO_Traffic.dll); no traffic", int(kFvoTrafficApiVersion));
 		if (!g_localTime) Log("FVO traffic: core has no FVO_LocalTime; scheduled routes wait (all-day routes run)");
 		if (const auto cycle = reinterpret_cast<FvoRegisterTrafficCycle_t>(GetProcAddress(core, "FVO_RegisterTrafficCycle"))) g_cycleSupported = cycle(&Cycle) != 0;
 		if (const auto plan = reinterpret_cast<FvoRegisterRoutePlanner_t>(GetProcAddress(core, "FVO_RegisterRoutePlanner"))) plan(&PlanRoute);
+		if (const auto plan = reinterpret_cast<FvoRegisterCruisePlanner_t>(GetProcAddress(core, "FVO_RegisterCruisePlanner"))) plan(&PlanCruise);
 		if (const auto tick = reinterpret_cast<FvoRegisterTick_t>(GetProcAddress(core, "FVO_RegisterTick"))) tick(&Markers);
 		if (!g_worldName) { Log("FVO traffic: core has no FVO_WorldName (an older FlyingVehicleOverhaul.dll); traffic files off"); return; }
-		if (g_trafficApi) Log("FVO Traffic addon 0.1: route traffic attached (files in %s)", Narrow(TrafficDir()).c_str());
+		if (g_trafficApi) Log("FVO Traffic addon 0.2: route traffic attached (files in %s)", Narrow(TrafficDir()).c_str());
 		Load();
 	}
 
@@ -889,7 +1128,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 3, "FVO_Traffic", "seemless",
+	SFSEPluginVersionData::kVersion, 4, "FVO_Traffic", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ kRuntime_1_16_244, 0 }, 0, 0, 0,

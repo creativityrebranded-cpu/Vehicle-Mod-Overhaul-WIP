@@ -14,6 +14,9 @@ namespace pilotquest
     void Reset(); // save/world load: discard cached forms and pending diagnostics
 	// Slot 0..5: the vehicle alias, then the pilot alias; then the actor re-evaluates its packages. Returns false with the reason logged.
 	bool Assign(int slot, std::uintptr_t npc, std::uintptr_t vehicle);
+    // Traffic reserves its controller slot, then polls this owned native
+    // service operation before handing the staged chassis to its pilot.
+    bool AssignTraffic(int slot,std::uintptr_t npc,std::uintptr_t vehicle);
 	// Logs (after delayMs) what the pilot alias holds and which package the actor runs; call from the main thread each frame via Tick.
 	void Diagnose(int slot, std::uintptr_t npc, unsigned delayMs);
 	void Tick();

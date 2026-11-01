@@ -71,6 +71,10 @@ namespace prefetch
 	{
 		return !A() && vehicle_probe::LatestRay(slot, out, age);
 	}
+	bool RayRefused(int slot, const float from[3], const float to[3])
+	{
+		return !A() && vehicle_probe::RayRefused(slot, from, to);
+	}
 	void RequestSweep(int slot, std::uintptr_t instance, float dirX, float dirY, float range, std::uint64_t mask)
 	{
 		if (!A()) vehicle_probe::RequestSweep(slot, instance, dirX, dirY, range, mask);

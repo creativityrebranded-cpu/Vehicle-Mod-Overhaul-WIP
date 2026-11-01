@@ -23,6 +23,8 @@
 #include "modscene.h"
 #include "navmap.h"
 #include "autodrive.h"
+#include "inputgate.h"
+#include "trafficarrival.h"
 #include "navfield.h"
 #include "recovery.h"
 #include "environment.h"
@@ -1493,6 +1495,11 @@ namespace vehicleflight
 			bool taxiArrived = false;
 			double taxiMz = std::numeric_limits<double>::quiet_NaN();
 			FvoTripClaim taxiRoute{};      // Auto on a traffic route to the marker (the addon's trip); step null = straight
+			bool cruise = false;           // Cruise: Auto with no destination, lap after lap of random traffic routes
+			FvoTripClaim cruiseRoute{};    // the lap under way; step null = asking for one
+			ULONGLONG cruiseAskAt = 0;
+			bool cruiseToldNone = false;
+			double cruiseWaitX = 0, cruiseWaitY = 0;
 			bool taxiRouteAsked = false;   // the planner was asked for this marker
 			TripProgress trip;
             recovery::Budget recovery;
@@ -1607,6 +1614,15 @@ namespace vehicleflight
 		// m over the ground under which an autopilot-flown vehicle may switch its flight off (the hover floor kMinClearance is 2.5 m):
 		// any higher, it descends first (Settle). Followers park only under it too.
 		constexpr double kDropMaxAbove = 3.5;
+		// A physics step within 1.5 s (the 500 ms of PilotPhysics flips on any frame hitch). A physical flight does not count steps this way, and a busy lock says nothing.
+		bool StepsRecent(int idx, ULONGLONG now)
+		{
+			auto& s = g_shs[idx];
+			std::unique_lock lock(s.lock, std::try_to_lock);
+			if (!lock.owns_lock() || s.physical) return true;
+			const auto instance = s.instance.load();
+			return instance && s.lastStepInstance == instance && s.lastStepAt && now - s.lastStepAt < 1500;
+		}
 		// A descent that does not get down in time ends anyway: 20 s plus 1 s per 5 m it started above the ground (2026-10-28 18:43
 		// run: 306 m and 351 m up after the drivers were lost; a flat 25 s dropped them from about 150 m).
 		constexpr ULONGLONG kSettleBaseMs = 20000;
@@ -2160,6 +2176,7 @@ namespace vehicleflight
 
 		// ---- The player's rover, remembered by form id (resolved through the form map, never a stale pointer) ----
 		FvoRoutePlanner g_routePlanner = nullptr;  // the traffic addon (FVO_RegisterRoutePlanner)
+		FvoCruisePlanner g_cruisePlanner = nullptr;  // the traffic addon (FVO_RegisterCruisePlanner)
 		std::uint32_t g_roverId = 0;
 		std::atomic<bool> g_scanCall{ false }, g_goOnBoard{ false };  // the scanner marker button: summon, then Auto on boarding
 		std::atomic<ULONGLONG> g_goAt{ 0 };
@@ -3400,6 +3417,32 @@ namespace vehicleflight
 			in.speedLimit = nv.speedLimit > 0 ? double(nv.speedLimit) : 0.0;
 			in.straight = idx >= 1 && g_straight[idx];
             in.strictTraffic=idx>=1&&nv.trafficLane;
+			// NPC pilots: the stuck logic acts only with someone in the driver seat (checked every 0.5 s). The player's own vehicle may
+			// be summoned empty on purpose, so it stays on there.
+			if (idx >= 1) {
+				static ULONGLONG seatAt[kPilots] = {};
+				static bool seated[kPilots] = {};
+				if (nowMs - seatAt[idx] >= 500) { seatAt[idx] = nowMs; seated[idx] = npcvehicles::HasDriver(self); }
+				in.driverSeated = seated[idx];
+			}
+			// Paused or covered (the same screens the traffic addon calls 2 and 3): the loading screen, or the local map / a menu
+			// holding gameplay (also the game window not in front). Read once a frame for all pilots.
+			{
+				static ULONGLONG pausedAt = 0;
+				static bool paused = false;
+				if (nowMs != pausedAt) { pausedAt = nowMs; paused = trafficarrival::Covered() || !inputgate::GameplayAllowed(); }
+				// Held on purpose (seat brake, waiting for a model) is not stuck: the watch would start escapes and backtracks on a vehicle told to stay.
+				const bool heldOnPurpose = (g_cmds[idx].c.set & Command::kBrake) && g_cmds[idx].c.brake && nowMs < g_cmds[idx].until;
+				// No physics steps: the vehicle cannot move whatever it is told, so it is not stuck and an escape cannot help (2026-11-01: 60 of 61 stuck reports, 44 from one pilot). generator: PairVerdict.
+				static ULONGLONG noStepSince[kPilots] = {};
+				const bool scriptedNow = (g_cmds[idx].c.set & Command::kScripted) && nowMs < g_cmds[idx].until;
+				if (paused || scriptedNow || StepsRecent(idx, nowMs)) noStepSince[idx] = 0;
+				else if (!noStepSince[idx]) noStepSince[idx] = nowMs;
+				const bool noSteps = noStepSince[idx] && nowMs - noStepSince[idx] >= 1500;
+				logger::Observe("autopilot.steps", self, noSteps ? 1u : 0u, "pilot=%d no_steps=%d for_ms=%llu", idx, noSteps, noStepSince[idx] ? nowMs - noStepSince[idx] : 0ull);
+				in.paused = paused || heldOnPurpose || noSteps;
+				logger::Observe("autopilot.hold", self, heldOnPurpose ? 1u : 0u, "pilot=%d held=%d screen_paused=%d", idx, heldOnPurpose, paused);
+			}
 			if (in.permit == autodrive::Permit::Both && dist > 20.0 && !in.straight)
 				in.waterAhead = environment::SurfaceAhead(self, pos.x, pos.y, pos.z, std::atan2(goal.x - pos.x, goal.y - pos.y), std::min(250.0, dist)).water;
 			in.contact = g.adContact;
@@ -3443,6 +3486,12 @@ namespace vehicleflight
 			};
 			g.adOut = g.ad.Step(in, map);
 			const auto& o = g.adOut;
+			logger::Observe("autopilot",self,unsigned(o.phase)|(std::uint64_t(o.mode)<<8)|(std::uint64_t(o.backtracking)<<16)|(std::uint64_t(in.driverSeated)<<17)|(std::uint64_t(in.paused)<<18),
+				"pilot=%d phase=%s mode=%s driver_seated=%d paused=%d pos=%.2f,%.2f,%.2f goal=%.2f,%.2f,%.2f speed_asked=%.2f speed_actual=%.2f distance=%.2f backtracking=%d reason=%s",
+				idx,autodrive::Name(o.phase),autodrive::Name(o.mode),in.driverSeated,in.paused,pos.x,pos.y,pos.z,goal.x,goal.y,goal.z,o.speed,std::hypot(in.vx,in.vy),dist,o.backtracking,o.why?o.why:"");
+			logger::Observe("avoidance",self,unsigned(o.usable)|(std::uint64_t(o.blocked)<<16)|(std::uint64_t(groundOk)<<32),
+				"pilot=%d ground_known=%d ground_z=%.2f ceiling_room=%.2f contacts=%d neighbours=%d open=%d blocked=%d routed=%d route_reaches=%d bearing=%.3f health_share=%.3f",
+				idx,groundOk,groundZ,ceilingRoom,in.contact,in.otherCount,o.usable,o.blocked,o.routed,o.routeReaches,o.bearing,vehiclehits::HealthShare(self));
 			const bool notable = o.phase == autodrive::Phase::Reverse || o.phase == autodrive::Phase::Turn || o.phase == autodrive::Phase::Boxed ||
 				o.phase == autodrive::Phase::Yield;
 			// (the 2 s repeat only with the detailed log: 2026-10-29 quieter log; changes and stuck events always)
@@ -3457,6 +3506,48 @@ namespace vehicleflight
 					o.routed ? (o.routeReaches ? "to the goal" : "partial") : "none", o.climb, o.escapeLevel, o.trapped ? ", trapped (exploring)" : "", o.stuckEvent ? ", STUCK" : "", dist,
 					pos.z - groundZ, groundOk ? "" : " (no ground reading)");
 			}
+			// Stuck sense and backtrack (autodrive.h / stucksense.h, 2026-10-31): what it noticed, where it backs off to, what it tries.
+			if (o.stuckEvent && o.stuckKind != stucksense::Kind::None) {
+				if (o.stuckKind == stucksense::Kind::NoProgress)
+					logger::Write("%s: autopilot STUCK (getting nowhere): %.1f m net in %.1f s (%.1f m driven), %.1f m closer to the goal, at (%.0f, %.0f, %.0f); %.0f m to the goal",
+						who, o.stuckMoved, o.stuckWindow, o.stuckTravelled, o.stuckGain, pos.x, pos.y, pos.z, dist);
+				else
+					logger::Write("%s: autopilot STUCK (pinned): %.1f m in %.1f s while asking %.1f m/s, at (%.0f, %.0f, %.0f); escape level %u",
+						who, o.stuckMoved, o.stuckWindow, o.speed, pos.x, pos.y, pos.z, o.escapeLevel);
+			}
+			if (o.refFrozen) {
+				static ULONGLONG frozenLogAt[kPilots] = {};
+				if (nowMs - frozenLogAt[idx] >= 3000) {
+					frozenLogAt[idx] = nowMs;
+					logger::Write("%s: autopilot: position NOT following the vehicle: %.1f m in %.1f s while it reports %.1f m/s, at (%.0f, %.0f, %.0f), mode %s; stuck escapes and backtrack held (reference and body apart?)",
+						who, o.frozenMoved, o.frozenWindow, o.frozenReported, pos.x, pos.y, pos.z, autodrive::Name(o.mode));
+				}
+			}
+			const auto& bp = o.backPlan;
+			switch (o.backEvent) {
+			case autodrive::Output::Back::Started:
+				logger::Write("%s: autopilot backtrack %d of 3: backing %.0f m along its trail (%.0f m straight) from (%.0f, %.0f) to (%.0f, %.0f); stuck spot marked closed at (%.0f, %.0f) r %.0f m for 90 s, heading %+.0f deg avoided; then %s",
+					who, bp.attempt, bp.along, bp.back, o.backX, o.backY, bp.tx, bp.ty, bp.markX, bp.markY, bp.markR, bp.heading * 57.2958, stucksense::Name(bp.alt));
+				break;
+			case autodrive::Output::Back::NoTrail:
+				logger::Write("%s: autopilot backtrack %d of 3: no trail to back along at (%.0f, %.0f); stuck spot marked closed at (%.0f, %.0f) r %.0f m for 90 s, heading %+.0f deg avoided; trying %s from here",
+					who, bp.attempt, o.backX, o.backY, bp.markX, bp.markY, bp.markR, bp.heading * 57.2958, stucksense::Name(bp.alt));
+				break;
+			case autodrive::Output::Back::Reached:
+			case autodrive::Output::Back::TimedOut:
+				logger::Write("%s: autopilot backtrack %d of 3: %s at (%.0f, %.0f) after %.0f s (trail point (%.0f, %.0f)); now trying %s",
+					who, bp.attempt, o.backEvent == autodrive::Output::Back::Reached ? "backed off" : "trail point NOT reached in 25 s; going on", o.backX, o.backY,
+					o.backSeconds, bp.tx, bp.ty, stucksense::Name(bp.alt));
+				break;
+			case autodrive::Output::Back::Recovered:
+				logger::Write("%s: autopilot backtrack worked: %.0f m closer to the goal than where it first got stuck, at (%.0f, %.0f); attempts reset", who, o.backSeconds, o.backX, o.backY);
+				break;
+			case autodrive::Output::Back::GaveUp:
+				logger::Write("%s: autopilot backtrack GAVE UP at (%.0f, %.0f): 3 tries without getting 15 m closer; the plain stuck escapes keep it moving, backtracking again in 60 s",
+					who, o.backX, o.backY);
+				break;
+			default: break;  // CoolingOff: the STUCK line above says enough
+			}
 		}
 		// One frame of a hovering pilot: the assist, avoidance, height hold and (autopilot) the flight to the goal.
 		void Fly(int idx, std::uintptr_t vehicle, Goal goal, bool focused)
@@ -3467,6 +3558,18 @@ namespace vehicleflight
 			const char* wc = idx ? Who(idx) : "Rover call";
 			// Scripted flight (flightscript.h, 2026-10-24): the caller's command is the plan this frame.
 			const bool scripted = (g_cmds[idx].c.set & Command::kScripted) && GetTickCount64() < g_cmds[idx].until;
+			{
+				std::unique_lock lock(g_sh.lock,std::try_to_lock);
+				if(lock.owns_lock()){
+				const auto now=GetTickCount64(),last=g_sh.lastStepAt;const auto instance=g_sh.instance.load(),owner=g_sh.vehicle.load();
+				const auto body=g_sh.bodyId.load(),count=g_sh.sceneCount,first=count?g_sh.sceneBodies[0]:0,steps=g_sh.steps;
+				const bool physical=g_sh.physical;lock.unlock();
+				logger::Observe("flight.physics",At<std::uint32_t>(vehicle,off::kFormId),body^(std::uint64_t(count)<<32)^(std::uint64_t(physical)<<48)^(std::uint64_t(instance!=0)<<49),
+					"pilot=%d active=%d autopilot=%d physical=%d scripted=%d instance=%p body=%08X scene_count=%u first_scene_body=%08X steps=%u step_age_ms=%llu controller_vehicle=%p",
+					idx,g.active,g.autopilot,physical,scripted,reinterpret_cast<void*>(instance),body,count,first,steps,
+					static_cast<unsigned long long>(last?now-last:0),reinterpret_cast<void*>(owner));
+				}else logger::Observe("flight.snapshot",At<std::uint32_t>(vehicle,off::kFormId),0,"pilot=%d unavailable=physics_lock_busy",idx);
+			}
 			bool scriptTraffic = false;  // a vehicle within 5 m in the scripted direction of travel
             {
                 const auto& nav=PilotNavOf(idx);const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);const auto now=GetTickCount64();
@@ -5384,8 +5487,14 @@ namespace vehicleflight
 			// The names: N is always Summon; U is Follow, or Cover while you are in combat.
 			hoverui::SetFoot(!driven && g_roverId != 0, rover && !driven && !g.autopilot && toRover <= kNearBoard, callKey.c_str(), followKey.c_str(), useKey.c_str(), status,
 				overrides::SummonLabel(), overrides::CoverLabel(npcvehicles::IsInCombat(player)));
+			if (g.cruise && !(driven && g.playerAuto)) {  // anything that ended Auto (the movement keys, leaving the vehicle) ends Cruise
+				g.cruise = false; g.cruiseRoute = {};
+				PilotNav(0, vcontract::NavParams{});
+				logger::Write("Rover cruise: off");
+			}
 			char line[64] = "";
-			if (driven && g.playerAuto) {
+			if (driven && g.playerAuto && g.cruise) std::snprintf(line, sizeof(line), g.cruiseRoute.step ? "CRUISING" : "FINDING TRAFFIC");
+			else if (driven && g.playerAuto) {
 				if (g.taxiMarker && ProgressFor(g_roverId).phase==triplogic::Phase::Arrived) std::snprintf(line, sizeof(line), "ARRIVED");
 				else if (g.taxiMarker) std::snprintf(line, sizeof(line), "%s  %.0f m", triplogic::Text(ProgressFor(g_roverId).phase), std::min(g.taxiLeft, 99999.0));
 				else std::snprintf(line, sizeof(line), "AIM + T");
@@ -5518,6 +5627,39 @@ namespace vehicleflight
 				if (g_guard && g.holdId == g_roverId && CoverFighting() && g_cf.haveSpot) {
 					goal.x = g_cf.spotX; goal.y = g_cf.spotY; goal.z = g_cf.spotZ; goal.stop = 6.0;  // defending the guard point from its best spot
 				}
+			}
+			else if (g.cruise) {
+				const ULONGLONG cruiseNow = GetTickCount64();
+				if (!g.cruiseRoute.step && g_cruisePlanner && cruiseNow >= g.cruiseAskAt) {
+					FvoTripClaim c{};
+					if (g_cruisePlanner(At<std::uint32_t>(vehicle, off::kFormId), pos.x, pos.y, pos.z, &c) && c.step) {
+						g.cruiseRoute = c; g.cruiseToldNone = false;
+					}
+					else {
+						g.cruiseAskAt = cruiseNow + 5000;
+						if (!g.cruiseToldNone) { g.cruiseToldNone = true; notify::Log("Cruise: no traffic to join here"); logger::Write("Rover cruise: no route to join; asking again every 5 s"); }
+					}
+				}
+				bool cruising = false;
+				if (g.cruiseRoute.step) {
+					FvoTripGoal tg{};
+					if (g.cruiseRoute.step(g.cruiseRoute.user, pos.x, pos.y, pos.z, &tg) == 0) {
+						cruising = true;
+						goal.x = tg.x; goal.y = tg.y; goal.z = tg.z;
+						goal.stop = tg.stop > 0 ? tg.stop : 6.0;
+						vcontract::NavParams nav;
+						nav.passThrough = tg.passThrough != 0;
+						nav.speedLimit = tg.speed;
+						nav.priority = 100;
+						PilotNav(0, nav);
+						g.cruiseWaitX = pos.x; g.cruiseWaitY = pos.y;
+					}
+					else g.cruiseRoute = {};  // the lap is over: the next one is asked for next frame
+				}
+				if (!cruising) {  // holds here until there is a lap to fly
+					goal.x = g.cruiseWaitX; goal.y = g.cruiseWaitY; goal.stop = 1.5;
+				}
+				goal.hold = !cruising;
 			}
 			else if (vcontract::Goal pg; vcontract::GoalFor(vcontract::User::Player, 0, vehicle, player, pg)) {
 				// HOOK 2a of the vehicle contract (Profile Fork): the player drives with Auto on and a profile is assigned to this vehicle.
@@ -6010,6 +6152,15 @@ namespace vehicleflight
 
 	bool ViewHeading(double& yaw) { return CameraHeading(yaw); }
     // A pilot is flying this vehicle right now (the traffic fall guard freezes one that no pilot holds).
+    int PilotLive(std::uint32_t id){
+        if(!id)return -1;
+        const auto now=GetTickCount64();
+        for(int i=1;i<kPilots;++i)if(g_jobs[i].vehicleId==id&&g_gs[i].active&&g_gs[i].autopilot){
+            if((g_cmds[i].c.set&Command::kScripted)&&now<g_cmds[i].until)return 1;
+            return StepsRecent(i,now)?1:0;
+        }
+        return -1;
+    }
     bool PilotHolds(std::uint32_t id){
         if(!id)return false;
         for(int i=1;i<kPilots;++i)if(g_jobs[i].vehicleId==id&&g_gs[i].active&&g_gs[i].autopilot)return true;
@@ -6072,9 +6223,19 @@ namespace vehicleflight
         return false;
     }
 
+	// A scanner order ends Cruise: the lap's traffic speed and pass-through settings go with it.
+	static void EndCruise()
+	{
+		if (!g.cruise) return;
+		g.cruise = false; g.cruiseRoute = {};
+		PilotNav(0, vcontract::NavParams{});
+		logger::Write("Rover cruise: off (scanner order)");
+	}
+
 	void CancelScannerTrip()
 	{
 		g_scanCall.store(false); g_goOnBoard.store(false); g_goAt.store(0);
+		EndCruise();  // scanner double T: hold here, Cruise does not carry on under the hold
 		if (g_crewPending==npcvehicles::CrewOrder::Marker) g_crewPending=npcvehicles::CrewOrder::None;
 		if (npcvehicles::CrewOrderOf(g_roverId)==npcvehicles::CrewOrder::Marker)
 			npcvehicles::SetCrewOrder(g_roverId,npcvehicles::CrewOrder::Hold);
@@ -6112,8 +6273,29 @@ namespace vehicleflight
 		g.wHold = false; g.cramped = 0; g_bumps[0] = Bumps{};
 		g.apClimb = !wasHovering; g.autopilotSince = GetTickCount64();
 		g_goOnBoard = false;
+		g.cruise = false; g.cruiseRoute = {};
 		notify::Log("Auto on - W/A/S/D or T takes over");
 		logger::Write("Rover auto: on (T tap, %s)", wasHovering ? "already hovering" : "lifting off");
+	}
+
+	// Cruise (2026-10-31, the user: "like double tapping T"): Auto with no destination. Double tap again, a tap, or the movement keys end it.
+	bool Cruising() { return g.cruise; }
+	void ToggleCruise()
+	{
+		const auto player = Ptr(addr::kPlayerCharacterPtr);
+		const auto driven = DrivenBy(player);
+		if (!driven) return;
+		if (g.playerAuto && g.cruise) { ToggleAuto(); notify::Log("Cruise off - you have control"); return; }
+		if (!g_cruisePlanner) { notify::Log("Cruise needs the traffic addon"); return; }
+		if (!g.playerAuto) ToggleAuto();
+		if (!g.playerAuto) return;
+		if (g.taxiRoute.step) { g.taxiRoute = {}; PilotNav(0, vcontract::NavParams{}); }
+		g.taxiRouteAsked = false;
+		const auto pos = At<game::Vec3>(driven, off::kRefPosition);
+		g.cruise = true; g.cruiseRoute = {}; g.cruiseAskAt = 0; g.cruiseToldNone = false;
+		g.cruiseWaitX = pos.x; g.cruiseWaitY = pos.y;
+		notify::Log("Cruise on - joining traffic. W/A/S/D or T takes over");
+		logger::Write("Rover cruise: on");
 	}
 
 	void RequestScannerTrip()
@@ -6128,6 +6310,7 @@ namespace vehicleflight
 			const bool wasHovering = g.active && g_hoverVehicle.load() == driven;
 			if (!wasHovering) Start(driven);
 			g.autopilot = g.playerAuto = true;
+			EndCruise();  // scanner T: go there
 			g.taxiWait = false; g.taxiMarker = 0; g.taxiArrived = false; g.taxiOrbit = false;
 			g.wHold = false; g.cramped = 0; g_bumps[0] = Bumps{};
 			g.apClimb = !wasHovering; g.autopilotSince = GetTickCount64();
@@ -6210,7 +6393,8 @@ namespace vehicleflight
 
 	namespace
 	{
-		struct FlipWatchEntry { std::uint32_t id = 0; ULONGLONG since = 0, fixedAt = 0, lastFixAt = 0; int repeats = 0; } g_flips[8];
+		constexpr double kFlipMoved = 3.0;  // m since the tip began that still counts as slow
+		struct FlipWatchEntry { std::uint32_t id = 0; ULONGLONG since = 0, fixedAt = 0, lastFixAt = 0; int repeats = 0; game::Vec3 at{}; } g_flips[8];
 
 		bool Upright(std::uintptr_t vehicle, const game::Vec3& p, double yaw)
 		{
@@ -6247,7 +6431,13 @@ namespace vehicleflight
 		const bool flipped = std::cos(double(rot.x)) * std::cos(double(rot.y)) < kFlipUp;
 		const ULONGLONG now = GetTickCount64();
 		if (!flipped) { e->since = 0; return; }
-		if (!e->since) e->since = now;
+		// Tipped and SLOW, as this function's contract says. A vehicle banking or tumbling through the air is not one to set upright: the old
+		// check had no speed, and the 18:59 run's 1,700-2,200 m body jumps came within 0.5 s of resets of vehicles in flight (FF016A59 at z 431).
+		const auto at = At<game::Vec3>(vehicle, off::kRefPosition);
+		if (!e->since || std::hypot(std::hypot(at.x - e->at.x, at.y - e->at.y), at.z - e->at.z) > kFlipMoved) {
+			if (e->since) logger::Observe("flight.flip", id, 1, "event=moving pitch=%.0f roll=%.0f pos=%.2f,%.2f,%.2f", rot.x * 57.2958, rot.y * 57.2958, at.x, at.y, at.z);
+			e->since = now; e->at = at;
+		}
 		if (now - e->since < kFlipMs || now - e->fixedAt < 5000) return;
 		e->fixedAt = now;
 		e->since = 0;
@@ -6260,7 +6450,10 @@ namespace vehicleflight
 		e->lastFixAt = now;
 		auto pos = At<game::Vec3>(vehicle, off::kRefPosition);
 		pos.z += float(e->repeats);
+		const auto before = At<game::Vec3>(vehicle, off::kRefPosition);
 		const bool ok = Upright(vehicle, pos, rot.z);
+		const auto after = At<game::Vec3>(vehicle, off::kRefPosition);
+		logger::Write("OBS system=flight.flip vehicle=%08X event=upright ok=%d repeats=%d before=%.2f,%.2f,%.2f after=%.2f,%.2f,%.2f", id, ok, e->repeats, before.x, before.y, before.z, after.x, after.y, after.z);
 		logger::Write("%s: %08X flipped (pitch %.0f, roll %.0f deg) -> set upright%s %s", who, id, rot.x * 57.2958, rot.y * 57.2958,
 			e->repeats ? (" " + std::to_string(e->repeats) + " m higher (flipped again)").c_str() : "", ok ? "" : "FAILED");
 	}
@@ -6271,6 +6464,7 @@ namespace vehicleflight
 		ULONGLONG g_navAt[kPilots] = {};
 	}
 
+	void SetCruisePlanner(FvoCruisePlanner planner) { g_cruisePlanner = planner; }
 	void SetRoutePlanner(FvoRoutePlanner planner)
 	{
 		g_routePlanner = planner;
@@ -6409,6 +6603,11 @@ namespace vehicleflight
 	}
 }
 
+extern "C" __declspec(dllexport) int FVO_RegisterCruisePlanner(FvoCruisePlanner planner)
+{
+	vehicleflight::SetCruisePlanner(planner);
+	return 1;
+}
 extern "C" __declspec(dllexport) int FVO_RegisterRoutePlanner(FvoRoutePlanner planner)
 {
 	vehicleflight::SetRoutePlanner(planner);

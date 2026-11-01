@@ -34,6 +34,7 @@ namespace bindings
 	std::string Label(Action a);
 	// A controller is connected (XInput).
 	bool PadConnected();
+	void PadLeftStick(double& x, double& y);  // the left stick now, -1 .. 1 (the Traffic Manager's pad cursor)
 	std::uint32_t PadState();  // the controller's raw button bits now (bindlogic::k*), 0 with none; for diagnostics
 	// One of the game's own actions (e.g. "MainGameplay", "Activate") as the game binds it: its keyboard key (fallbackVk
 	// when it binds none) or its controller button. GameLabel names the one for the device in use.

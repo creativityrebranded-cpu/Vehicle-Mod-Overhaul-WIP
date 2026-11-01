@@ -27,6 +27,7 @@ namespace world
 		float heading = 0;       // radians, ref +0x88; forward = (sin, cos)
 		float half[3] = {};      // half-extents x (width), y (length), z (height)
 		bool baseBoundsValid = false; // false means half[] is the legacy fallback, not measured bounds
+		bool heldFar = false;    // kept loaded outside the attached cells (Keep in sight): only VehiclesAndHeld lists it
 		std::uint32_t driverId = 0;
 		enum class Who : std::uint8_t { None, Player, Npc, Parked } who = Who::None;
 		std::uint32_t bodyId = 0;
@@ -52,6 +53,9 @@ namespace world
 	void Reset();
 	// Any thread: a synchronized copy of the latest snapshot; false before the first publication.
 	bool Vehicles(Snapshot& out);
+	// The same, plus the vehicles Keep in sight holds outside the attached cells within kHeldReach. For what must meet them where they are (a shot); everything else keeps
+	// to Vehicles, the attached cells.
+	bool VehiclesAndHeld(Snapshot& out);
 	// Any vehicle base form's size from its bounds (half-extents width, length, height; centre offset from the origin).
 	// False when unreadable (half/centre then hold a REV-8-sized default).
 	bool BaseSize(std::uintptr_t base, float half[3], float centre[3]);

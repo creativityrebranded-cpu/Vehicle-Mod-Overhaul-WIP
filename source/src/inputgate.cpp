@@ -28,7 +28,8 @@ namespace inputgate
         std::array<std::atomic<bool>,256> g_keys{};
         std::array<std::array<std::uint8_t,256>,3> g_owner{}; // input queue is serialized by the game's queue lock
         std::atomic<std::uint64_t> g_devicePress{0};
-        std::atomic<ULONGLONG> g_mapEditUntil{0}, g_mapAllUntil{0};
+        std::atomic<ULONGLONG> g_mapEditUntil{0}, g_mapAllUntil{0}, g_wheelUntil{0};
+        std::atomic<int> g_wheel{0};
         // The map's camera keys and the ways out stay with the map while the route editor holds it.
         bool MapKeyAllowed(std::uint32_t vk)
         {
@@ -51,14 +52,29 @@ namespace inputgate
 			const std::uint32_t bits = g_blocked.load(std::memory_order_relaxed);
 			__try {
 				auto* reason = reinterpret_cast<std::uint8_t*>(event + 0x34);
-                if(*reinterpret_cast<std::uint8_t*>(event+0x10)!=kButton)return;
                 const auto device=*reinterpret_cast<std::uint8_t*>(event+8);
                 const auto code=*reinterpret_cast<std::uint32_t*>(event+0x30);
+                const auto kind=*reinterpret_cast<std::uint8_t*>(event+0x10);
+                if(device==1&&code!=0&&GetTickCount64()<g_mapEditUntil.load(std::memory_order_relaxed)){
+                    // What the wheel really sends is only known from a live run (2026-10-30, scroll height): the first few events are logged.
+                    static std::atomic<int> told{0};
+                    if(told.fetch_add(1,std::memory_order_relaxed)<16)logger::WriteUnlocked("Input gate: mouse event while the route editor is open: type %u, code %u, value %.2f, held %.2f",
+                        unsigned(kind),code,*reinterpret_cast<float*>(event+0x48),*reinterpret_cast<float*>(event+0x4C));
+                }
+                if(kind!=kButton)return;
                 if(device>2)return;
+                if(device==1&&(code==8||code==9)&&GetTickCount64()<g_wheelUntil.load(std::memory_order_relaxed)){
+                    if(*reinterpret_cast<float*>(event+0x4C)==0)g_wheel.fetch_add(code==8?1:-1,std::memory_order_relaxed);
+                    if(!*reason){*reason=kBlockedReason;g_count.fetch_add(1,std::memory_order_relaxed);}
+                    return;
+                }
                 if(GetTickCount64()<g_mapEditUntil.load(std::memory_order_relaxed)){
                     // keyboard (0): all but the camera keys and the exits; mouse (1): the left button only
                     const bool all=GetTickCount64()<g_mapAllUntil.load(std::memory_order_relaxed);
-                    const bool hold=(device==0&&(all||!MapKeyAllowed(code)))||(device==1&&code==0);
+                    // The pad belongs to the editor too (2026-10-30, Traffic Manager V1): D-pad, A B X Y, LB RB, Start, View and the triggers. The sticks and the
+                    // right stick's click stay with the map, so the map still turns and the editor still closes.
+                    const bool dpad=device==kGamepad&&(code==1||code==2||code==4||code==8||code==0x10||code==0x20||code==0x100||code==0x200||code==0x1000||code==0x2000||code==0x4000||code==0x8000||code==9||code==10);
+                    const bool hold=(device==0&&(all||!MapKeyAllowed(code)))||(device==1&&code==0)||dpad;
                     if(hold){if(!*reason){*reason=kBlockedReason;g_count.fetch_add(1,std::memory_order_relaxed);}return;}
                 }
                 std::uint32_t index=code;
@@ -127,4 +143,6 @@ namespace inputgate
 	unsigned TakeBlockedCount() { return g_count.exchange(0, std::memory_order_relaxed); }
 	void HoldMapForEditor() { g_mapEditUntil.store(GetTickCount64() + 300, std::memory_order_relaxed); }
 	void HoldMapAll() { const auto t = GetTickCount64() + 300; g_mapEditUntil.store(t, std::memory_order_relaxed); g_mapAllUntil.store(t, std::memory_order_relaxed); }
+	void WheelForEditor(bool on) { g_wheelUntil.store(on ? GetTickCount64() + 300 : 0, std::memory_order_relaxed); if (!on) g_wheel.store(0, std::memory_order_relaxed); }
+	int TakeWheel() { return g_wheel.exchange(0, std::memory_order_relaxed); }
 }

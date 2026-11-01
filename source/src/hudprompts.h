@@ -41,6 +41,7 @@ inline std::string Name(std::size_t index){
     case A::OwnProfile:return "Vehicle profile";
     case A::NpcProfile:return "Escort profiles";
     case A::AutoToggle:return "Autopilot";
+    case A::Cruise:return "Cruise";
     case A::ClearRoute:return "Clear route";
     case A::GuardPoint:return "Guard location";
     case A::FocusTarget:return "Focus fire";

@@ -25,6 +25,7 @@ namespace logger
 		std::mutex g_lock;
         char g_buffer[65536]{};
         logbuffer::Policy g_flush;
+        unsigned long long g_sequence=0;
 #ifdef SP_LOG_TEST
         ULONGLONG g_testTime=1000;
 #endif
@@ -83,7 +84,9 @@ namespace logger
 		va_end(args);
 		{
 			std::lock_guard lock(g_lock);
-			const int bytes=std::fprintf(g_file, "[%02u:%02u:%02u.%03u] %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, text);
+            // Preserve the existing line prefix so older log searches keep working; append correlation metadata.
+            const int bytes=std::fprintf(g_file, "[%02u:%02u:%02u.%03u] %s {seq=%llu tick=%llu pid=%lu tid=%lu epoch=%u}\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, text,
+                ++g_sequence,static_cast<unsigned long long>(Now()),GetCurrentProcessId(),GetCurrentThreadId(),observations::epoch.load());
             if(bytes>0)g_flush.Added(std::size_t(bytes));
             const auto now=Now();
             if(g_flush.Due(now)){std::fflush(g_file);g_flush.Flushed(now);}

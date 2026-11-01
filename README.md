@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current packaged version: **1.0**, with Traffic Addon 0.1, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current packaged version: **1.1**, with Traffic Addon 0.2, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -82,7 +82,7 @@ before installing or upgrading.
 
 ## Installation
 
-Release 1.0 is organized in a version folder with a main ZIP, separate optional
+Release 1.1 is organized in a version folder with a main ZIP, separate optional
 Extra Vehicles and Parked Vehicles patch ZIPs, and an alternative all-in-one
 FOMOD ZIP. Matching source and hashes are alongside them. See
 [release packaging](docs/RELEASE_PACKAGING.md). Published 0.73.0 archives predate
@@ -145,6 +145,17 @@ Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation 
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
 
+## What's new in 1.1 (Traffic Addon 0.2)
+
+**Update the main mod and the Traffic Addon together:** 1.1 and Addon 0.2 share a new interface, and a mismatch means no traffic. Details: [docs/RELEASE_1.1.md](docs/RELEASE_1.1.md).
+
+- **Traffic shows first and is checked after:** pairs near you appear without waiting to be proven, then get checked outward as models load. A pair is only removed for a specific fault, and only out of sight.
+- **Frozen vehicles:** a vehicle getting no physics from the game no longer counts as stuck; after 20 seconds it is swapped out of sight.
+- **Faults ahead of you:** replaced after 5 seconds instead of 10.
+- **Drivers:** no more getting out in mid-air after a trip; seated drivers are no longer re-seated because of a lagging position in flight.
+- **Diagnostics:** zone stages with reasons, a local map trace, and small stack dumps for hitches.
+- **Known issues:** the local map can show no terrain or buildings when opened while flying; multi-second hitches in cities; some vehicles still stop getting physics, and are recovered rather than prevented; shots at traffic may not register.
+
 ## What's new in 1.0 (Traffic Addon 0.1)
 
 - **Traffic Manager:** press F7 on the local map to create and edit traffic routes; traffic is generated along them, and autopilot near a traffic zone follows the same path. A first-time message explains it.
@@ -180,7 +191,7 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 - **Route making:** traffic flies routes in plain `.ini` files in `Data\SFSE\Plugins\FVO_Traffic` (rings, open or looping paths, exits, landing places, per-world rules). `HOW-TO-MAKE-ROUTES.txt` in that folder explains every line; "Show traffic routes" draws them with probes.
 - **Installer:** the same options and pages as 0.8 (updates keep choices); New Atlantis City Traffic installs the route traffic, New Atlantis City Placements the parked vehicles.
 
-Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_1.0.txt](docs/NEXUS_POST_1.0.txt).
+Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_1.1.txt](docs/NEXUS_POST_1.1.txt).
 
 ## What's new in 0.73.0
 

@@ -3,12 +3,13 @@
 // Core FlyingVehicleOverhaul.dll does the engine work (create, seat, persist, move, ground, jobs); FVO_Traffic.dll makes every
 // traffic decision. Plain C types only, so the two DLLs never have to be built together. The addon asks once, after all
 // plugins have loaded:  const FvoTrafficApi* api = FVO_TrafficApi(kFvoTrafficApiVersion, &hooks);  (null: core too old).
-// Everything is by form id and runs on the main thread unless said otherwise.
+// Calls come from SFSE's serialized update, which may be a worker. Native
+// mutations execute in the engine lifecycle service and are asynchronous.
 #include "fvo_addon_api.h"
 
 extern "C" {
 
-enum { kFvoTrafficApiVersion = 8 };  // v8: the pair health record; v7: pre-armed traffic pilots; v6: covered arrival population; v4 read-only prefix remains queryable
+enum { kFvoTrafficApiVersion = 12 };  // v12: pilotLive; v11: asynchronous lifecycle completion; v4 read-only prefix remains queryable
 
 struct FvoTrafficPlayer {
     char world[201];   // the worldspace's editor name
@@ -114,7 +115,16 @@ struct FvoTrafficApi {
     int (*pairHealth)(unsigned vehicleId);
     double (*noticeFar)(unsigned baseId);      // v8: how far a thing of that base must be not to be made out, metres (0: a driver's size)
     int (*inCameraView)(double x,double y,double z); // v8: inside the camera's view cone now (1 when unknown)
-    int (*playerTook)(unsigned vehicleId);     // v8: the player has had this vehicle as their own since the load: it is no traffic any more
+    int (*playerTook)(unsigned vehicleId);     // v8: the player has had this vehicle as their own since the load: it is no traffic any more
+    // A driver and vehicle linked by a seat in the attached cells, both made at run time, with no job, not the player's (2026-10-31: traffic a save holds that no registry knows).
+    int (*linkedPairs)(unsigned* drivers, unsigned* vehicles, int max);
+    // A proving spot over the player for this slot (trafficpair::ProveAt), proved for createVehicle: nothing there can be seen. 1: filled in.
+    int (*provingSpot)(unsigned baseId,int slot,double* x,double* y,double* z,double* heading);
+    int (*sendPair)(unsigned vehicleId,unsigned driverId,double x,double y,double z,double heading);  // moves a seated pair: the vehicle, its driver kept on it. The caller knows it is unseen.
+    int (*deleteRef)(unsigned id);  // a persistent, disabled run-time reference goes through the game's own delete. 0: it stays hidden
+    void (*holdDriver)(unsigned driverId,unsigned vehicleId);  // keeps a linked driver at the vehicle by writing the position: the game's mover would release the seat
+    int (*pilotLive)(unsigned vehicleId);  // v12: -1 no pilot, 0 a pilot but no physics steps, 1 stepping or not meant to step (a menu, a scripted flight)
+    int (*mutationPending)(unsigned id,const char* operation); // v11: id 0 matches all; operation create/driver/move/delete (null matches all). Includes unconsumed completion. Repeat identical request to acknowledge it.
 };
 
 typedef const FvoTrafficApi* (*FvoTrafficApi_t)(int version, const FvoTrafficHooks* hooks);  // export "FVO_TrafficApi"

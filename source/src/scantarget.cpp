@@ -559,6 +559,8 @@ namespace scantarget
             }
         }
         if(bindings::Triggered(bindings::Action::AutoToggle)&&driving)vehicleflight::ToggleAuto();
+        // Starting Cruise drops any scanner route, so a later scanner T means "go there" and not a queued stop nothing flies to.
+        if(bindings::Triggered(bindings::Action::Cruise)&&driving){vehicleflight::ToggleCruise();if(vehicleflight::Cruising()){DropRoute();g_clearedAt=0;}}
         if(bindings::Triggered(bindings::Action::ClearRoute))ClearRoute();
         if(bindings::Triggered(bindings::Action::ClearFocus)){npcvehicles::SetCombatFocus(0);notify::Show("Focus cleared | automatic targeting");}
 

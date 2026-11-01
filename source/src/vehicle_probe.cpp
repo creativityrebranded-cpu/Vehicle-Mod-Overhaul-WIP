@@ -70,6 +70,8 @@ namespace vehicle_probe
 			bool haveResult = false;
 			prefetch::RayHit hit;
 			unsigned resultTick = 0;  // g_rayTick when the result arrived (age = g_rayTick - resultTick)
+			bool refused = false;     // the last cast had no world to run in (from a place not loaded): no answer is coming
+			float refusedFrom[3] = {}, refusedTo[3] = {};
 		};
 		RayProbe g_rays[prefetch::kRaySlots];
 		// Queued slots (2026-10-29 audit): the service used to copy the whole table onto the stack and age every slot on every game update
@@ -297,26 +299,47 @@ namespace vehicle_probe
 			F<std::uint32_t>(collector, 0x3C) = 0x8000000A;
 		}
 
+		// The instance was asked for on another thread and its vehicle may have unloaded since: this memory can already be something else (most runs fault here, 0x1200000012 and
+		// -1 in the 2026-10-30 14:00 one; 0x1A6B00000000 and -1 in the 2026-10-31 18:59 one). Never call through what is not a pointer to code.
+		// 1: read; 0: nothing to cast; -1: the memory is gone.
+		int ReadSweepStart(const SweepReq& r, std::uintptr_t& read, std::uint32_t& ownId, float start[3])
+		{
+			__try {
+				read = *reinterpret_cast<std::uintptr_t*>(r.instance + 0x28);
+				ownId = *reinterpret_cast<std::uint32_t*>(r.instance + 0x20);
+				if (!read || (read & 7)) return 0;
+				void** vt = *reinterpret_cast<void***>(read);
+				if (!vt || !InImage(reinterpret_cast<std::uintptr_t>(vt)) || !InImage(reinterpret_cast<std::uintptr_t>(vt[0x70 / 8]))) return 0;
+				const std::uintptr_t body = reinterpret_cast<std::uintptr_t (*)(std::uintptr_t, std::uint32_t)>(vt[0x70 / 8])(read, ownId);
+				if (!body) return 0;
+				const float* bt = reinterpret_cast<const float*>(body + 0x30);
+				start[0] = bt[0]; start[1] = bt[1]; start[2] = bt[2];
+				return 1;
+			}
+			__except (CaptureFault(GetExceptionInformation())) {
+				return -1;
+			}
+		}
+
 		bool CastShapeNow(std::uintptr_t tes, const SweepReq& r, prefetch::SweepHit& out)
 		{
 			out = prefetch::SweepHit{};
 			if (!r.instance || !(r.range > 1.0f)) return false;
 			const auto base = game::Base();
-			const std::uintptr_t read = *reinterpret_cast<std::uintptr_t*>(r.instance + 0x28);
-			const std::uint32_t ownId = *reinterpret_cast<std::uint32_t*>(r.instance + 0x20);
-			// The instance was asked for on another thread and its vehicle may have unloaded since: this memory can already be something else (most runs fault here, 0x1200000012 and
-			// -1 in the 2026-10-30 14:00 one). Never call through what is not a pointer to code.
-			if (!read || (read & 7)) return false;
-			{
-				void** vt = *reinterpret_cast<void***>(read);
-				if (!vt || !InImage(reinterpret_cast<std::uintptr_t>(vt)) || !InImage(reinterpret_cast<std::uintptr_t>(vt[0x70 / 8]))) return false;
+			std::uintptr_t read = 0;
+			std::uint32_t ownId = 0;
+			float start[3] = {};
+			const int begun = ReadSweepStart(r, read, ownId, start);
+			if (begun < 0) {
+				// A vehicle that unloaded is not a broken query: this does not count toward turning sweeps off.
+				static unsigned stale = 0;
+				if (++stale <= 8 || stale % 64 == 0)
+					logger::Write("OBS system=sensing.sweep vehicle=00000000 event=stale_instance count=%u instance=%p read_at=0x%llX", stale, reinterpret_cast<void*>(r.instance), static_cast<unsigned long long>(g_fault.target));
+				return false;
 			}
+			if (!begun) return false;
 			const auto bodyOf = reinterpret_cast<std::uintptr_t (*)(std::uintptr_t, std::uint32_t)>((*reinterpret_cast<void***>(read))[0x70 / 8]);
-			const std::uintptr_t unlockedBody = bodyOf(read, ownId);
-			if (!unlockedBody) return false;
-			const float* bt = reinterpret_cast<const float*>(unlockedBody + 0x30);
-			const float start[3] = { bt[0], bt[1], bt[2] };
-			const float dl = std::sqrt(r.dir[0] * r.dir[0] + r.dir[1] * r.dir[1]);
+			const float dl =std::sqrt(r.dir[0] * r.dir[0] + r.dir[1] * r.dir[1]);
 			if (!std::isfinite(start[0]) || !std::isfinite(start[1]) || !std::isfinite(start[2]) || !(dl > 1e-4f)) return false;
 			const float dx = r.dir[0] / dl, dy = r.dir[1] / dl;
 			const std::uintptr_t bs = RayWorld(tes, start);
@@ -492,12 +515,18 @@ namespace vehicle_probe
 					g_rayBackoff.Fault("forward ray");
 					return;
 				}
-				if (r == 0) continue;
+				if (r == 0) {
+					std::lock_guard lk(g_lock);
+					g_rays[i].refused = true;
+					for (int j = 0; j < 3; ++j) { g_rays[i].refusedFrom[j] = w.from[j]; g_rays[i].refusedTo[j] = w.to[j]; }
+					continue;
+				}
 				for (int j = 0; j < 3; ++j) {
 					hit.from[j] = w.from[j];
 					hit.to[j] = w.to[j];
 				}
 				std::lock_guard lk(g_lock);
+				g_rays[i].refused = false;
 				g_rays[i].hit = hit;
 				g_rays[i].haveResult = true;
 				g_rays[i].resultTick = tick;
@@ -808,6 +837,16 @@ namespace vehicle_probe
 		if (!r.haveResult) return false;
 		out = r.hit;
 		age = g_rayTick - r.resultTick;
+		return true;
+	}
+
+	bool RayRefused(int slot, const float from[3], const float to[3])
+	{
+		if (slot < 0 || slot >= prefetch::kRaySlots) return false;
+		std::lock_guard lk(g_lock);
+		const auto& r = g_rays[slot];
+		if (!r.refused) return false;
+		for (int i = 0; i < 3; ++i) if (std::fabs(r.refusedFrom[i] - from[i]) > 0.1f || std::fabs(r.refusedTo[i] - to[i]) > 0.1f) return false;
 		return true;
 	}
 }

@@ -14,6 +14,7 @@ namespace realvehicles
 {
 	// Main thread: jobs every frame; registry passes start every 2 s and visit one cell/frame.
 	void Tick();
+	bool PlayersOrOwn(std::uint32_t id);  // main thread: the player's vehicle, or one of the mod's own placements
 	bool CanManagePlacement(std::uint32_t id); // main thread: known idle vehicle, not owned/occupied/being swapped
 	// Bounded discovery: up to 256 references / about 0.5 ms per call, including dense
 	// cells. Cursor starts empty; true when a complete sweep finishes and resets it.

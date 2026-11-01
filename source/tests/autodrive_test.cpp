@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <string_view>
 #include <vector>
 
 using namespace autodrive;
@@ -81,6 +82,8 @@ struct Car
 	double ceiling = 1e9;
 	bool onWheels = true;
 	bool preferAir = false;
+	bool reportsContacts = true;  // false: the game never reports this vehicle's contacts (the pilot only sees it not moving)
+	int backStarts = 0, backReached = 0, backGaveUp = 0, noProgress = 0;
 	Output last;
 	int modeChanges = 0, stuckEvents = 0, contacts = 0;
 	double minGap = 1e9;
@@ -159,6 +162,10 @@ struct Sim
 			});
 			if (o.modeChanged) ++c.modeChanges;
 			if (o.stuckEvent) ++c.stuckEvents;
+			if (o.stuckEvent && o.stuckKind == stucksense::Kind::NoProgress) ++c.noProgress;
+			if (o.backEvent == Output::Back::Started || o.backEvent == Output::Back::NoTrail) ++c.backStarts;
+			if (o.backEvent == Output::Back::Reached) ++c.backReached;
+			if (o.backEvent == Output::Back::GaveUp) ++c.backGaveUp;
 			c.last = o;
 			// Vehicle response.
 			const double target = o.reverse ? -o.speed : o.speed;
@@ -181,7 +188,7 @@ struct Sim
 			c.contact = false;
 			if (Blocked(c, nx, ny, nz, o.mode, i)) {
 				c.v = 0; c.vx = c.vy = 0;
-				c.contact = true;
+				c.contact = c.reportsContacts;
 				++c.contacts;
 				if (o.mode == Mode::Hover) c.z = c.z + std::clamp(std::max(w.Ground(c.x, c.y), -1e9) + c.limits.hoverClear + o.climb - c.z, -5.0 * dt, 5.0 * dt);
 			}
@@ -193,6 +200,9 @@ struct Sim
 				std::printf("  [%zu] t=%.2f pos %.1f,%.1f z %.1f hd %.0f v %.1f %s %s want %.1f brg %.0f path %s/%s free %.1f usable %d lvl %u trap %d route %d%s\n", i, t, c.x, c.y, c.z,
 					c.heading * 57.3, c.v, Name(o.mode), Name(o.phase), o.speed, o.bearing * 57.3, Name(o.path.v), o.path.why, o.path.free, o.usable, o.escapeLevel,
 					o.trapped ? 1 : 0, o.routed ? 1 : 0, c.contact ? " CONTACT" : "");
+			if (trace && (o.stuckEvent || o.backEvent != Output::Back::None))
+				std::printf("  [%zu] t=%.2f stuck %s (moved %.1f m in %.1f s), backtrack event %d attempt %d alt %s to %.1f,%.1f%s\n", i, t, stucksense::Name(o.stuckKind), o.stuckMoved,
+					o.stuckWindow, int(o.backEvent), o.backPlan.attempt, stucksense::Name(o.backPlan.alt), o.backPlan.tx, o.backPlan.ty, o.backtracking ? " (backing)" : "");
 			for (size_t j = 0; j < cars.size(); ++j)
 				if (j != i) c.minGap = std::min(c.minGap, std::hypot(cars[j].x - c.x, cars[j].y - c.y) - Radius(c) - Radius(cars[j]));
 		}
@@ -268,6 +278,7 @@ int main()
 		Sim s;
 		s.w.terrain = [](double x, double y) { return (std::fabs(x - 30.0) < 6.0) ? std::clamp((y - 30.0) * 0.2, 0.0, 12.0) : std::clamp((y - 50.0) * 2.0, 0.0, 12.0); };
 		s.cars.push_back(MakeCar(0, 0, 0, 0, 90));
+		s.trace = std::getenv("AD_TRACE4") != nullptr;
 		const double t = s.RunUntilArrived(90);
 		Report("cliff: finds the ramp gap", s, t, 90);
 	}
@@ -589,7 +600,7 @@ int main()
 		// A ground ledge closes every wheel route; all of it is below the aircraft.
 		auto map=[](double, double, double) { Cell c; c.known=c.haveGround=true; c.ground=5; return c; };
 		Output out;
-		for (int k=0;k<=38;++k) { in.now=k*0.1; out=pilot.Step(in,map); }
+		for (int k=0;k<=88;++k) { in.now=k*0.1; out=pilot.Step(in,map); }  // (stuck at 8.5 s: 5 s start grace + 3.5 s)
 		Check(out.phase==Phase::Turn && !out.reverse && out.speed>0,
 			"airborne stuck recovery turns toward open air instead of reversing or waiting on ground slopes");
 	}
@@ -598,9 +609,9 @@ int main()
 		Input in; in.gy=100; in.z=0.8; in.above=0.8; in.groundOk=true;
 		auto map=[](double, double, double) { Cell c; c.known=c.haveGround=true; return c; };
 		Output out;
-		for (int k=0;k<=38;++k) { in.now=k*0.1; out=pilot.Step(in,map); }
+		for (int k=0;k<=88;++k) { in.now=k*0.1; out=pilot.Step(in,map); }  // (stuck at 8.5 s: 5 s start grace + 3.5 s)
 		Check(out.reverse,"wheel recovery fixture begins by backing out");
-		in.now=3.9; in.preferAir=true; in.onWheels=false;
+		in.now=8.9; in.preferAir=true; in.onWheels=false;
 		out=pilot.Step(in,map);
 		Check(out.mode==Mode::Hover && !out.reverse && out.phase!=Phase::Turn,
 			"takeoff discards the wheel escape and replans in the air");
@@ -615,6 +626,142 @@ int main()
         const auto t=TrafficFor(0,0,10,0,30,3,1,100,&oncoming,1,2,false);
         Check(t.yieldTo==2&&t.cap<1e8,"imminent collision beyond old 50m limit is detected even with right of way / ignore timer");
     }
+	// ---------------- Stuck sense and backtrack (stucksense.h, 2026-10-31) ----------------
+	{  // A wall the map never saw and the game never reports a contact for: the pilot only sees it not moving.
+		Sim s;
+		s.w.boxes.push_back({ -12, 40, 12, 44, 6, true });
+		Car c = MakeCar(0, 0, 0, 0, 100);
+		c.reportsContacts = false;
+		s.cars.push_back(c);
+		s.trace = std::getenv("AD_TRACE_S1") != nullptr;
+		const double t = s.RunUntilArrived(150);
+		Report("unreported hidden wall: notices it is stuck and arrives", s, t, 150);
+		char b[96]; std::snprintf(b, sizeof b, "(%d stuck events, %d frames pressed on the wall)", s.cars[0].stuckEvents, s.cars[0].contacts);
+		Check(s.cars[0].stuckEvents >= 1 && s.cars[0].contacts < 600, "unreported hidden wall: stuck sense fires, no endless pushing", b);
+	}
+	{  // A hidden pocket (a dead end the map never saw, open toward the start), contacts unreported: the short escapes stay
+		// inside it; the backtrack backs out along the trail, marks the pocket and goes round.
+		Sim s;
+		s.w.boxes.push_back({ -15, 40, 15, 43, 6, true });
+		s.w.boxes.push_back({ -15, 20, -12, 43, 6, true });
+		s.w.boxes.push_back({ 12, 20, 15, 43, 6, true });
+		Car c = MakeCar(0, 0, 0, 0, 100);
+		c.reportsContacts = false;
+		s.cars.push_back(c);
+		s.trace = std::getenv("AD_TRACE_S2") != nullptr;
+		const double t = s.RunUntilArrived(180);
+		const auto& q = s.cars[0];
+		char b[160]; std::snprintf(b, sizeof b, "(t=%.1f s, %d stuck events, %d backtracks started, %d reached, %d gave up, end %.1f,%.1f)", t, q.stuckEvents, q.backStarts, q.backReached, q.backGaveUp, q.x, q.y);
+		Check(t > 0, "hidden pocket, contacts unreported: arrives", b);
+		Check(q.backStarts >= 1, "hidden pocket, contacts unreported: backtracks along its trail", b);
+	}
+	{  // Circling in place (the world spins it round, whatever it asks): getting nowhere, then backs off to a trail point.
+		Pilot pilot;
+		Input in; in.gy = 200; in.groundOk = true; in.z = 0.8; in.above = 0.8; in.permit = Permit::DriveOnly;
+		auto map = [](double, double, double) { Cell c; c.known = c.haveGround = true; return c; };
+		Output out;
+		double t = 0;
+		// 60 m of plain driving north at 6 m/s: the trail.
+		for (; t < 10.0; t += 1.0 / 30.0) { in.now = t; in.y = 6.0 * t; in.vy = 6.0; in.heading = 0; out = pilot.Step(in, map); }
+		const double cy = in.y;
+		int noProgress = 0, started = 0;
+		Output first;
+		for (double u = 0; u < 16.0; u += 1.0 / 30.0) {
+			in.now = t + u;
+			in.x = 5.0 * std::sin(u * 0.8); in.y = cy + 5.0 - 5.0 * std::cos(u * 0.8);
+			in.vx = 4.0 * std::cos(u * 0.8); in.vy = 4.0 * std::sin(u * 0.8); in.heading = Wrap(u * 0.8);
+			out = pilot.Step(in, map);
+			if (out.stuckEvent && out.stuckKind == stucksense::Kind::NoProgress) ++noProgress;
+			if (std::getenv("AD_TRACE_CIRCLE") && (int(u * 30) % 15 == 0 || out.stuckEvent || out.refFrozen))
+				std::printf("  u=%.2f phase %s speed %.1f trapped %d stuck %d (%s) frozen %d usable %d\n", u, Name(out.phase), out.speed, out.trapped, out.stuckEvent, stucksense::Name(out.stuckKind), out.refFrozen, out.usable);
+			if (out.backEvent == Output::Back::Started && !started++) first = out;
+			if (started) break;
+		}
+		char b[160]; std::snprintf(b, sizeof b, "(getting nowhere %d, started %d, attempt %d, back %.1f m to %.1f,%.1f)", noProgress, started, first.backPlan.attempt,
+			first.backPlan.back, first.backPlan.tx, first.backPlan.ty);
+		Check(noProgress == 1 && started == 1, "circling: getting nowhere fires once and a backtrack starts", b);
+		Check(first.backPlan.haveCrumb && first.backPlan.back >= 8.0 && first.backPlan.ty < cy && std::fabs(first.backPlan.tx) < 1.0, "circling: backs off to a point on the road it came along", b);
+		in.vx = in.vy = 0;  // slowed down (a sharp turn at speed costs more in the fan)
+		for (int k = 0; k < 30; ++k) { in.now += 1.0 / 30.0; out = pilot.Step(in, map); }
+		const double toCrumb = Bearing(first.backPlan.tx - in.x, first.backPlan.ty - in.y);
+		std::snprintf(b, sizeof b, "(phase %s, bearing %.0f deg, trail point at %.0f deg%s)", Name(out.phase), out.bearing * 57.3, toCrumb * 57.3, out.reverse ? ", reversing" : "");
+		Check(out.backtracking && (out.reverse ? std::fabs(Wrap(out.bearing + kPi - toCrumb)) : std::fabs(Wrap(out.bearing - toCrumb))) < 1.6, "circling: steers toward the trail point while backing", b);
+	}
+	{  // Waiting on purpose: held at the goal for 60 s with the vehicle still: never stuck, never backtracks.
+		Sim s;
+		s.cars.push_back(MakeCar(0, 0, 0, 0, 40));
+		s.RunUntilArrived(30);
+		const int before = s.cars[0].stuckEvents;
+		for (int i = 0; i < 30 * 60; ++i) s.Step();
+		Check(s.cars[0].stuckEvents == before && s.cars[0].backStarts == 0, "held at the goal 60 s: never stuck, never backtracks");
+	}
+	{  // A frame gap (paused map, loading screen) while pressed on an unreported wall restarts the window: nothing fires on resume.
+		Pilot pilot;
+		Input in; in.gy = 100; in.groundOk = true; in.z = 0.8; in.above = 0.8; in.permit = Permit::DriveOnly;
+		auto map = [](double, double, double) { Cell c; c.known = c.haveGround = true; return c; };
+		bool fired = false;
+		for (double t = 0; t < 3.0; t += 1.0 / 30.0) { in.now = t; fired |= pilot.Step(in, map).stuckEvent; }
+		in.now = 63.0;  // a minute paused
+		for (double t = 63.0; t < 65.0; t += 1.0 / 30.0) { in.now = t; fired |= pilot.Step(in, map).stuckEvent; }
+		Check(!fired, "a pause while not moving: no stuck event on resume (the window restarts)");
+	}
+	{  // Paused (map, menu, loading screen) while frames keep coming and nothing moves: never stuck (2026-10-31 17:18 live run).
+		Pilot pilot;
+		Input in; in.gy = 100; in.groundOk = true; in.z = 0.8; in.above = 0.8; in.permit = Permit::DriveOnly;
+		auto map = [](double, double, double) { Cell c; c.known = c.haveGround = true; return c; };
+		for (double t = 0; t < 6.0; t += 1.0 / 30.0) { in.now = t; in.y = 3.0 * t; in.vy = 3.0; pilot.Step(in, map); }  // driving
+		bool fired = false;
+		in.paused = true; in.vy = 0;
+		for (double t = 6.0; t < 30.0; t += 1.0 / 30.0) { in.now = t; fired |= pilot.Step(in, map).stuckEvent; }
+		in.paused = false;
+		bool early = false;
+		for (double t = 30.0; t < 33.0; t += 1.0 / 30.0) { in.now = t; early |= pilot.Step(in, map).stuckEvent; }
+		Check(!fired && !early, "paused 24 s with frames running: no stuck event, none in the first 3 s after");
+	}
+	{  // Just started: the first 5 s never count (a spawn settling).
+		Pilot pilot;
+		Input in; in.gy = 100; in.groundOk = true; in.z = 0.8; in.above = 0.8; in.permit = Permit::DriveOnly;
+		auto map = [](double, double, double) { Cell c; c.known = c.haveGround = true; return c; };
+		double first = -1;
+		for (double t = 0; t < 12.0 && first < 0; t += 1.0 / 30.0) { in.now = t; if (pilot.Step(in, map).stuckEvent) first = t; }
+		char b[64]; std::snprintf(b, sizeof b, "(first stuck at %.2f s)", first);
+		Check(first >= 8.5, "just started and not moving: first stuck only after the 5 s grace + 3.5 s", b);
+	}
+	{  // It reports moving fast but the position never changes (reference not following the body): no escape, a report instead.
+		Pilot pilot;
+		Input in; in.gy = 100; in.groundOk = true; in.z = 10; in.above = 10; in.permit = Permit::HoverOnly; in.onWheels = false;
+		auto map = [](double, double, double) { Cell c; c.known = c.haveGround = true; return c; };
+		int frozen = 0, stuck = 0, backs = 0;
+		for (double t = 0; t < 30.0; t += 1.0 / 30.0) {
+			in.now = t; in.vy = 20.0;  // the body says 20 m/s
+			const Output o = pilot.Step(in, map);
+			frozen += o.refFrozen; stuck += o.stuckEvent; backs += o.backEvent != Output::Back::None;
+		}
+		char b[96]; std::snprintf(b, sizeof b, "(%d frozen reports, %d stuck, %d backtrack events)", frozen, stuck, backs);
+		Check(frozen >= 1 && stuck == 0 && backs == 0, "position not following the body: reported, never escapes or backtracks", b);
+	}
+	{  // No driver seated (2026-10-31 live run: a pilot restarted on a driverless vehicle): the stuck logic never acts.
+		Sim s;
+		s.w.boxes.push_back({ -15, 40, 15, 43, 6, true });
+		s.w.boxes.push_back({ -15, 20, -12, 43, 6, true });
+		s.w.boxes.push_back({ 12, 20, 15, 43, 6, true });
+		s.cars.push_back(MakeCar(0, 0, 0, 0, 100));
+		int stuck = 0, backs = 0, reverses = 0;
+		for (int i = 0; i < 30 * 60; ++i) {
+			Car& c = s.cars[0];
+			Input in;
+			in.now = s.t; in.x = c.x; in.y = c.y; in.z = c.z; in.heading = c.heading; in.vx = c.vx; in.vy = c.vy;
+			in.groundUnder = 0; in.groundOk = true; in.above = c.z; in.gx = c.gx; in.gy = c.gy; in.permit = c.permit;
+			in.contact = c.contact; in.driverSeated = false;
+			const Output o = c.pilot.Step(in, [&](double x, double y, double) { return s.w.MapCell(x, y, c.x, c.y); });
+			stuck += o.stuckEvent; backs += o.backEvent != Output::Back::None; reverses += o.reverse && o.phase == Phase::Reverse && o.why && std::string_view(o.why) == "backing out";
+			// The world: it drives north into the pocket and stays pressed on the back wall.
+			c.y = std::min(c.y + 4.0 / 30.0, 37.0); c.contact = c.y >= 37.0;
+			s.t += 1.0 / 30.0;
+		}
+		char b[96]; std::snprintf(b, sizeof b, "(%d stuck events, %d backtrack events, %d back-out frames)", stuck, backs, reverses);
+		Check(stuck == 0 && backs == 0, "no driver seated: never stuck, never backtracks", b);
+	}
 	std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
 	return g_failures ? 1 : 0;
 }

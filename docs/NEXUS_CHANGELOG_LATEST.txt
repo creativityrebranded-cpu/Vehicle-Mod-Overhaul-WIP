@@ -1,3 +1,13 @@
+1.1 (Traffic Addon 0.2) — 1 November 2026
+
+- Update the main mod and the Traffic Addon together: 1.1 and Addon 0.2 only work with each other.
+- Traffic shows first and is checked after; a pair is removed only for a specific fault, and only out of sight.
+- A vehicle getting no physics no longer counts as stuck; after 20 seconds it is swapped out of sight.
+- A fault on your path is replaced after 5 seconds instead of 10.
+- Drivers no longer get out in mid-air after a trip, and seated drivers are not re-seated because of a lagging position.
+- Diagnostics: zone stages with reasons, a local map trace (mapTrace=0 under [diagnostics] turns it off), small stack dumps for hitches.
+- Known issues: the local map can show no terrain or buildings when opened while flying; multi-second hitches in cities; some vehicles still stop getting physics, and are recovered rather than prevented; shots at traffic may not register.
+
 1.0 (Traffic Addon 0.1) — 30 October 2026
 
 - Traffic Manager: press F7 on the local map to create and edit traffic routes; traffic is generated along them; autopilot near a traffic zone follows the same path.

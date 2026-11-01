@@ -32,5 +32,22 @@ int main() {
     check(!ParseWindows("1080 360 2, 300 600 3",parsed),"overlap parsing rejected");
     check(!ParseWindows("100 200 2,",parsed),"trailing empty window rejected");
     check(!ParseWindows("100 200 2 extra",parsed),"unexpected fields rejected");
+    {   // busy words become windows; the count eases between zones
+        Schedule day; day.peak=20; day.zones={{0,1},{480,4},{1200,0}};
+        Expand(day);
+        check(Validate(day)==Issue::None&&!day.allDay,"busy words expand to a valid day");
+        check(Evaluate(day,true,300).vehicles==5,"Quiet is 25% of the peak");
+        check(Evaluate(day,true,600).vehicles==20,"Rush is 100% of the peak");
+        const int eased=Evaluate(day,true,485).vehicles;
+        check(eased>5&&eased<20,"the count eases into a new zone");
+        check(!Evaluate(day,true,1300).active,"Closed flies nothing");
+        Schedule one; one.peak=8; one.zones={{360,3}}; Expand(one);
+        check(Validate(one)==Issue::None&&Evaluate(one,true,10).vehicles==6&&Evaluate(one,true,800).vehicles==6,"one zone holds all day");
+        Schedule few; few.peak=1; few.zones={{0,1}}; Expand(few);
+        check(Evaluate(few,true,5).vehicles==1,"a share of a small peak is still one vehicle");
+        Schedule read; check(ParseDay("0 quiet, 360 BUSY",read)&&read.zones.size()==2&&read.zones[1].word==3,"day line parses");
+        check(FormatDay(read)=="0 quiet, 360 busy","day line round trip");
+        check(!ParseDay("0 quiet, 0 busy",read)&&!ParseDay("0 sleepy",read)&&!ParseDay("1500 busy",read)&&!ParseDay("",read),"bad day lines refused");
+    }
     std::printf("routeschedule: %d checks, %d failures\n",checks,failures);return failures?1:0;
 }

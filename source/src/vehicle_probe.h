@@ -22,6 +22,7 @@ namespace vehicle_probe
 	void RequestRay(int slot, const float from[3], const float to[3], std::uint64_t mask);
 	int CastNow(const float from[3], const float to[3], std::uint64_t mask, prefetch::RayHit& out);  // main thread; paused game OK
 	bool LatestRay(int slot, prefetch::RayHit& out, unsigned& age);
+	bool RayRefused(int slot, const float from[3], const float to[3]);
 	// Hull sweeps (prefetch::RequestSweep / LatestSweep in this DLL).
 	void RequestSweep(int slot, std::uintptr_t instance, float dirX, float dirY, float range, std::uint64_t mask);
 	bool LatestSweep(int slot, prefetch::SweepHit& out, unsigned& age);

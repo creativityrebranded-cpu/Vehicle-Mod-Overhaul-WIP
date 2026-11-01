@@ -10,6 +10,7 @@ struct Services {
     std::uint32_t (*owned)()=nullptr;
     std::uint32_t (*driver)(std::uint32_t)=nullptr;
     bool (*inUse)(std::uint32_t)=nullptr;
+    void (*held)(void (*)(std::uint32_t))=nullptr;  // optional: vehicles kept loaded outside the attached cells
     constexpr explicit operator bool() const {return scan&&owned&&driver&&inUse;}
 };
 }

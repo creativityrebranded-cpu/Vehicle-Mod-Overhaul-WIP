@@ -42,6 +42,17 @@ int main()
         check(Pick({ { 1, 4, 300, false }, { 1, 4, 50, false } }, 600) == 1, "a tie otherwise takes the nearer");
         check(Pick({ { 2, 4, 10, true }, { 1, 4, 500, false } }, 600) == 1, "a less filled route wins over its own");
     }
+    {   // Cruise
+        using O = CruiseOption;
+        check(PickCruise({}, 600, 5) == -1, "no routes: nowhere to cruise");
+        const std::vector<O> three{ { 100, true, false }, { 200, true, true }, { 300, true, false } };
+        check(PickCruise(three, 600, 0) == 0 && PickCruise(three, 600, 1) == 2, "any route in reach, not the one just flown");
+        check(PickCruise({ { 100, true, true } }, 600, 3) == 0, "the only route: that one again");
+        check(PickCruise({ { 100, false, false }, { 200, true, false } }, 600, 0) == 1, "not one that isn't flying now");
+        check(PickCruise({ { 5000, true, false }, { 2000, true, false } }, 600, 0) == 1, "none in reach: the nearest");
+        check(PickCruise({ { 5000, false, false }, { 2000, false, false } }, 600, 7) == 1, "none flying: the nearest, so it still goes somewhere");
+        check(PickCruise({ { 100, false, false }, { 5000, true, false } }, 600, 0) == 1, "a far route flying beats a near one that isn't");
+    }
     std::printf("routeshare: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

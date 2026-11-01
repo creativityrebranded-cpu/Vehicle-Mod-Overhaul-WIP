@@ -183,6 +183,8 @@ namespace addr
 	inline constexpr std::uint32_t kCloneCopyType = 0x05E7A424;       // uint32 global: default copy type for NiCloningProcess (set at runtime)
 	inline constexpr std::uint32_t kCloneScale = 0x04F044E8;          // float constant 1.0 used as the cloning scale
 
+	inline constexpr std::uint32_t kCachedTerrainHeight = 0x0057E840;  // (unused, float* xy, float* height) -> byte: the active terrain's cached heightfield, false outside its window
+
 	// Planet content (BGSPlanetContentManager, "PCM"): generation around a landing marker, and removal.
 	inline constexpr std::uint32_t kContentLandingBlock = 0x018ABD60;  // (PCM, markerRef): generate the virtual landing block around the marker
 	inline constexpr std::uint32_t kCreateReference = 0x005A0520;     // (dataHandler, uint32* handle out, NEW_REFR_DATA*)

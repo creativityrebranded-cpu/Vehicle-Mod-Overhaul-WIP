@@ -1,0 +1,31 @@
+Flying Vehicle Overhaul 1.1, with Traffic Addon 0.2
+
+This release is about making traffic dependable: drivers get seated, vehicles that freeze are replaced where you cannot see it, and nobody gets out in mid-air.
+
+This is a prerelease. Traffic has been tested in a few short sessions in cities, and the known issues below are still open. Please report problems with your log.
+
+UPDATE BOTH FILES TOGETHER
+The main mod and the Traffic Addon now share a new interface. Traffic Addon 0.1 does not work with FVO 1.1, and Traffic Addon 0.2 does not work with FVO 1.0. With a mismatch you get no traffic, and the log says why.
+
+TRAFFIC SHOWS FIRST AND IS CHECKED AFTER
+Pairs near you are assumed correct and appear without waiting to be proven. They are then checked outward as the game loads their models. A pair is only removed for a specific fault, and only when you cannot see it.
+
+FROZEN VEHICLES
+A vehicle whose pilot is getting no physics from the game cannot move, whatever it is told. These were being reported as stuck, and the autopilot wasted its escape manoeuvres on them. They no longer count as stuck. After 20 seconds such a pair counts as faulty and is swapped when out of sight, which rebuilds its chassis. In testing, stuck reports fell from 64 to 4 in similar sessions. The swap itself has not yet been seen to fire in game.
+
+FAULTS AHEAD OF YOU
+A proven fault on the path you are heading along is replaced after 5 seconds instead of 10, so it is put right before you arrive. This has not yet been seen to fire in game.
+
+DRIVERS
+A driver could be told to get out while the vehicle was still descending after a trip, and end up high in the air. They now get out once parked. A seated driver is no longer asked to re-seat because of a lagging position reading in flight.
+
+DIAGNOSTICS
+- The log now includes each pair's zone stage with the reason, and a trace of the local map's builders. Set mapTrace=0 under [diagnostics] in settings.ini to turn the map trace off.
+- A hitch of 3 seconds or more during play saves a small stack dump, last-stall-1.dmp to last-stall-3.dmp, next to settings.ini. These are useful in bug reports.
+- Repeated seat messages are limited to one per driver every 10 seconds.
+
+KNOWN ISSUES
+- The local map can show only trees and rocks, with no terrain or buildings, when opened while flying. It looks normal when you are not flying. The cause is not known yet.
+- Hitches of several seconds still happen in cities. The cause is not known yet, and drivers can be knocked out of place right after one.
+- Some vehicles still stop getting physics from the game. The swap recovers them, but the cause is not known yet.
+- Shots at traffic may not register yet.

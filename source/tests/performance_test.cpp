@@ -38,9 +38,13 @@ int main(){
     const auto beforeLarge=_filelengthi64(_fileno(file));
     const std::string payload(1024,'x');for(int i=0;i<40;++i)logger::Write("%s",payload.c_str());
     check(_filelengthi64(_fileno(file))>beforeLarge,"buffer size threshold bounds unflushed output during bursts");
+    logger::Observe("test.vehicle",0xFF001234,1,"phase=ready");
+    logger::ObserveReference("test.reference",0xFF005678,1,"phase=pending");
     logger::testing::Clock(1500);logger::Service();
     std::rewind(file);std::string text;char line[4096];while(std::fgets(line,sizeof(line),file))text+=line;
     check(text.find("startup-marker")<text.find("batched-marker")&&text.find("pending-before-fault")<text.find("fault-marker"),"batching preserves message order and fault breadcrumbs");
+    check(text.find("startup-marker {seq=1 tick=1000 pid=")!=std::string::npos&&text.find(" tid=")!=std::string::npos&&text.find(" epoch=0}")!=std::string::npos,"ordinary logs carry sequence, monotonic time, process, thread and reset epoch");
+    check(text.find("OBS system=test.vehicle vehicle=FF001234")!=std::string::npos&&text.find("OBS system=test.reference reference=FF005678")!=std::string::npos,"observations distinguish vehicle identities from general references");
     logger::testing::Open(nullptr);std::fclose(file);
     controlindex::Index index;
     index.Add("Vehicle","Forward",0);index.Add("Vehicle","Forward",0xFF);index.Add("Vehicle","Forward",87);index.Add("Vehicle","Forward",99);

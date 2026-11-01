@@ -92,6 +92,12 @@ namespace world
                 g_sweepIds[g_sweepCount++]=id;
 		}
 
+		// A held vehicle has moved to the persistent cell, which the sweep above never visits (2026-10-30 14:31 run: 4 listed, 52 held, and shots passed through traffic without
+		// a hit). The scanner's reach, past any weapon here.
+		constexpr double kHeldReach = 1000.0;
+		std::vector<std::uint32_t> g_heldIds;
+		void NoteHeld(std::uint32_t id) { g_heldIds.push_back(id); }
+
 		uptr Lookup(std::uint32_t id)
 		{
 			__try {
@@ -270,7 +276,7 @@ namespace world
 		// when it is driven, in use, moving, new, or its 3D root changed (stale body ids broke the chassis binding before); an idle
 		// vehicle is re-read when its own measured cost still fits this frame's budget, oldest first (at least one a frame), and
 		// otherwise keeps its last reading, which holds while its 3D root is unchanged.
-		struct Order { std::uint32_t id; uptr r, root; bool required; ULONGLONG age; };
+		struct Order { std::uint32_t id; uptr r, root; bool required; ULONGLONG age; bool held; };
 		static std::vector<Order> order;
 		order.clear();
 		for (std::uint32_t i = 0; i < g_idCount; ++i) {
@@ -283,7 +289,22 @@ namespace world
 			const uptr root = Root(r);
 			const bool required = r == driven || id == g_services.owned() || g_services.inUse(id) || moving || c == g_cache.end() ||
 				!c->second.have || c->second.root != root;
-			order.push_back({ id, r, root, required, c == g_cache.end() ? 0 : c->second.sampledAt });
+			order.push_back({ id, r, root, required, c == g_cache.end() ? 0 : c->second.sampledAt, false });
+		}
+		g_heldIds.clear();
+		if (g_services.held) g_services.held(&NoteHeld);
+		for (const std::uint32_t id : g_heldIds) {
+			if (std::find(g_ids, g_ids + g_idCount, id) != g_ids + g_idCount) continue;
+			const uptr r = Lookup(id);
+			if (!r || (At<std::uint32_t>(r, 0x20) & 0x800) || !At<uptr>(r, off::kRefParentCell) || !At<uptr>(r, 0x98)) continue;
+			if (player) {
+				const auto from = At<game::Vec3>(player, off::kRefPosition), at = At<game::Vec3>(r, off::kRefPosition);
+				if (std::hypot(at.x - from.x, at.y - from.y) > kHeldReach) continue;
+			}
+			const auto c = g_cache.find(id);
+			const uptr root = Root(r);
+			const bool required = c == g_cache.end() || !c->second.have || c->second.root != root;  // otherwise the frame's budget decides: a shot needs its place, read every frame anyway
+			order.push_back({ id, r, root, required, c == g_cache.end() ? 0 : c->second.sampledAt, true });
 		}
 		std::stable_partition(order.begin(), order.end(), [](const Order& o) { return o.required; });
 		const auto idle = std::find_if(order.begin(), order.end(), [](const Order& o) { return !o.required; });
@@ -409,8 +430,12 @@ namespace world
             QueryPerformanceCounter(&partEnd);driverMs+=milliseconds(partStart,partEnd);
             const auto vehicleMs=milliseconds(vehicleStart,partEnd);
             if(vehicleMs>slowMs){slowMs=vehicleMs;slowId=id;}
+			v.heldFar = o.held;
 			cache.info = v;
 			cache.have = true;
+			logger::Observe("world.streaming",v.formId,unsigned(v.bodyCount)|(std::uint64_t(v.who)<<16)|(std::uint64_t(v.heldFar)<<24),
+				"driver=%08X base=%08X owner=%u body=%08X scene_count=%u pos=%.2f,%.2f,%.2f velocity=%.2f,%.2f,%.2f held_far=%d native_mass=%d mass=%.2f",
+				v.driverId,v.baseId,unsigned(v.who),v.bodyId,v.bodyCount,v.pos[0],v.pos[1],v.pos[2],v.vel[0],v.vel[1],v.vel[2],v.heldFar,v.nativeMass,v.mass);
 			if (++s.count >= kMaxVehicles) break;
 		}
 		if (g_track.size() > 2 * kMaxVehicles) g_track.clear();
@@ -451,8 +476,16 @@ namespace world
 	bool Vehicles(Snapshot& out)
 	{
         std::lock_guard lk(g_pubLock);
+        out.frame=g_pub.frame;out.count=0;
+        for(std::uint32_t i=0;i<g_pub.count;++i)if(!g_pub.v[i].heldFar)out.v[out.count++]=g_pub.v[i];  // only the listed vehicles
+        return out.frame!=0;
+	}
+
+	bool VehiclesAndHeld(Snapshot& out)
+	{
+        std::lock_guard lk(g_pubLock);
         out.frame=g_pub.frame;out.count=g_pub.count;
-        std::copy(g_pub.v,g_pub.v+g_pub.count,out.v);  // only the listed vehicles
+        std::copy(g_pub.v,g_pub.v+g_pub.count,out.v);
         return out.frame!=0;
 	}
 

@@ -1,13 +1,14 @@
 #pragma once
+#include <cstdint>
 // Stable traffic fleet facade: the addon reconciles configuration and the core validates engine actions.
 namespace trafficpool
 {
 	void Tick();   // main thread, every frame
 	bool WellHiddenFar(unsigned vehicleId,double distance);  // past the distance that vehicle can be made out at
 	bool PutBack(unsigned id,double x,double y,double z);    // back to where it was, no sight check: undoes the game's own move (vehiclediag)
-	bool MarkDriverForFarPass(unsigned driverId);  // something attached to the driver: the cell unload skips it. True: it has that now
 	int PairHealth(unsigned vehicleId);  // trafficpair::PairHealth as an int; a vehicle that is no traffic pair is 0 (unproven)
 	void Reset();  // a save load
+	bool MadeVehicle(std::uint32_t id);  // the traffic addon made or reused it since the load
     void WorldActionsAllowed(bool allowed); // main scheduler: false during save loads and world teardown
     void ArrivalChecks(int& rayChecked,int& mapOnly,bool reset); // arrival placements since the last reset, by clearance check
 	// Start/Swap requests reconciliation; existing identities and live trips are retained.

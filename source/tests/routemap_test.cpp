@@ -79,6 +79,24 @@ int main()
         Camera c = MakeCamera({ 0, -100, 100 }, { 0, 0, 0 }, 0.8, 1.6, false);
         check(!ToStage(c, { NAN, 0, 0 }, s), "NaN refused");
     }
+    {   // marker shapes: only what faces the eye is drawn, lit from above
+        const Vec3 p{ 10, 20, 30 };
+        const auto pad = Pad(p, 5, 1, 0);
+        const auto above = Visible(pad, { 10, 20, 29.5 }, { 10, 20, 500 });
+        check(pad.size() == 6 && above.size() == 1 && (*above[0].face)[0].z == 30, "a pad seen from straight above shows only its top");
+        const auto slant = Visible(pad, { 10, 20, 29.5 }, { 500, 20, 500 });
+        check(slant.size() == 2, "from an angle: its top and one side");
+        check(slant[0].light > slant[1].light, "the top is lit more than the side");
+        const auto turned = Pad(p, 5, 1, 1.5707963267948966);
+        check(std::fabs(turned[0][0].x - 15) < 1e-9 && std::fabs(turned[0][0].y - 15) < 1e-9, "a pad turned a quarter clockwise has its front to the east");
+        const auto cone = Cone(p, 4, 10, 3);
+        check(cone.size() == 11 && Visible(cone, p, { 10, 20, 500 }).size() == 10, "a cone from above: all its sides, not its base");
+        check(Visible(cone, p, { 10, 20, -500 }).size() == 1, "a cone from below: only its base");
+        check(std::fabs((*Visible(cone, p, { 10, 20, 500 })[0].face)[2].z - 37) < 1e-9, "its point stands above the base");
+        const auto gem = Diamond(p, 4);
+        check(gem.size() == 8 && Visible(gem, p, { 10, 20, 500 }).size() == 4, "a diamond from above: its four upper faces");
+        check(Visible(gem, p, { 500, 500, 30 }).size() == 4, "and from the side: the four that face that way");
+    }
     std::printf("routemap: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

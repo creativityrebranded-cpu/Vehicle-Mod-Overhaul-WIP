@@ -56,11 +56,12 @@ namespace prefetch
 	// Pilots 7..12 (2026-10-29: 12 NPC pilots): 8 rays each after the air traffic's (3 corridors, 2 ceiling, 3 sweep); pilots 0..6 keep the
 	// ranges above (slots 21..23 and 45..47 between them belong to scantarget and environment).
 	enum { kRayAirTraffic0=62,kRayAirTrafficCount=16,kRayExtra0=kRayAirTraffic0+kRayAirTrafficCount,kRayExtraEach=8,kRayPilots=1+kSlotPilotCount,
-		kRaySlots=kRayExtra0+kRayExtraEach*(kRayPilots-7) };
+		kRayEnvironment0=kRayExtra0+kRayExtraEach*(kRayPilots-7),kRayEnvironmentCount=11,  // environment's own, after every pilot's (2026-10-31: 5 rays against about 900 asked a second)
+		kRaySlots=kRayEnvironment0+kRayEnvironmentCount };
 	constexpr int CorridorRay(int pilot, int c) { return pilot < 7 ? pilot * 3 + c : kRayExtra0 + (pilot - 7) * kRayExtraEach + c; }
 	constexpr int CeilingRay(int pilot, int k) { return pilot < 7 ? 48 + pilot * 2 + k : kRayExtra0 + (pilot - 7) * kRayExtraEach + 3 + k; }
 	constexpr int SweepRay(int pilot, int k) { return pilot < 7 ? 24 + pilot * 3 + k : kRayExtra0 + (pilot - 7) * kRayExtraEach + 5 + k; }
-	static_assert(CorridorRay(6, 2) == 20 && SweepRay(6, 2) == 44 && CeilingRay(6, 1) == 61 && SweepRay(kRayPilots - 1, 2) == kRaySlots - 1);
+	static_assert(CorridorRay(6, 2) == 20 && SweepRay(6, 2) == 44 && CeilingRay(6, 1) == 61 && SweepRay(kRayPilots - 1, 2) == kRayEnvironment0 - 1);
 	struct RayHit
 	{
 		bool hit = false;
@@ -75,6 +76,7 @@ namespace prefetch
 	};
 	void RequestRay(int slot, const float from[3], const float to[3], std::uint64_t mask);
 	bool LatestRay(int slot, RayHit& out, unsigned& age);
+	bool RayRefused(int slot, const float from[3], const float to[3]);  // that ray had no world to run in: no answer will come
 
 	// Hull sweeps (2026-10-18, step 3 of the nav service): the vehicle's OWN collision shape cast along a level line through
 	// the game's hknpBSWorld::CastShape (FUN_142362840, query laid out as the vehicle-exit check FUN_14219AE90 builds it;

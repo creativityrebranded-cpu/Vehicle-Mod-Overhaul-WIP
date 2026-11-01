@@ -9,6 +9,28 @@
 #include <vector>
 
 namespace routeshare {
+// Cruise (2026-10-31, the user: "randomly assimilates my player into traffic without a specific direction"): any route in reach that is flying now, not the one just flown if there
+// is another; none in reach: the nearest one flying now; none flying: the nearest at all, so it still goes somewhere. `roll`: any random number. -1: no routes.
+struct CruiseOption { double dist = 0; bool active = true, last = false; };
+inline int PickCruise(const std::vector<CruiseOption>& options, double reach, unsigned roll)
+{
+    const auto pick = [&](bool needActive, bool skipLast) {
+        std::vector<int> in;
+        for (std::size_t i = 0; i < options.size(); ++i) {
+            const auto& o = options[i];
+            if (o.dist <= reach && (o.active || !needActive) && !(skipLast && o.last)) in.push_back(int(i));
+        }
+        return in.empty() ? -1 : in[roll % in.size()];
+    };
+    for (const int k : { pick(true, true), pick(true, false) }) if (k >= 0) return k;
+    const auto nearest = [&](bool needActive) {
+        int best = -1;
+        for (std::size_t i = 0; i < options.size(); ++i) if ((options[i].active || !needActive) && (best < 0 || options[i].dist < options[std::size_t(best)].dist)) best = int(i);
+        return best;
+    };
+    const int any = nearest(true);
+    return any >= 0 ? any : nearest(false);
+}
 struct Candidate {
     int on = 0, want = 0;   // vehicles on the route now (not counting the one asking), its count now
     double dist = 0;        // m from the vehicle to the route

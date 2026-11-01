@@ -1,4 +1,5 @@
 #include "addresses.h"
+#include "lifecycle.h"
 #include "features.h"
 #include "framepacing.h"
 #include "updateschedule.h"
@@ -89,9 +90,12 @@ namespace
     std::uintptr_t LoadGameDetour(std::uintptr_t a, std::uintptr_t b, std::uint64_t c, std::uint64_t d)
     {
         g_loadBegan = GetTickCount64();
+        // Before anything else: work queued against the old world never runs against the one being read. The frame's reset comes later, or not at all.
+        lifecycle::Close();
         trafficarrival::Reset();
         logger::Write("Save load: the game's load routine started; FVO world actions paused until it finishes");
         const auto r = g_loadGameOriginal(a, b, c, d);
+        lifecycle::Open();
         g_loadDone = GetTickCount64();
         logger::Write("Save load: the game's load routine returned after %.1f s", (g_loadDone.load() - g_loadBegan.load()) / 1000.0);
         return r;
@@ -160,6 +164,7 @@ namespace
         }
         wasScreen = screen; wasWindow = window;
         trafficarrival::Window(window);
+        crash::SetGameplay(worldReady && !screen && !readingSave);
         return window;
     }
     std::atomic_flag g_inCallback=ATOMIC_FLAG_INIT;
@@ -172,6 +177,7 @@ namespace
 	void Reset()
 	{
         trafficpool::WorldActionsAllowed(false);
+        lifecycle::Reset();  // first: a queued callback must not refill what the resets below clear
         secretunpause::Reset();
         g_worldReady=false;g_pacing={};g_schedule.Reset();g_scheduleBegan=g_scheduleWork=0;ResetCostWindow();
         runtimecells::Reset();
@@ -225,7 +231,6 @@ namespace
         features::Tick();bindings::Tick();
         vehicleflight::BeginFrame(); // decision owners must renew their commands in this frame
         npcvehicles::BeginFrame();
-        crash::Beat();
         world::Publish();mark(0);
         vehiclehits::Tick();mark(1);
         // Per-part timing (the stutter pass, 2026-10-27): a spike line names the slowest part of "map+navigation" and "other".
@@ -256,6 +261,9 @@ namespace
         // mutable world/AI pipeline; this guard skips rather than waits.
         if(g_inCallback.test_and_set(std::memory_order_acquire))return;
         struct Release {~Release(){g_inCallback.clear(std::memory_order_release);}} release;
+        // Paused/map frames still prove the callback is alive. Measuring only
+        // full simulation updates mislabels a paused menu as a hung thread.
+        crash::Beat();
         static const double ticksPerMs=[] {LARGE_INTEGER f{};QueryPerformanceFrequency(&f);return double(f.QuadPart)/1000.0;}();
         LARGE_INTEGER start{},end{};QueryPerformanceCounter(&start);const double now=double(start.QuadPart)/ticksPerMs;
         g_pacing.Begin(now); // all raw callbacks, including rejected duplicate polls
@@ -277,6 +285,7 @@ namespace
         const bool loading=Loading(GetTickCount64());
         trafficpool::WorldActionsAllowed(!loading&&g_worldReady);
         const bool arrival=ArrivalWindow(g_worldReady);
+        logger::Observe("runtime",0,unsigned(loading)|(std::uint64_t(g_worldReady)<<1)|(std::uint64_t(arrival)<<2)|(std::uint64_t(work)<<8),"loading=%d world_ready=%d arrival=%d schedule=%u manager_state=%d",loading,g_worldReady,arrival,unsigned(work),state.haveManager?int(state.managerState):-1);
         if(arrival&&loading&&work!=updateschedule::Work::Skip){
             // The save settle runs no full update. Only the vehicle list (reads) and the traffic addon (arrival placement
             // behind the loading screen) run here; flight, AI and everything else wait for gameplay as before.
@@ -336,7 +345,7 @@ namespace
 	} g_frameTask;
 
     void InstallFeatureSystems() {
-        world::SetServices({realvehicles::ForEachLoadedStep,vehicleflight::OwnRoverId,npcvehicles::VehicleDriverId,npcvehicles::UsesVehicle});
+        world::SetServices({realvehicles::ForEachLoadedStep,vehicleflight::OwnRoverId,npcvehicles::VehicleDriverId,npcvehicles::UsesVehicle,vehiclekeep::ForEachHeld});
         hoverui::Install();routeedit::Install();mapguard::Install();disableguard::Install();inputgate::Install();mappoints::Install();loadedarea::Install();
         npcvehicles::Install();profiles::Install();vehicleaim::Install();
         vehiclediag::Install();vehiclehits::InstallEnemyBar();flighttune::Load();
@@ -396,6 +405,7 @@ namespace
 			break;
 		case SFSEMessagingInterface::kMessage_PreLoadGame:
 			g_loadBegan = GetTickCount64();
+			lifecycle::Reset();
 			logger::Write("Save load: started; FVO world actions paused until it finishes");
 			if (g_standalone) Reset();
 			break;
@@ -411,7 +421,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 90, "FlyingVehicleOverhaul", "seemless",
+	SFSEPluginVersionData::kVersion, 91, "FlyingVehicleOverhaul", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -420,6 +430,7 @@ __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
 __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 {
 	logger::Init();
+	logger::Write("OBS system=runtime event=trace-start schema=1 cadence_ms=5000 transition_min_ms=250 correlation=seq,tick,pid,tid,epoch");
 	telemetry::Init();
 	crash::Install();
 	if (sfse->runtimeVersion != addr::kRuntimeVersion) {
@@ -434,10 +445,11 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Persistent vehicle callbacks precede the game's normal listener initialization.
 	if (!vehiclediag::PrepareForDataLoad()) return false;
 	InstallLoadHook();
+	lifecycle::InstallCover();  // traffic's commands run behind the loading screen (lifecycle_cover.h)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Write("Flying Vehicle Overhaul (FVO) 1.0 loaded; core optional");
+	logger::Write("Flying Vehicle Overhaul (FVO) 1.1 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

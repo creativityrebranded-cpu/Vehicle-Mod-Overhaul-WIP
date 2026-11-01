@@ -19,7 +19,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace vehiclekeep
@@ -176,6 +178,7 @@ namespace vehiclekeep
 			WriteJournal();
 		}
 
+		unsigned g_birthMax = 40;
 		void ReadSettings()
 		{
 			const auto& ini = fvopaths::Settings();
@@ -185,8 +188,16 @@ namespace vehiclekeep
 			if (enabled != g_enabled || cone != g_coneDeg || max != g_max)
 				logger::Write("Keep in sight: %s, view cone %.0f deg, at most %u vehicles (settings.ini [view])", enabled ? "on" : "off", cone, max);
 			g_enabled = enabled; g_coneDeg = cone; g_max = max;
+			g_birthMax = std::min(GetPrivateProfileIntW(L"view", L"holdFromBirth", 40, ini.c_str()), 256u);
+			logger::Write("OBS system=keep.birth vehicle=00000000 event=settings max=%u", g_birthMax);
 		}
 
+		// Traffic vehicles held from birth, in view or not (2026-10-31, the foundation: 35-57 of 76-94 pairs never got a chassis because their model only loads when the player comes near,
+		// and this list only saw vehicles already loaded). [view] holdFromBirth = how many at once; 0 = off. Paced like every hold: one change per evaluation.
+		std::mutex g_wantedLock;
+		std::unordered_set<std::uint32_t> g_wanted;
+		bool Wanted(std::uint32_t id) { std::lock_guard lock(g_wantedLock); return g_wanted.count(id) != 0; }
+		void Unwant(std::uint32_t id) { std::lock_guard lock(g_wantedLock); g_wanted.erase(id); }
 		void Found(uptr ref, void*)
 		{
 			RefView v;
@@ -215,6 +226,12 @@ namespace vehiclekeep
 			const double cosCone = std::cos(double(g_coneDeg) * 3.14159265358979 / 180.0);
 			const std::uint32_t own = vehicleflight::OwnRoverId();
 
+			{
+				std::lock_guard lock(g_wantedLock);
+				for (const auto id : g_wanted) g_candidates[id] = now;  // not loaded yet, so the scan will not find them
+			}
+			unsigned heldFromBirth = 0;
+			for (const auto& [id, h] : g_held) if (Wanted(id)) ++heldFromBirth;
 			std::vector<std::uint32_t> ids;
 			ids.reserve(g_candidates.size() + g_held.size());
 			for (const auto& [id, t] : g_candidates) ids.push_back(id);
@@ -225,7 +242,7 @@ namespace vehiclekeep
 			// evaluation (250 ms); the rest wait for the next one.
 			int changes = 0;
 			std::size_t decorative=0;
-			for(const auto& entry:g_held)if(!npcvehicles::UsesVehicle(entry.first)&&!npcvehicles::VehicleDriverId(entry.first))++decorative;
+			for(const auto& entry:g_held)if(!npcvehicles::UsesVehicle(entry.first)&&!npcvehicles::VehicleDriverId(entry.first)&&!Wanted(entry.first))++decorative;
 			std::unordered_map<std::uint32_t,bool> occupied;
 			for(const auto id:ids)occupied[id]=npcvehicles::UsesVehicle(id);
 			std::stable_sort(ids.begin(),ids.end(),[&](auto a,auto b){return occupied[a]>occupied[b];});
@@ -236,6 +253,7 @@ namespace vehiclekeep
 				if (!ref || (v.flags & (kDisabledFlag | kDeletedFlag))) {
 					if (held) Release(id, ref ? "disabled" : "gone", 0.0);
 					g_candidates.erase(id);
+					Unwant(id);
 					continue;
 				}
 				const double dx = double(v.pos.x) - pv.pos.x, dy = double(v.pos.y) - pv.pos.y;
@@ -246,7 +264,8 @@ namespace vehiclekeep
 				// 2026-10-24 (23:11 run): releasing a vehicle hands it back to its cell, which reloads it and drops whoever sits in
 				// it. A vehicle with a driver, or one of the scheduled-traffic vehicles, is held regardless of view past the edge
 				// and never released for distance or view while that lasts.
-				const bool busy = occupied[id] || npcvehicles::VehicleDriverId(id) != 0;
+				const bool wanted = Wanted(id);
+				const bool busy = occupied[id] || npcvehicles::VehicleDriverId(id) != 0 || (wanted && (held || heldFromBirth < g_birthMax));
 				if (held) {
 					Held& h = g_held[id];
 					if (v.world != pv.world) { Release(id, "other world", dPlayer); continue; }
@@ -281,7 +300,8 @@ namespace vehiclekeep
 				h.since = h.seen = now;
 				h.maxDist = dPlayer;
 				g_held[id] = h;
-				if(!busy)++decorative;
+				if(wanted)++heldFromBirth;
+				else if(!busy)++decorative;
 				logger::Write("Keep in sight: holding %08X at %.0f m (visibility hold estimate %.0f m)%s, 3D %s, flags 0x%X -> 0x%X",
 					id, dPlayer, edge, inSight ? "" : " (occupied / traffic, out of view)", after.has3D ? "loaded" : "none", v.flags, after.flags);
 				WriteJournal();
@@ -298,6 +318,9 @@ namespace vehiclekeep
 					}
 				}
 				logger::Write("Keep in sight: %zu held, %u with 3D loaded, farthest %.0f m (visibility hold estimate %.0f m)", g_held.size(), with3D, farthest, edge);
+				std::size_t wantedCount = 0;
+				{ std::lock_guard lock(g_wantedLock); wantedCount = g_wanted.size(); }
+				logger::Write("OBS system=keep.birth vehicle=00000000 event=state wanted=%zu held_from_birth=%u max=%u held=%zu with_model=%u", wantedCount, heldFromBirth, g_birthMax, g_held.size(), with3D);
 			}
 		}
 	}
@@ -317,6 +340,12 @@ namespace vehiclekeep
 		Evaluate(now);
 	}
 
+	void WantFromBirth(std::uint32_t id)
+	{
+		if (!id || !g_birthMax) return;
+		std::lock_guard lock(g_wantedLock);
+		g_wanted.insert(id);
+	}
 	bool InCameraView(double x, double y, double z)
 	{
 		float o[3], f[3];
@@ -324,8 +353,14 @@ namespace vehiclekeep
 		const double cx = x - o[0], cy = y - o[1], cz = z - o[2], d = std::sqrt(cx * cx + cy * cy + cz * cz);
 		return d <= 1.0 || (cx * f[0] + cy * f[1] + cz * f[2]) / d >= std::cos(double(g_coneDeg) * 3.14159265358979 / 180.0);
 	}
+	void ForEachHeld(void (*visit)(std::uint32_t))
+	{
+		for (const auto& [id, h] : g_held) visit(id);
+	}
+
 	void Reset()
 	{
+		{ std::lock_guard lock(g_wantedLock); g_wanted.clear(); }
 		// The held refs belong to the save being left; the loaded save decides their state, and the journal (still listing
 		// them) releases any that came back held once the world settles.
 		g_held.clear();

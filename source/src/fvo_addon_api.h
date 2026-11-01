@@ -55,6 +55,10 @@ typedef void (*FvoPoolSetEx_t)(const char* world, const FvoPoolSpot* spots, int 
 // the rest of the way to the marker when the step returns non-zero.
 typedef int (*FvoRoutePlanner)(unsigned vehicleId, double x, double y, double z, double tx, double ty, double tz, FvoTripClaim* out);
 typedef int (*FvoRegisterRoutePlanner_t)(FvoRoutePlanner planner);  // export "FVO_RegisterRoutePlanner"; 1: registered
+// Cruise (2026-10-31): the player's vehicle joins traffic with no destination. Return 1 and fill `out` with one lap of a route chosen at random; core flies it and asks again when it
+// ends. 0 = nothing to join now, asked again in a few seconds.
+typedef int (*FvoCruisePlanner)(unsigned vehicleId, double x, double y, double z, FvoTripClaim* out);
+typedef int (*FvoRegisterCruisePlanner_t)(FvoCruisePlanner planner);  // export "FVO_RegisterCruisePlanner"; 1: registered
 // export "FVO_LocalTime" (2026-10-28, route schedules): the current planet's local time of day in hours (0 .. 24); 0 when there
 // is no planet (scheduled routes then wait; all-day routes run).
 typedef int (*FvoLocalTime_t)(double* hours);

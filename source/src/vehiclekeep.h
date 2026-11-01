@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 // Keep vehicles in sight loaded (2026-10-24, the user: "just make the game render it, if it's far away it'll be a dot";
 // approved keeping vehicle references loaded past the normal cell limit, "esp if you can tie it to sight").
@@ -12,6 +13,8 @@
 namespace vehiclekeep
 {
 	void Tick();   // main thread
+	void WantFromBirth(std::uint32_t id);  // a traffic vehicle to hold loaded from now on, in view or not, up to [view] holdFromBirth
 	bool InCameraView(double x, double y, double z);  // inside the camera's view cone now; true when the camera cannot be read
 	void Reset();  // a save load: forget held refs (the journal releases leftovers once the world settles)
+	void ForEachHeld(void (*visit)(std::uint32_t));  // main thread: the vehicles held now
 }

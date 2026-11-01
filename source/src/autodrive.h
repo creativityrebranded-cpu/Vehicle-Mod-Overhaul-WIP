@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "stucksense.h"
+
 // The autopilot's decision core (2026-10-27). One authority per vehicle: it picks the heading, the speed, drive or
 // hover, and the way out when stuck. It replaces 0.8's stacked rules (route worker, MPC, detours, lane offsets, assist
 // states, travel-mode flips, stuck/lost blocks), which the 2026-10-25 22:18 log showed fighting each other:
@@ -366,6 +368,12 @@ namespace autodrive
 		// route search or heading fan (too far away to see); the full decision comes back on the first step without it.
 		bool straight = false;
         bool strictTraffic = false; // ambient traffic never overrides a proven physical stop to force progress
+		// A driver sits in the driver seat (2026-10-31, the 16:35 run: a pilot restarted on a driverless vehicle, FF10E519, whose
+		// body was then thrown ~1,000 km). False: the stuck watch, its escapes and the backtrack never act; no trail is laid.
+		bool driverSeated = true;
+		// The game is paused or covered (the local map or a menu holds gameplay, the loading screen): the stuck window restarts and
+		// paused time does not count toward backing off (2026-10-31 17:18 run: six rovers far apart all "pinned" within 0.3 s).
+		bool paused = false;
 		std::uint32_t self = 0;
 		int priority = 60;
 		const Other* others = nullptr;
@@ -395,6 +403,19 @@ namespace autodrive
 		int blockedWhyCount = 0;
 		bool routed = false;    // a coarse route set the aim this frame
 		bool routeReaches = false;
+		// ---- Stuck sense and backtrack (stucksense.h, 2026-10-31) ----
+		stucksense::Kind stuckKind = stucksense::Kind::None;  // which rule fired (with stuckEvent)
+		double stuckWindow = 0, stuckMoved = 0, stuckTravelled = 0, stuckGain = 0;
+		enum class Back : std::uint8_t { None, Started, NoTrail, Reached, TimedOut, GaveUp, Recovered, CoolingOff };
+		Back backEvent = Back::None;  // what the backtrack did this frame (one event a frame)
+		bool backtracking = false;    // steering back along the trail now
+		stucksense::Plan backPlan;    // the attempt (with Started / NoTrail / GaveUp; the current one with Reached / TimedOut)
+		double backX = 0, backY = 0;  // where the vehicle is at the event
+		double backSeconds = 0;       // s spent backing (Reached / TimedOut); m gained (Recovered)
+		// The position did not follow the vehicle's own speed reading (pinned by position while it reports moving): no escape,
+		// no backtrack; a sign the reference and the body are apart, for the log.
+		bool refFrozen = false;
+		double frozenMoved = 0, frozenWindow = 0, frozenReported = 0;
 	};
 
 	class Pilot
@@ -402,8 +423,82 @@ namespace autodrive
 	public:
 		void Reset() { *this = Pilot{}; }
 
+		// One frame. Around the decision: the trail memory and the backtrack (stucksense.h). While backing off, the trail
+		// point is the goal the decision steers to (with every usual check: map, traffic, escapes); the real goal comes back
+		// when it is reached or after the time-out, with the alternative applied.
 		template <class MapFn>
 		Output Step(const Input& in, MapFn&& map)
+		{
+			// A new goal (a jump of over 8 m in one frame: a new job or waypoint): earlier attempts were about another way.
+			if (!btInit_ || std::hypot(in.gx - realGx_, in.gy - realGy_) > 8.0) { btInit_ = true; back_.NewGoal(); }
+			realGx_ = in.gx; realGy_ = in.gy;
+			// The trail is only what it drove through: moved while nobody watched (the player drove, a teleport): start over.
+			if (btLastNow_ > 0) {
+				const double jump = std::hypot(in.x - btLastX_, in.y - btLastY_);
+				if (jump > 30.0 || (in.now - btLastNow_ > 1.0 && jump > 6.0)) { back_.trail.Clear(); back_.Cancel(); }
+			}
+			btLastNow_ = in.now; btLastX_ = in.x; btLastY_ = in.y;
+
+			if (!in.driverSeated) back_.Cancel();  // never back off a vehicle with nobody at the wheel
+			if (in.paused && btPrevNow_ > 0 && in.now > btPrevNow_) back_.Delay(in.now - btPrevNow_);
+			btPrevNow_ = in.now;
+			Output ev = pendingBack_;
+			pendingBack_ = Output{};
+			if (back_.NoteGoalDist(std::hypot(in.gx - in.x, in.gy - in.y)) && ev.backEvent == Output::Back::None) {
+				ev.backEvent = Output::Back::Recovered; ev.backSeconds = back_.Gained(); ev.backX = in.x; ev.backY = in.y;
+			}
+			if (back_.Active()) {
+				const auto u = back_.Step(in.now, in.x, in.y);
+				if (u != stucksense::Backtracker::Update::None) {
+					ev.backEvent = u == stucksense::Backtracker::Update::Reached ? Output::Back::Reached : Output::Back::TimedOut;
+					ev.backPlan = back_.Current();
+					ev.backSeconds = in.now - back_.Since();
+					ev.backX = in.x; ev.backY = in.y;
+					goalX_ = in.gx; goalY_ = in.gy;  // the real goal again, without a new-goal reset
+					arrived_ = false;
+					sense_.Restart(in.now, in.x, in.y);
+					ApplyAlt(in, back_.Current(), ev);
+				}
+			}
+			Input eff = in;
+			if (back_.Active()) {
+				eff.gx = back_.TargetX(); eff.gy = back_.TargetY();
+				eff.gz = std::numeric_limits<double>::quiet_NaN();
+				eff.stop = 1.5;
+				eff.keepGoing = eff.hold = eff.cruise = false;
+				eff.cruiseSpeed = 0;
+				goalX_ = eff.gx; goalY_ = eff.gy;
+			}
+			note_ = Output{};
+			Output out = Core(eff, map);
+			// The core's stuck and backtrack notes (kept in a member: the three-point turn runs the core again in the same frame).
+			if (note_.stuckEvent) {
+				out.stuckEvent = true;
+				out.stuckKind = note_.stuckKind; out.stuckWindow = note_.stuckWindow; out.stuckMoved = note_.stuckMoved;
+				out.stuckTravelled = note_.stuckTravelled; out.stuckGain = note_.stuckGain;
+			}
+			if (note_.refFrozen) { out.refFrozen = true; out.frozenMoved = note_.frozenMoved; out.frozenWindow = note_.frozenWindow; out.frozenReported = note_.frozenReported; }
+			if (note_.modeChanged || ev.modeChanged) { out.modeChanged = true; out.mode = mode_; }
+			auto put = [](Output& to, const Output& from) {
+				to.backEvent = from.backEvent; to.backPlan = from.backPlan; to.backX = from.backX; to.backY = from.backY; to.backSeconds = from.backSeconds;
+			};
+			if (note_.backEvent != Output::Back::None) {
+				put(out, note_);
+				if (ev.backEvent != Output::Back::None) put(pendingBack_, ev);  // one event a frame: the other next frame
+			}
+			else if (ev.backEvent != Output::Back::None) put(out, ev);
+			note_ = Output{};
+			out.backtracking = back_.Active();
+			if (out.backtracking && (out.phase == Phase::Travel || out.phase == Phase::Climb)) out.why = "backing along its trail";
+			// The trail: only plain forward travel (no manoeuvre, no backing off) at a real speed.
+			const double sp = std::hypot(in.vx, in.vy);
+			if (in.driverSeated && !back_.Active() && !out.reverse && (out.phase == Phase::Travel || out.phase == Phase::Climb) && sp > 1.5 && in.now >= turnUntil_ && in.now >= reverseUntil_)
+				back_.trail.Record(in.now, in.x, in.y);
+			return out;
+		}
+
+		template <class MapFn>
+		Output Core(const Input& in, MapFn&& map)
 		{
 			Output out;
 			const double dx = in.gx - in.x, dy = in.gy - in.y;
@@ -428,6 +523,8 @@ namespace autodrive
 				for (const auto& b : bumps_) {
 					if (in.now < b.until && std::hypot(x - b.x, y - b.y) < 2.2) { c.object = true; c.known = true; break; }
 				}
+				// Spots it got stuck at (backtrack marks): closed up to 3 m over where it stood, so a climb passes over them.
+				if (Avoided(x, y, z, in.now)) { c.object = true; c.objectSoft = false; c.known = true; }
 				return c;
 			};
 			Crumb(in);
@@ -454,7 +551,7 @@ namespace autodrive
 			// ---- Progress watch: commanded to move, but not moving ----
 			const double since = in.now - lastNow_;
 			lastNow_ = in.now;
-			Watch(in, sp, since > 1.0, out);
+			Watch(in, sp, since > 1.0 || in.paused, out);
 			out.mode = mode_;
 
 			const double top = std::min(mode_ == Mode::Drive ? in.limits.driveTop : in.limits.hoverTop, in.speedLimit > 0 ? in.speedLimit : 1e9);
@@ -670,7 +767,7 @@ namespace autodrive
 					const Traffic ta = TrafficFor(in.x, in.y, in.z, in.heading, 3.0, Radius(in.shape), in.self, in.priority, in.others, in.otherCount, 0, true, in.shape.halfWidth, in.shape.halfLength);
 					if ((ahead.v == Verdict::Blocked && ahead.free < 5.0) || ta.free < 4.0 || (std::fabs(Wrap(chosen_ - in.heading)) > 1.8 && SidesTight(in))) {
 						TryReverse(in, view, groundUnder, chosen_);
-						if (in.now < reverseUntil_ || in.now < turnUntil_ || in.now < waitUntil_) return Step(in, map);
+						if (in.now < reverseUntil_ || in.now < turnUntil_ || in.now < waitUntil_) return Core(in, map);
 					}
 				}
 			}
@@ -762,15 +859,23 @@ namespace autodrive
 		bool pendingReverse_ = false;
 		bool creep_ = false, upWins_ = false;
 		int waits_ = 0;
-		double creepFree_ = -1, creepH_ = 0, creepOff_ = 1e9, lastContact_ = -1e9, boxedSince0_ = 0;
+		double creepFree_ = -1, creepH_ = 0, creepOff_ = 1e9, lastContact_ = -1e9, lastRearContact_ = -1e9, reverseSetAt_ = -1e9, boxedSince0_ = 0;
 		const char* creepWhy_ = "";
 		const char* whyName_[8] = {};
 		int whyCount_[8] = {}, whyN_ = 0;
 		double contactSince_ = 0;
 		double climb_ = 0, clearSince_ = 0, lastNow_ = 0;
 		// progress watch
-		double watchAt_ = 0, watchX_ = 0, watchY_ = 0, commanded_ = 0, lastStuck_ = -1e9, goodSince_ = 0;
+		double commanded_ = 0, lastStuck_ = -1e9, goodSince_ = 0;
 		unsigned level_ = 0;
+		stucksense::Sense sense_;
+		// trail memory and backtrack (2026-10-31)
+		stucksense::Backtracker back_;
+		struct Avoid { double x = 0, y = 0, r = 0, z = 0, until = 0; } avoid_[8];
+		int avoidNext_ = 0;
+		bool btInit_ = false;
+		double realGx_ = 0, realGy_ = 0, btLastNow_ = 0, btLastX_ = 0, btLastY_ = 0, btPrevNow_ = 0, startedAt_ = 0;
+		Output note_, pendingBack_;
 		// avoided headings (where it got stuck or bumped)
 		struct Sector { double heading = 0, half = 0, until = 0; } bad_[4];
 		int badNext_ = 0;
@@ -793,11 +898,12 @@ namespace autodrive
 		void Start(const Input& in, bool goalHigh)
 		{
 			started_ = true;
+			startedAt_ = in.now;
 			mode_ = in.permit == Permit::HoverOnly || (in.permit == Permit::Both && (goalHigh || in.above > 2.5 || in.preferAir)) ? Mode::Hover : Mode::Drive;
 			modeSince_ = in.now;
 			chosen_ = Bearing(in.gx - in.x, in.gy - in.y);
 			goalX_ = in.gx; goalY_ = in.gy;
-			watchAt_ = in.now; watchX_ = in.x; watchY_ = in.y;
+			sense_.Restart(in.now, in.x, in.y);
 			lastNow_ = in.now;
 			bestAt_ = in.now;
 		}
@@ -806,7 +912,7 @@ namespace autodrive
 			goalX_ = in.gx; goalY_ = in.gy;
 			arrived_ = false;
 			trapped_ = false; bestDist_ = 1e18; bestAt_ = in.now;
-			watchAt_ = in.now; watchX_ = in.x; watchY_ = in.y;
+			sense_.Restart(in.now, in.x, in.y);
 		}
 		void SetMode(const Input& in, Mode m, const char* why, Output& out)
 		{
@@ -822,7 +928,7 @@ namespace autodrive
 				reverseUntil_ = turnUntil_ = waitUntil_ = 0;
 				pendingReverse_ = false;
 				contactSince_ = 0;
-				watchAt_ = in.now; watchX_ = in.x; watchY_ = in.y;
+				sense_.Restart(in.now, in.x, in.y);
 			}
 			if (m == Mode::Drive) climb_ = 0;
 		}
@@ -870,7 +976,7 @@ namespace autodrive
 		// ground pulls more until it gains 6 m on its best, or 40 s pass.
 		void Trap(const Input& in)
 		{
-			const double dist = std::hypot(in.gx - in.x, in.gy - in.y);
+			const double dist = std::hypot(realGx_ - in.x, realGy_ - in.y);  // the real goal, also while backing off along the trail
 			if (dist < bestDist_ - 3.0) {
 				if (trapped_ && dist < bestDist_ - 6.0) trapped_ = false;
 				bestDist_ = dist; bestAt_ = in.now;
@@ -926,10 +1032,14 @@ namespace autodrive
 			// pauses, and never more than twice running (2026-10-27 run: an enemy rover sat in "no room: waiting" for good).
 			// Nose pressed against something: a forward turn cannot swing round it (the wheels need room), so any room
 			// behind wins.
-			const bool pressed = in.now - lastContact_ < 0.6;
-			if (rearOpen || (rearFree > 1.0 && rearFree >= bestFree) || (pressed && rearFree > 1.2)) {
+			// A contact while backing up was the tail, not the nose: it says nothing for backing up, and backing up again
+			// right away pushes into the same thing (2026-10-31 cliff scenario: 17 s of reversing into a cliff face).
+			const bool rearHit = in.now - lastRearContact_ < 1.5;
+			const bool pressed = in.now - lastContact_ < 0.6 && !rearHit;
+			if (!rearHit && (rearOpen || (rearFree > 1.0 && rearFree >= bestFree) || (pressed && rearFree > 1.2))) {
 				const bool tight = in.onWheels && SidesTight(in);
 				reverseUntil_ = in.now + (tight ? 3.0 : 2.0);
+				reverseSetAt_ = in.now;
 				// Backing up turns the nose toward `away`; hemmed in at the sides it backs out straight (nose kept).
 				reverseBearing_ = tight ? in.heading : away;
 				waits_ = 0;
@@ -943,7 +1053,15 @@ namespace autodrive
 			// Turning out is a forward try: the stuck watch still runs (2026-10-27 run: a rover "turned out" at 0 m/s for 40 s).
 			const bool reversing = in.now < reverseUntil_ || in.now < waitUntil_;
 			if (in.contact) lastContact_ = in.now;
-			if (in.contact && !reversing) {
+			if (!pause && in.driverSeated && in.contact && in.now < reverseUntil_ && reverseSetAt_ < in.now) {  // (a reverse begun this frame: the contact was the nose)
+				// The tail hit something while backing up: stop backing and let the decision pick a forward way out; no
+				// back-out for 1.5 s (TryReverse). No bump mark behind: with the nose against something too, a rear that read
+				// closed for a minute left only a forward turn at 0 m/s.
+				lastRearContact_ = in.now;
+				reverseUntil_ = 0;
+				decideAt_ = 0;
+			}
+			if (!pause && in.contact && !reversing && in.driverSeated) {
 				AddBump(in, in.heading);
 				if (sp > 1.0) AddBad(in.heading, 0.45, in.now + 6.0);
 				if (!contactSince_) contactSince_ = in.now;
@@ -956,27 +1074,42 @@ namespace autodrive
 				}
 			}
 			else if (!in.contact) contactSince_ = 0;
-			const bool trying = commanded_ >= 1.2 && !reversing && !(arrived_ && !(in.keepGoing && !in.hold));
-			if (!trying || pause) {  // a pause (menu, load) restarts the window
-				watchAt_ = in.now; watchX_ = in.x; watchY_ = in.y;
+			// The first 5 s after the pilot starts (a fresh spawn settling, a launch) never count.
+			const bool trying = in.driverSeated && in.now - startedAt_ >= 5.0 && commanded_ >= 1.2 && !reversing && !(arrived_ && !(in.keepGoing && !in.hold));
+			// Getting nowhere counts only plain tries: giving way to a vehicle or creeping on purpose is waiting, not stuck, and
+			// exploring (the trapped rule, at most 40 s) is already trying another way (2026-10-31 cliff scenario: a backtrack cut
+			// into the exploring that finds the ramp).
+			const bool countProgress = trying && !pause && yieldId_ == 0 && !creep_ && !trapped_;
+			const stucksense::Reading r = sense_.Feed(in.now, in.x, in.y, std::hypot(in.gx - in.x, in.gy - in.y), trying && !pause, countProgress, commanded_, sp);
+			// Track real-goal progress during startup too; the grace period suppresses stuck verdicts, not route memory.
+			if (!pause && in.driverSeated && !reversing && commanded_ >= 1.2) Trap(in);
+			if (!trying || pause) return;  // a pause (menu, load) restarts the window
+			if (r.kind == stucksense::Kind::Pinned && std::isfinite(r.reported) && r.reported > std::max(3.0, 3.0 * r.moved / std::max(r.window, 0.1))) {
+				// It reports moving but the position stays: the reference is not following the body. Escapes and backtracks
+				// steer the body, so they cannot help and could carry it further off; report it instead.
+				note_.refFrozen = true; note_.frozenMoved = r.moved; note_.frozenWindow = r.window; note_.frozenReported = r.reported;
 				return;
 			}
-			Trap(in);
-			const double moved = std::hypot(in.x - watchX_, in.y - watchY_);
-			if (moved > 4.0) {
-				watchAt_ = in.now; watchX_ = in.x; watchY_ = in.y;
+			if (r.movedOn) {
 				if (!goodSince_) goodSince_ = in.now;
 				if (level_ && in.now - goodSince_ > 12.0 && in.now - lastStuck_ > 12.0) level_ = 0;
+			}
+			if (r.kind == stucksense::Kind::None) return;
+			goodSince_ = 0;
+			out.stuckEvent = true;
+			note_.stuckEvent = true;
+			note_.stuckKind = r.kind; note_.stuckWindow = r.window; note_.stuckMoved = r.moved; note_.stuckTravelled = r.travelled; note_.stuckGain = r.gain;
+			if (r.kind == stucksense::Kind::NoProgress) {
+				// Moving but getting nowhere (circling, sliding to and fro, pushing on something no contact reports): back off
+				// along the trail and try another way. The blocked direction is the way to the goal it could not make.
+				StartBacktrack(in, Bearing(realGx_ - in.x, realGy_ - in.y), r.window);
+				decideAt_ = 0;
 				return;
 			}
-			if (in.now - watchAt_ < 3.5) return;
-			// Stuck: under 4 m in 3.5 s while asking to move.
-			goodSince_ = 0;
-			watchAt_ = in.now; watchX_ = in.x; watchY_ = in.y;
+			// Pinned: under 4 m in 3.5 s while asking to move.
 			if (in.now - lastStuck_ > 25.0) level_ = 0;
 			lastStuck_ = in.now;
 			++level_;
-			out.stuckEvent = true;
 			const double h = in.heading;
 			AddBump(in, commanded_ < 0 ? h + kPi : h);
 			const double toGoal = Bearing(in.gx - in.x, in.gy - in.y);
@@ -993,17 +1126,81 @@ namespace autodrive
 				else RequestReverse(Wrap(h + side * 1.4));
 				break;
 			case 3:
+				// Backing out and lifting failed twice running: back off along the trail and try another way. Over the
+				// bound (or cooling off after giving up), the plain escape below as before.
+				if (StartBacktrack(in, h, r.window)) { if (mode_ == Mode::Drive) RequestReverse(Wrap(h - side * 1.4)); break; }
 				if (mode_ == Mode::Hover) { climb_ = std::min(30.0, climb_ + 10.0); forceHoverUntil_ = in.now + 10.0; }
 				else RequestReverse(Wrap(h - side * 1.4));
 				break;
 			default:
 				// Keep cycling: back out and try the far side; the hover keeps rising (capped).
+				if (StartBacktrack(in, h, r.window)) { if (mode_ == Mode::Drive) RequestReverse(Wrap(h + side * 2.0)); level_ = 1; break; }
 				RequestReverse(Wrap(h + side * 2.0));
 				if (mode_ == Mode::Hover) climb_ = std::min(30.0, climb_ + 6.0);
 				level_ = 1;
 				break;
 			}
+			if (out.modeChanged) note_.modeChanged = true;
 			decideAt_ = 0;
+		}
+
+		// ---- Backtrack (stucksense.h) ----
+		// Stuck pushing along `heading`: mark the spot ahead blocked, avoid that direction a while, and back off along the
+		// trail (or, with no trail, try the alternative from here). False: nothing done (over the bound, or cooling off).
+		bool StartBacktrack(const Input& in, double heading, double window)
+		{
+			const bool air = in.permit != Permit::DriveOnly && in.hoverPossible && in.ceiling > 6.0;
+			const stucksense::Plan pl = back_.OnStuck(in.now, in.x, in.y, in.z, heading, in.shape.halfLength, std::hypot(realGx_ - in.x, realGy_ - in.y), air,
+				[&](double x, double y) { return Avoided(x, y, in.z, in.now); }, in.now - window - 3.0);  // (3 s more: the run-up into it)
+			note_.backPlan = pl;
+			note_.backX = in.x; note_.backY = in.y;
+			if (pl.coolingOff) { note_.backEvent = Output::Back::CoolingOff; return false; }
+			if (pl.gaveUp) { note_.backEvent = Output::Back::GaveUp; return false; }
+			AddAvoid(pl.markX, pl.markY, pl.markR, pl.markZ, in.now + back_.p.markSeconds);
+			AddBad(pl.heading, pl.half, in.now + back_.p.sectorSeconds);
+			route_.planAt = -1e9;  // replan round the mark at once
+			decideAt_ = 0;
+			if (pl.haveCrumb) {
+				note_.backEvent = Output::Back::Started;
+				arrived_ = false;
+			}
+			else {
+				note_.backEvent = Output::Back::NoTrail;
+				ApplyAlt(in, pl, note_);
+			}
+			return true;
+		}
+		// Back at the trail point (or out of time, or with no trail): the alternative for this attempt. The detours need
+		// nothing more than the mark and the avoided sector already set (the route search and the heading fan go round them).
+		void ApplyAlt(const Input& in, const stucksense::Plan& pl, Output& out)
+		{
+			route_.planAt = -1e9;
+			decideAt_ = 0;
+			switch (pl.alt) {
+			case stucksense::Alt::Climb:
+				if (mode_ == Mode::Drive) { forceHoverUntil_ = in.now + 12.0; SetMode(in, Mode::Hover, "backtracked: climbing over the stuck spot", out); }
+				climb_ = std::min(30.0, climb_ + 8.0);
+				climbAt_ = in.now + 1.5;
+				break;
+			case stucksense::Alt::OtherRoute:
+				// Explore: the goal pulls less and fresh ground more (the trapped rule), with the wide mark and sector set.
+				trapped_ = true; trappedAt_ = in.now;
+				bestDist_ = std::hypot(realGx_ - in.x, realGy_ - in.y); bestAt_ = in.now;
+				break;
+			default:
+				break;
+			}
+		}
+		void AddAvoid(double x, double y, double r, double z, double until)
+		{
+			avoid_[avoidNext_] = { x, y, r, z, until };
+			avoidNext_ = (avoidNext_ + 1) % 8;
+		}
+		bool Avoided(double x, double y, double z, double now) const
+		{
+			for (const auto& a : avoid_)
+				if (now < a.until && z < a.z + 3.0 && std::hypot(x - a.x, y - a.y) < a.r) return true;
+			return false;
 		}
 	};
 }

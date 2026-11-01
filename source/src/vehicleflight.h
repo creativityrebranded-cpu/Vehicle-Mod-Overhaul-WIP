@@ -23,6 +23,7 @@ namespace vehicleflight
     bool RouteTripActive(std::uint32_t vehicleId);
     bool BirthControlReady(std::uint32_t vehicleId);
     bool PilotHolds(std::uint32_t vehicleId);
+    int PilotLive(std::uint32_t vehicleId);  // -1 no pilot, 0 a pilot but no physics steps, 1 stepping (or a scripted or physical flight, which does not use them)
     bool PlayerDriving(std::uint32_t vehicle);
 	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera, instrument and key set: physical flight with you at the wheel, you or the autopilot flying
 
@@ -64,8 +65,11 @@ namespace vehicleflight
 	void RequestScannerTrip();
 	// T tapped outside the scanner while driving (2026-10-21, the user): Auto on (to the marker / route) or off (you drive).
 	void ToggleAuto();
+	void ToggleCruise();  // Auto with no destination: joins traffic at random
+	bool Cruising();
 	// The traffic addon's route planner for Auto (fvo_addon_api.h FVO_RegisterRoutePlanner).
 	void SetRoutePlanner(FvoRoutePlanner planner);
+	void SetCruisePlanner(FvoCruisePlanner planner);
 	void RetryScannerTrip();
     void CancelScannerTrip(); // hold current position, preserving hover and the crew driver
 	struct TripProgress {

@@ -1,4 +1,5 @@
 #include "realvehicles.h"
+#include "trafficpool.h"
 #include "runtimeforms.h"
 #include "runtimecells.h"
 #include "parkedlayout.h"
@@ -519,6 +520,8 @@ namespace realvehicles
 		constexpr float kDupRadius = 2.5f;
 		void ClearStacked(const std::vector<uptr>& parked)
 		{
+			// Live traffic always wins (2026-10-31 run: new traffic was disabled eight times to keep what an old save left on the same lane spot, and its drivers were left with no seat).
+			auto liveTraffic = [](uptr r) { return trafficpool::MadeVehicle(At<std::uint32_t>(r, 0x28)); };
 			auto spotType = [](uptr r) {
 				const uptr b = At<uptr>(r, 0x98);
 				return b && (b == g.rev8 || b == g.deimog || b == g.moonJumper);
@@ -536,14 +539,14 @@ namespace realvehicles
 				if (here.size() < 2) continue;
 				std::size_t keep = here[0];
 				for (const std::size_t k : here) {
-					const bool better = spotType(parked[k]) && !spotType(parked[keep]);
-					const bool same = spotType(parked[k]) == spotType(parked[keep]);
+					const bool better = liveTraffic(parked[k]) != liveTraffic(parked[keep]) ? liveTraffic(parked[k]) : spotType(parked[k]) && !spotType(parked[keep]);
+					const bool same = liveTraffic(parked[k]) == liveTraffic(parked[keep]) && spotType(parked[k]) == spotType(parked[keep]);
 					if (better || (same && At<std::uint32_t>(parked[k], 0x28) < At<std::uint32_t>(parked[keep], 0x28))) keep = k;
 				}
 				for (const std::size_t k : here) {
 					const uptr r = parked[k];
 					const std::uint32_t id = At<std::uint32_t>(r, 0x28);
-					if (k == keep || (id >> 24) != 0xFF || Protected(r)) continue;
+					if (k == keep || (id >> 24) != 0xFF || Protected(r) || liveTraffic(r)) continue;
 					Disable(r);
 					gone[k] = true;
 					g.registry.erase(id);
@@ -695,6 +698,8 @@ namespace realvehicles
         g_registryActive=false;
 		OwnRetire();
 	}
+
+	bool PlayersOrOwn(std::uint32_t id) { return g.ownVehicles.count(id) != 0 || id == vehicleflight::OwnRoverId(); }
 
     bool CanManagePlacement(std::uint32_t id){
         if(!id||!g.haveVehicles)return false;

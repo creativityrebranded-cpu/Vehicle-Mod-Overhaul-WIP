@@ -45,10 +45,34 @@ inline std::vector<Junction> Of(const std::vector<trafficdata::Link>& links, con
         const double last = EndU(*b, true);
         const double ub = k.toEnd ? last : std::clamp(U(*b,k.toAt), 0.0, b->ring ? double(trafficroute::kRingSamples) : last);
         const double ua = U(*a, k.at);
-        if (k.from == name) out.push_back({ ua, k.to, ub, k.share, k.name, k.radius });
-        if (k.to == name) out.push_back({ ub, k.from, ua, k.share, k.name, k.radius });
+        // The types only leave a way out of the list; what is left behaves as every junction did before types.
+        if (k.from == name && k.type != "merge" && k.type != "crossing") out.push_back({ ua, k.to, ub, k.share, k.name, k.radius });
+        if (k.to == name && k.type != "exit" && k.type != "crossing") out.push_back({ ub, k.from, ua, k.share, k.name, k.radius });
     }
     return out;
+}
+// The type a junction's shape asks for (2026-10-30, the user: a default based on the interaction, not one fixed answer). A one-way route
+// that starts or ends at the other route only leaves or joins it; a two-way one does both. Two routes meeting mid-way swap
+// traffic only when running side by side; at an angle (or head on) they cross. Empty: both ways.
+inline std::string Suggested(const trafficroute::Line& from, int fromLanes, double ua, const trafficroute::Line& to, int toLanes, double ub)
+{
+    auto endOf = [](const trafficroute::Line& l, double u) { return l.closed ? 0 : u < 0.5 ? -1 : u > l.Span() - 0.5 ? 1 : 0; };
+    const int toEnd = endOf(to, ub), fromEnd = endOf(from, ua);
+    if (toEnd) return toLanes > 1 ? std::string() : toEnd < 0 ? "exit" : "merge";
+    if (fromEnd) return fromLanes > 1 ? std::string() : fromEnd < 0 ? "merge" : "exit";
+    auto heading = [](const trafficroute::Line& l, double u, double& x, double& y) {
+        const auto a = trafficroute::At(l, 0, u - 0.05), b = trafficroute::At(l, 0, u + 0.05);
+        x = b.x - a.x; y = b.y - a.y;
+        const double n = std::hypot(x, y);
+        if (n < 1e-9) return false;
+        x /= n; y /= n;
+        return true;
+    };
+    double ax = 0, ay = 0, bx = 0, by = 0;
+    if (!heading(from, ua, ax, ay) || !heading(to, ub, bx, by)) return {};
+    double along = ax * bx + ay * by;
+    if (fromLanes > 1 || toLanes > 1) along = std::fabs(along);  // a two-way route runs both ways along that line
+    return along > 0.82 ? std::string() : "crossing";  // within 35 degrees: side by side
 }
 // The lane a vehicle takes on route `q` arriving at uQ: a ring or the middle of a path, lane 0; a path's start, lane 0 (it
 // runs forward); a path's end, lane 1 (back along it) on a two-way path, none (-1) on a one-way path, whose end is its exit.
