@@ -417,7 +417,9 @@ namespace mapguard
 
 	bool Install()
 	{
+#ifndef FVO_RELEASE
         InstallMapTrace();
+#endif
 		auto** p = reinterpret_cast<void**>(game::Base() + kTaskVtbl) + kRunSlot;
 		if (reinterpret_cast<uptr>(*p) != game::Base() + kRunRva) {
 			logger::Write("Map guard: the local map's model build task is not the expected function; guard off");

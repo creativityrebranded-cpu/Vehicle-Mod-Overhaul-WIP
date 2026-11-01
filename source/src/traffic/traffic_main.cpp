@@ -1095,7 +1095,9 @@ namespace
 	{
 		const HMODULE core = GetModuleHandleW(L"FlyingVehicleOverhaul.dll");
 		if (!core) return;
+#ifndef FVO_RELEASE  // release DLLs: g_log stays null, so Log and observations::Record stop at their null check
 		g_log = reinterpret_cast<FvoLog_t>(GetProcAddress(core, "FVO_Log"));
+#endif
 		g_worldName = reinterpret_cast<FvoWorldName_t>(GetProcAddress(core, "FVO_WorldName"));
 		g_baseOf = reinterpret_cast<FvoBaseOf_t>(GetProcAddress(core, "FVO_BaseOf"));
 		g_setMarkers = reinterpret_cast<FvoSetRouteMarkers_t>(GetProcAddress(core, "FVO_SetRouteMarkers"));

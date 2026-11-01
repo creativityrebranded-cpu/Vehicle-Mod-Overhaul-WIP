@@ -85,6 +85,9 @@ namespace telemetry
 	{
 		QueryPerformanceFrequency(&g_freq);
 		QueryPerformanceCounter(&g_start);
+#ifdef FVO_RELEASE
+		return;  // no file, no writer thread: Record stops at g_ready
+#endif
 
 		PWSTR docs = nullptr;
 		if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {

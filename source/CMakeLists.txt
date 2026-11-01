@@ -129,6 +129,16 @@ add_executable(traffic_lifecycle_test tests/traffic_lifecycle_test.cpp)
 sp_options(traffic_lifecycle_test)
 target_link_libraries(traffic_lifecycle_test PRIVATE Shell32 Ole32)
 
+# Published DLLs: logging, freeze watcher, telemetry, map trace and debug keys compiled out; a crash report stays. Off by default, so development builds
+# keep all of it. With ON build only these two targets: cmake --build <dir> --config Release --target FlyingVehicleOverhaul FVO_Traffic. Run the
+# offline suites from a normal build (they test the logger itself).
+option(FVO_RELEASE "Build the DLLs for publishing, without logging and diagnostics" OFF)
+if(FVO_RELEASE)
+    foreach(target sp_common FlyingVehicleOverhaul FVO_Traffic)
+        target_compile_definitions(${target} PRIVATE FVO_RELEASE)
+    endforeach()
+endif()
+
 # Gravspace was deleted 2026-10-22 (source in disabled_gravspace_20261022/Source). Gravlanes was deleted 2026-10-24 at the user's request.
 
 # Interactive Cover: on-foot run-to-cover mod (notes/INTERACTIVE_COVER_PLAN.md). Standalone; test stage for now.

@@ -2,10 +2,10 @@ Flying Vehicle Overhaul 1.1, with Traffic Addon 0.2
 
 This release is about making traffic dependable: drivers get seated, vehicles that freeze are replaced where you cannot see it, and nobody gets out in mid-air.
 
-This is a prerelease. Traffic has been tested in a few short sessions in cities, and the known issues below are still open. Please report problems with your log.
+This is a prerelease. Traffic has been tested in a few short sessions in cities, and the known issues below are still open. The replacement downloads use stripped release builds. They pass offline build and load checks, but have not yet been validated in game.
 
 UPDATE BOTH FILES TOGETHER
-The main mod and the Traffic Addon now share a new interface. Traffic Addon 0.1 does not work with FVO 1.1, and Traffic Addon 0.2 does not work with FVO 1.0. With a mismatch you get no traffic, and the log says why.
+The main mod and the Traffic Addon now share a new interface. Traffic Addon 0.1 does not work with FVO 1.1, and Traffic Addon 0.2 does not work with FVO 1.0. With a mismatch you get no traffic. Install the matching versions together.
 
 TRAFFIC SHOWS FIRST AND IS CHECKED AFTER
 Pairs near you are assumed correct and appear without waiting to be proven. They are then checked outward as the game loads their models. A pair is only removed for a specific fault, and only when you cannot see it.
@@ -20,9 +20,9 @@ DRIVERS
 A driver could be told to get out while the vehicle was still descending after a trip, and end up high in the air. They now get out once parked. A seated driver is no longer asked to re-seat because of a lagging position reading in flight.
 
 DIAGNOSTICS
-- The log now includes each pair's zone stage with the reason, and a trace of the local map's builders. Set mapTrace=0 under [diagnostics] in settings.ini to turn the map trace off.
-- A hitch of 3 seconds or more during play saves a small stack dump, last-stall-1.dmp to last-stall-3.dmp, next to settings.ini. These are useful in bug reports.
-- Repeated seat messages are limited to one per driver every 10 seconds.
+- Player downloads are built with FVO_RELEASE=ON. Routine logging, verbose logging, the freeze watcher, stall/hang dumps, telemetry output, map tracing and debug keys are disabled. Crash reports and crash dumps remain, along with minimal startup and installer messages.
+- For crashes, include the crash report and dump if available. For hitches or traffic problems, describe the location, steps and matching mod versions; detailed diagnosis requires a development build with logging enabled.
+- Source builds keep diagnostics by default (FVO_RELEASE=OFF). To reproduce the player DLLs, configure with -DFVO_RELEASE=ON and build the FlyingVehicleOverhaul and FVO_Traffic targets.
 
 KNOWN ISSUES
 - The local map can show only trees and rocks, with no terrain or buildings, when opened while flying. It looks normal when you are not flying. The cause is not known yet.

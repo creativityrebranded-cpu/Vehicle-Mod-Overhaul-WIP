@@ -557,9 +557,11 @@ namespace crash
 		g_gameBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
 		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 			reinterpret_cast<LPCSTR>(&Install), &g_self);
+#ifndef FVO_RELEASE
 		g_hangPath = fvopaths::File(L"last-hang.dmp");
 		g_runPath = fvopaths::File(L"run-state.txt");
 		ReportPreviousRun();
+#endif
 		{ SYSTEMTIME st{}; GetLocalTime(&st); std::snprintf(g_runStarted, sizeof g_runStarted, "%02u:%02u:%02u", st.wHour, st.wMinute, st.wSecond); }
 		WriteRunState();
 		const unsigned seconds = GetPrivateProfileIntW(L"diagnostics", L"hangDumpSeconds", 45, fvopaths::Settings().c_str());
@@ -572,10 +574,12 @@ namespace crash
 			g_dumpDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 			if (g_writeDump && g_dumpAsk && g_dumpDone) { if (HANDLE t = CreateThread(nullptr, 0, DumpThread, nullptr, 0, nullptr)) CloseHandle(t); else g_writeDump = nullptr; }
 		}
+#ifndef FVO_RELEASE  // release DLLs: only a real crash is reported (the unhandled filter below)
 		// Publish paths, configuration and DbgHelp before starting the watcher.
 		if (HANDLE t = CreateThread(nullptr, 0, FreezeWatch, nullptr, 0, nullptr)) CloseHandle(t);
 		logger::Write("Freeze recorder: all-thread dump %s after %llu s without an update (last-hang.dmp)", g_writeDump ? "armed" : "UNAVAILABLE", g_hangDelay / 1000);
 		AddVectoredExceptionHandler(1, Handler);
+#endif
 		g_previous = SetUnhandledExceptionFilter(Unhandled);
 		// A normal exit (ExitProcess) runs this; a crash or a killed process does not: the log then tells the two apart.
 		std::atexit([] { logger::WriteUnlocked("Process exiting normally (ExitProcess)"); g_runState.store("clean"); WriteRunState(); });

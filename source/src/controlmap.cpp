@@ -333,6 +333,9 @@ namespace controlmap
 
 	bool DebugKeys()
 	{
+#ifdef FVO_RELEASE
+		return false;
+#endif
 		static ULONGLONG lastRead = 0;
 		static bool value = false;
 		const ULONGLONG now = GetTickCount64();

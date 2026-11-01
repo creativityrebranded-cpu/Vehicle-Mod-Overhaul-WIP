@@ -74,9 +74,9 @@ namespace features
                         directory.resize(slash);directory+=L"\\Data\\SFSE\\Plugins\\FlyingVehicleOverhaul.features";
                         const auto result=featureinstaller::Apply(directory,ini,kInfo);
                         if(result.status==featureinstaller::Status::Applied)
-                            logger::Write("Installer features: applied %u changed choices; unchanged choices retain gameplay settings",result.changed);
+                            logger::Important("Installer features: applied %u changed choices; unchanged choices retain gameplay settings",result.changed);
                         else if(result.status==featureinstaller::Status::Invalid||result.status==featureinstaller::Status::Failed)
-                            logger::Write("Installer features: configuration import failed (%d); existing settings retained where possible",int(result.status));
+                            logger::Important("Installer features: configuration import failed (%d); existing settings retained where possible",int(result.status));
                     }
                 }
             }

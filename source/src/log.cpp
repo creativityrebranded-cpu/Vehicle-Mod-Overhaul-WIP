@@ -54,6 +54,7 @@ namespace logger
         if(g_file)std::setvbuf(g_file,g_buffer,_IOFBF,sizeof(g_buffer));
 	}
 
+#ifndef FVO_RELEASE
 	bool Verbose()
 	{
 		static std::atomic<bool> value{false};
@@ -93,6 +94,7 @@ namespace logger
 		}
 		trace::Raw("log", text);
 	}
+#endif
 
 	void WriteUnlocked(const char* fmt, ...)
 	{
