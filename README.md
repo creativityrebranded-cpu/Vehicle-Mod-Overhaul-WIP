@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current packaged version: **1.2**, with Traffic Addon 0.3, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current packaged version: **1.2.1**, with Traffic Addon 0.3.1, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -82,7 +82,7 @@ before installing or upgrading.
 
 ## Installation
 
-Release 1.2 is organized in a version folder with a main ZIP, separate optional
+Release 1.2.1 is organized in a version folder with a main ZIP, separate optional
 Extra Vehicles and Parked Vehicles patch ZIPs, and an alternative all-in-one
 FOMOD ZIP. Matching source and hashes are alongside them. See
 [release packaging](docs/RELEASE_PACKAGING.md). Published 0.73.0 archives predate
@@ -145,6 +145,15 @@ Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation 
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
 
+## What's new in 1.2.1 (Traffic Addon 0.3.1)
+
+- **Older save, older traffic files:** each game save captures an immutable snapshot of routes, groups, city settings and the remembered fleet. Later edits do not overwrite older saves. Save in the Traffic Manager applies edits; save the game to preserve them.
+- **Structures are advisory:** routes inside or through buildings show red clearance warnings and remain editable/saveable. Optional clearance fixes are your choice.
+- **Backwards compatible:** existing v1.2 profiles and saves are preserved; the ESM field, API 13 and read-only API 4 remain unchanged. Old history that v1.2 never captured cannot be reconstructed.
+- **Validation:** offline save-branching, same-save reload, legacy data, failure, concurrency, clearance and mixed-binary checks pass. Actual game serialization and warning display still need live verification.
+
+Details: [release notes](docs/RELEASE_1.2.1.md), [save-specific traffic](docs/TRAFFIC_PLAYTHROUGHS.md), [standing compatibility requirement](docs/DEVELOPMENT_MANDATE.md).
+
 ## What's new in 1.2 (Traffic Addon 0.3)
 
 - **One setup per playthrough:** routes, route groups, city settings and remembered traffic are separate. Returning to the same playthrough keeps its setup; another starts with installed defaults.
@@ -201,7 +210,7 @@ Details: [release notes](docs/RELEASE_1.2.md), [playthrough setups](docs/TRAFFIC
 - **Route making:** traffic flies routes in plain `.ini` files in `Data\SFSE\Plugins\FVO_Traffic` (rings, open or looping paths, exits, landing places, per-world rules). `HOW-TO-MAKE-ROUTES.txt` in that folder explains every line; "Show traffic routes" draws them with probes.
 - **Installer:** the same options and pages as 0.8 (updates keep choices); New Atlantis City Traffic installs the route traffic, New Atlantis City Placements the parked vehicles.
 
-Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_1.2.txt](docs/NEXUS_POST_1.2.txt).
+Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_1.2.1.txt](docs/NEXUS_POST_1.2.1.txt).
 
 ## What's new in 0.73.0
 

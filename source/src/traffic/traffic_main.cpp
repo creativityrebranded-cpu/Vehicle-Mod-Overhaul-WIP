@@ -186,6 +186,8 @@ namespace
 
 	void Load()
 	{
+		trafficprofileclient::Guard trafficFilesLock;
+		if (!trafficFilesLock) return;
 		const std::wstring dir = TrafficDir();
 		if (dir.empty()) { g_reloadWanted = true; return; }
 		if (dir != g_loadedProfile) { g_loadedProfile = dir; g_stamp = ~0ull; g_found.clear(); g_reloadWanted = true; }
@@ -1135,7 +1137,7 @@ namespace
 		if (const auto plan = reinterpret_cast<FvoRegisterCruisePlanner_t>(GetProcAddress(core, "FVO_RegisterCruisePlanner"))) plan(&PlanCruise);
 		if (const auto tick = reinterpret_cast<FvoRegisterTick_t>(GetProcAddress(core, "FVO_RegisterTick"))) tick(&Markers);
 		if (!g_worldName) { Log("FVO traffic: core has no FVO_WorldName (an older FlyingVehicleOverhaul.dll); traffic files off"); return; }
-		if (g_trafficApi) Log("FVO Traffic addon 0.3: route traffic attached (playthrough files loaded after the save)");
+		if (g_trafficApi) Log("FVO Traffic addon 0.3.1: route traffic attached (playthrough files loaded after the save)");
 	}
 
 	void SfseMessage(SFSEMessagingInterface::Message* msg)
@@ -1147,7 +1149,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 5, "FVO_Traffic", "seemless",
+	SFSEPluginVersionData::kVersion, 6, "FVO_Traffic", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ kRuntime_1_16_244, 0 }, 0, 0, 0,

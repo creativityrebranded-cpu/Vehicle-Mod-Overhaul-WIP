@@ -9,7 +9,7 @@
 
 extern "C" {
 
-enum { kFvoTrafficApiVersion = 13 };  // v13: matching playthrough profile storage required; v12: pilotLive; v4 read-only prefix remains queryable
+enum { kFvoTrafficApiVersion = 13 };  // Preserve the published v13 ABI; snapshot file locking is an optional export. v4 read-only prefix remains queryable.
 
 struct FvoTrafficPlayer {
     char world[201];   // the worldspace's editor name

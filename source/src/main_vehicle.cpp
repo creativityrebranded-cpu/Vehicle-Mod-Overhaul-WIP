@@ -12,6 +12,7 @@
 #include "hoverui.h"
 #include "routeedit.h"
 #include "trafficprofile.h"
+#include "notify.h"
 #include "mapguard.h"
 #include "cellbake.h"
 #include "disableguard.h"
@@ -90,10 +91,10 @@ namespace
     LoadGame_t g_loadGameOriginal = nullptr;
     std::uintptr_t LoadGameDetour(std::uintptr_t a, std::uintptr_t b, std::uint64_t c, std::uint64_t d)
     {
-        trafficprofile::Allow(false);
         g_loadBegan = GetTickCount64();
         // Before anything else: work queued against the old world never runs against the one being read. The frame's reset comes later, or not at all.
         lifecycle::Close();
+        trafficprofile::BeginLoad();
         trafficarrival::Reset();
         logger::Write("Save load: the game's load routine started; FVO world actions paused until it finishes");
         const auto r = g_loadGameOriginal(a, b, c, d);
@@ -111,6 +112,29 @@ namespace
             logger::Write("Save load: load-game hook installed (141815620)");
         }
         else logger::Write("Save load: load-game hook NOT installed (bytes differ); FVO does not pause during loads");
+    }
+    using SaveGame_t = void (*)(std::int64_t*, std::uint64_t, std::int64_t, std::uint64_t);
+    SaveGame_t g_saveGameOriginal = nullptr;
+    void BeforeTrafficSave() { if (trafficpool::AddonAttached()) trafficprofile::BeforeSave(); }
+    void AfterTrafficSave() { trafficprofile::AfterSave(); }
+    void SaveGameDetour(std::int64_t* a, std::uint64_t b, std::int64_t c, std::uint64_t d)
+    {
+        BeforeTrafficSave();
+        struct Finish { ~Finish() { AfterTrafficSave(); } } finish;
+        g_saveGameOriginal(a, b, c, d);
+    }
+    void InstallSaveHook()
+    {
+        static const std::uint8_t prologue[15] = {0x4C,0x89,0x4C,0x24,0x20,0x4C,0x89,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10};
+        void* original = nullptr;
+        if (hook::Install(game::Base() + addr::kSaveGame, prologue, sizeof prologue, reinterpret_cast<void*>(&SaveGameDetour), &original)) {
+            g_saveGameOriginal = reinterpret_cast<SaveGame_t>(original);
+            trafficprofile::SaveReady(true);
+            logger::Write("Traffic snapshots: native SaveGame hook installed");
+        } else {
+            trafficprofile::SaveReady(false);
+            logger::Important("Traffic snapshots: SaveGame hook unavailable; traffic remains paused");
+        }
     }
     bool Loading(ULONGLONG now)
     {
@@ -260,6 +284,12 @@ namespace
     }
     void Frame()
     {
+        // Do not add a save hook to core-only installs with no Traffic Addon.
+        static bool saveHookAttempted = false;
+        if (g_standalone && !saveHookAttempted && trafficpool::AddonAttached()) {
+            saveHookAttempted = true; InstallSaveHook();
+        }
+        trafficprofile::Report();
         // Engine calls may pump SFSE tasks recursively. Never re-enter our
         // mutable world/AI pipeline; this guard skips rather than waits.
         if(g_inCallback.test_and_set(std::memory_order_acquire))return;
@@ -363,6 +393,9 @@ namespace
 			return;
 		}
         InstallFeatureSystems();
+		api.OnBeforeSave(&BeforeTrafficSave);
+		api.OnAfterSave(&AfterTrafficSave);
+		trafficprofile::SaveReady(true);
 		api.OnFrame(&Frame);
 		api.OnPlayerUpdate(&CorePlayerUpdate);
 		api.OnLoadReset(&Reset);
@@ -408,8 +441,8 @@ namespace
 			if (!g_started) WithoutCore();
 			break;
 		case SFSEMessagingInterface::kMessage_PreLoadGame:
-			trafficprofile::Allow(false);
 			g_loadBegan = GetTickCount64();
+			trafficprofile::BeginLoad();
 			lifecycle::Reset();
 			logger::Write("Save load: started; FVO world actions paused until it finishes");
 			if (g_standalone) Reset();
@@ -426,7 +459,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 120, "FlyingVehicleOverhaul", "seemless",
+	SFSEPluginVersionData::kVersion, 121, "FlyingVehicleOverhaul", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -454,7 +487,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Important("Flying Vehicle Overhaul (FVO) 1.2 loaded; core optional");
+	logger::Important("Flying Vehicle Overhaul (FVO) 1.2.1 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-// A save holds a 24-bit profile identity; files are mutable within that playthrough.
+// A save holds a 24-bit immutable snapshot identity. Edits use a separate working copy.
 // Reserve identities with an exclusive directory create; never recycle an old profile.
 namespace trafficprofilestore {
 namespace fs = std::filesystem;
@@ -33,19 +33,37 @@ inline void Write(const fs::path& path, const std::string& text) {
     if (!stream) throw std::runtime_error("Could not write traffic profile");
 }
 struct Created { std::uint32_t id; fs::path routes; bool imported; };
+inline std::pair<std::uint32_t, fs::path> Reserve(const fs::path& root, std::uint32_t seed) {
+    fs::create_directories(root);
+    auto id = seed % kMaxId + 1;
+    for (std::uint32_t count = 0; count < kMaxId; ++count) {
+        const auto folder = Folder(root, id);
+        if (fs::create_directory(folder)) return {id, folder};
+        id = id == kMaxId ? 1 : id + 1;
+    }
+    throw std::runtime_error("No unused traffic profile identity");
+}
+// Used both to branch a loaded snapshot into a working copy and to freeze a game save.
+// Never writes to the source. An interrupted copy has no ready marker and is not published.
+inline Created Clone(const fs::path& root, const fs::path& sourceRoutes, std::uint32_t seed) {
+    const auto source = sourceRoutes.parent_path();
+    if (!fs::is_regular_file(source / "ready") || !fs::is_directory(sourceRoutes))
+        throw std::runtime_error("Traffic snapshot source is missing or incomplete");
+    const auto [id, folder] = Reserve(root, seed);
+    const auto routes = folder / "routes";
+    fs::create_directory(routes);
+    for (const auto& file : fs::directory_iterator(sourceRoutes)) {
+        if (file.is_regular_file()) fs::copy_file(file.path(), routes / file.path().filename());
+    }
+    for (const auto* name : {"trafficpool.ini", "ringroad.ini"})
+        if (fs::is_regular_file(source / name)) fs::copy_file(source / name, folder / name);
+    Write(folder / "ready", "Traffic profile snapshot v2\n");
+    return {id, routes, false};
+}
 inline Created Create(const fs::path& root, const fs::path& defaults, const fs::path& legacy,
                       bool established, std::uint32_t seed) {
     if (!fs::is_directory(defaults)) throw std::runtime_error("Traffic Addon defaults are missing");
-    fs::create_directories(root);
-    auto id = seed % kMaxId + 1;
-    fs::path folder;
-    bool reserved = false;
-    for (std::uint32_t count = 0; count < kMaxId; ++count) {
-        folder = Folder(root, id);
-        if (fs::create_directory(folder)) { reserved = true; break; }
-        id = id == kMaxId ? 1 : id + 1;
-    }
-    if (!reserved) throw std::runtime_error("No unused traffic profile identity");
+    const auto [id, folder] = Reserve(root, seed);
     const bool imported = established && fs::create_directory(root / "legacy-imported");
     try {
         const auto routes = folder / "routes";

@@ -6,6 +6,7 @@
 // the game's create-reference for the vehicle and the driver (the driver is seated inside its creation), then, once both have
 // 3D, the driver must really sit (sit state > 0), else the instant seat every second, six tries at most.
 #include "generator.h"
+#include "trafficprofileclient.h"
 #include "admission.h"
 #include "observations.h"
 #include "fvolimits.h"
@@ -163,6 +164,14 @@ namespace generator
 			const bool named = i < int(g_names.size()) && !g_names[std::size_t(i)].empty();
 			return named ? L"pair_" + Wide(g_names[std::size_t(i)]) : L"spot" + std::to_wstring(i);
 		}
+        void WriteRegistry(const wchar_t* section, const wchar_t* key, const wchar_t* value) {
+#ifndef FVO_GENERATOR_TEST
+            // Lock only the file operation, never engine queries/mutations made by Tick.
+            trafficprofileclient::Guard files;
+            if (!files) return;
+#endif
+            WritePrivateProfileStringW(section, key, value, Ini().c_str());
+        }
 		void LoadIds(int i, Pair& p)
 		{
 			wchar_t text[64]{};
@@ -175,7 +184,7 @@ namespace generator
 		{
 			wchar_t text[64];
 			std::swprintf(text, 64, L"%08X %08X %08X %X", p.vehicle, p.driver, p.base,p.staged?1:0);
-			WritePrivateProfileStringW(Wide(g_world).c_str(), PairKey(i).c_str(), text, Ini().c_str());
+			WriteRegistry(Wide(g_world).c_str(), PairKey(i).c_str(), text);
 		}
 
         // A landing spot works like a placement: a vehicle waits there, one per spot, once the player is in range, and stays for later. Kept in trafficpool.ini per world; a remembered id is checked by its base.
@@ -186,7 +195,7 @@ namespace generator
         void SaveLanding(const Landing& l){
             const std::wstring key=L"landing_"+std::wstring(l.key.begin(),l.key.end()),section(g_world.begin(),g_world.end());
             wchar_t text[64]{};if(l.vehicle)swprintf_s(text,L"%08X %08X",l.vehicle,l.base);
-            WritePrivateProfileStringW(section.c_str(),key.c_str(),l.vehicle?text:nullptr,Ini().c_str());
+            WriteRegistry(section.c_str(),key.c_str(),l.vehicle?text:nullptr);
         }
         bool LandingUnseen(double x,double y,double z){
             if(!g_api->presentation)return false;
@@ -239,7 +248,7 @@ namespace generator
         void SaveSpares(){
             if(g_world.empty())return;std::wstring list;
             for(const auto& sp:g_spares){wchar_t b[40];swprintf(b,40,L"%s%08X %08X %08X",list.empty()?L"":L", ",sp.vehicle,sp.driver,sp.base);list+=b;}
-            WritePrivateProfileStringW(Wide(g_world).c_str(),L"spares",list.c_str(),Ini().c_str());
+            WriteRegistry(Wide(g_world).c_str(),L"spares",list.c_str());
         }
         void LoadSpares(){
             if(g_sparesWorld==g_world)return;g_sparesWorld=g_world;g_spares.clear();
@@ -511,7 +520,7 @@ namespace generator
 				for(const wchar_t* c=buf;*c;){wchar_t* end=nullptr;const unsigned long v=std::wcstoul(c,&end,16);if(end==c){++c;continue;}if(v)skip.insert(unsigned(v));c=end;}
 				if(skip.insert(p.base).second){
 					std::wstring list;for(const unsigned id:skip){wchar_t b[16];swprintf(b,16,L"%s%08X",list.empty()?L"":L", ",id);list+=b;}
-					WritePrivateProfileStringW(L"types",L"auto_skip",list.c_str(),Ini().c_str());
+					WriteRegistry(L"types",L"auto_skip",list.c_str());
 					g_typePool.clear();g_typeWorld.clear();
 					Log("Traffic models: model %08X left out of traffic: its drivers failed to sit %d times and never sat (trafficpool.ini [types] auto_skip)",p.base,r.failed);
 				}

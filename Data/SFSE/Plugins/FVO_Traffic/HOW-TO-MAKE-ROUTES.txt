@@ -7,11 +7,14 @@ one playthrough do not change another. Open the local map and press F7 to edit
 the current playthrough. The Readme button beside City opens quick instructions.
 
 The active files are in:
-Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul\TrafficProfiles\<identity>\routes
+Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul\TrafficProfiles\Working\<identity>\routes
 Every *.ini there is a traffic file. FVO re-reads the active files while you play.
 NewAtlantis.ini is a working example: copy it, rename it (for example MyCity.ini)
 and change it. Editing the installed defaults affects future playthroughs;
-existing playthroughs keep their own files. Back up TrafficProfiles with saves.
+existing saved setups keep their own files. Save in the Traffic Manager applies edits;
+save the game to keep them. Older game saves restore their own traffic snapshot.
+Do not edit numbered saved-snapshot folders. Back up TrafficProfiles with saves.
+Building intersections are red warnings: intentional routes through structures are allowed.
 
 Traffic can use vehicles already parked in the world (vanilla, Carfield, Parked
 Vehicles and Extra Vehicles placements). Routes with start_on_route also let the

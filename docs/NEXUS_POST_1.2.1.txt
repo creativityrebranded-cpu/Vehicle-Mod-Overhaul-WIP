@@ -1,0 +1,94 @@
+[size=5][b]About this mod[/b][/size]
+
+Fly hover vehicles with gears, terrain following and autopilot. Summon your vehicle, have it follow or cover you, or send it along scanner routes. Ride with NPC drivers, or create your own city traffic routes in game with the Traffic Manager. NPCs use vehicles to travel and fight.
+
+[b]Update/Installation Notice:[/b]
+Replace your old installation with FVO 1.2.1 and recommended Traffic Addon 0.3.1. Existing saves and v1.2 profiles are supported; keep your TrafficProfiles folder. FVO works with mod managers.
+
+[size=5][b]Features[/b][/size]
+
+[list]
+[*]Hover flight: four gears, boost, climb, descend and terrain following.
+[*]Physical flight: momentum and banking for you and every AI pilot, with flight assist, camera roll and an attitude instrument, on autopilot too. Off by default.
+[*]Autopilot: summon, follow, cover, guard and scanner destinations, with chained stops and improved AI navigation.
+[*]Seats and passengers: ride with NPC drivers, pull a driver out and take the wheel, and followers ride along.
+[*]Combat: improved vehicle combat AI, squads and morale, Defend / Attack / Hold fire and focus fire.
+[*]Damage and wrecks: vehicles and occupants take damage, wrecks come down, and occupants climb out.
+[*]Traffic Manager: press F7 on the local map to create and edit traffic routes. Readme beside City opens instructions. Structure intersections show red warnings and allow intentional routes. Autopilot follows nearby traffic paths.
+[*]Traffic Addon 0.3.1: traffic over ten cities, with models from your whole load order. Each game save keeps its own routes, route groups and traffic settings; older saves restore older setups.
+[*]City Placements: parked vehicles in nine cities.
+[*]Controls and HUD: full keyboard and controller support with rebinding, and a movable, resizable HUD.
+[/list]
+
+[size=5][b]Requirements[/b][/size]
+
+[list]
+[*]Steam Starfield 1.16.244 and its matching SFSE. Game Pass and Microsoft Store are not supported.
+[*]Carfield and Parked Vehicles are optional.
+[/list]
+
+[size=5][b]Downloads[/b][/size]
+
+[list]
+[*]FlyingVehicleOverhaul-1.2.1.zip — main mod.
+[*]FlyingVehicleOverhaul-TrafficAddon-0.3.1.zip — optional: city traffic and its routes.
+[*]FlyingVehicleOverhaul-1.2.1-ExtraVehicles.zip — optional: City Placements.
+[*]FlyingVehicleOverhaul-1.2.1-ParkedVehiclesPatch.zip — optional: makes the Parked Vehicles mod's props drivable.
+[*]FlyingVehicleOverhaul-1.2.1-FOMOD.zip — all-in-one installer for Vortex/MO2. Choose your cities, traffic defaults and features. Use it instead of the separate ZIPs.
+[/list]
+
+[size=5][b]Installation[/b][/size]
+
+[list]
+[*]Install the FOMOD with a mod manager, or extract the main ZIP and any addons into Starfield\Data.
+[*]Enable FVO_NPCPilots.esm and any optional ESMs. Launch through SFSE.
+[*]When updating, replace the old installation. Remove SeamlessVehicle.dll, FVO_CityPlacements.dll, FVO_CityTraffic.esm and Vehicles - Real.esm if present.
+[*]Save in the Traffic Manager applies edits; save the game to keep them. v1.2 profiles are preserved, but old traffic-file history that was never recorded cannot be recovered.
+[/list]
+
+[size=5][b]Settings[/b][/size]
+
+[list]
+[*]Settings > Gameplay Options > Flying Vehicle Overhaul. Bindings are under Settings > Controls.
+[*]Config files are in Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul. Back up its TrafficProfiles folder with your saves.
+[/list]
+
+[size=5][b]Main controls[/b][/size]
+
+[list]
+[*]Keyboard: V hover or land, Space climb, C descend, Shift boost, T Auto, E exit. On foot, N summons and U is follow or cover. Hold E at an occupied vehicle to pull the driver out. F7 opens the HUD editor, or the Traffic Manager on the local map.
+[*]Controller: L3 hover or land, Y climb, X descend, RB boost, D-pad Left Auto, B exit.
+[/list]
+
+[size=5][b]Known issues[/b][/size]
+
+[list]
+[*]Prerelease: save snapshots and the updated red warnings still need in-game verification.
+[*]Shots at traffic may not register yet.
+[*]City hitches remain; the local map can miss terrain or buildings while flying.
+[*]Some NPCs give up walking to their vehicle.
+[*]Pulling out a neutral driver counts as theft.
+[*]More live vehicles cost more CPU.
+[/list]
+
+[size=5][b]Reporting[/b][/size]
+
+[list]
+[*]Include your versions, location and steps. Player downloads disable routine logging but retain crash reporting. After a crash, include FlyingVehicleOverhaul.log from Documents\My Games\Starfield\SFSE\Logs and last-crash.dmp from its FlyingVehicleOverhaul folder, if available.
+[/list]
+
+[size=5][b]Credits[/b][/size]
+
+[list]
+[*]The SFSE team. SarthesArai (Carfield, Parked Vehicles).
+[*]Source: [url=https://github.com/creativityrebranded-cpu/Vehicle-Mod-Overhaul-WIP]GitHub[/url]
+[/list]
+
+[size=5][b]Making your own routes[/b][/size]
+
+[list]
+[*]Install the Traffic Addon, open your local map and press F7. Create or edit a route; Readme explains the controls.
+[*]Turn on Show traffic routes in the settings to see the lanes.
+[*]Active .ini files are in TrafficProfiles\Working\<identity>\routes under the config folder. Do not edit saved snapshot folders. Data\SFSE\Plugins\FVO_Traffic holds new-playthrough defaults.
+[*]HOW-TO-MAKE-ROUTES.txt explains every option, with examples. Existing saved setups keep their files when installer defaults change.
+[/list]

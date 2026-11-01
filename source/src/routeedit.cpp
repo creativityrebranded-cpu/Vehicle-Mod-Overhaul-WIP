@@ -2,6 +2,7 @@
 #include "trafficprofile.h"
 #include "pilotlayout.h"
 #include "routeeditor.h"
+#include "routeclearance.h"
 #include "bindings.h"
 #include "bindlogic.h"
 #include "routefiles.h"
@@ -718,6 +719,7 @@ namespace routeedit
 		}
 		void Save()
 		{
+			trafficprofile::Guard files(trafficprofile::Mutex());
 			const auto profile = TrafficDir();
 			if (profile.empty() || profile != g_ed.profileDir) { Status("Playthrough changed: reopen the Traffic Manager before saving"); return; }
 			routefiles::File next = g_ed.file;
@@ -895,16 +897,22 @@ namespace routeedit
 			if (top.haveGround && std::isfinite(top.ground)) { ground = top.ground; return true; }
 			return CachedTerrain(x, y, ground);
 		}
-		// A point or spot the editor refuses (2026-10-29 late, the user: the editor "should know when you placing a point that's bad
-		// ... and should not accept those points"): below 0, under the terrain, or inside a mapped building or other solid.
+		// Known terrain and invalid coordinates can refuse an edit. Buildings/solids are advisory:
+		// the user may intentionally author a route inside or through a structure (2026-11-01).
 		const char* PointProblem(double x, double y, double z)
 		{
+			if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return "not a finite position";
 			double ground = 0;
-			if (const int buried = Buried(x, y, z, ground); buried >= 0) { if (buried) return "under the ground"; }
-			else if (TerrainAt(x, y, z, ground)) { if (z < ground + 1.0) return "under the ground"; }
-			else if (z < kPlaceFloor - 0.01) return "below 0 with the ground there unknown";
+			// Use the actual terrain heightfield, not the top of a roof mistaken for ground.
+			const bool known = CachedTerrain(x, y, ground);
 			const auto m = navmap::At(x, y, z);
-			if (m.blocked || m.objBlocked) return "inside a building or other solid";
+			const auto advice = routeclearance::Judge(x, y, z, known, ground, m.blocked || m.objBlocked, kPlaceFloor);
+			switch (advice.block) {
+			case routeclearance::Block::InvalidPosition: return "not a finite position";
+			case routeclearance::Block::UnderTerrain: return "under the ground";
+			case routeclearance::Block::BelowUnknownFloor: return "below 0 with the ground there unknown";
+			default: break;
+			}
 			return nullptr;
 		}
 		void Refused(const char* what, double x, double y, double z, const char* why)
@@ -1937,6 +1945,7 @@ namespace routeedit
 		constexpr double kInner = kPanelW - 28;      // content width
 		constexpr double kLabelW = 130;              // a row's label cell
 		constexpr unsigned kTeal = 0x6FE0D0, kText = 0xDFE7EE, kDim = 0x8C9AAB, kAmber = 0xF2B04E, kCoral = 0xE8705C, kRowA = 0x27303F, kRowB = 0x1A2331;
+		constexpr unsigned kClearanceRed = 0xFF5555;
 		double PanelX() { return g_ui.width - kPanelW - 12; }
 		bool OverPanel(double x, double y) { return x >= PanelX() && x <= PanelX() + kPanelW && y >= 12 && y <= g_ui.panelBottom; }
 		bool OverUi(double x, double y)
@@ -2057,7 +2066,7 @@ namespace routeedit
 		int ListSelected() { return g_ed.route >= 0 ? g_ed.route : g_ed.other >= 0 ? int(g_ed.file.routes.size()) + g_ed.other : g_ed.draft && g_ed.draftIndex < 0 ? -2 : -1; }
 		// ---- Problems with one-click fixes (2026-10-30, Traffic Manager V1) ----
 		// kind: 0 none, 1 set points a and b to z, 2 set point b to z, 3 remove point b, 4 round point a, 5 set point a to z, 6 move a and b up by z.
-		struct Problem { std::string text, fix; int kind = 0, a = -1, b = -1; double z = 0; };
+		struct Problem { std::string text, fix; int kind = 0, a = -1, b = -1; double z = 0; bool clearanceWarning = false; };
 		// Where a segment crosses another route (on the map), the two heights there: true when found.
 		bool CrossAt(const trafficdata::Vec& a, const trafficdata::Vec& b, const trafficdata::Vec& c, const trafficdata::Vec& d, double& ha, double& hc, double* xAt = nullptr, double* yAt = nullptr)
 		{
@@ -2087,7 +2096,21 @@ namespace routeedit
 		std::vector<Problem> Problems(const trafficdata::Route& r, bool deep = false)
 		{
 			std::vector<Problem> out;
-			if (r.ring) return out;
+			if (r.ring) {
+				if (deep) {
+					const auto line = trafficroute::Build(r);
+					for (int i = 0; i < 32; ++i) {
+						const auto at = trafficroute::At(line, 0, trafficroute::Length(line) * i / 32.0);
+						const auto m = navmap::At(at.x, at.y, at.z);
+						const auto& s = SurfaceUnder(at.x, at.y, at.z);
+						if (m.blocked || m.objBlocked || s.covered || s.buried) {
+							out.push_back({"Ring may intersect a building, roof or terrain. Allowed: check clearance.", "", 0, -1, -1, 0, true});
+							break;
+						}
+					}
+				}
+				return out;
+			}
 			const auto& p = r.points;
 			const int n = int(p.size());
 			const int segs = r.closed ? n : n - 1;
@@ -2135,10 +2158,12 @@ namespace routeedit
 			// Roofs, bridges and the ground: at each point, and sampled along each stretch (about every 20 m, at most 10 a stretch).
 			for (int i = 0; i < n; ++i) {
 				const auto& s = SurfaceUnder(p[i].x, p[i].y, p[i].z);
-				if (!s.covered && !s.buried) continue;
-				std::snprintf(b, sizeof b, s.buried ? "Point %d is inside the ground" : "Point %d is under a roof or a bridge", i + 1);
-				std::snprintf(b + 120, 40, "Raise to %.0f m", s.above + 10);
-				out.push_back({ b, b + 120, 5, i, -1, s.above + 10 });
+				const auto mapped = navmap::At(p[i].x, p[i].y, p[i].z);
+				if (!s.covered && !s.buried && !mapped.blocked && !mapped.objBlocked) continue;
+				std::snprintf(b, 120, "Point %d may intersect a structure or terrain. Allowed: check clearance.", i + 1);
+				const double raiseTo = std::max(p[i].z, s.above) + 10;
+				std::snprintf(b + 120, 40, "Raise to %.0f m", raiseTo);
+				out.push_back({ b, b + 120, 5, i, -1, raiseTo, true });
 			}
 			for (int i = 0; i < segs && n >= 2; ++i) {
 				const int j = (i + 1) % n;
@@ -2147,13 +2172,15 @@ namespace routeedit
 				double top = -1e18;
 				for (int k = 1; k <= m; ++k) {
 					const double t = double(k) / (m + 1);
-					const auto& s = SurfaceUnder(p[i].x + (p[j].x - p[i].x) * t, p[i].y + (p[j].y - p[i].y) * t, p[i].z + (p[j].z - p[i].z) * t);
-					if (s.covered || s.buried) top = std::max(top, s.above);
+					const double x = p[i].x + (p[j].x - p[i].x) * t, yy = p[i].y + (p[j].y - p[i].y) * t, z = p[i].z + (p[j].z - p[i].z) * t;
+					const auto& s = SurfaceUnder(x, yy, z);
+					const auto mapped = navmap::At(x, yy, z);
+					if (s.covered || s.buried || mapped.blocked || mapped.objBlocked) top = std::max(top, std::max(z, s.above));
 				}
 				if (top > -1e17) {
-					std::snprintf(b, sizeof b, "Points %d to %d pass through a building, a bridge or the ground", i + 1, j + 1);
+					std::snprintf(b, 120, "Points %d to %d may cross a structure or terrain. Allowed: check clearance.", i + 1, j + 1);
 					std::snprintf(b + 120, 40, "Raise both to %.0f m", top + 10);
-					out.push_back({ b, b + 120, 1, i, j, top + 10 });
+					out.push_back({ b, b + 120, 1, i, j, top + 10, true });
 				}
 			}
 			// Other routes crossing within 15 m of height (their lines as traffic flies them).
@@ -2548,11 +2575,13 @@ namespace routeedit
 				}
 				if (draft) if (const auto issue = g_ed.draft->Check(); issue != routeeditor::Issue::None) line(std::string("Can't save yet: the route ") + IssueText(issue), kCoral);
 				const auto problems = Problems(*shown, true);
+				if (std::any_of(problems.begin(), problems.end(), [](const Problem& p){return p.clearanceWarning;}))
+					line("Warning: possible structure intersection. Route is allowed; check clearance.", kClearanceRed);
 				if (!problems.empty()) { button(kProblems, x0, y, kInner, 22, "! " + std::to_string(problems.size()) + (problems.size() > 1 ? " problems" : " problem") + ((open & 8) ? ": hide" : ": show"), (open & 8) != 0, true, 6); y += 28; }
 				else { text("No problems found. Buildings need Test route.", x0, y + 2, kInner, kDim); y += 22; }
 				if (open & 8) {
 					for (std::size_t k = 0; k < problems.size() && k < 6; ++k) {
-						line(problems[k].text, kAmber);
+						line(problems[k].text, problems[k].clearanceWarning ? kClearanceRed : kAmber);
 						button(kProblemShow + int(k), x0, y, 70, 22, "Show", false, problems[k].a >= 0, 0);
 						if (problems[k].kind) button(kProblemFix + int(k), x0 + 76, y, 190, 22, problems[k].fix, true, true, 0);
 						y += 28;
@@ -4439,7 +4468,7 @@ namespace routeedit
 			if (!s || !s->known) return rays ? s : nullptr;
 			double fx = 0, fy = 0;
 			if (!Local(c, { p.x, p.y, s->below }, fx, fy)) return rays ? s : nullptr;
-			const unsigned color = s->buried ? kCoral : s->covered ? kAmber : 0xFFFFFF;
+			const unsigned color = s->buried || s->covered ? kClearanceRed : 0xFFFFFF;
 			pen.Style(selected ? 1.6 : 1, color, s->buried || s->covered ? 0.95 : 0.55); pen.Move(x, y); pen.Line(fx, fy);
 			// a tick every 25 m of height between the surface and the point
 			for (double h = std::ceil((s->below + 0.01) / kHeightLevel) * kHeightLevel; h < p.z - 0.01; h += kHeightLevel) {
@@ -4611,9 +4640,9 @@ namespace routeedit
 			if (!ShowGameMessage("Traffic Manager - Readme",
 				"Press F7 on the local map to open or close the Traffic Manager. Select a route on the map or in the route list.\n\n"
 				"Use New route to make a route, then the point and shape tools to draw its path. Select an existing route to edit it. Set its height, speed, lanes and vehicle count; use Time rules for its schedule.\n\n"
-				"Save (Ctrl+S) keeps your changes. Cancel discards unsaved edits. Use Test route to check clearance: buildings and terrain are not checked automatically.\n\n"
+				"Save (Ctrl+S) applies route edits; Cancel discards unsaved edits. Red structure warnings do not block routes. Use Test route to check clearance.\n\n"
 				"City controls local traffic and density. Reset traffic replaces the current traffic; finish or cancel your route edits first, and leave combat before resetting.\n\n"
-				"Routes, groups and traffic settings belong to this playthrough. Other playthroughs start with the installed defaults.\n\n"
+				"Save your game to keep its routes, groups and traffic settings. Loading an older game save restores its setup. Other playthroughs start with installed defaults.\n\n"
 				"Autopilot near a traffic zone follows its path. Reopen this Readme whenever you need it."))
 				Status("Could not open the Readme. Close and reopen the local map, then try again.");
 		}

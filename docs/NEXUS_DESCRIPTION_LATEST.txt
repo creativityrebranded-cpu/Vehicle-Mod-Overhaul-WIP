@@ -3,7 +3,7 @@
 Fly hover vehicles with gears, terrain following and autopilot. Summon your vehicle, have it follow or cover you, or send it along scanner routes. Ride with NPC drivers, or create your own city traffic routes in game with the Traffic Manager. NPCs use vehicles to travel and fight.
 
 [b]Update/Installation Notice:[/b]
-Replace your old installation with the new files. Update FVO 1.2, Traffic Addon 0.3 and the included FVO_NPCPilots.esm together. FVO works with mod managers. Works best with new saves.
+Replace your old installation with FVO 1.2.1 and recommended Traffic Addon 0.3.1. Existing saves and v1.2 profiles are supported; keep your TrafficProfiles folder. FVO works with mod managers.
 
 [size=5][b]Features[/b][/size]
 
@@ -14,8 +14,8 @@ Replace your old installation with the new files. Update FVO 1.2, Traffic Addon 
 [*]Seats and passengers: ride with NPC drivers, pull a driver out and take the wheel, and followers ride along.
 [*]Combat: improved vehicle combat AI, squads and morale, Defend / Attack / Hold fire and focus fire.
 [*]Damage and wrecks: vehicles and occupants take damage, wrecks come down, and occupants climb out.
-[*]Traffic Manager: press F7 on the local map to create and edit traffic routes. Readme beside City opens instructions. Autopilot near a traffic zone follows its path.
-[*]Traffic Addon 0.3: traffic over ten cities, with models from your whole load order. Each playthrough keeps its own routes, route groups and traffic settings.
+[*]Traffic Manager: press F7 on the local map to create and edit traffic routes. Readme beside City opens instructions. Structure intersections show red warnings and allow intentional routes. Autopilot follows nearby traffic paths.
+[*]Traffic Addon 0.3.1: traffic over ten cities, with models from your whole load order. Each game save keeps its own routes, route groups and traffic settings; older saves restore older setups.
 [*]City Placements: parked vehicles in nine cities.
 [*]Controls and HUD: full keyboard and controller support with rebinding, and a movable, resizable HUD.
 [/list]
@@ -30,11 +30,11 @@ Replace your old installation with the new files. Update FVO 1.2, Traffic Addon 
 [size=5][b]Downloads[/b][/size]
 
 [list]
-[*]FlyingVehicleOverhaul-1.2.zip — main mod.
-[*]FlyingVehicleOverhaul-TrafficAddon-0.3.zip — optional: city traffic and its routes.
-[*]FlyingVehicleOverhaul-1.2-ExtraVehicles.zip — optional: City Placements.
-[*]FlyingVehicleOverhaul-1.2-ParkedVehiclesPatch.zip — optional: makes the Parked Vehicles mod's props drivable.
-[*]FlyingVehicleOverhaul-1.2-FOMOD.zip — all-in-one installer for Vortex/MO2. Choose your cities, traffic defaults and features. Use it instead of the separate ZIPs.
+[*]FlyingVehicleOverhaul-1.2.1.zip — main mod.
+[*]FlyingVehicleOverhaul-TrafficAddon-0.3.1.zip — optional: city traffic and its routes.
+[*]FlyingVehicleOverhaul-1.2.1-ExtraVehicles.zip — optional: City Placements.
+[*]FlyingVehicleOverhaul-1.2.1-ParkedVehiclesPatch.zip — optional: makes the Parked Vehicles mod's props drivable.
+[*]FlyingVehicleOverhaul-1.2.1-FOMOD.zip — all-in-one installer for Vortex/MO2. Choose your cities, traffic defaults and features. Use it instead of the separate ZIPs.
 [/list]
 
 [size=5][b]Installation[/b][/size]
@@ -43,7 +43,7 @@ Replace your old installation with the new files. Update FVO 1.2, Traffic Addon 
 [*]Install the FOMOD with a mod manager, or extract the main ZIP and any addons into Starfield\Data.
 [*]Enable FVO_NPCPilots.esm and any optional ESMs. Launch through SFSE.
 [*]When updating, replace the old installation. Remove SeamlessVehicle.dll, FVO_CityPlacements.dll, FVO_CityTraffic.esm and Vehicles - Real.esm if present.
-[*]Load your usual playthrough first to import the old shared traffic setup, then save once. Other playthroughs start with installed defaults.
+[*]Save in the Traffic Manager applies edits; save the game to keep them. v1.2 profiles are preserved, but old traffic-file history that was never recorded cannot be recovered.
 [/list]
 
 [size=5][b]Settings[/b][/size]
@@ -63,7 +63,7 @@ Replace your old installation with the new files. Update FVO 1.2, Traffic Addon 
 [size=5][b]Known issues[/b][/size]
 
 [list]
-[*]Prerelease: playthrough switching and Readme still need in-game verification.
+[*]Prerelease: save snapshots and the updated red warnings still need in-game verification.
 [*]Shots at traffic may not register yet.
 [*]City hitches remain; the local map can miss terrain or buildings while flying.
 [*]Some NPCs give up walking to their vehicle.
@@ -89,6 +89,6 @@ Replace your old installation with the new files. Update FVO 1.2, Traffic Addon 
 [list]
 [*]Install the Traffic Addon, open your local map and press F7. Create or edit a route; Readme explains the controls.
 [*]Turn on Show traffic routes in the settings to see the lanes.
-[*]Active .ini files are in TrafficProfiles\<identity>\routes under the config folder. Files in Data\SFSE\Plugins\FVO_Traffic are defaults for new playthroughs.
-[*]HOW-TO-MAKE-ROUTES.txt explains every option, with examples. Existing playthroughs keep their own setup when installer defaults change.
+[*]Active .ini files are in TrafficProfiles\Working\<identity>\routes under the config folder. Do not edit saved snapshot folders. Data\SFSE\Plugins\FVO_Traffic holds new-playthrough defaults.
+[*]HOW-TO-MAKE-ROUTES.txt explains every option, with examples. Existing saved setups keep their files when installer defaults change.
 [/list]

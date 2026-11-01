@@ -12,7 +12,7 @@ DLL = 'SFSE/Plugins/FlyingVehicleOverhaul.dll'
 PILOTS = 'FVO_NPCPilots.esm'
 PATCH = 'FVO_ParkedVehiclesPatch.esm'
 CITY = 'FVO_CityPlacements.esm'
-TRAFFIC_ADDON_VERSION = '0.3'  # its own version and its own optional ZIP (2026-10-30, the user)
+TRAFFIC_ADDON_VERSION = '0.3.1'  # API 13 retained for prior-version compatibility
 CITY_DLL = 'SFSE/Plugins/FVO_Traffic.dll'  # FVO Traffic (was FVO_CityPlacements.dll before 2026-10-29)
 OLD_CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'  # never install both
 CITY_TRAFFIC = 'SFSE/Plugins/FVO_Traffic/NewAtlantis.ini'
@@ -356,7 +356,9 @@ Optional addons (the Traffic Addon and City Placements are ticked by default):
   Paradiso and Red Mile. HOW-TO-MAKE-ROUTES.txt explains writing your own; every
   *.ini in a playthrough's routes folder is read. Installer files are defaults for new
   playthroughs; existing setups keep their own routes, groups and city settings.
-  Back up TrafficProfiles with saves. Traffic can start already flying (vehicles with
+  Save in the Traffic Manager applies route edits; save the game to keep a snapshot.
+  Loading an older game save restores its traffic setup. Back up TrafficProfiles with saves.
+  Traffic can start already flying (vehicles with
   seated drivers, made once per save) or empty. Route beacons can be shown or hidden.
 - City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities.
   Requires: {', '.join(dependencies[CITY])}. Enable it after its masters.
@@ -459,7 +461,7 @@ validation.
     guide = Path(__file__).resolve().parents[1]/'docs/FOMOD_INSTALLER.md'
     if guide.is_file():
         sources['Docs/FOMOD_INSTALLER.md'] = guide.read_bytes()
-    for name in ('RELEASE_PACKAGING.md','TRAFFIC_PLAYTHROUGHS.md',f'RELEASE_{version}.md'):
+    for name in ('RELEASE_PACKAGING.md','TRAFFIC_PLAYTHROUGHS.md','DEVELOPMENT_MANDATE.md',f'RELEASE_{version}.md'):
         document=Path(__file__).resolve().parents[1]/'docs'/name
         if document.is_file():sources['Docs/'+name]=document.read_bytes()
     sources['README.txt'] = (readme.decode()+'\nBuild: cmake -S plugin -B build -G "Visual Studio 17 2022" -A x64\n'

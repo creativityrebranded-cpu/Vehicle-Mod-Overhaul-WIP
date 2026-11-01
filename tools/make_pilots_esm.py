@@ -62,7 +62,7 @@ PKG_BASE = 0x801
 ACT_QUEST_ID = 0x810
 ACT_PKG_BASE = 0x811
 MAP_SEEN_ID = 0xD00  # global: the Traffic Manager's first-time message was shown in this playthrough (saved with the game)
-TRAFFIC_PROFILE_ID = 0xD01  # global: stable per-playthrough traffic profile, inherited by later saves
+TRAFFIC_PROFILE_ID = 0xD01  # global: saved traffic snapshot identity; same field retained for compatibility
 F_COMPRESSED, F_ESM = 0x40000, 0x1
 
 
