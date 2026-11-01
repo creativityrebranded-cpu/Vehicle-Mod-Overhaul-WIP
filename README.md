@@ -2,7 +2,7 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current packaged version: **1.1**, with Traffic Addon 0.2, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
+Current packaged version: **1.2**, with Traffic Addon 0.3, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
 first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -82,7 +82,7 @@ before installing or upgrading.
 
 ## Installation
 
-Release 1.1 is organized in a version folder with a main ZIP, separate optional
+Release 1.2 is organized in a version folder with a main ZIP, separate optional
 Extra Vehicles and Parked Vehicles patch ZIPs, and an alternative all-in-one
 FOMOD ZIP. Matching source and hashes are alongside them. See
 [release packaging](docs/RELEASE_PACKAGING.md). Published 0.73.0 archives predate
@@ -145,6 +145,16 @@ Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation 
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
 
+## What's new in 1.2 (Traffic Addon 0.3)
+
+- **One setup per playthrough:** routes, route groups, city settings and remembered traffic are separate. Returning to the same playthrough keeps its setup; another starts with installed defaults.
+- **Readme button:** beside City in the Traffic Manager, opening instructions in the game's message dialog.
+- **Update together:** core 1.2, Traffic Addon 0.3 and the included FVO_NPCPilots.esm use the new playthrough identity. Save after first using this version, and back up TrafficProfiles with your saves.
+- **Player builds:** routine diagnostics disabled, crash reporting retained. Development builds keep logging by default.
+- **Validation:** offline checks pass; the new profile switching and Readme still need in-game validation.
+
+Details: [release notes](docs/RELEASE_1.2.md), [playthrough setups](docs/TRAFFIC_PLAYTHROUGHS.md).
+
 ## What's new in 1.1 (Traffic Addon 0.2)
 
 **Update the main mod and the Traffic Addon together:** 1.1 and Addon 0.2 share a new interface, and a mismatch means no traffic. Details: [docs/RELEASE_1.1.md](docs/RELEASE_1.1.md).
@@ -153,7 +163,7 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 - **Frozen vehicles:** a vehicle getting no physics from the game no longer counts as stuck; after 20 seconds it is swapped out of sight.
 - **Faults ahead of you:** replaced after 5 seconds instead of 10.
 - **Drivers:** no more getting out in mid-air after a trip; seated drivers are no longer re-seated because of a lagging position in flight.
-- **Diagnostics:** zone stages with reasons, a local map trace, and small stack dumps for hitches.
+- **Development diagnostics:** zone stages, map traces and stall dumps remain available in development builds. Published player builds disable these diagnostics.
 - **Known issues:** the local map can show no terrain or buildings when opened while flying; multi-second hitches in cities; some vehicles still stop getting physics, and are recovered rather than prevented; shots at traffic may not register.
 
 ## What's new in 1.0 (Traffic Addon 0.1)
@@ -191,7 +201,7 @@ The complete keyboard/controller, passenger, placement and HUD editor guide is [
 - **Route making:** traffic flies routes in plain `.ini` files in `Data\SFSE\Plugins\FVO_Traffic` (rings, open or looping paths, exits, landing places, per-world rules). `HOW-TO-MAKE-ROUTES.txt` in that folder explains every line; "Show traffic routes" draws them with probes.
 - **Installer:** the same options and pages as 0.8 (updates keep choices); New Atlantis City Traffic installs the route traffic, New Atlantis City Placements the parked vehicles.
 
-Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_1.1.txt](docs/NEXUS_POST_1.1.txt).
+Nexus description and post: [docs/NEXUS_DESCRIPTION_LATEST.txt](docs/NEXUS_DESCRIPTION_LATEST.txt), [docs/NEXUS_POST_1.2.txt](docs/NEXUS_POST_1.2.txt).
 
 ## What's new in 0.73.0
 

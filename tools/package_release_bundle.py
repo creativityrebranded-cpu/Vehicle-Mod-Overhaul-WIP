@@ -37,8 +37,8 @@ includes the same files, the optional Traffic Addon, City Placements and Parked 
 conversion, and grouped feature configuration. It is an
 alternative install method, not another required package.
 
-The Traffic Manager (F7 on the local map) needs the optional Traffic Addon to generate
-traffic: without it F7 still opens, but no traffic flies the routes.
+The Traffic Manager (F7 on the local map) needs the optional Traffic Addon.
+Readme beside City opens instructions. Each playthrough keeps its own traffic setup.
 
 Without a FOMOD feature profile, the main package uses existing settings or
 the built-in defaults. Change features in Gameplay Options or settings.ini:
@@ -77,8 +77,11 @@ SFSE/Plugins/FVO_Traffic.dll and SFSE/Plugins/FVO_Traffic/:
    NewAtlantis-ColdStart.ini; NewAtlantis-3D.ini, the district loop), Akila City,
    Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead, Paradiso and Red Mile,
    and HOW-TO-MAKE-ROUTES.txt.
-   Every .ini in FVO_Traffic is a route file you can edit, add or delete (delete a
-   city's file to leave it without route traffic).
+   These are defaults copied into each new playthrough's traffic setup. Existing
+   playthroughs keep their own routes, route groups and city settings.
+   Edit the active setup through F7 on the local map; Readme beside City explains
+   the controls. Active files live under the FVO settings folder's
+   TrafficProfiles/<identity>/routes. Back up TrafficProfiles with your saves.
 
 These route files start with traffic already flying (start_on_route = N: vehicles with
 seated drivers, made once per save). Set start_on_route = 0 in a file for traffic that

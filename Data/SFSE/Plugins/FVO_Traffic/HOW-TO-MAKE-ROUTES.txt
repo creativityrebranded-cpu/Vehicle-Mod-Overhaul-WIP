@@ -1,17 +1,24 @@
 FVO traffic files - how to make your own routes
 ================================================
 
-Every *.ini file in this folder (Data\SFSE\Plugins\FVO_Traffic) is a traffic file.
-FVO reads them all, and re-reads them every 10 seconds while you play, so you can
-edit a file and watch the change. NewAtlantis.ini is a working example: copy it,
-rename it (for example MyCity.ini) and change it.
+The files in Data\SFSE\Plugins\FVO_Traffic are the installed defaults. Each
+playthrough gets its own copy, so routes, route groups and city settings from
+one playthrough do not change another. Open the local map and press F7 to edit
+the current playthrough. The Readme button beside City opens quick instructions.
 
-Traffic uses vehicles that are already parked in the world (vanilla, Carfield,
-Parked Vehicles, the Extra Vehicles placements) and calm NPCs near them. A file
-does not create vehicles or NPCs.
+The active files are in:
+Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul\TrafficProfiles\<identity>\routes
+Every *.ini there is a traffic file. FVO re-reads the active files while you play.
+NewAtlantis.ini is a working example: copy it, rename it (for example MyCity.ini)
+and change it. Editing the installed defaults affects future playthroughs;
+existing playthroughs keep their own files. Back up TrafficProfiles with saves.
 
-Lines starting with ; are comments. A bad line is skipped and named in
-Documents\My Games\Starfield\SFSE\Logs\FlyingVehicleOverhaul.log ("FVO traffic: skipped ...").
+Traffic can use vehicles already parked in the world (vanilla, Carfield, Parked
+Vehicles and Extra Vehicles placements). Routes with start_on_route also let the
+addon generate vehicles and drivers for the initial traffic.
+
+Lines starting with ; are comments. A bad line is skipped. Development builds
+also name it in FlyingVehicleOverhaul.log ("FVO traffic: skipped ...").
 
 
 1. Find your coordinates

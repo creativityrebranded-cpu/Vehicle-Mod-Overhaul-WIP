@@ -62,6 +62,7 @@ PKG_BASE = 0x801
 ACT_QUEST_ID = 0x810
 ACT_PKG_BASE = 0x811
 MAP_SEEN_ID = 0xD00  # global: the Traffic Manager's first-time message was shown in this playthrough (saved with the game)
+TRAFFIC_PROFILE_ID = 0xD01  # global: stable per-playthrough traffic profile, inherited by later saves
 F_COMPRESSED, F_ESM = 0x40000, 0x1
 
 
@@ -180,12 +181,13 @@ def main(src, dst):
         return b"GRUP" + struct.pack("<I", 24 + len(recs)) + label + struct.pack("<IIHH", 0, 0, 0x245, 0) + recs
 
     seen = record(b"GLOB", 0x01000000 | MAP_SEEN_ID, sub(b"EDID", b"FVO_TrafficManagerSeen\0") + sub(b"FLTV", struct.pack("<f", 0.0)), tail)
-    groups = group(b"GLOB", seen) + group(b"QUST", quest + quest2) + group(b"PACK", packs + packs2)
-    nrec = 1 + 2 + PILOTS * 2 + 3  # 1 global + 2 quests + 2 x PILOTS packages + 3 groups
+    profile = record(b"GLOB", 0x01000000 | TRAFFIC_PROFILE_ID, sub(b"EDID", b"FVO_TrafficProfile\0") + sub(b"FLTV", struct.pack("<f", 0.0)), tail)
+    groups = group(b"GLOB", seen + profile) + group(b"QUST", quest + quest2) + group(b"PACK", packs + packs2)
+    nrec = 2 + 2 + PILOTS * 2 + 3  # 2 globals + 2 quests + 2 x PILOTS packages + 3 groups
     assert pkg_id(11) < ACT_QUEST_ID and act_pkg_id(11) < 0x820 and pkg_id(63) < 0xA00 and act_pkg_id(63) < 0xB00
     assert PILOTS <= 256 and pkg_id(PILOTS - 1) < 0xC00 and act_pkg_id(PILOTS - 1) < 0xD00
     hedr_ver = struct.unpack_from("<f", d, 24 + 6)[0]
-    items = [(b"HEDR", struct.pack("<fII", hedr_ver, nrec, MAP_SEEN_ID + 1)),
+    items = [(b"HEDR", struct.pack("<fII", hedr_ver, nrec, TRAFFIC_PROFILE_ID + 1)),
              (b"CNAM", b"Flying Vehicle Overhaul (FVO)\0"),
              (b"MAST", b"Starfield.esm\0"), (b"DATA", struct.pack("<Q", 0))]
     tes4 = b"".join(sub(t, v) for t, v in items)

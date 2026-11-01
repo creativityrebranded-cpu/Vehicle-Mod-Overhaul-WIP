@@ -149,12 +149,13 @@ namespace generator
 			return trafficpair::ReadyAt(v3D,d3D,aboard,sit,separation);}  // sitting (sit state 3), not merely linked
 		bool Grounded(const Pos& vp){double nav=0,baked=0;const int known=g_api->ground(vp.x,vp.y,vp.z,&nav,&baked);return known&&std::isfinite(known&2?baked:nav)&&std::fabs(vp.z-(known&2?baked:nav))<2.5;}
 
-		// trafficpool.ini [<world>] pair_<name> = vehicle driver: the pairs made for this world in earlier visits (any save; checked).
+		// Bound at the start of a frame, so a concurrent load cannot redirect an old frame's writes.
+        std::wstring g_profileIni;
 #ifdef FVO_GENERATOR_TEST
         std::wstring g_testIni;
         const std::wstring& Ini(){return g_testIni;}
 #else
-        const std::wstring& Ini() { static const std::wstring p = fvopaths::File(L"trafficpool.ini"); return p; }
+        const std::wstring& Ini() { return g_profileIni; }
 #endif
 		std::wstring Wide(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 		std::wstring PairKey(int i)
@@ -1136,6 +1137,7 @@ namespace generator
 		g_trip = trip;
 	}
 
+    void SetStorage(const wchar_t* registry){std::lock_guard lock(g_lock);g_profileIni=registry?registry:L"";}
     void SetModelRules(const std::vector<std::vector<unsigned>>& skip){g_slotSkip=skip;}
     void SetInitialScene(const FvoPoolSpot* spots,int count){
         g_initialScene.clear();if(spots&&count>0)g_initialScene.assign(spots,spots+std::min(count,kMaxSpots));g_initialRejected.clear();
@@ -1432,6 +1434,7 @@ namespace generator
         g_initialScene.clear();g_initialRejected.clear();g_initialAlternatives.clear();g_initialAttempt.clear();g_initialFails.clear();g_initialCursor=0;g_initialMap=false;
         g_initialClockPending=false;
         g_coldFilling=false;g_landings.clear();g_landingAt=0;g_doomed.clear();g_retiring.clear();
+        g_seatRecords.clear();g_slotSkip.clear();
     }
     void Rush(const FvoRushPlace*,int){g_rushRequest.store(true);}
     void SetClearedHook(void (*hook)()){g_onCleared=hook;}

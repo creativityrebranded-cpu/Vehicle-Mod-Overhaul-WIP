@@ -1,4 +1,5 @@
 #include "ringroad.h"
+#include "trafficprofile.h"
 #include "runtimeforms.h"
 #include "addresses.h"
 #include "fvopaths.h"
@@ -41,7 +42,7 @@ namespace ringroad
 		std::vector<std::uint32_t> ListedBeacons()
 		{
 			std::vector<std::uint32_t> ids;
-			const std::wstring ini = fvopaths::File(L"ringroad.ini");
+			const std::wstring ini = trafficprofile::File(L"ringroad.ini");
 			if (ini.empty()) return ids;
 			std::vector<wchar_t> names(8192, 0);
 			GetPrivateProfileSectionNamesW(names.data(), DWORD(names.size()), ini.c_str());

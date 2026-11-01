@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyingVehicleOverhaul VERSION 1.0.0 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 1.2.0 LANGUAGES CXX)
 add_executable(observations_test tests/observations_test.cpp)
 target_compile_features(observations_test PRIVATE cxx_std_20)
 target_include_directories(observations_test PRIVATE src)
@@ -99,6 +99,7 @@ target_link_libraries(SeamlessPlanets PRIVATE sp_common Synchronization)
 # when SeamlessPlanets is not installed. With the core present it uses its API.
 
 add_library(FlyingVehicleOverhaul SHARED
+    src/trafficprofile.cpp
     src/lifecycle.cpp
     src/native_movement_controller.cpp src/native_movement_engine.cpp src/native_movement_probe.cpp
     src/main_vehicle.cpp src/resources.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/api_traffic.cpp src/crash.cpp
@@ -114,6 +115,9 @@ target_link_libraries(FlyingVehicleOverhaul PRIVATE sp_common Synchronization Dx
 add_library(FVO_Traffic SHARED src/traffic/traffic_main.cpp src/traffic/generator.cpp src/traffic/everyday.cpp)
 sp_options(FVO_Traffic)
 target_link_libraries(FVO_Traffic PRIVATE Shell32 Ole32)
+
+add_executable(trafficprofile_test tests/trafficprofile_test.cpp)
+sp_options(trafficprofile_test)
 
 add_executable(trafficcycle_test tests/trafficcycle_test.cpp src/traffic/generator.cpp src/traffic/everyday.cpp)
 sp_options(trafficcycle_test)

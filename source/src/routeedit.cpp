@@ -1,4 +1,5 @@
 #include "routeedit.h"
+#include "trafficprofile.h"
 #include "pilotlayout.h"
 #include "routeeditor.h"
 #include "bindings.h"
@@ -268,12 +269,7 @@ namespace routeedit
 		// ---- Files ----
 		std::wstring TrafficDir()
 		{
-			HMODULE self = nullptr;
-			GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&TrafficDir), &self);
-			wchar_t path[MAX_PATH]{};
-			GetModuleFileNameW(self, path, MAX_PATH);
-			std::wstring dir(path);
-			return dir.substr(0, dir.find_last_of(L"\\/")) + L"\\FVO_Traffic";
+			return trafficprofile::Routes();
 		}
 		std::wstring Wide(const std::string& s) { return std::wstring(s.begin(), s.end()); }
 		std::string Narrow(const std::wstring& w) { std::string s; for (const wchar_t c : w) s.push_back(c < 128 ? char(c) : '?'); return s; }
@@ -324,6 +320,7 @@ namespace routeedit
 		struct Other { std::string name, file; trafficroute::Line line; bool ring = false; trafficdata::Route route; };
 		struct Editor {
 			bool on = false, loaded = false;
+			std::wstring profileDir;
 			std::string world, fileName, status;
 			ULONGLONG statusAt = 0;
 			routefiles::File saved, file;           // on disk / being edited (spots edit `file` directly)
@@ -557,6 +554,7 @@ namespace routeedit
 		{
 			g_ed.othersAt = GetTickCount64();
 			const std::wstring dir = TrafficDir();
+			if (dir.empty()) return;
 			trafficdata::Data d;
 			WIN32_FIND_DATAW fd{};
 			std::vector<std::wstring> files;
@@ -573,7 +571,7 @@ namespace routeedit
 			}
 			// ringroad.ini: one ring per world id
 			{
-				const std::wstring ini = fvopaths::File(L"ringroad.ini");
+				const std::wstring ini = trafficprofile::File(L"ringroad.ini");
 				wchar_t ring[256]{};
 				GetPrivateProfileStringW(Wide(g_ed.world).c_str(), L"ring", L"", ring, 256, ini.c_str());
 				if (*ring) trafficdata::AddRingroad(g_ed.world, Narrow(ring), d);
@@ -625,15 +623,18 @@ namespace routeedit
 		void LoadGroups();
 		void Open()
 		{
+			const auto profile = TrafficDir();
+			if (profile.empty()) { Status("Traffic setup is not available yet"); return; }
 			char world[201]{};
 			if (!FVO_WorldName(world, sizeof world)) { Status("No world: the route editor works on a planet's local map"); return; }
-			if (!g_ed.loaded || g_ed.world != world) {
+			if (!g_ed.loaded || g_ed.world != world || g_ed.profileDir != profile) {
 				g_ed = Editor{};
+				g_ed.profileDir = profile;
 				g_ed.world = world;
 				g_ed.fileName = routefiles::FileName(world);
 				g_ed.file.worldId = world;
 				std::string text, why;
-				const std::wstring path = TrafficDir() + L"\\" + Wide(g_ed.fileName);
+				const std::wstring path = profile + L"\\" + Wide(g_ed.fileName);
 				if (ReadText(path, text)) {
 					std::vector<std::string> problems;
 					if (text.find(kSignature) == std::string::npos) Status("Warning: " + g_ed.fileName + " was not written by the editor; saving is off for it");
@@ -717,6 +718,8 @@ namespace routeedit
 		}
 		void Save()
 		{
+			const auto profile = TrafficDir();
+			if (profile.empty() || profile != g_ed.profileDir) { Status("Playthrough changed: reopen the Traffic Manager before saving"); return; }
 			routefiles::File next = g_ed.file;
 			if (g_ed.draft) {
 				const auto issue = g_ed.draft->Check();
@@ -738,7 +741,7 @@ namespace routeedit
 					if (const auto it = g_ed.spotShifts.find(sp.id); it != g_ed.spotShifts.end()) { sp.at.x -= it->second.x; sp.at.y -= it->second.y; sp.at.z -= it->second.z; }
 			for (auto& z : disk.zones)
 				if (const auto it = g_ed.spotShifts.find(z.name); it != g_ed.spotShifts.end()) { z.at.x -= it->second.x; z.at.y -= it->second.y; z.at.z -= it->second.z; z.top -= it->second.z; }
-			const std::wstring path = TrafficDir() + L"\\" + Wide(g_ed.fileName);
+			const std::wstring path = profile + L"\\" + Wide(g_ed.fileName);
 			std::string existing;
 			if (ReadText(path, existing) && existing.find(kSignature) == std::string::npos) {
 				Status("Not saved: " + g_ed.fileName + " exists and was not written by the editor (rename it to keep it)");
@@ -746,11 +749,11 @@ namespace routeedit
 			}
 			next.traffic = !g_ed.othersHaveTraffic;
 			disk.traffic = next.traffic;
-			CreateDirectoryW(TrafficDir().c_str(), nullptr);
+			CreateDirectoryW(profile.c_str(), nullptr);
 			std::string why;
 			if (!WriteAtomic(path, routefiles::Format(disk), why)) { Status("Not saved: " + why); return; }
 			if (routefiles::FormatGroups(g_ed.routeGroups) != routefiles::FormatGroups(g_ed.routeGroupsSaved)) {
-				if (!WriteAtomic(GroupsPath(), routefiles::FormatGroups(g_ed.routeGroups), why)) { Status("Routes saved, but not the route groups: " + why); return; }
+				if (!WriteAtomic(profile + L"\\VehicleGroups.ini", routefiles::FormatGroups(g_ed.routeGroups), why)) { Status("Routes saved, but not the route groups: " + why); return; }
 				g_ed.routeGroupsSaved = g_ed.routeGroups;
 			}
 			const int route = g_ed.draft ? g_ed.draftIndex : g_ed.route;
@@ -1893,6 +1896,7 @@ namespace routeedit
 			kZoneKeep, kZoneSlow, kZoneSizeDown, kZoneSizeUp, kZoneTopDown, kZoneTopUp, kZoneSpeedDown, kZoneSpeedUp,
 			kGroupNext, kGroupSheet, kGroupNew, kGroupRename, kGroupDelete,
 			kSizeDown, kSizeUp, kShapeADown, kShapeAUp, kShapeBDown, kShapeBUp, kShapeCDown, kShapeCUp,
+			kReadme,
 			kDayRow = 5000,    // + 4 x a zone of the day: earlier, later, next word, remove
 			kLevelBase = 5500, // + 2 x a word: less, more
 			kPlaceRow = 5600,  // + a line of the places list (landing areas, then zones)
@@ -2318,8 +2322,9 @@ namespace routeedit
 			const double px = PanelX(), x0 = px + 14, cx = x0 + kLabelW + 4, cw = kInner - kLabelW - 4;
 			double y = 12;
 			text("TRAFFIC MANAGER", x0, y + 12, 300, 0xFFFFFF, 2.3);
-			text(g_ed.world, x0, y + 40, 260, kDim);
+			text(g_ed.world, x0, y + 40, 210, kDim);
 			text("F7 close", px + kPanelW - 14 - TextWidth("F7 close"), y + 12, 80, kDim);
+			button(kReadme, px + kPanelW - 14 - 128, y + 34, 64, 22, "Readme", false, true, 0);
 			button(kCity, px + kPanelW - 14 - 60, y + 34, 60, 22, "City", g_ed.sheet == 3, true, 0);
 			y += 66;
 			auto section = [&](const std::string& title, const std::string& right, unsigned color = kText) {
@@ -3311,6 +3316,7 @@ namespace routeedit
 				return 0;
 			}
 		}
+		void ShowReadme();
 		void Press(int id, const routemap::Camera& c);
 		bool g_replaying = false;
 		bool Replay(int id, const routemap::Camera& c)
@@ -3658,6 +3664,7 @@ namespace routeedit
 			}
 			case kNew: NewRoute(); break;
 			case kSave: Save(); break;
+			case kReadme: ShowReadme(); break;
 			case kCancel: Cancel(); break;
 			case kDeleteRoute: DeleteRoute(); break;
 			case kPrevRoute: case kNextRoute: {
@@ -4598,6 +4605,18 @@ namespace routeedit
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 		}
+		void ShowReadme()
+		{
+			g_ed.menu = 0;
+			if (!ShowGameMessage("Traffic Manager - Readme",
+				"Press F7 on the local map to open or close the Traffic Manager. Select a route on the map or in the route list.\n\n"
+				"Use New route to make a route, then the point and shape tools to draw its path. Select an existing route to edit it. Set its height, speed, lanes and vehicle count; use Time rules for its schedule.\n\n"
+				"Save (Ctrl+S) keeps your changes. Cancel discards unsaved edits. Use Test route to check clearance: buildings and terrain are not checked automatically.\n\n"
+				"City controls local traffic and density. Reset traffic replaces the current traffic; finish or cancel your route edits first, and leave combat before resetting.\n\n"
+				"Routes, groups and traffic settings belong to this playthrough. Other playthroughs start with the installed defaults.\n\n"
+				"Autopilot near a traffic zone follows its path. Reopen this Readme whenever you need it."))
+				Status("Could not open the Readme. Close and reopen the local map, then try again.");
+		}
 		int g_mapOpenFrames = 0;
 		void FirstMapMessage(bool focused)
 		{
@@ -4630,6 +4649,9 @@ namespace routeedit
 			// The Traffic Manager comes with the Traffic Addon (2026-10-30, the user): without it no traffic would fly these routes, so no F7, no hint and no first-time
 			// message. The message's flag stays unset, so someone who adds the addon later still gets it.
 			if (!trafficpool::AddonAttached()) { Hide(); g_ed.dragging = false; return; }
+			const auto profile = TrafficDir();
+			if (profile.empty()) { Hide(); return; }
+			if (g_ed.loaded && g_ed.profileDir != profile) { g_ed = Editor{}; g_mapOpenFrames = 0; }
 			FirstMapMessage(focused);
 			// Our values belong to one movie; they are forgotten only after it is destroyed (MovieGone), never overwritten
 			// while still linked into a live movie.

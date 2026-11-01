@@ -12,7 +12,7 @@ DLL = 'SFSE/Plugins/FlyingVehicleOverhaul.dll'
 PILOTS = 'FVO_NPCPilots.esm'
 PATCH = 'FVO_ParkedVehiclesPatch.esm'
 CITY = 'FVO_CityPlacements.esm'
-TRAFFIC_ADDON_VERSION = '0.2'  # its own version and its own optional ZIP (2026-10-30, the user)
+TRAFFIC_ADDON_VERSION = '0.3'  # its own version and its own optional ZIP (2026-10-30, the user)
 CITY_DLL = 'SFSE/Plugins/FVO_Traffic.dll'  # FVO Traffic (was FVO_CityPlacements.dll before 2026-10-29)
 OLD_CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'  # never install both
 CITY_TRAFFIC = 'SFSE/Plugins/FVO_Traffic/NewAtlantis.ini'
@@ -189,9 +189,10 @@ def module_config(dependencies, features, route_texts):
     traffic = ET.SubElement(addons, 'plugin', name='Traffic Addon')
     ET.SubElement(traffic, 'description').text = (
         f'Traffic Addon {TRAFFIC_ADDON_VERSION}: generates air traffic along routes. Choose the included cities on the next page, or '
-        'make your own: press F7 on the local map to open the Traffic Manager. Autopilot near a traffic zone follows the same path. '
+        'make routes in the Traffic Manager. These choices are defaults for new playthrough setups; existing playthroughs keep their own routes and groups. '
+        'Press F7 on the local map to open the Traffic Manager; Readme beside City explains the controls. Autopilot near a traffic zone follows the same path. '
         'Uses any parked vehicles (vanilla, Carfield, Parked Vehicles or City Placements). Needs only the core. Without this addon '
-        'F7 still opens, but no traffic flies the routes. Replaces FVO_CityPlacements.dll and the 0.8 FVO_CityTraffic.esm: remove '
+        'the Traffic Manager is unavailable. Replaces FVO_CityPlacements.dll and the 0.8 FVO_CityTraffic.esm: remove '
         'them if another mod entry still supplies them.')
     files = ET.SubElement(traffic, 'files')
     for name in (CITY_DLL, ROUTE_GUIDE):
@@ -247,7 +248,7 @@ def module_config(dependencies, features, route_texts):
     routes=ET.SubElement(ET.SubElement(ET.SubElement(step,'optionalFileGroups',order='Explicit'),'group',name='Routes',type='SelectAny'),'plugins',order='Explicit')
     for key,label,description,names in ROUTES:
         plugin=ET.SubElement(routes,'plugin',name=label)
-        ET.SubElement(plugin,'description').text=route_description(label,description,route_texts[names[0]])+' Uncheck to leave this city without route traffic.'
+        ET.SubElement(plugin,'description').text=route_description(label,description,route_texts[names[0]])+' Uncheck to omit this route from new playthrough setups. Existing setups keep their own copies; use the Traffic Manager to change them.'
         ET.SubElement(ET.SubElement(plugin,'conditionFlags'),'flag',name='route_'+key).text='Yes'
         ET.SubElement(ET.SubElement(plugin,'typeDescriptor'),'type',name='Recommended')
     step=ET.SubElement(steps,'installStep',name='Traffic options')
@@ -256,7 +257,7 @@ def module_config(dependencies, features, route_texts):
     for flag,label,text,kind in (('Yes','Already flying','Vehicles with seated drivers start on the routes, so a city has traffic as soon as you arrive. They are made once per save and reused.','Recommended'),
                                  ('No','Starts empty','No vehicles are made: route traffic comes only from parked vehicles that NPCs walk to and take.','Optional')):
         plugin=ET.SubElement(arrive,'plugin',name=label)
-        ET.SubElement(plugin,'description').text=text
+        ET.SubElement(plugin,'description').text=text+' This is a default for new playthrough setups; existing routes retain their current settings.'
         ET.SubElement(ET.SubElement(plugin,'conditionFlags'),'flag',name='coldstart').text=flag
         ET.SubElement(ET.SubElement(plugin,'typeDescriptor'),'type',name=kind)
     beacons=next(f for f in features if f['id']=='RouteMarkers')
@@ -348,12 +349,14 @@ Core always installs: FlyingVehicleOverhaul.dll, FVO_NPCPilots.esm and this guid
 Optional addons (the Traffic Addon and City Placements are ticked by default):
 - Traffic Addon {TRAFFIC_ADDON_VERSION}: generates air traffic along routes. Press F7 on the local map to
   open the Traffic Manager and make your own; autopilot near a traffic zone follows
-  the same path. Without this addon F7 still opens, but no traffic flies the routes.
+  the same path. Readme beside City opens instructions. The Traffic Manager requires this addon.
   SFSE/Plugins/FVO_Traffic.dll and route files in
   SFSE/Plugins/FVO_Traffic, chosen city by city: New Atlantis (ring and district
   loop), Akila City, Cydonia, Eleos Retreat, Gagarin, HopeTown, Neon, New Homestead,
   Paradiso and Red Mile. HOW-TO-MAKE-ROUTES.txt explains writing your own; every
-  *.ini in FVO_Traffic is read. Traffic can start already flying (vehicles with
+  *.ini in a playthrough's routes folder is read. Installer files are defaults for new
+  playthroughs; existing setups keep their own routes, groups and city settings.
+  Back up TrafficProfiles with saves. Traffic can start already flying (vehicles with
   seated drivers, made once per save) or empty. Route beacons can be shown or hidden.
 - City Placements: FVO_CityPlacements.esm adds parked vehicles in nine cities.
   Requires: {', '.join(dependencies[CITY])}. Enable it after its masters.
@@ -456,7 +459,7 @@ validation.
     guide = Path(__file__).resolve().parents[1]/'docs/FOMOD_INSTALLER.md'
     if guide.is_file():
         sources['Docs/FOMOD_INSTALLER.md'] = guide.read_bytes()
-    for name in ('RELEASE_PACKAGING.md',f'RELEASE_{version}.md'):
+    for name in ('RELEASE_PACKAGING.md','TRAFFIC_PLAYTHROUGHS.md',f'RELEASE_{version}.md'):
         document=Path(__file__).resolve().parents[1]/'docs'/name
         if document.is_file():sources['Docs/'+name]=document.read_bytes()
     sources['README.txt'] = (readme.decode()+'\nBuild: cmake -S plugin -B build -G "Visual Studio 17 2022" -A x64\n'

@@ -11,6 +11,7 @@
 #include "game.h"
 #include "hoverui.h"
 #include "routeedit.h"
+#include "trafficprofile.h"
 #include "mapguard.h"
 #include "cellbake.h"
 #include "disableguard.h"
@@ -89,6 +90,7 @@ namespace
     LoadGame_t g_loadGameOriginal = nullptr;
     std::uintptr_t LoadGameDetour(std::uintptr_t a, std::uintptr_t b, std::uint64_t c, std::uint64_t d)
     {
+        trafficprofile::Allow(false);
         g_loadBegan = GetTickCount64();
         // Before anything else: work queued against the old world never runs against the one being read. The frame's reset comes later, or not at all.
         lifecycle::Close();
@@ -176,6 +178,7 @@ namespace
 
 	void Reset()
 	{
+        trafficprofile::Allow(false);
         trafficpool::WorldActionsAllowed(false);
         lifecycle::Reset();  // first: a queued callback must not refill what the resets below clear
         secretunpause::Reset();
@@ -285,6 +288,7 @@ namespace
         const bool loading=Loading(GetTickCount64());
         trafficpool::WorldActionsAllowed(!loading&&g_worldReady);
         const bool arrival=ArrivalWindow(g_worldReady);
+        trafficprofile::Allow(((!loading && g_worldReady) || arrival) && trafficpool::AddonAttached());
         logger::Observe("runtime",0,unsigned(loading)|(std::uint64_t(g_worldReady)<<1)|(std::uint64_t(arrival)<<2)|(std::uint64_t(work)<<8),"loading=%d world_ready=%d arrival=%d schedule=%u manager_state=%d",loading,g_worldReady,arrival,unsigned(work),state.haveManager?int(state.managerState):-1);
         if(arrival&&loading&&work!=updateschedule::Work::Skip){
             // The save settle runs no full update. Only the vehicle list (reads) and the traffic addon (arrival placement
@@ -404,6 +408,7 @@ namespace
 			if (!g_started) WithoutCore();
 			break;
 		case SFSEMessagingInterface::kMessage_PreLoadGame:
+			trafficprofile::Allow(false);
 			g_loadBegan = GetTickCount64();
 			lifecycle::Reset();
 			logger::Write("Save load: started; FVO world actions paused until it finishes");
@@ -421,7 +426,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 91, "FlyingVehicleOverhaul", "seemless",
+	SFSEPluginVersionData::kVersion, 120, "FlyingVehicleOverhaul", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,
@@ -449,7 +454,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Important("Flying Vehicle Overhaul (FVO) 1.1 loaded; core optional");
+	logger::Important("Flying Vehicle Overhaul (FVO) 1.2 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

@@ -9,7 +9,7 @@
 
 extern "C" {
 
-enum { kFvoTrafficApiVersion = 12 };  // v12: pilotLive; v11: asynchronous lifecycle completion; v4 read-only prefix remains queryable
+enum { kFvoTrafficApiVersion = 13 };  // v13: matching playthrough profile storage required; v12: pilotLive; v4 read-only prefix remains queryable
 
 struct FvoTrafficPlayer {
     char world[201];   // the worldspace's editor name
@@ -115,7 +115,7 @@ struct FvoTrafficApi {
     int (*pairHealth)(unsigned vehicleId);
     double (*noticeFar)(unsigned baseId);      // v8: how far a thing of that base must be not to be made out, metres (0: a driver's size)
     int (*inCameraView)(double x,double y,double z); // v8: inside the camera's view cone now (1 when unknown)
-    int (*playerTook)(unsigned vehicleId);     // v8: the player has had this vehicle as their own since the load: it is no traffic any more
+    int (*playerTook)(unsigned vehicleId);     // v8: the player has had this vehicle as their own since the load: it is no traffic any more
     // A driver and vehicle linked by a seat in the attached cells, both made at run time, with no job, not the player's (2026-10-31: traffic a save holds that no registry knows).
     int (*linkedPairs)(unsigned* drivers, unsigned* vehicles, int max);
     // A proving spot over the player for this slot (trafficpair::ProveAt), proved for createVehicle: nothing there can be seen. 1: filled in.

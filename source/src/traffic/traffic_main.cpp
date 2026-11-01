@@ -10,6 +10,7 @@
 // and home, or to a destination place via the exit nearest it. Core boards the driver and parks the vehicle at the end. Needs
 // core FlyingVehicleOverhaul.dll (fvo_addon_api.h); without it, this does nothing.
 #include "traffic_api.h"
+#include "trafficprofileclient.h"
 #include "observations.h"
 #include "fvolimits.h"
 #include "generator.h"
@@ -77,13 +78,7 @@ namespace
 	}
 	std::wstring TrafficDir()
 	{
-		HMODULE self = nullptr;
-		GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&TrafficDir), &self);
-		wchar_t path[MAX_PATH]{};
-		GetModuleFileNameW(self, path, MAX_PATH);
-		std::wstring dir(path);
-		dir = dir.substr(0, dir.find_last_of(L"\\/"));
-		return dir + L"\\FVO_Traffic";
+		return trafficprofileclient::Routes();
 	}
 	std::string ReadFile(const std::wstring& path)
 	{
@@ -97,7 +92,8 @@ namespace
 	std::vector<std::pair<std::string, std::string>> Ringroad()
 	{
 		std::vector<std::pair<std::string, std::string>> out;
-		const std::wstring ini = fvopaths::File(L"ringroad.ini");
+		const std::wstring ini = trafficprofileclient::File(L"ringroad.ini");
+		if (ini.empty()) return out;
 		std::vector<wchar_t> names(32768);
 		const DWORD n = GetPrivateProfileSectionNamesW(names.data(), DWORD(names.size()), ini.c_str());
 		for (const wchar_t* sec = names.data(); n && *sec; sec += wcslen(sec) + 1) {
@@ -185,13 +181,16 @@ namespace
 	// button in the menu"): the folder was scanned every ~2 s (each everyday pick, each Auto route plan, the 5 s marker tick). Now
 	// once at start, then only when asked: the settings menu's "Reload traffic files", or the map route editor after it saves.
 	std::atomic<bool> g_reloadWanted{ true };
+	std::wstring g_loadedProfile;
 	void RequestReload() { g_reloadWanted.store(true); }
 
 	void Load()
 	{
+		const std::wstring dir = TrafficDir();
+		if (dir.empty()) { g_reloadWanted = true; return; }
+		if (dir != g_loadedProfile) { g_loadedProfile = dir; g_stamp = ~0ull; g_found.clear(); g_reloadWanted = true; }
 		if (!g_reloadWanted.exchange(false)) return;
 		const ULONGLONG now = GetTickCount64();
-		const std::wstring dir = TrafficDir();
 		std::vector<std::wstring> files;
 		unsigned long long stamp = 0;
 		auto scan = [&] {
@@ -209,7 +208,7 @@ namespace
 		scan();
 		if (files.empty()) { WriteStarter(dir); scan(); }
 		WIN32_FILE_ATTRIBUTE_DATA ra{};
-		if (GetFileAttributesExW(fvopaths::File(L"ringroad.ini").c_str(), GetFileExInfoStandard, &ra))
+		if (GetFileAttributesExW(trafficprofileclient::File(L"ringroad.ini").c_str(), GetFileExInfoStandard, &ra))
 			stamp = stamp * 31 + (static_cast<unsigned long long>(ra.ftLastWriteTime.dwHighDateTime) << 32 | ra.ftLastWriteTime.dwLowDateTime);
 		if (stamp == g_stamp) return;
 		g_stamp = stamp;
@@ -1015,14 +1014,27 @@ namespace
     }
     // Reset traffic (the editor's X, its loading panel covers the map): re-read the files and re-plan every route position from the
     // schedule as it is now, then the generator clears every pair and fills them under the panel, the same cold start as arriving in the city.
-    void StartSwap(const FvoRushPlace* places,int count){RequestReload();g_poolResend=true;generator::Rush(places,count);}
+    bool SyncProfile();
+    void StartSwap(const FvoRushPlace* places,int count){if(!SyncProfile())return;RequestReload();g_poolResend=true;generator::Rush(places,count);}
     void PreparePool(){
         Load();char world[201]{};if(!g_worldName||!g_worldName(world,sizeof world))return;
         int minute=0;
         if(g_poolResend.exchange(false)||g_poolWorld!=world||g_poolStamp!=g_stamp||(g_initialClockPending&&LocalMinute(minute))){FindAnchors();SendPool(world);g_poolWorld=world;g_poolStamp=g_stamp;}
     }
-    void TrafficTick(){PreparePool();generator::Tick();}
-    void TrafficHousekeeping(){PreparePool();generator::Housekeeping();}
+    void ResetAll();
+    std::wstring g_runningProfile;
+    bool SyncProfile() {
+        const auto profile = TrafficDir();
+        if (profile.empty()) return false;
+        if (profile != g_runningProfile) {
+            ResetAll(); g_runningProfile = profile;
+            const auto registry = profile.substr(0, profile.find_last_of(L"\\/")) + L"\\trafficpool.ini";
+            generator::SetStorage(registry.c_str());
+        }
+        return true;
+    }
+    void TrafficTick(){if(SyncProfile()){PreparePool();generator::Tick();}}
+    void TrafficHousekeeping(){if(SyncProfile()){PreparePool();generator::Housekeeping();}}
 
 	// Route lights (2026-10-28, the user: the beacons were "too crowded and too large ... maybe small lights"): small lights (core's
 	// probe model, routeprobes.ini [look] model) every `spacing` m along the middle of each route, a row of three at each exit and
@@ -1089,7 +1101,13 @@ namespace
 		Log("FVO traffic: %zu route probe point(s) sent for %s", m.size() / 4, world);
 	}
 
-	void ResetAll() { for(auto& s:g_slots)s={};g_poolWorld.clear();g_poolStamp=~0ull;g_testDone.clear();g_lastStart=0;generator::Reset();everyday::Reset(); }  // a save load
+	void ResetAll() {
+		for(auto& s:g_slots)s={};g_poolWorld.clear();g_poolStamp=~0ull;g_testDone.clear();g_lastStart=0;
+		g_found.clear();g_read={};g_data={};g_stamp=~0ull;g_reloadWanted=true;g_poolResend=true;
+		g_initialSlots.clear();g_initialClockPending=false;g_emptyTrips.clear();
+		g_cruiseLast.clear();
+		generator::Reset();everyday::Reset();
+	}  // a save load or a different playthrough
 
 	void Attach()
 	{
@@ -1117,8 +1135,7 @@ namespace
 		if (const auto plan = reinterpret_cast<FvoRegisterCruisePlanner_t>(GetProcAddress(core, "FVO_RegisterCruisePlanner"))) plan(&PlanCruise);
 		if (const auto tick = reinterpret_cast<FvoRegisterTick_t>(GetProcAddress(core, "FVO_RegisterTick"))) tick(&Markers);
 		if (!g_worldName) { Log("FVO traffic: core has no FVO_WorldName (an older FlyingVehicleOverhaul.dll); traffic files off"); return; }
-		if (g_trafficApi) Log("FVO Traffic addon 0.2: route traffic attached (files in %s)", Narrow(TrafficDir()).c_str());
-		Load();
+		if (g_trafficApi) Log("FVO Traffic addon 0.3: route traffic attached (playthrough files loaded after the save)");
 	}
 
 	void SfseMessage(SFSEMessagingInterface::Message* msg)
@@ -1130,7 +1147,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 4, "FVO_Traffic", "seemless",
+	SFSEPluginVersionData::kVersion, 5, "FVO_Traffic", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ kRuntime_1_16_244, 0 }, 0, 0, 0,

@@ -9,6 +9,7 @@
 namespace generator
 {
 	void Attach(const FvoTrafficApi* api, FvoLog_t log);
+    void SetStorage(const wchar_t* registry); // bind a stable playthrough path before starting a frame
 	// Authored ground origins for stable fleet names, then parking places with parking[i] = 1.
 	void SetSpots(const char* world, const FvoPoolSpot* spots, int count, const int* parking, const char* const* names, FvoPoolTrip trip);
     void SetModelRules(const std::vector<std::vector<unsigned>>& skip); // per position (as SetSpots): models it may not hold (vehicle rules)

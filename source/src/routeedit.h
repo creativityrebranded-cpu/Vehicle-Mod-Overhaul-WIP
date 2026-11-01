@@ -5,7 +5,7 @@
 // building"; design: notes/traffic-route-editor-20261028/DESIGN.md). F7 while the local map is open shows every traffic
 // route of this world over the map's own 3D view and edits the editor's routes: drop, drag, height, reverse, one / two
 // way, speed, vehicles, an all-day or local-time schedule, landing and spawn spots, a one-vehicle test. Saves to
-// FVO_Traffic\Editor_<world>.ini, which the traffic addon re-reads within ~2 s. Elsewhere F7 stays the HUD editor.
+// TrafficProfiles/<playthrough>/routes/Editor_<world>.ini, re-read by the addon. Elsewhere F7 stays the HUD editor.
 // Engine evidence and limits: notes/traffic-route-editor-20261028/ENGINE_RESEARCH.md.
 namespace routeedit
 {
