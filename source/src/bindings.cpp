@@ -368,7 +368,7 @@ namespace bindings
 		}
 	}
 
-	void Tick(bool gameplay)
+	void Tick(bool gameplay, bool world)
 	{
 		const ULONGLONG now = GetTickCount64();
 		PollPad(now);
@@ -387,16 +387,18 @@ namespace bindings
             logger::Write("Bindings: prompts now name the %s",g_device.device==bindlogic::Device::Pad?"controller":"keyboard and mouse");
 		g_padShown.store(g_device.device == bindlogic::Device::Pad, std::memory_order_relaxed);
         {
-            const auto ctx=Situation();
+            // 2026-11-15 hotfix (crash loading a save from a running game): with no world (a save loading, the loading screen,
+            // the main menu) the player and its vehicle are not read; the mod's input is off and no key is taken from the game.
+            const std::uint8_t ctx=world?Situation():std::uint8_t(bindlogic::kCtxFoot);
             const bool contextChanged=g_ctx.exchange(ctx)!=ctx;
             if(contextChanged)g_generation.fetch_add(1);
-            const bool allowed=inputgate::ModKeysAllowed();
+            const bool allowed=world&&inputgate::ModKeysAllowed();
             g_allowed=allowed;
             g_sample={};g_sample.context=ctx;g_sample.pad=g_pad.load();
             {std::lock_guard axes(g_axesLock);g_sample.axes=g_axes;}
             g_sample.allowed=allowed&&!g_suppressInput&&g_captureAction<0;
             const auto player=*reinterpret_cast<std::uintptr_t*>(game::Base()+addr::kPlayerCharacterPtr);
-            const auto driven=player?reinterpret_cast<std::uintptr_t(*)(std::uintptr_t)>(game::Base()+addr::kPlayerVehicle)(player):0;
+            const auto driven=world&&player?reinterpret_cast<std::uintptr_t(*)(std::uintptr_t)>(game::Base()+addr::kPlayerVehicle)(player):0;
             g_sample.driving=driven&&!passenger::RidingVehicle();
             g_sample.placement=!g_sample.driving&&realvehicles::RecordingPlacements();
             for(int key=1;key<256;++key)g_sample.keys[std::size_t(key)]=KeyDown(key);

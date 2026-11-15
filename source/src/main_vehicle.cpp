@@ -83,6 +83,10 @@ namespace
     // while cells already attach, and FVO had started traffic and filled its pilot-quest aliases (quest + package changes)
     // 3-4 s before each fault, mid-load. Nothing that changes the world runs from PreLoadGame until PostLoadGame + a settle.
     std::atomic<ULONGLONG> g_loadBegan{0}, g_loadDone{0};
+    // 2026-11-15 hotfix (Nexus: crash loading a save from a running game; first load fine). As in the rewrite's load rule:
+    // the moment a load starts, the next frame drops everything FVO holds from the old world (Reset), instead of waiting
+    // until the planet manager is seen at state 0/1 (about a second later, with hooks still holding old pointers).
+    std::atomic<bool> g_dropAll{false};
     constexpr ULONGLONG kLoadSettleMs = 3000, kLoadTimeoutMs = 180000;
     // SFSE never sent PreLoadGame / PostLoadGame here (01:53 run: no "Save load" lines), so the game's own load routine
     // FUN_141815620 ("***Loading game: %s (%s)") is wrapped: it runs the whole load on a background thread.
@@ -96,11 +100,14 @@ namespace
         lifecycle::Close();
         trafficprofile::BeginLoad();
         trafficarrival::Reset();
-        logger::Write("Save load: the game's load routine started; FVO world actions paused until it finishes");
+        g_dropAll = true;
+        crash::Crumb("save load: routine started");
+        logger::Important("Save load: the game's load routine started; FVO world actions paused and held objects dropped");
         const auto r = g_loadGameOriginal(a, b, c, d);
         lifecycle::Open();
         g_loadDone = GetTickCount64();
-        logger::Write("Save load: the game's load routine returned after %.1f s", (g_loadDone.load() - g_loadBegan.load()) / 1000.0);
+        crash::Crumb("save load: routine returned");
+        logger::Important("Save load: the game's load routine returned after %.1f s", (g_loadDone.load() - g_loadBegan.load()) / 1000.0);
         return r;
     }
     void InstallLoadHook()
@@ -297,6 +304,12 @@ namespace
         // Paused/map frames still prove the callback is alive. Measuring only
         // full simulation updates mislabels a paused menu as a hung thread.
         crash::Beat();
+        if (g_dropAll.exchange(false) && g_standalone) {
+            crash::Crumb("save load: drop held objects");
+            Reset();
+            g_worldReady = false;
+            logger::Important("Save load: FVO dropped every vehicle, pilot and pointer it held from the previous world");
+        }
         static const double ticksPerMs=[] {LARGE_INTEGER f{};QueryPerformanceFrequency(&f);return double(f.QuadPart)/1000.0;}();
         LARGE_INTEGER start{},end{};QueryPerformanceCounter(&start);const double now=double(start.QuadPart)/ticksPerMs;
         g_pacing.Begin(now); // all raw callbacks, including rejected duplicate polls
@@ -325,18 +338,31 @@ namespace
             // behind the loading screen) run here; flight, AI and everything else wait for gameplay as before.
             world::Publish();navseed::Tick();trafficpool::Tick();  // the nav map is seeded before anything is placed
         }
-        if(work==updateschedule::Work::Full&&loading)work=updateschedule::Work::Housekeeping;  // a save is still loading
+        // 2026-11-15 hotfix: the full simulation runs only with a world: none at the main menu (manager state 0), while a save
+        // loads, or behind the loading screen (the rewrite's rule). 1.2 ran it at the main menu after play and faulted in game
+        // functions on the player and escorts (2026-11-01 run: ConditionFloat, HealthOf).
+        const bool worldSafe=!loading&&g_worldReady&&!LoadingScreenUp();
+        {
+            static int lastSafe=-1;
+            if(lastSafe!=int(worldSafe)){
+                lastSafe=int(worldSafe);crash::Crumb(worldSafe?"world: simulation on":"world: simulation held",state.haveManager?int(state.managerState):-1);
+                logger::Write("World: simulation %s (loading %d, world ready %d, loading screen %d, manager state %d)",worldSafe?"on":"held",int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1);
+            }
+        }
+        if(work==updateschedule::Work::Full&&!worldSafe)work=updateschedule::Work::Housekeeping;
         if(work==updateschedule::Work::Full)Update();
         else if(work==updateschedule::Work::Housekeeping) {
             // UI bindings/settings and logs keep working while simulation is
             // paused. Never enumerate the scene or queue placement/AI work here.
-            features::Tick();bindings::Tick(false);logger::Service();
+            features::Tick();bindings::Tick(false,worldSafe);logger::Service();
             if(!loading&&g_worldReady)trafficpool::RushTick(); // never mutate a world during a save load
         }
         if(work!=updateschedule::Work::Skip) {
             mapguard::Tick(Loading(GetTickCount64()));  // the persistent cell report and the wheel dust cleanup
-            secretunpause::Tick();  // Start/Swap's running world: back to paused on combat, a closed map or the time cap
-            routeedit::GroundTick();  // the editor's ground asks (new points sit 2 m over what is under the cursor), paused or not
+            if(worldSafe){  // 2026-11-15 hotfix: both can reach the player or cast rays; never without a world
+                secretunpause::Tick();  // Start/Swap's running world: back to paused on combat, a closed map or the time cap
+                routeedit::GroundTick();  // the editor's ground asks (new points sit 2 m over what is under the cursor), paused or not
+            }
             if(!g_scheduleBegan)g_scheduleBegan=now;
             if(now-g_scheduleBegan>=10000) {
                 const auto counts=g_schedule.TakeCounts();const auto elapsed=now-g_scheduleBegan;
