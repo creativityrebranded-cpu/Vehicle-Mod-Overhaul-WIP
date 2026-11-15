@@ -209,6 +209,8 @@ namespace
 
 	void Reset()
 	{
+        crash::Crumb("reset: begin");
+        logger::Write("Load trace: reset begins (thread %lu, world_ready %d)", GetCurrentThreadId(), int(g_worldReady));
         trafficprofile::Allow(false);
         trafficpool::WorldActionsAllowed(false);
         lifecycle::Reset();  // first: a queued callback must not refill what the resets below clear
@@ -243,6 +245,8 @@ namespace
 		navfield::Reset();
 		groundnav::Reset();
         environment::Reset();
+        crash::Crumb("reset: done");
+        logger::Write("Load trace: reset done");
 	}
 
     struct FrameCost {
@@ -348,6 +352,17 @@ namespace
                 lastSafe=int(worldSafe);crash::Crumb(worldSafe?"world: simulation on":"world: simulation held",state.haveManager?int(state.managerState):-1);
                 logger::Write("World: simulation %s (loading %d, world ready %d, loading screen %d, manager state %d)",worldSafe?"on":"held",int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1);
             }
+        }
+        if(!worldSafe){  // load trace: once a second while the simulation is held
+            static ULONGLONG heldAt=0;const ULONGLONG t=GetTickCount64();
+            if(t-heldAt>=1000){heldAt=t;
+                static std::uint64_t steps0=0,updates0=0;
+                const auto steps=vehicleflight::NativeStepCount(),updates=g_standalone?vehicle_probe::UpdateSerial():0;
+                logger::Write("Load trace: frame held (thread %lu) loading %d world_ready %d loading_screen %d manager_state %d schedule %u load_began %llu load_done %llu; hooks since last line: vehicle steps %llu, component updates %llu",
+                GetCurrentThreadId(),int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1,unsigned(work),
+                static_cast<unsigned long long>(g_loadBegan.load()),static_cast<unsigned long long>(g_loadDone.load()),
+                static_cast<unsigned long long>(steps-steps0),static_cast<unsigned long long>(updates-updates0));
+                steps0=steps;updates0=updates;}
         }
         if(work==updateschedule::Work::Full&&!worldSafe)work=updateschedule::Work::Housekeeping;
         if(work==updateschedule::Work::Full)Update();
@@ -470,12 +485,14 @@ namespace
 			g_loadBegan = GetTickCount64();
 			trafficprofile::BeginLoad();
 			lifecycle::Reset();
-			logger::Write("Save load: started; FVO world actions paused until it finishes");
+			crash::Crumb("save load: SFSE PreLoadGame");
+			logger::Write("Save load: SFSE PreLoadGame (thread %lu); FVO world actions paused until it finishes", GetCurrentThreadId());
 			if (g_standalone) Reset();
 			break;
 		case SFSEMessagingInterface::kMessage_PostLoadGame:
 			g_loadDone = GetTickCount64();
-			logger::Write("Save load: PostLoadGame (%s)", msg->data ? "ok" : "failed");
+			crash::Crumb("save load: SFSE PostLoadGame");
+			logger::Write("Save load: PostLoadGame (%s, thread %lu)", msg->data ? "ok" : "failed", GetCurrentThreadId());
 			break;
 		default:
 			break;

@@ -618,6 +618,7 @@ namespace vehicleflight
 		using Step_t = physicsstep::Callback;
 		Step_t g_original = nullptr;
 		std::atomic<unsigned> g_nativeStepSamples{0}, g_nativeStepSkipped{0};
+		std::atomic<std::uint64_t> g_nativeStepTotal{0};  // load trace; never reset
 		std::atomic<float> g_nativeStepSeconds{0};
 
 		// Booster visuals held while hovering. Paid forward boost uses the native fuel fraction (+0x238),
@@ -1055,6 +1056,7 @@ namespace vehicleflight
 		{
 			StepTiming timing;const auto massEpoch=bodymass::observations.Epoch();
 			g_nativeStepSamples.fetch_add(1, std::memory_order_relaxed);
+			g_nativeStepTotal.fetch_add(1, std::memory_order_relaxed);
 			g_nativeStepSeconds.store(seconds, std::memory_order_relaxed);
 			if (physicsstep::ModelSeconds(seconds) == 0.0) g_nativeStepSkipped.fetch_add(1, std::memory_order_relaxed);
 			// This hook sees every vehicle. Unowned steps must never default to the player's controller.
@@ -3132,6 +3134,7 @@ namespace vehicleflight
     bool PlayerDriving(std::uint32_t id){return id&&g_manualDriverId.load()==id;}
 
 	bool Active() { return g.active; }
+	std::uint64_t NativeStepCount() { return g_nativeStepTotal.load(std::memory_order_relaxed); }
 	bool PhysicalCameraActive(std::uintptr_t vehicle) {
 		return vehicle && g_sh.physOn.load(std::memory_order_acquire) && g_sh.physInstance.load() &&
 			g_hoverVehicle.load()==vehicle && g_driverVehicle.load()==vehicle;

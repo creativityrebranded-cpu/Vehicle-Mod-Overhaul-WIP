@@ -25,6 +25,7 @@ namespace vehicleflight
     bool PilotHolds(std::uint32_t vehicleId);
     int PilotLive(std::uint32_t vehicleId);  // -1 no pilot, 0 a pilot but no physics steps, 1 stepping (or a scripted or physical flight, which does not use them)
     bool PlayerDriving(std::uint32_t vehicle);
+	std::uint64_t NativeStepCount(); // load trace: vehicle physics steps seen by the step hook so far
 	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera, instrument and key set: physical flight with you at the wheel, you or the autopilot flying
 
 	// NPC pilots 1..3 (the "pursuit" side; pilot 0 is the player's escort autopilot): the same flight model, terrain

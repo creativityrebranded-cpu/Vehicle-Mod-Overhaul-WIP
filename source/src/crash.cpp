@@ -195,6 +195,34 @@ namespace crash
 			return ok;
 		}
 
+		// One line per address (16 at most per run) plus a short stack: no lock, no allocation (exception context).
+		void OwnFaultOutsideGameplay(EXCEPTION_POINTERS* info)
+		{
+			static std::atomic<std::uintptr_t> seen[16]{};
+			static std::atomic<int> count{ 0 };
+			const auto* rec = info->ExceptionRecord;
+			const auto addr = reinterpret_cast<std::uintptr_t>(rec->ExceptionAddress);
+			for (auto& s : seen) if (s.load(std::memory_order_relaxed) == addr) return;
+			const int k = count.fetch_add(1, std::memory_order_relaxed);
+			if (k >= 16) return;
+			seen[k].store(addr, std::memory_order_relaxed);
+			char where[160];
+			Describe(reinterpret_cast<DWORD64>(rec->ExceptionAddress), where, sizeof(where));
+			logger::WriteUnlocked("Load trace: fault inside FVO outside gameplay at %s (thread %lu), %s address 0x%llX; FVO's own guard may handle it",
+				where, GetCurrentThreadId(), rec->NumberParameters >= 2 ? (rec->ExceptionInformation[0] == 1 ? "write" : "read") : "?",
+				static_cast<unsigned long long>(rec->NumberParameters >= 2 ? rec->ExceptionInformation[1] : 0));
+			CONTEXT ctx = *info->ContextRecord;
+			for (int frame = 0; frame < 10 && ctx.Rip; ++frame) {
+				char fn[160];
+				Describe(ctx.Rip, fn, sizeof(fn));
+				logger::WriteUnlocked("  #%02d %s", frame, fn);
+				DWORD64 imageBase = 0;
+				auto* entry = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+				if (!entry) { ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp); ctx.Rsp += 8; continue; }
+				void* handlerData = nullptr; DWORD64 establisher = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, entry, &ctx, &handlerData, &establisher, nullptr);
+			}
+		}
 		LONG CALLBACK Handler(EXCEPTION_POINTERS* info)
 		{
 			const auto* rec = info->ExceptionRecord;
@@ -210,6 +238,9 @@ namespace crash
 			GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 				reinterpret_cast<LPCSTR>(rec->ExceptionAddress), &faulting);
 			if (faulting == g_self && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+				// 2026-11-15 load trace (crash loading a save from a running game, nothing logged): outside gameplay (a save
+				// loading, the loading screen, the main menu) a fault inside this DLL is named once per address, with its stack.
+				if (!g_gameplay.load(std::memory_order_relaxed) && !t_unhandled) OwnFaultOutsideGameplay(info);
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
 			// The same goes for the other plugins of this mod set (each guards its own reads and ignores its own faults above): two of them in one game must not report each
