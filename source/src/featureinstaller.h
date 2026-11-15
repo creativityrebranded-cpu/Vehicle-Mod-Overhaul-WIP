@@ -33,13 +33,18 @@ Result Apply(const std::wstring& directory,const std::wstring& settings,const Fe
     std::array<bool,N> changed{};
     const auto ledger=settings+L".fomod-applied";
     unsigned count=0;
+    std::array<bool,N> chosen{};
     for(std::size_t i=0;i<N;++i){
         keys[i]=std::wstring(features[i].section)+L"."+features[i].key;
         const auto file=directory+L"\\"+Filename(features[i].section,features[i].key);
+        // 2026-11-15 hotfix (Nexus: "configuration import failed (3)"): an installer page that was not shown installs no file
+        // (Route beacons appears only with the Traffic Addon). No file = no choice: that setting stays as it is.
+        if(Missing(file))continue;
         if(Read(file,L"feature",L"section")!=features[i].section||Read(file,L"feature",L"key")!=features[i].key)
             return {Status::Invalid};
         values[i]=Read(file,L"feature",L"value");
         if(values[i]!=L"0"&&values[i]!=L"1")return {Status::Invalid};
+        chosen[i]=true;
         changed[i]=Read(ledger,L"applied",keys[i].c_str())!=values[i];
         if(changed[i])++count;
     }
@@ -66,7 +71,7 @@ Result Apply(const std::wstring& directory,const std::wstring& settings,const Fe
     }
     for(std::size_t i=0;i<N;++i){
         if(changed[i]&&!WritePrivateProfileStringW(features[i].section,features[i].key,values[i].c_str(),temp.c_str()))return {Status::Failed};
-        if(!WritePrivateProfileStringW(L"applied",keys[i].c_str(),values[i].c_str(),stateTemp.c_str()))return {Status::Failed};
+        if(chosen[i]&&!WritePrivateProfileStringW(L"applied",keys[i].c_str(),values[i].c_str(),stateTemp.c_str()))return {Status::Failed};
     }
     // Publish settings first; a ledger failure safely retries the same choices.
     if(!Replace(temp,settings)||!Replace(stateTemp,ledger))return {Status::Failed};

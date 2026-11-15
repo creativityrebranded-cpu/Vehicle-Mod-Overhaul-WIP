@@ -15,6 +15,9 @@ namespace inputgate
 	void SetBlocked(std::uint32_t padBits);  // bindlogic controller bits; any thread
     void SetBlockedKeys(const std::array<bool,256>& keys);
     bool GameplayAllowed();
+    // GameplayAllowed and no menu input context (ship builder, maps, settings, terminals...) on the stack: only then do the
+    // mod's bindings act and take keys or buttons from the game (inputownership::ModKeys).
+    bool ModKeysAllowed();
     // Ordered fresh native button presses; low bit pad, upper bits sequence.
     std::uint64_t LastDevicePress();
 	unsigned TakeBlockedCount();             // events blocked since the last call (for the log)

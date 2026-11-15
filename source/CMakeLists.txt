@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyingVehicleOverhaul VERSION 1.2.1 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 1.2.2 LANGUAGES CXX)
 add_executable(observations_test tests/observations_test.cpp)
 target_compile_features(observations_test PRIVATE cxx_std_20)
 target_include_directories(observations_test PRIVATE src)

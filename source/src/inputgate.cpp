@@ -9,6 +9,7 @@
 #include <Windows.h>
 
 #include <atomic>
+#include <cstdio>
 
 namespace inputgate
 {
@@ -94,7 +95,7 @@ namespace inputgate
                         g_devicePress.store(((previous&~1ull)+2)|(device==kGamepad?1ull:0ull),std::memory_order_release);
                     }
                 }
-                requested=requested&&GameplayAllowed();
+                requested=requested&&ModKeysAllowed();
                 const bool owned=inputownership::Own(g_owner[device][index],value>0,seconds==0,requested);
                 if(!owned||*reason)return; // never replace a native block reason
 				*reason = kBlockedReason;
@@ -126,19 +127,42 @@ namespace inputgate
         if(keys[VK_MENU]){g_keys[VK_LMENU]=true;g_keys[VK_RMENU]=true;}
     }
     std::uint64_t LastDevicePress(){return g_devicePress.load(std::memory_order_acquire);}
+    namespace
+    {
+        // The control map's input context stack (+0x2A8 count, +0x2B0 entries of 16 bytes, id in the first byte).
+        // Returns the count, or -1 when it cannot be read; the game window must have the focus.
+        int ContextStack(std::uint8_t (&ids)[128])
+        {
+            DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
+            if(pid!=GetCurrentProcessId())return -1;
+            __try{
+                const auto cm=*reinterpret_cast<std::uintptr_t*>(game::Base()+0x061DE668);
+                if(!cm)return -1;
+                const auto count=*reinterpret_cast<std::uint32_t*>(cm+0x2A8);
+                const auto stack=*reinterpret_cast<std::uintptr_t*>(cm+0x2B0);
+                if(count>128||(count&&!stack))return -1;
+                for(std::uint32_t i=0;i<count;++i)ids[i]=*reinterpret_cast<std::uint8_t*>(stack+i*16);
+                return int(count);
+            }__except(EXCEPTION_EXECUTE_HANDLER){return -1;}
+        }
+    }
     bool GameplayAllowed()
     {
-        DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
-        if(pid!=GetCurrentProcessId())return false;
-        __try{
-            const auto cm=*reinterpret_cast<std::uintptr_t*>(game::Base()+0x061DE668);
-            if(!cm)return false;
-            const auto count=*reinterpret_cast<std::uint32_t*>(cm+0x2A8);
-            const auto stack=*reinterpret_cast<std::uintptr_t*>(cm+0x2B0);
-            if(count>128||(count&&!stack))return false;
-            for(std::uint32_t i=0;i<count;++i){const auto id=*reinterpret_cast<std::uint8_t*>(stack+i*16);if(id==0x4E||id==0x11)return false;}
-            return true;
-        }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+        std::uint8_t ids[128];const int n=ContextStack(ids);
+        return n>=0&&inputownership::Gameplay(ids,std::size_t(n));
+    }
+    bool ModKeysAllowed()
+    {
+        std::uint8_t ids[128];const int n=ContextStack(ids);
+        const bool on=n>=0&&inputownership::ModKeys(ids,std::size_t(n));
+        // Trace (diagnostic builds): the stack each time the answer changes, so a live run shows which contexts a menu uses.
+        static std::atomic<int> last{-1};
+        if(last.exchange(on?1:0,std::memory_order_relaxed)!=(on?1:0)){
+            char text[128*3+1]{};int at=0;
+            for(int i=0;i<n&&at<int(sizeof(text))-4;++i)at+=std::snprintf(text+at,sizeof(text)-at,"%s%02X",i?" ":"",ids[i]);
+            logger::WriteUnlocked("Input gate: mod keys %s (contexts: %s)",on?"on":"given back to the game",n<0?"unreadable or unfocused":text);
+        }
+        return on;
     }
 	unsigned TakeBlockedCount() { return g_count.exchange(0, std::memory_order_relaxed); }
 	void HoldMapForEditor() { g_mapEditUntil.store(GetTickCount64() + 300, std::memory_order_relaxed); }

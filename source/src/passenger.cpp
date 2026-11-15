@@ -1,4 +1,5 @@
 #include "passenger.h"
+#include "inputgate.h"
 #include "bindings.h"
 
 #include "addresses.h"
@@ -425,7 +426,7 @@ namespace passenger
             static bool gDown = false, gHeld = false;
             static ULONGLONG gAt = 0;
             bool rawExit = false, rawWheel = false;
-            const bool rawG = !bindings::Allowed() && Focused() && (GetAsyncKeyState('G') & 0x8000) != 0;
+            const bool rawG = !bindings::Allowed() && inputgate::ModKeysAllowed() && Focused() && (GetAsyncKeyState('G') & 0x8000) != 0;
             if (rawG && !gDown) { gAt = now; gHeld = false; logger::Write("Passenger: G pressed (bindings not taking input here; read directly)"); }
             if (rawG && gDown && !gHeld && now - gAt >= 500) { gHeld = true; rawWheel = true; }
             if (!rawG && gDown && !gHeld) rawExit = true;

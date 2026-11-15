@@ -390,7 +390,7 @@ namespace bindings
             const auto ctx=Situation();
             const bool contextChanged=g_ctx.exchange(ctx)!=ctx;
             if(contextChanged)g_generation.fetch_add(1);
-            const bool allowed=inputgate::GameplayAllowed();
+            const bool allowed=inputgate::ModKeysAllowed();
             g_allowed=allowed;
             g_sample={};g_sample.context=ctx;g_sample.pad=g_pad.load();
             {std::lock_guard axes(g_axesLock);g_sample.axes=g_axes;}

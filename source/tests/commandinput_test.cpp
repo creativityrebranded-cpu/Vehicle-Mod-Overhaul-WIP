@@ -88,6 +88,12 @@ int main(){
     check(inputownership::Own(owner,false,false,false),"mod-owned release does not leak into native context");
     const std::uint8_t gameplay[]={0,0x49,0x38},menu[]={0,0x49,0x4E};
     check(inputownership::Gameplay(gameplay,3)&&!inputownership::Gameplay(menu,3),"native UI blocker suppresses mod gameplay");
+    const std::uint8_t builder[]={0,0x2C,0x2E},surfaceMap[]={0,0x38,0x2B},settings[]={0,0x02},monocle[]={0,0x38},ship[]={0,0x21};
+    check(inputownership::ModKeys(gameplay,3)&&inputownership::ModKeys(monocle,2)&&inputownership::ModKeys(ship,2),"mod keys stay on foot, in the scanner, vehicle and ship");
+    check(!inputownership::ModKeys(builder,3),"ship builder keeps its own keys (G adds)");
+    check(!inputownership::ModKeys(surfaceMap,3),"local map opened over the scanner keeps its keys");
+    check(!inputownership::ModKeys(settings,2),"Controls page remap receives every key");
+    check(!inputownership::ModKeys(menu,3),"old UI blocker still releases keys");
     commandinput::Frame analog;commandinput::Sample axis;axis.context=kCtxGround;axis.driving=true;
     analog.Update(map,keys,pads,axis,0);axis.axes.ly=.62;axis.pad=kLUp;analog.Update(map,keys,pads,axis,10);
     check(std::fabs(analog.Amount(std::size_t(Action::Accelerate),map,keys,pads,axis)-.5)<1e-9,"analog throttle stays analog in native ground bridge");
