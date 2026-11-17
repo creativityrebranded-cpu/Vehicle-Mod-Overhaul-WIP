@@ -156,8 +156,12 @@ namespace inputgate
         std::uint8_t ids[128];const int n=ContextStack(ids);
         const bool on=n>=0&&inputownership::ModKeys(ids,std::size_t(n));
         // Trace (diagnostic builds): the stack each time the answer changes, so a live run shows which contexts a menu uses.
-        static std::atomic<int> last{-1};
-        if(last.exchange(on?1:0,std::memory_order_relaxed)!=(on?1:0)){
+        // Also each new readable stack (first 400), so a stack that keeps the keys from the mod is named in the log.
+        static std::atomic<int> last{-1};static std::atomic<std::uint64_t> lastStack{0};static std::atomic<int> stackLines{0};
+        std::uint64_t h=1469598103934665603ull;for(int i=0;i<n;++i)h=(h^ids[i])*1099511628211ull;h^=std::uint64_t(n<0?0xFFFF:n)<<48;
+        const bool changed=last.exchange(on?1:0,std::memory_order_relaxed)!=(on?1:0);
+        const bool newStack=n>=0&&lastStack.exchange(h,std::memory_order_relaxed)!=h&&stackLines.fetch_add(1,std::memory_order_relaxed)<400;
+        if(changed||newStack){
             char text[128*3+1]{};int at=0;
             for(int i=0;i<n&&at<int(sizeof(text))-4;++i)at+=std::snprintf(text+at,sizeof(text)-at,"%s%02X",i?" ":"",ids[i]);
             logger::WriteUnlocked("Input gate: mod keys %s (contexts: %s)",on?"on":"given back to the game",n<0?"unreadable or unfocused":text);

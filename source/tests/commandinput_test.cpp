@@ -94,6 +94,9 @@ int main(){
     check(!inputownership::ModKeys(surfaceMap,3),"local map opened over the scanner keeps its keys");
     check(!inputownership::ModKeys(settings,2),"Controls page remap receives every key");
     check(!inputownership::ModKeys(menu,3),"old UI blocker still releases keys");
+    const std::uint8_t listeners[]={0,0x01,0x4C,0x49},listenersMenu[]={0,0x01,0x4C,0x02};
+    check(inputownership::ModKeys(listeners,4),"console/almanac key listeners in play are not menus (2026-11-17 UNBOUND)");
+    check(!inputownership::ModKeys(listenersMenu,4),"a real menu over the listeners still takes the keys back");
     commandinput::Frame analog;commandinput::Sample axis;axis.context=kCtxGround;axis.driving=true;
     analog.Update(map,keys,pads,axis,0);axis.axes.ly=.62;axis.pad=kLUp;analog.Update(map,keys,pads,axis,10);
     check(std::fabs(analog.Amount(std::size_t(Action::Accelerate),map,keys,pads,axis)-.5)<1e-9,"analog throttle stays analog in native ground bridge");

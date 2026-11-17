@@ -17,9 +17,12 @@ inline bool Gameplay(const std::uint8_t* contexts,std::size_t count) {
 // worked on the local map): the mod's keys were taken from the game in every menu but the console, so the remap capture
 // never saw an FVO-owned key and menus lost theirs. Input contexts are the game's names table (Starfield.exe 1.16.244
 // +0x4A554E0, 78 entries). Any menu context on the stack gives every key and button back to the game.
+// 2026-11-17 in game: 0x01 ConsoleOpening and 0x4C OpenAlmanac are the key listeners that open those menus and stay on
+// the stack in ordinary play; counting them as menus took every key from the mod (HUD Hover / Change gear "UNBOUND").
+// Only contexts a menu pushes while it is open belong here.
 inline bool MenuContext(std::uint8_t id) {
     switch(id){
-    case 0x01: /*ConsoleOpening*/ case 0x02: /*BasicMenuNav*/ case 0x04: case 0x05: /*Menu3DModel*/ case 0x06: /*QuickContainer*/
+    case 0x02: /*BasicMenuNav*/ case 0x04: case 0x05: /*Menu3DModel*/ case 0x06: /*QuickContainer*/
     case 0x0D: case 0x0E: /*Cursor*/ case 0x0F: /*Book*/ case 0x10: /*DataSlateButtons*/ case 0x11: /*Console*/
     case 0x16: case 0x17: /*Workshop*/ case 0x18: /*Terminal*/ case 0x19: /*PhotoMode*/ case 0x1A: /*Security*/
     case 0x1D: case 0x1E: /*DataMenu*/ case 0x23: /*Ship_QuickContainer*/
@@ -28,7 +31,7 @@ inline bool MenuContext(std::uint8_t id) {
     case 0x35: case 0x36: case 0x37: /*ShipInfo*/ case 0x3A: /*LevelUp*/ case 0x3D: /*TextInput*/ case 0x3E: /*MissionFromStarMap*/
     case 0x3F: case 0x40: case 0x41: case 0x42: case 0x43: /*ShipBuilder simple*/ case 0x45: /*BasicMenuNav_JustCancel*/
     case 0x46: /*StarMap_QuickSelect*/ case 0x47: /*Creations*/ case 0x48: /*Login*/ case 0x4A: /*Vehicle_Hangar*/
-    case 0x4B: case 0x4C: /*Almanac*/ case 0x4E:
+    case 0x4B: /*Almanac*/ case 0x4E: /*StopContextProcessing*/
         return true;
     default: return false;
     }
