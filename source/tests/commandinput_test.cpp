@@ -98,6 +98,11 @@ int main(){
     check(inputownership::ModKeys(play,3),"ConsoleOpening (owner TES, pushed after every load) is play, not a menu (2026-11-17 UNBOUND)");
     check(inputownership::ModKeys(prompts,5)&&inputownership::ModKeys(shipPrompt,4),"HUD prompts (loot, multi-activate, level up, ship loot) keep the mod's keys");
     check(!inputownership::ModKeys(overMenu,3)&&!inputownership::ModKeys(starMap,4),"a real menu over ConsoleOpening still takes the keys back");
+    const std::uint8_t scanner[]={0,0x01,0x0E,0x38,0x39},scope[]={0,0x01,0x1B},sitting[]={0,0x01,0x1C};
+    check(inputownership::ModKeys(scanner,5),"scanner menu's own list (Cursor_LeftStick, Monocle, MonocleKBMZoom) keeps the mod's keys");
+    check(inputownership::ModKeys(scope,3)&&inputownership::ModKeys(sitting,3),"weapon scope and sitting are play");
+    const std::uint8_t inventory[]={0,0x01,0x02,0x03,0x0B,0x4C},pickpocket[]={0,0x01,0x06,0x07,0x45},workshop[]={0,0x01,0x16};
+    check(!inputownership::ModKeys(inventory,6)&&!inputownership::ModKeys(pickpocket,5)&&!inputownership::ModKeys(workshop,3),"inventory, pickpocket and outpost build keep their keys");
     commandinput::Frame analog;commandinput::Sample axis;axis.context=kCtxGround;axis.driving=true;
     analog.Update(map,keys,pads,axis,0);axis.axes.ly=.62;axis.pad=kLUp;analog.Update(map,keys,pads,axis,10);
     check(std::fabs(analog.Amount(std::size_t(Action::Accelerate),map,keys,pads,axis)-.5)<1e-9,"analog throttle stays analog in native ground bridge");

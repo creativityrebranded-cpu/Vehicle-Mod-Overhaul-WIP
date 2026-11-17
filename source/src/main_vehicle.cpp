@@ -345,7 +345,9 @@ namespace
         // 2026-11-15 hotfix: the full simulation runs only with a world: none at the main menu (manager state 0), while a save
         // loads, or behind the loading screen (the rewrite's rule). 1.2 ran it at the main menu after play and faulted in game
         // functions on the player and escorts (2026-11-01 run: ConditionFloat, HealthOf).
-        const bool worldSafe=!loading&&g_worldReady&&!LoadingScreenUp();
+        // 2026-11-17 audit: the loading screen alone does not hold it. Door / fast-travel / landing screens (no save load)
+        // keep 1.2's full update, which places arrival traffic behind them; the crash evidence was a save loading or no world.
+        const bool worldSafe=!loading&&g_worldReady;
         {
             static int lastSafe=-1;
             if(lastSafe!=int(worldSafe)){

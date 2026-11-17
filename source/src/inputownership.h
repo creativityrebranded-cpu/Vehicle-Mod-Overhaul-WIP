@@ -29,7 +29,9 @@ inline bool MenuContext(std::uint8_t id) {
     // 0x03 VirtualController and 0x0C RightThumbstick stay out: every menu list holding them also holds 0x02, and one
     // list (FUN_141EC8A80) holds 0x03 alone with its owner not identified.
     case 0x02: /*BasicMenuNav*/ case 0x04: case 0x05: /*Menu3DModel*/
-    case 0x0D: case 0x0E: /*Cursor*/ case 0x0F: /*Book*/ case 0x10: /*DataSlateButtons*/ case 0x11: /*Console*/
+    // 0x0D Cursor: pushed by the cursor menu (FUN_142561F20 show/hide, owner the menu) while a menu shows the pointer.
+    // 0x0E Cursor_LeftStick stays out: the scanner's own list is {0x0E, 0x38 Monocle, 0x39} (MonocleMenu, FUN_1415F8490).
+    case 0x0D: /*Cursor*/ case 0x0F: /*Book*/ case 0x10: /*DataSlateButtons*/ case 0x11: /*Console*/
     case 0x16: case 0x17: /*Workshop*/ case 0x18: /*Terminal*/ case 0x19: /*PhotoMode*/ case 0x1A: /*Security*/
     case 0x1D: case 0x1E: /*DataMenu*/
     case 0x28: case 0x29: case 0x2A: /*StarMap*/ case 0x2B: /*SurfaceMap*/
