@@ -94,9 +94,10 @@ int main(){
     check(!inputownership::ModKeys(surfaceMap,3),"local map opened over the scanner keeps its keys");
     check(!inputownership::ModKeys(settings,2),"Controls page remap receives every key");
     check(!inputownership::ModKeys(menu,3),"old UI blocker still releases keys");
-    const std::uint8_t listeners[]={0,0x01,0x4C,0x49},listenersMenu[]={0,0x01,0x4C,0x02};
-    check(inputownership::ModKeys(listeners,4),"console/almanac key listeners in play are not menus (2026-11-17 UNBOUND)");
-    check(!inputownership::ModKeys(listenersMenu,4),"a real menu over the listeners still takes the keys back");
+    const std::uint8_t play[]={0,0x01,0x49},prompts[]={0,0x01,0x06,0x08,0x3A},shipPrompt[]={0,0x01,0x21,0x23},overMenu[]={0,0x01,0x02},starMap[]={0,0x01,0x28,0x4C};
+    check(inputownership::ModKeys(play,3),"ConsoleOpening (owner TES, pushed after every load) is play, not a menu (2026-11-17 UNBOUND)");
+    check(inputownership::ModKeys(prompts,5)&&inputownership::ModKeys(shipPrompt,4),"HUD prompts (loot, multi-activate, level up, ship loot) keep the mod's keys");
+    check(!inputownership::ModKeys(overMenu,3)&&!inputownership::ModKeys(starMap,4),"a real menu over ConsoleOpening still takes the keys back");
     commandinput::Frame analog;commandinput::Sample axis;axis.context=kCtxGround;axis.driving=true;
     analog.Update(map,keys,pads,axis,0);axis.axes.ly=.62;axis.pad=kLUp;analog.Update(map,keys,pads,axis,10);
     check(std::fabs(analog.Amount(std::size_t(Action::Accelerate),map,keys,pads,axis)-.5)<1e-9,"analog throttle stays analog in native ground bridge");
