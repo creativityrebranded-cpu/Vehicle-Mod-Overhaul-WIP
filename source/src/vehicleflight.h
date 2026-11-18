@@ -101,7 +101,14 @@ namespace vehicleflight
 			kScripted = 256,
 			// With kScripted: the script picks how it travels (travel: 1 float = the hover at the commanded height, 2 drive = the hover
 			// held just over the surface under it, following the road; the automatic hover-or-drive choice is skipped).
-			kTravel = 512 };
+			kTravel = 512,
+			// 2026-11-17 passenger control (the user: "take control directly ... we dont need to swap seats"): the player drives an
+			// NPC-driven vehicle from the passenger seat. kManual: the player's own hands, as at their own wheel: no planner veto, no
+			// arrival turn or avoidance braking, kTravel picks hover / wheels (wheels = the game's own driving). kSteer: wheel
+			// steering -1 left .. 1 right for drive mode (hover keeps kYaw).
+			kSteer = 1024, kManual = 2048,
+			// With kManual: the game's forward boost on its own wheels (drive mode).
+			kBoost = 4096 };
 		unsigned set = 0;
 		double throttle = 0;   // -1 full reverse .. 1 full forward (the gear's thrust)
 		double strafe = 0;     // -1 slide left .. 1 slide right
@@ -113,12 +120,18 @@ namespace vehicleflight
 		int gear = 0;          // 1-4
 		unsigned holdMs = 300;
 		int travel = 0;        // with kTravel: 1 float, 2 drive
+		double steer = 0;      // with kSteer: -1 full left .. 1 full right (drive mode)
+		bool boost = false;    // with kBoost
 	};
 	void ClearPilotCommand(int pilot);
     bool ImpactSince(std::uint32_t vehicleId, unsigned long long since);
     double CruiseLimit(std::uint32_t vehicleId);
     double TurnLimit(std::uint32_t vehicleId);
 	bool PilotCommand(int pilot, const Command& c);  // false: that pilot is not on autopilot
+	// Passenger control while hovering (2026-11-17, the user: "just the flying matters", as at your own wheel): this pilot flies through
+	// the player's own hover model (your keys, camera turn, roll, lift, gear, boost) every frame, its autopilot off for that pass.
+	// Renew every frame (lasts 250 ms); gear 1-4.
+	void PlayerHands(int pilot, int gear);
 
 	// The navigation settings of a profile (vcontract::Goal::nav) travel with the goal: PilotFly(pilot, vehicle, Goal) stores them; nothing else sets them.
 

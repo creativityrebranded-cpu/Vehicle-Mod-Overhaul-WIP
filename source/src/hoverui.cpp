@@ -2082,14 +2082,14 @@ namespace hoverui
 			// One vehicle prompt of FVO's own (2026-10-28, the user: "merge the UI for this all ... just change based on context";
 			// the separate passenger prompt overlapped). It lives in the "Board vehicle" slot (moved in the UI editor) and its
 			// meaning follows the situation: facing a vehicle someone drives, E = passenger seat / hold E = pull the driver out;
-			// riding as a passenger, G = get out / hold G = take the wheel. Otherwise hidden: the game's own Enter prompt is
+			// riding as a passenger, G = take / give back control (leaving is the game's own hold E). Otherwise hidden: the game's own Enter prompt is
 			// left as it is.
 			{
 				const bool riding = passenger::RidingVehicle() != 0;
 				std::string text, keys;
 				if (riding) {
 					keys = bindings::PromptInput(bindings::Action::PassengerExit, pad, bindlogic::kCtxPassenger);
-					text = "Get out  |  hold: Take the wheel";
+					text = passenger::Controlling() ? "Give back control" : "Take control";
 				}
 				else if (!inVehicle && occupied) {
 					keys = passengerKey;

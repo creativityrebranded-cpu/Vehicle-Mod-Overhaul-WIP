@@ -33,10 +33,6 @@ namespace npcvehicles
 	int PilotFor(std::uint32_t vehicleId);
 	// Anyone (a job NPC, a gang driver, a stranger) sits in the driver seat of this vehicle.
 	bool HasDriver(std::uint32_t vehicleId);
-	// Take the wheel: stops that job and takes its NPC out at once (the NPC's form id, 0 when nobody drives it).
-	std::uint32_t TakeDriver(std::uint32_t vehicleId);
-	// Seats the player as the driver of the vehicle (the game's own put-the-player-in), true when the game agrees.
-	bool SeatPlayerDriver(std::uintptr_t vehicle);
 	// ---- Exit service (spec: vcontract.h ExitRequest / SeatState; polled). An actor aboard any vehicle gets out; a job's driver also ends its job and the
 	// vehicle is Unassigned from its profile. Modes: Auto = wait landed, the game's animated dismount, then the instant exit; Normal = the first two (Refused
 	// if they fail); Quick = the dismount with a short watch; Instant = the game's instant exit at once. After it the actor stands at the request's point or
@@ -115,6 +111,8 @@ namespace npcvehicles
 	// The player rides `vehicle` as a passenger: its driver (seated, or posed in the driver seat) gets an autopilot job if it
 	// has none, so the vehicle drives itself. true when a job flies it.
 	bool AdoptDriver(std::uintptr_t vehicle);
+	// Passenger control: the seated driver of `vehicle` gets an autopilot job again (no walk, no trip); true when it has one.
+	bool StartSeatedForPassenger(std::uintptr_t vehicle);
 	// Return home: a following job's vehicle flies back to where it was taken from and parks there (false: no home known, or already there).
 	bool SendHome(std::uint32_t vehicleId);
 	int CivilJobs();                                         // jobs running a civil task now

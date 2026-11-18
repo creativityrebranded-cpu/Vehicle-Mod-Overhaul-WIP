@@ -15,6 +15,12 @@ namespace vehiclediag
 	std::uintptr_t ComponentOf(std::uint32_t formId);  // the VehicleRuntimeComponent last updated for this vehicle form id, or 0
 	// A save load: forget every component pointer of the old game (they may be freed) and the per-vehicle repair state.
 	void Reset();
+	// The game's load routine is about to run (load hook thread): note each listed vehicle's reference and cell object and
+	// its form flags, to tell after the load whether a vehicle without a component stayed in memory through it.
+	void NoteBeforeLoad();
+	// Every frame from the load routine's return until the world's first live frame: the native attach for noted vehicles
+	// kept in memory through the load without a component (confirmed in game 2026-11-17).
+	void AfterLoadTick();
     void StageBirth(std::uint32_t formId); // creation callback, before the chassis can attach
     bool ReleaseBirth(std::uint32_t formId); // once its flight controller is armed and the game has built its physics vehicle
     bool Built(std::uint32_t formId); // the game built its physics vehicle (instance) since the last reset

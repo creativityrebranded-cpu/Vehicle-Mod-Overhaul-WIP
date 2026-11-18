@@ -15,6 +15,8 @@ namespace passenger
 	void Reset();  // a save load
 	// The vehicle the player rides as a passenger (form id), or 0.
 	std::uint32_t RidingVehicle();
+	// You drive the vehicle you ride in (G in the passenger seat; the NPC stays at the wheel).
+	bool Controlling();
 	// Requests native boarding in the companion seat; true when accepted, completion is asynchronous.
 	bool BoardVehicle(std::uintptr_t player, std::uintptr_t vehicle);
 	// The keyword of the vehicle's first passenger seat (after the driver's), 0 when it has none.

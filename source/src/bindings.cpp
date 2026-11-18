@@ -322,7 +322,13 @@ namespace bindings
 		{
             if(hoverui::Editing())return bindlogic::kCtxEditor;
 			if (hoverui::IsScannerOpen()) return bindlogic::kCtxScanner;
-			if (passenger::RidingVehicle()) return bindlogic::kCtxPassenger;
+			if (passenger::RidingVehicle()) {
+				if (!passenger::Controlling()) return bindlogic::kCtxPassenger;
+				// 2026-11-17 (the user: "the full set ... as if I was just driving the vehicle"): with control from the passenger seat
+				// your keys are a driver's, in the layer of the vehicle's mode (its wheels or its hover).
+				vehicleflight::DriveInput wheels{};
+				return vehicleflight::DriveFor(passenger::RidingVehicle(), wheels) ? bindlogic::kCtxGround : bindlogic::kCtxHover;
+			}
 			const auto player = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kPlayerCharacterPtr);
 			const auto driven = player ? reinterpret_cast<std::uintptr_t (*)(std::uintptr_t)>(game::Base() + addr::kPlayerVehicle)(player) : 0;
 			if (!driven) return bindlogic::kCtxFoot;
@@ -399,7 +405,7 @@ namespace bindings
             g_sample.allowed=allowed&&!g_suppressInput&&g_captureAction<0;
             const auto player=*reinterpret_cast<std::uintptr_t*>(game::Base()+addr::kPlayerCharacterPtr);
             const auto driven=world&&player?reinterpret_cast<std::uintptr_t(*)(std::uintptr_t)>(game::Base()+addr::kPlayerVehicle)(player):0;
-            g_sample.driving=driven&&!passenger::RidingVehicle();
+            g_sample.driving=driven&&(!passenger::RidingVehicle()||passenger::Controlling());
             g_sample.placement=!g_sample.driving&&realvehicles::RecordingPlacements();
             for(int key=1;key<256;++key)g_sample.keys[std::size_t(key)]=KeyDown(key);
             g_commands.Update(g_bind,g_defaultVk,g_gamePad,g_sample,now);
@@ -423,7 +429,7 @@ namespace bindings
             }
             // 2026-10-28 (the user: "restrict input from wasd" in the passenger seat): the driver's own job flies it; the game
             // never gets the passenger's movement, boost or jump keys.
-            if(ctx==bindlogic::kCtxPassenger)for(const int vk:{int('W'),int('A'),int('S'),int('D'),VK_SPACE,VK_LSHIFT,VK_SHIFT})keys[std::size_t(vk)]=true;
+            if(passenger::RidingVehicle())for(const int vk:{int('W'),int('A'),int('S'),int('D'),VK_SPACE,VK_LSHIFT,VK_SHIFT})keys[std::size_t(vk)]=true;
             inputgate::SetBlocked(g_connected?blocked:0);
             inputgate::SetBlockedKeys(keys);
             if(blocked!=g_blockedShown){g_blockedShown=blocked;logger::Write("Bindings: situation %u, owned controller buttons: %s",unsigned(ctx),PadList(blocked).c_str());}

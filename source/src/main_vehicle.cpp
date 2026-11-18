@@ -12,6 +12,7 @@
 #include "hoverui.h"
 #include "routeedit.h"
 #include "trafficprofile.h"
+#include "flightsave.h"
 #include "notify.h"
 #include "mapguard.h"
 #include "cellbake.h"
@@ -100,6 +101,8 @@ namespace
         lifecycle::Close();
         trafficprofile::BeginLoad();
         trafficarrival::Reset();
+        flightsave::OnLoad(reinterpret_cast<const char*>(b));  // FUN_141815620 param_2: the save's name
+        vehiclediag::NoteBeforeLoad();  // no-chassis trace: which vehicles stay in memory through the load
         g_dropAll = true;
         crash::Crumb("save load: routine started");
         logger::Important("Save load: the game's load routine started; FVO world actions paused and held objects dropped");
@@ -126,10 +129,15 @@ namespace
     void AfterTrafficSave() { trafficprofile::AfterSave(); }
     void SaveGameDetour(std::int64_t* a, std::uint64_t b, std::int64_t c, std::uint64_t d)
     {
+        flightsave::OnSave(reinterpret_cast<const char*>(d));  // FUN_141814220 param_4: the save's name ("Finished saving game: %s")
         BeforeTrafficSave();
         struct Finish { ~Finish() { AfterTrafficSave(); } } finish;
         g_saveGameOriginal(a, b, c, d);
     }
+    // 2026-11-17 (user: the hook system belongs to the core; the Traffic Addon only manages what the core has): the core owns
+    // the SaveGame hook in every standalone install, installed with the load hook. It records the core's own per-save state
+    // (saved hover) and, only while a Traffic Addon is attached, takes the traffic snapshot as in 1.2.1. Replaces 1.2.1's
+    // addon-only install ("Do not add a save hook to core-only installs"). Save files and settings are unchanged.
     void InstallSaveHook()
     {
         static const std::uint8_t prologue[15] = {0x4C,0x89,0x4C,0x24,0x20,0x4C,0x89,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10};
@@ -137,10 +145,10 @@ namespace
         if (hook::Install(game::Base() + addr::kSaveGame, prologue, sizeof prologue, reinterpret_cast<void*>(&SaveGameDetour), &original)) {
             g_saveGameOriginal = reinterpret_cast<SaveGame_t>(original);
             trafficprofile::SaveReady(true);
-            logger::Write("Traffic snapshots: native SaveGame hook installed");
+            logger::Write("Save hook: native SaveGame hook installed (core per-save state; traffic snapshots while the Traffic Addon is attached)");
         } else {
             trafficprofile::SaveReady(false);
-            logger::Important("Traffic snapshots: SaveGame hook unavailable; traffic remains paused");
+            logger::Important("Save hook: SaveGame hook unavailable (bytes differ); saved hover is off and traffic remains paused");
         }
     }
     bool Loading(ULONGLONG now)
@@ -166,6 +174,18 @@ namespace
     {
         __try { return *reinterpret_cast<volatile std::uint8_t*>(game::Base() + kLoadingScreenFlag) != 0; }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    // 2026-11-17 no-chassis research: the cell attach FUN_140B02C80 skips RuntimeComponentDBFactory::ReferenceAttach for every
+    // reference of an exterior cell while TES +0xE8 (the interior cell, null outdoors) is set, and for an interior cell that is not
+    // that one (cVar11 -> FUN_140B02630 param_3). Without the event no vehicle gets a component. Logged during loads to see the value.
+    std::uint32_t TesInteriorCellId()
+    {
+        __try {
+            const auto tes = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kTESPtr);
+            const auto cell = tes ? *reinterpret_cast<std::uintptr_t*>(tes + off::kTESInteriorCell) : 0;
+            return cell ? *reinterpret_cast<std::uint32_t*>(cell + off::kFormId) : 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0xFFFFFFFF; }
     }
     // The arrival window: the loading screen is up, the save (if any) has been read and the planet manager has the world.
     bool ArrivalWindow(bool worldReady)
@@ -295,11 +315,6 @@ namespace
     }
     void Frame()
     {
-        // Do not add a save hook to core-only installs with no Traffic Addon.
-        static bool saveHookAttempted = false;
-        if (g_standalone && !saveHookAttempted && trafficpool::AddonAttached()) {
-            saveHookAttempted = true; InstallSaveHook();
-        }
         trafficprofile::Report();
         // Engine calls may pump SFSE tasks recursively. Never re-enter our
         // mutable world/AI pipeline; this guard skips rather than waits.
@@ -352,7 +367,7 @@ namespace
             static int lastSafe=-1;
             if(lastSafe!=int(worldSafe)){
                 lastSafe=int(worldSafe);crash::Crumb(worldSafe?"world: simulation on":"world: simulation held",state.haveManager?int(state.managerState):-1);
-                logger::Write("World: simulation %s (loading %d, world ready %d, loading screen %d, manager state %d)",worldSafe?"on":"held",int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1);
+                logger::Write("World: simulation %s (loading %d, world ready %d, loading screen %d, manager state %d, TES interior cell %08X)",worldSafe?"on":"held",int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1,TesInteriorCellId());
             }
         }
         if(!worldSafe){  // load trace: once a second while the simulation is held
@@ -360,12 +375,15 @@ namespace
             if(t-heldAt>=1000){heldAt=t;
                 static std::uint64_t steps0=0,updates0=0;
                 const auto steps=vehicleflight::NativeStepCount(),updates=g_standalone?vehicle_probe::UpdateSerial():0;
-                logger::Write("Load trace: frame held (thread %lu) loading %d world_ready %d loading_screen %d manager_state %d schedule %u load_began %llu load_done %llu; hooks since last line: vehicle steps %llu, component updates %llu",
-                GetCurrentThreadId(),int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1,unsigned(work),
+                logger::Write("Load trace: frame held (thread %lu) loading %d world_ready %d loading_screen %d manager_state %d TES_interior %08X schedule %u load_began %llu load_done %llu; hooks since last line: vehicle steps %llu, component updates %llu",
+                GetCurrentThreadId(),int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1,TesInteriorCellId(),unsigned(work),
                 static_cast<unsigned long long>(g_loadBegan.load()),static_cast<unsigned long long>(g_loadDone.load()),
                 static_cast<unsigned long long>(steps-steps0),static_cast<unsigned long long>(updates-updates0));
                 steps0=steps;updates0=updates;}
         }
+        // 2026-11-17: from the load routine's return until the world's first live frame, re-attach the vehicles the load kept
+        // in memory without a component (vehiclediag::AfterLoadTick), so they have a chassis before the world runs.
+        if(!worldSafe&&g_standalone&&g_worldReady){const auto began=g_loadBegan.load(),done=g_loadDone.load();if(began&&done>=began)vehiclediag::AfterLoadTick();}
         if(work==updateschedule::Work::Full&&!worldSafe)work=updateschedule::Work::Housekeeping;
         if(work==updateschedule::Work::Full)Update();
         else if(work==updateschedule::Work::Housekeeping) {
@@ -457,6 +475,7 @@ namespace
 			return;
 		}
 		g_standalone = true;
+		InstallSaveHook();  // the core owns the save hook in every standalone install (2026-11-17); with the Seamless core its own hook saves
         InstallFeatureSystems();
 		g_tasks->AddTaskPermanent(&g_frameTask);
 		logger::Write("Vehicle: standalone ground and physics service started; native pulse scheduling with 60 Hz fallback, 240 Hz admission ceiling, no catch-up queue");
@@ -532,7 +551,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Important("Flying Vehicle Overhaul (FVO) 1.2.2 loaded; core optional");
+	logger::Important("Flying Vehicle Overhaul (FVO) 1.2.4 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(FlyingVehicleOverhaul VERSION 1.2.2 LANGUAGES CXX)
+project(FlyingVehicleOverhaul VERSION 1.2.4 LANGUAGES CXX)
 add_executable(observations_test tests/observations_test.cpp)
 target_compile_features(observations_test PRIVATE cxx_std_20)
 target_include_directories(observations_test PRIVATE src)
@@ -103,7 +103,7 @@ add_library(FlyingVehicleOverhaul SHARED
     src/lifecycle.cpp
     src/native_movement_controller.cpp src/native_movement_engine.cpp src/native_movement_probe.cpp
     src/main_vehicle.cpp src/resources.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/api_traffic.cpp src/crash.cpp
-    src/npcvehicles.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/secretunpause.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp src/routeedit.cpp src/disableguard.cpp src/mapguard.cpp src/cellbake.cpp
+    src/npcvehicles.cpp src/flightsave.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/routeplan.cpp src/navmap.cpp src/navfield.cpp src/groundnav.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/secretunpause.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp src/routeedit.cpp src/disableguard.cpp src/mapguard.cpp src/cellbake.cpp
     src/vehicleflight.cpp src/vehiclecamera.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(FlyingVehicleOverhaul)
@@ -258,6 +258,9 @@ add_executable(bindlogic_test tests/bindlogic_test.cpp)
 sp_options(bindlogic_test)
 add_executable(commandinput_test tests/commandinput_test.cpp)
 sp_options(commandinput_test)
+
+add_executable(flightsave_test tests/flightsave_test.cpp)
+sp_options(flightsave_test)
 
 add_executable(travelmode_test tests/travelmode_test.cpp)
 sp_options(travelmode_test)

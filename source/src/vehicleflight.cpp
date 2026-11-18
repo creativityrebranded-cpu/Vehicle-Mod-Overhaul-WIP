@@ -54,6 +54,7 @@
 #include "vehiclehits.h"
 #include "realvehicles.h"
 #include "travelmode.h"
+#include "flightsave.h"
 #include "groundnav.h"
 
 #include "fvopaths.h"
@@ -1995,6 +1996,10 @@ namespace vehicleflight
 		struct Escape { int count = 0; ULONGLONG at = 0; } g_escape[kPilots];
 		struct Bumps { int count = 0; ULONGLONG at = 0; ULONGLONG ev = 0; } g_bumps[kPilots];
 		struct HeldCommand { Command c; ULONGLONG until = 0; } g_cmds[kPilots];
+		// Passenger control while hovering (PlayerHands): the pilot the player flies by hand, its gear, until when.
+		std::atomic<int> g_hands{-1}, g_handsGear{2};
+		std::atomic<ULONGLONG> g_handsUntil{0};
+		bool HandsOn(int idx) { return idx > 0 && g_hands.load() == idx && GetTickCount64() < g_handsUntil.load(); }
 
 		// The player's trail (ring buffer, by sequence number) and smoothed velocity, updated every frame.
 		struct TrailPoint { double x = 0, y = 0; };
@@ -3561,6 +3566,8 @@ namespace vehicleflight
 			const char* wc = idx ? Who(idx) : "Rover call";
 			// Scripted flight (flightscript.h, 2026-10-24): the caller's command is the plan this frame.
 			const bool scripted = (g_cmds[idx].c.set & Command::kScripted) && GetTickCount64() < g_cmds[idx].until;
+			// Passenger control (kManual, 2026-11-17): the player's own hands on this NPC-driven vehicle; see vehicleflight.h Command.
+			const bool manual = (g_cmds[idx].c.set & Command::kManual) && GetTickCount64() < g_cmds[idx].until;
 			{
 				std::unique_lock lock(g_sh.lock,std::try_to_lock);
 				if(lock.owns_lock()){
@@ -3731,7 +3738,7 @@ namespace vehicleflight
 			const double above = groundOk ? pos.z - g.ground : pos.z - g.baseZ;
 
 			// The new autopilot (autodrive.h) decides heading, speed, drive/hover and escapes; the 0.8 rules below stand aside.
-			const bool useAd = g.autopilot && !scripted && navmap::NewAutopilot();
+			const bool useAd = g.autopilot && !scripted && !manual && navmap::NewAutopilot();  // your hands: your travel choice, not autodrive's
 			if (useAd) {
 				LARGE_INTEGER adStart{}, adEnd{}, adFreq{};
 				QueryPerformanceCounter(&adStart);
@@ -4308,7 +4315,7 @@ namespace vehicleflight
 				const char* travelWhy = "cramped";
 				// NPC pilots, and your own vehicle on autopilot (2026-10-21, the user: summon, follow, cover, guard, Auto), except a ram.
 				const auto& scmd = g_cmds[idx].c;
-				const int scriptTravel = scripted && (scmd.set & Command::kTravel) ? scmd.travel : 0;
+				const int scriptTravel = (scripted || manual) && (scmd.set & Command::kTravel) ? scmd.travel : 0;
 				if (useAd) {
 					// autodrive picks drive or hover (with dwell times); the game's own wheels when someone is aboard, else the hover held low.
 					decided = true;
@@ -4323,8 +4330,8 @@ namespace vehicleflight
 				}
 				else if (scriptTravel == 1 || scriptTravel == 2) {
 					// The script decides (2026-10-25, the user: "drive and float when needed ... swapping based on obstacle based on script").
-					decided = true; wantDrive = scriptTravel == 2; nativeWanted = false;
-					travelWhy = wantDrive ? "script: drive" : "script: float";
+					decided = true; wantDrive = scriptTravel == 2; nativeWanted = manual && wantDrive && occupied;  // yours: the game's own wheels
+					travelWhy = manual ? (wantDrive ? "you: drive" : "you: float") : wantDrive ? "script: drive" : "script: float";
 					const bool hug = wantDrive && !g.drive;
 					if (hug != g.groundHug) {
 						g.groundHug = hug;
@@ -4499,6 +4506,14 @@ namespace vehicleflight
 						const bool inWay = g.vehWarn && g.vehGap < 1.2 && std::cos(Wrap(g.vehBearing - motion)) > 0.64;
 						if (g.personAhead || inWay) { accel = 0.0; brake = spD > 0.5 ? 1.0 : 0.0; fwdBoost = false; if (inWay && o.reverse) steer = 0; }
 					}
+					if (manual) {  // passenger control: your keys on the game's own wheels (no avoidance braking or arrival turn)
+						const auto& mc = g_cmds[idx].c;
+						if (mc.set & Command::kSteer) steer = std::clamp(mc.steer, -1.0, 1.0);
+						if (mc.set & Command::kThrottle) { accel = std::max(0.0, std::clamp(mc.throttle, -1.0, 1.0)); brake = mc.throttle < 0 ? std::min(1.0, -mc.throttle) : 0.0; }
+						if ((mc.set & Command::kBrake) && mc.brake) { accel = 0.0; brake = 1.0; }
+						vert = (mc.set & Command::kVertical) && mc.vertical > 0.5;
+						fwdBoost = (mc.set & Command::kBoost) && mc.boost;
+					}
 					const bool driveBoost = !g.recovery.failed && (fwdBoost || (vert && accel > 0.4));  // (named so it no longer hides the booster-visuals `boost` above)
 					g.drvSteer = steer;
 					g_driveOut[idx].steer.store(float(steer * g.steerSign));
@@ -4660,7 +4675,8 @@ namespace vehicleflight
                             std::cos(Wrap(g.vehBearing - dir)) > 0.5;
                         braking = false; strafe = 0;  // the planner's avoidance braking and side-steps do not apply
                     }
-                    const bool allowMovement=scripted||!requestedMotion||integrationlogic::MovementAllowed(fence,ValidateCommand(idx,vehicle,pos,bodyHeading,sp,top,goal,c));
+                    if (manual) { braking = false; strafe = 0; }  // passenger control: your hands, as at your own wheel
+                    const bool allowMovement=scripted||manual||!requestedMotion||integrationlogic::MovementAllowed(fence,ValidateCommand(idx,vehicle,pos,bodyHeading,sp,top,goal,c));
                     const unsigned allowed=c.set&((allowMovement?movement:0)|Command::kPitch|Command::kRoll|Command::kBrake);
                     const int cg = (allowed & Command::kGear) ? std::clamp(c.gear, 1, 4) : apGear;
                     if (scripted) {  // the script picks the gear: the planner's path caps do not limit it
@@ -4685,7 +4701,7 @@ namespace vehicleflight
 					if (allowed & Command::kGear) g.gear = cg;
 				}
 			}
-            if(g.autopilot&&!scripted&&!g.wallAhead&&!g.personAhead) {
+            if(g.autopilot&&!scripted&&!manual&&!g.wallAhead&&!g.personAhead) {
                 const double yaw=integrationlogic::ArrivalYaw(bodyHeading,PilotNavOf(idx).arriveYaw,std::hypot(goal.x-pos.x,goal.y-pos.y),goal.stop,sp,g_sh.hull.YawAt(sp));
                 if(std::isfinite(yaw)){yawWant=yaw;thrustAcc=0;thrust=false;braking=true;}
             }
@@ -5028,6 +5044,11 @@ namespace vehicleflight
 		hoverui::SetState(driven != 0, g.active && (!g.autopilot || g.playerAuto), g.gear, g.wHold);
 		const auto priorDriven=g_driverVehicle.exchange(driven,std::memory_order_relaxed);
         g_manualDriverId.store(driven&&!passenger::RidingVehicle()?At<std::uint32_t>(driven,off::kFormId):0);
+		// Saved hover (flightsave.h): what a save made now records; only your own manual hover at the wheel.
+		{
+			const bool manual = driven && g.active && !g.autopilot && !passenger::RidingVehicle() && g_hoverVehicle.load() == driven;
+			flightsave::Publish(manual ? At<std::uint32_t>(driven, off::kFormId) : 0, manual ? At<game::Vec3>(driven, off::kRefPosition).z : 0.f, g.gear);
+		}
 		if (driven && priorDriven != driven) {
 			const auto id = At<std::uint32_t>(driven, off::kFormId);
 			logger::Write("Vehicle health: player boarded %08X with %.3f / %.0f health; existing chassis record retained", id,
@@ -5512,6 +5533,18 @@ namespace vehicleflight
 			if (!heldVehicle) Stop("held vehicle lost");
 		}
 		const auto vehicle = driven ? driven : (g.autopilot ? (heldVehicle ? heldVehicle : Rover()) : 0);
+		// Saved hover (flightsave.h): a loaded save that was made while you hovered asks for the hover once, through this
+		// same on path as the hover key. Asked every frame while hover is off until it is answered or expires (logged).
+		if (!g.active) {
+			const bool seat = driven && !passenger::RidingVehicle();
+			const std::uint32_t seatId = seat ? At<std::uint32_t>(driven, off::kFormId) : 0;
+			const double seatZ = seat ? double(At<game::Vec3>(driven, off::kRefPosition).z) : std::numeric_limits<double>::quiet_NaN();
+			int savedGear = g.gear;
+			if (flightsave::TakeRestore(seatId, seatZ, savedGear)) {
+				g.gear = savedGear;  // Start carries the gear over
+				Start(driven);
+			}
+		}
 		if (!driven && g.autopilot && !vehicle) {
 			Stop("rover lost");
 			return;
@@ -6027,6 +6060,14 @@ namespace vehicleflight
 					ULONGLONG every = unbound ? 333 : g_farHold[idx] ? (sp > 2.0 ? 200 : 1000) : tierEvery[idx] ? tierEvery[idx] : 50;
 					if (relaxed) every = std::max(every, d < kMidM ? kOutMidMs : kOutFarMs);
 					g_ageScale[idx] = unsigned(std::max<ULONGLONG>(every, 50) / 50);  // probe age limit follows the interval actually used
+					if (HandsOn(idx) && !g.settle) {  // your hands: every frame, through the player's own hover model
+						flownAt[idx] = now;
+						g.gear = std::clamp(g_handsGear.load(), 1, 4);
+						g.autopilot = false;
+						Fly(idx, vehicle, g_jobs[idx].goal, Focused());
+						g.autopilot = true;  // the job, its trip and the command channel stay the autopilot's
+						continue;
+					}
 					if (flownAt[idx] && now - flownAt[idx] < every) continue;
 					flownAt[idx] = now;
 					if (unbound) ++slowed; else { ++flown; ++tierCount[every <= 50 ? 0 : every <= 100 ? 1 : 2]; }
@@ -6523,6 +6564,12 @@ namespace vehicleflight
             return hulllogic::For(v.half[0],v.half[1],v.half[2]).YawAt(speed);
         }
         return 0.8;
+    }
+    void PlayerHands(int pilot, int gear)
+    {
+        if (pilot < 1 || pilot >= kPilots) return;
+        if (g_hands.exchange(pilot) != pilot || GetTickCount64() >= g_handsUntil.load()) logger::Write("%s: flown by your hands from the passenger seat (your hover model)", Who(pilot));
+        g_handsGear = gear; g_handsUntil = GetTickCount64() + 250;
     }
     bool PilotCommand(int pilot, const Command& c)
 	{

@@ -4171,7 +4171,9 @@ namespace npcvehicles
 				else if (have && vehicleflight::PilotActive(j.pilot)) {
 					const double above = vehicleflight::PilotAboveGround(j.pilot, vehicle);
 					// Parked only once down (2026-10-28: a follower parked in the air dropped); ground unknown: as before.
-					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar && !busyGoal && (!std::isfinite(above) || above < 3.5)) {
+					// Never while you drive it from the passenger seat (2026-11-18 00:30:37: parked ~20 times a second under your control).
+					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar && !busyGoal && (!std::isfinite(above) || above < 3.5) &&
+						!(passenger::Controlling() && passenger::RidingVehicle() == j.vehicle)) {
 						vehicleflight::PilotStop(j.pilot, "follow: player stopped; parked");
 						j.parked = true;
 						logger::Write("NPC vehicles: [%d] parked %.0f m from you (NPC stays aboard)", j.pilot, toPlayer);
@@ -5145,15 +5147,6 @@ namespace npcvehicles
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
-			}
-		}
-
-		void SeatPlayerNow(uptr vehicle)
-		{
-			__try {
-				g_seatPlayerOriginal(vehicle);
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
 			}
 		}
 
@@ -6391,32 +6384,6 @@ namespace npcvehicles
 		return player && v && DriverOf(v, player) != 0;
 	}
 
-	std::uint32_t TakeDriver(std::uint32_t vehicleId)
-	{
-		for (auto& j : g_jobs) {
-			if (!vehicleId || j.phase != Phase::Following || j.vehicle != vehicleId) continue;
-			const std::uint32_t npcId = j.npc;
-			const uptr npc = RefById(npcId);
-			vehicleflight::PilotStop(j.pilot, "the player took the wheel");
-			Set(j, Phase::Idle);
-			if (npc) {
-				g_allowDismount = true;
-				EndInteraction(npc);
-				g_allowDismount = false;
-			}
-			return npc ? npcId : 0;
-		}
-		return 0;
-	}
-
-	bool SeatPlayerDriver(std::uintptr_t vehicle)
-	{
-		const uptr player = Ptr(addr::kPlayerCharacterPtr);
-		if (!player || !vehicle || !g_seatPlayerOriginal) return false;
-		SeatPlayerNow(vehicle);
-		return InVehicle(player) == vehicle;
-	}
-
 	bool RequestExit(std::uintptr_t actor, const vcontract::ExitRequest& req) { return StartExit(actor, req); }
 
 	int UnloadVehicle(std::uintptr_t vehicle, const vcontract::ExitRequest& req, bool includeDriver)
@@ -6831,6 +6798,42 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: [%d] %s: seated NPC %08X drives vehicle %08X (cold start)", j.pilot, claim.name ? claim.name : "scripted trip", npcId, vehId);
 			return true;
 		}
+		return false;
+	}
+
+	// Passenger control (2026-11-18 00:31 run: back in the passenger seat after the driver's trip had ended, G found "nobody drives it"):
+	// the seated driver gets an autopilot job again, as a cold-start driver does (no walk, no trip), so G has a pilot to hand you.
+	bool StartSeatedForPassenger(std::uintptr_t vehicle)
+	{
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		if (!vehicle || !player) return false;
+		const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId);
+		if (PilotFor(vehId)) return true;
+		const uptr actor = DriverOf(vehicle, player);
+		const char* refusal = actor ? ScriptedRefusal(actor, vehicle) : "no seated driver";
+		if (*refusal || IsFollower(player, actor)) {
+			logger::Write("NPC vehicles: passenger control: %08X gets no autopilot job: %s", vehId, *refusal ? refusal : "the driver is your follower");
+			return false;
+		}
+		const std::uint32_t npcId = At<std::uint32_t>(actor, off::kFormId);
+		for (auto& j : g_jobs) {
+			if (j.phase != Phase::Idle) continue;
+			j = Job{};
+			j.pilot = int(&j - g_jobs) + 1;
+			j.npc = npcId; j.vehicle = vehId;
+			j.profile = Profile::Escort;
+			j.cmd = true;  // already seated: no instant-seat fallback
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			j.homeX = vp.x; j.homeY = vp.y; j.haveHome = true;
+			j.originX = vp.x; j.originY = vp.y; j.haveOrigin = true;
+			j.coldStart = true;
+			Set(j, Phase::Boarding);
+			const bool pkg = pilotquest::AssignTraffic(j.pilot - 1, actor, vehicle);
+			j.questPending = !pkg && lifecycle::Pending(npcId, "pilot-assign");
+			logger::Write("NPC vehicles: [%d] passenger control: seated NPC %08X takes vehicle %08X on its autopilot again (no trip)", j.pilot, npcId, vehId);
+			return true;
+		}
+		logger::Write("NPC vehicles: passenger control: %08X gets no autopilot job: every NPC job slot is in use", vehId);
 		return false;
 	}
 
