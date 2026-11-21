@@ -44,6 +44,9 @@ namespace hoverui
 	void SetAutoKey(const char* key);
 	// Main thread: the vehicle health line (the lifebar) for the status card; empty hides it.
 	void SetLifebar(const char* line);
+	// Main thread, test builds: the plan ledger line for your car on the plan (vehicleflight::PlanLedgerLine), shown on the status card's
+	// last line while refreshed within the last second; nothing in FVO_RELEASE builds.
+	void SetPlanLine(const char* line);
 	// Main thread: the vehicle bar under the game's enemy bar (the driver's): the vehicle's name and health share (0..1);
 	// an empty name hides it.
 	void SetVehicleBar(const char* name, float share);

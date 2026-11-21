@@ -1,4 +1,6 @@
 #pragma once
+#include "traffic/birth_api.h"
+struct FvoTrafficVehicle;
 
 #include <cstdint>
 #include <vector>
@@ -12,6 +14,12 @@
 // build created at a parked spot are cleared once (one kept).
 namespace realvehicles
 {
+    bool ReadModelBounds(std::uintptr_t base, double (&half)[3], double& bottom, double& top);
+    void RefreshRoadInventory(std::uintptr_t playerCell, std::uintptr_t world);
+    void ResetRoadInventory();
+    int AppendRoadVehicles(FvoTrafficVehicle* out, int count, int max);
+    FvoRoadClearance CheckRoadSite(std::uintptr_t playerCell, std::uintptr_t world,
+        const FvoRoadSiteV1& site, std::uint64_t& epoch);
 	// Main thread: jobs every frame; registry passes start every 2 s and visit one cell/frame.
 	void Tick();
 	bool PlayersOrOwn(std::uint32_t id);  // main thread: the player's vehicle, or one of the mod's own placements

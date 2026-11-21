@@ -10,12 +10,30 @@
 #include "targetinput.h"
 #include "overrides.h"
 #include "keygesture.h"
+#include "farmover.h"
 #include <cstdio>
 #include <string>
 #include <cmath>
 #include <limits>
 int main(){
  int failures=0;auto check=[&](bool ok,const char*message){std::printf("%s %s\n",ok?"PASS":"FAIL",message);if(!ok)++failures;};
+ {
+  const auto first=farmover::FlightArc(10,20,30,0,650,0);
+  const auto later=farmover::FlightArc(10,20,30,0,650,10);
+  check(first.x==10&&first.y==670&&first.z==55,"far mover starts at the requested distance and height");
+  check(std::fabs(std::hypot(later.x-10,later.y-20)-650)<1e-6&&later.x>first.x&&later.z>first.z,
+        "far mover advances on a constant-distance arc and follows the altitude plan");
+  check(farmover::Advance(5,10,false)==5&&std::fabs(farmover::Advance(5,10,true)-5.1)<1e-9&&
+        farmover::Advance(21.99,1,true)==farmover::rules::duration,"far mover clock pauses, limits jumps and ends");
+  float parent[16]={0,1,0,0,-1,0,0,0,0,0,1,0,10,20,30,2};
+  float local[16]{};
+  const farmover::Pose wanted{14,26,38,0,0};
+  check(farmover::LocalTransform(parent,wanted,1,local)&&local[12]==-3&&local[13]==2&&
+        local[14]==4&&local[15]==.5f&&local[1]==-1&&local[4]==1,
+        "far mover preserves its world pose through a translated, rotated and scaled parent");
+  parent[15]=0;
+  check(!farmover::LocalTransform(parent,wanted,1,local),"far mover rejects an unusable parent transform");
+ }
  bodybinding::Binding owners[]={{0x01000011,true},{0x01000022,true},{0x01000033,false}};
  check(bodybinding::Owner(0x01000011,owners)==0,"player body resolves only to player controller");
  check(bodybinding::Owner(0x01000022,owners)==1,"NPC body resolves only to its controller");

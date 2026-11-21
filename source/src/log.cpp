@@ -49,9 +49,16 @@ namespace logger
 		SHCreateDirectoryExW(nullptr, dir.c_str(), nullptr);
 		// Keep the previous session (it may hold a crash report) before starting a new log.
 		const std::wstring path = dir + L"\\" + plugininfo::Name() + L".log";
-		MoveFileExW(path.c_str(), (dir + L"\\" + plugininfo::Name() + L".prev.log").c_str(), MOVEFILE_REPLACE_EXISTING);
-		g_file = _wfopen(path.c_str(), L"w");
+		// 2026-11-07: a relaunch while the old game process still held the log failed the move unchecked, then "w" truncated the
+		// live file (01:05 run lost: 9.7 MB of NUL, two writers). If the old log cannot be moved aside, this run writes its own file.
+		std::wstring use = path; DWORD moveError = 0;
+		if (!MoveFileExW(path.c_str(), (dir + L"\\" + plugininfo::Name() + L".prev.log").c_str(), MOVEFILE_REPLACE_EXISTING)) {
+			moveError = GetLastError();
+			if (moveError != ERROR_FILE_NOT_FOUND) use = dir + L"\\" + plugininfo::Name() + L"." + std::to_wstring(GetCurrentProcessId()) + L".log";
+		}
+		g_file = _wfopen(use.c_str(), L"w");
         if(g_file)std::setvbuf(g_file,g_buffer,_IOFBF,sizeof(g_buffer));
+		if (g_file && use != path) { std::fprintf(g_file, "OBS system=log event=own_file reason=previous_log_still_held move_error=%lu pid=%lu\n", moveError, GetCurrentProcessId()); std::fflush(g_file); }
 	}
 
 #ifndef FVO_RELEASE

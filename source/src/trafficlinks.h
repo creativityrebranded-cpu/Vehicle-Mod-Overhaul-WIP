@@ -21,6 +21,7 @@ struct Junction {
     double share = 0;        // the chance that a lap passing it turns
     std::string link;        // the [link] name (for the log)
     double radius=0;
+    int fromLane=-1,toLane=-1;
 };
 // A link point on a route in its own u: rings in degrees (as exits), paths by point index; an end is the path's last index.
 inline double U(const trafficdata::Route& r, double at) { return r.ring ? at / 360.0 * trafficroute::kRingSamples : trafficroute::Build(r).ToLine(at); }
@@ -46,8 +47,8 @@ inline std::vector<Junction> Of(const std::vector<trafficdata::Link>& links, con
         const double ub = k.toEnd ? last : std::clamp(U(*b,k.toAt), 0.0, b->ring ? double(trafficroute::kRingSamples) : last);
         const double ua = U(*a, k.at);
         // The types only leave a way out of the list; what is left behaves as every junction did before types.
-        if (k.from == name && k.type != "merge" && k.type != "crossing") out.push_back({ ua, k.to, ub, k.share, k.name, k.radius });
-        if (k.to == name && k.type != "exit" && k.type != "crossing") out.push_back({ ub, k.from, ua, k.share, k.name, k.radius });
+        if (k.from == name && k.type != "merge" && k.type != "crossing") out.push_back({ ua, k.to, ub, k.share, k.name, k.radius,k.fromLane,k.toLane });
+        if (k.to == name && k.type != "exit" && k.type != "crossing") out.push_back({ ub, k.from, ua, k.share, k.name, k.radius,k.toLane,k.fromLane });
     }
     return out;
 }
@@ -78,6 +79,7 @@ inline std::string Suggested(const trafficroute::Line& from, int fromLanes, doub
 // runs forward); a path's end, lane 1 (back along it) on a two-way path, none (-1) on a one-way path, whose end is its exit.
 inline int EntryLane(const trafficroute::Line& q, int lanes, double uQ)
 {
+    if(!q.lanes.empty()) {for(auto lane:q.lanes)if(q.closed||((uQ>q.Span()-.5)?trafficroute::Direction(q,lane)<0:trafficroute::Direction(q,lane)>0))return lane;return -1;}
     if (q.closed || q.Count() < 2) return 0;
     if (uQ > q.Span() - 0.5) return lanes > 1 ? 1 : -1;
     return 0;
@@ -89,7 +91,7 @@ inline bool Crossed(const trafficroute::Line& l, int lane, double from, double t
     return std::isfinite(moved)&&moved>0&&trafficroute::DistanceAlong(l,lane,from,to)<150&&std::isfinite(reach)&&reach>0&&reach<=moved;
 }
 // The end an open path's lane runs to (lane 0: its last point, lane 1: its first).
-inline double LaneEnd(const trafficroute::Line& l, int lane) { return lane == 1 ? 0.0 : l.Span(); }
+inline double LaneEnd(const trafficroute::Line& l, int lane) { return trafficroute::Direction(l,lane)<0 ? 0.0 : l.Span(); }
 // The junction at u (within half a point), if any.
 inline const Junction* At(const std::vector<Junction>& js, double u)
 {
@@ -99,12 +101,31 @@ inline const Junction* At(const std::vector<Junction>& js, double u)
 // A rounded network transition, shared by the map preview and the actual trip.
 inline std::vector<trafficroute::Vec> TurnPath(const trafficroute::Line& from,int inLane,double at,const trafficroute::Line& to,int outLane,double otherAt,double radius){
     if(!(radius>0))return {};
+    if(from.routeName==to.routeName&&inLane!=outLane){
+        const auto a=trafficroute::At(from,inLane,at),d=trafficroute::At(to,outLane,otherAt);
+        const auto ahead=trafficroute::At(from,inLane,trafficroute::LeadU(from,inLane,at,1)),behind=trafficroute::At(to,outLane,trafficroute::LeadU(to,outLane,otherAt,1,true));
+        const double length=std::hypot(d.x-a.x,d.y-a.y,d.z-a.z),aa=std::hypot(ahead.x-a.x,ahead.y-a.y,ahead.z-a.z),dd=std::hypot(d.x-behind.x,d.y-behind.y,d.z-behind.z);
+        if(length<8||aa<.01||dd<.01||!std::isfinite(trafficroute::Ahead(from,inLane,at,otherAt)))return {};
+        const double arm=length/3;const trafficroute::Vec b{a.x+(ahead.x-a.x)*arm/aa,a.y+(ahead.y-a.y)*arm/aa,a.z+(ahead.z-a.z)*arm/aa},c{d.x-(d.x-behind.x)*arm/dd,d.y-(d.y-behind.y)*arm/dd,d.z-(d.z-behind.z)*arm/dd};
+        std::vector<trafficroute::Vec> path;const int count=std::clamp(int(std::ceil(length)),8,512);
+        for(int i=0;i<=count;++i){const double t=double(i)/count,u=1-t;path.push_back({u*u*u*a.x+3*u*u*t*b.x+3*u*t*t*c.x+t*t*t*d.x,u*u*u*a.y+3*u*u*t*b.y+3*u*t*t*c.y+t*t*t*d.y,u*u*u*a.z+3*u*u*t*b.z+3*u*t*t*c.z+t*t*t*d.z});}return path;
+    }
     const auto a=trafficroute::At(from,inLane,trafficroute::LeadU(from,inLane,at,2.5*radius,true));
     const auto b=trafficroute::At(from,inLane,at);
     const auto c=trafficroute::At(to,outLane,trafficroute::LeadU(to,outLane,otherAt,2.5*radius));
     return routecurve::Build({a,b,c},{0,radius,0},false).points;
 }
 // Deterministic per-vehicle dice (xorshift): 0 .. 1.
+// Player Cruise at a junction (user, 2026-11-03): "stay on this route" plus every link passed there start equal
+// (one link = 50/50). Each earlier pick of an option at this junction during this cruise lowers it to 1/(1+picks).
+inline std::vector<double> CruiseWeights(const std::vector<int>& picks) {
+    std::vector<double> w;for(int n:picks)w.push_back(1.0/(1+std::max(0,n)));return w;
+}
+inline std::size_t CruisePick(const std::vector<double>& weights,double roll) {
+    double total=0;for(double w:weights)total+=w;double at=std::clamp(roll,0.0,1.0)*total;
+    for(std::size_t i=0;i<weights.size();++i){if(at<weights[i])return i;at-=weights[i];}
+    return weights.empty()?0:weights.size()-1;
+}
 inline double Roll(std::uint64_t& state)
 {
     if (!state) state = 0x9E3779B97F4A7C15ull;

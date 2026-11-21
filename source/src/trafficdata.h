@@ -5,7 +5,15 @@
 // [exit.NAME], [place.NAME] and [traffic.NAME]; names join them across files. The rings the in-game ring editor saves in
 // ringroad.ini are routes too, named "ringroad" in their world. Pure: tests/trafficdata_test.cpp.
 #include "ringlogic.h"
+#include "roadplan.h"
+#include "routeend.h"
 #include "routeschedule.h"
+#include "routepolicy.h"
+#include "laneplan.h"
+#include "splinekit.h"
+#include "journeyplan.h"
+#include "trafficconstraints.h"
+#include "placeaccess.h"
 
 #include <algorithm>
 #include <cctype>
@@ -20,6 +28,7 @@
 namespace trafficdata {
 struct Vec { double x = 0, y = 0, z = 0; };
 struct Route {
+
     std::string name, world, file;
     bool ring = true;
     ringlogic::Ring shape;           // a ring
@@ -45,8 +54,44 @@ struct Route {
     // Depots, patrol only flies laps, civilian (the default) lands anywhere but a depot.
     std::string role;
     std::string group;               // a route group (VehicleGroups.ini): its vehicle rules apply here too; empty: none
+    routepolicy::Travel travel = routepolicy::Travel::Hover;
+    std::vector<routepolicy::Section> sections;
+    double corridor = 7; // usable width of each lane, independent of lane spacing
+    laneplan::Plan lanePlan;
+    splinekit::Plan spacePlan;
+    roadplan::Plan road;
+    journeyplan::Plan journey;trafficconstraints::Rules restrictions;
+    routeend::Plan end;              // line_end / line_arrive (2026-11-06); none written: pass, as before
+    double trafficMetres = 0;        // derived on file load for the addon's demand readers
+
 };
+template <class AuthoredRoute>
+inline double TrafficLength(const AuthoredRoute& route) {
+    if (route.ring) {
+        double metres = 0;
+        auto last = ringlogic::Marker(route.shape, 0);
+        for (int i = 1; i <= ringlogic::kPoints; ++i) {
+            const auto next = ringlogic::Marker(route.shape, i);
+            metres += std::hypot(next.x - last.x, next.y - last.y);
+            last = next;
+        }
+        return metres;
+    }
+    const auto& points = route.points;
+    if (points.size() < 2) return 0;
+    const auto distance = [](const Vec& a, const Vec& b) { return std::hypot(b.x-a.x,b.y-a.y,b.z-a.z); };
+    double metres = route.closed ? distance(points.back(), points.front()) : 0;
+    for (std::size_t i = 1; i < points.size(); ++i) metres += distance(points[i-1], points[i]);
+    return metres;
+}
+template <class AuthoredRoute>
+inline double DemandLength(const AuthoredRoute& route) {
+    return routeschedule::HasLevel(route.schedule) ? TrafficLength(route) : 0;
+}
 // A list of hex form ids ("FE001033, 0001AB2C"); false when a word is not one.
+// Stored form ids carry the load-order index of the day they were written. Set by the addon only (trafficidmap.ini), so the editor still saves the ids as read.
+inline unsigned (*idAdapter)(unsigned)=nullptr;
+inline unsigned MapId(unsigned id){return idAdapter?idAdapter(id):id;}
 inline bool FormIds(const std::string& s, std::vector<unsigned>& out)
 {
     std::string list = s;
@@ -57,7 +102,7 @@ inline bool FormIds(const std::string& s, std::vector<unsigned>& out)
     while (ids >> w) {
         char* end = nullptr;
         const unsigned long id = std::strtoul(w.c_str(), &end, 16);
-        if (end && !*end && id) out.push_back(unsigned(id)); else ok = false;
+        if (end && !*end && id) out.push_back(MapId(unsigned(id))); else ok = false;
     }
     return ok;
 }
@@ -70,7 +115,7 @@ struct Exit { std::string name, route; double at = 0; };  // ring: degrees round
 // in the middle of the branch; vehicles join or leave the branch there by the share, as at the main route.
 // type (2026-10-30): how traffic uses it. Empty or both: either way, as every link before types. exit: `from` traffic turns onto
 // `to`, never back. merge: `to` traffic turns onto `from`, never back. crossing: no turning; they pass and one gives way.
-struct Link { std::string name, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; };
+struct Link { std::string name, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; int fromLane=-1,toLane=-1; };
 // parked = 1 (2026-10-29, map route editor "Bake parking"): a REV-8 is baked here (FVO_EditorPlacements.esm); the cold-start pool
 // gives it a driver when a route needs one (core never creates a vehicle at such a spot).
 // Landing areas (2026-10-30, Traffic Manager V1): layout = single, row, bays (two facing rows) or ring; spaces; turn in degrees
@@ -80,7 +125,8 @@ struct Place {
     std::string name, world, exitName; Vec at; double radius = 40; bool parked = false;
     std::string layout = "single", purpose = "stop", full = "circle";
     int spaces = 1; double turn = 0, stay = 0;
-    std::vector<std::string> routes;
+    std::vector<std::string> routes;placeaccess::Plan access;
+    std::vector<placeaccess::Wire> wires;  // landing wires (In / Out); the first of each mirrors `access`
 };
 constexpr double kSpaceGap = 14.0;  // m between the middles of two spaces
 // Where each space of a landing area is.
@@ -103,17 +149,19 @@ inline std::vector<Vec> Spaces(const Place& p)
 }
 inline bool RouteMayPark(const Place& p, const std::string& route, const std::string& role)
 {
-    if (!p.routes.empty() && std::find(p.routes.begin(), p.routes.end(), route) == p.routes.end()) return false;
+    // A route wired to the landing belongs to it as well as the routes listed.
+    const bool wired = std::any_of(p.wires.begin(), p.wires.end(), [&](const placeaccess::Wire& w) { return w.route == route; });
+    if (!p.routes.empty() && !wired && std::find(p.routes.begin(), p.routes.end(), route) == p.routes.end()) return false;
     if (role == "patrol") return false;
     if (role == "taxi") return p.purpose == "taxi";
     if (role == "cargo") return p.purpose == "depot";
     return p.purpose != "depot";
 }
 // A keep-out zone (traffic stays above `top`) or a slow zone (speed limit inside): a circle on the map.
-struct Zone { std::string name, world; Vec at; double radius = 100, top = 0, speed = 10; bool slow = false; };
+struct Zone { std::string name, world; Vec at; double radius = 100, top = 0, speed = 10; bool slow = false;trafficconstraints::Rules restrictions;double restrictionFloor=-1000000000,restrictionTop=1000000000; };
 // A city's settings (2026-10-30, Traffic Manager V1): traffic on or off, density in percent of every route's count, the most
 // vehicles at once, and whether the routes of other files fly.
-struct City { std::string world; bool on = true, originals = true; int density = 100, limit = fvolimits::kVehicles; };
+struct City { std::string world; bool on = true, originals = true; int density = 100, limit = fvolimits::kVehicles;trafficconstraints::Rules restrictions;laneplan::Plan laneDefaults; };
 inline int Scaled(int vehicles, const City& c)
 {
     if (!c.on || vehicles <= 0) return 0;
@@ -139,7 +187,7 @@ struct Traffic {
 struct AnchorRef { unsigned id = 0; Vec at; };
 // Vehicle rules beyond one route (2026-10-31, the user: "global exclusions and route group types ... custom groups I can assign each route to"). Kept in FVO_Traffic\\VehicleGroups.ini
 // as [group.name] label = ..., exclude = FORMID, FORMID, so they hold on every planet. The group named "global" applies to every route.
-struct RouteGroup { std::string name, label; std::vector<unsigned> exclude; };
+struct RouteGroup { std::string name, label; std::vector<unsigned> exclude;trafficconstraints::Rules restrictions;laneplan::Plan laneDefaults; };
 inline const char* GlobalGroup() { return "global"; }
 inline bool InList(const std::vector<unsigned>& list, unsigned id) { return std::find(list.begin(), list.end(), id) != list.end(); }
 // Left out by the route's group or by all routes, whatever the route itself says.
@@ -149,6 +197,14 @@ inline bool LeftOutAbove(const std::vector<RouteGroup>& groups, const Route& r, 
     return false;
 }
 inline bool LeftOut(const std::vector<RouteGroup>& groups, const Route& r, unsigned id) { return InList(r.exclude, id) || LeftOutAbove(groups, r, id); }
+inline bool LaneLeftOut(const std::vector<RouteGroup>& groups,const Route& route,int lane,unsigned id){
+    if(LeftOut(groups,route,id)||!route.lanePlan.vehicles.unsupported.empty())return true;
+    const auto* rule=lanevehicles::Find(route.lanePlan.vehicles,lane);if(!rule)return false;
+    if(InList(rule->exclude,id))return true;
+    if(!rule->group.empty()){const auto group=std::find_if(groups.begin(),groups.end(),[&](const auto& candidate){return candidate.name==rule->group;});if(group==groups.end()||InList(group->exclude,id))return true;}
+    return false;
+}
+
 // Everything this route may not fly: its own list, its group's and all routes'.
 inline std::vector<unsigned> AllLeftOut(const std::vector<RouteGroup>& groups, const Route& r)
 {
@@ -158,6 +214,8 @@ inline std::vector<unsigned> AllLeftOut(const std::vector<RouteGroup>& groups, c
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }
+inline std::vector<unsigned> LaneLeftOut(const std::vector<RouteGroup>& groups,const Route& route,int lane){auto out=AllLeftOut(groups,route);if(const auto* rule=lanevehicles::Find(route.lanePlan.vehicles,lane)){out.insert(out.end(),rule->exclude.begin(),rule->exclude.end());for(const auto& group:groups)if(group.name==rule->group)out.insert(out.end(),group.exclude.begin(),group.exclude.end());}std::sort(out.begin(),out.end());out.erase(std::unique(out.begin(),out.end()),out.end());return out;}
+
 struct Data {
     std::vector<RouteGroup> groups;
     std::map<std::string, std::string> worlds;  // world name -> id (the worldspace's editor name)
@@ -174,6 +232,14 @@ struct Data {
     int files = 0;
 };
 
+inline laneplan::Plan LaneDefaults(const std::vector<City>& cities,const std::vector<RouteGroup>& groups,const Route& route,const std::map<std::string,std::string>* worlds=nullptr){
+    if((route.lanePlan.enabled||!route.lanePlan.unsupported.empty())&&!route.lanePlan.inherited)return route.lanePlan;laneplan::Plan plan;
+    auto sameWorld=[&](const std::string& a,const std::string& b){if(a==b)return true;if(!worlds)return false;const auto x=worlds->find(a),y=worlds->find(b);return x!=worlds->end()&&y!=worlds->end()&&x->second==y->second;};
+    for(const auto& city:cities)if(sameWorld(city.world,route.world)&&(city.laneDefaults.enabled||!city.laneDefaults.unsupported.empty())){if(plan.enabled&&laneplan::Write(plan)!=laneplan::Write(city.laneDefaults)){plan={};plan.unsupported="conflicting world lane defaults";break;}plan=city.laneDefaults;}
+    for(const auto& name:{std::string(GlobalGroup()),route.group})if(!name.empty())for(const auto& group:groups)if(group.name==name&&(group.laneDefaults.enabled||!group.laneDefaults.unsupported.empty()))plan=group.laneDefaults;
+    if(plan.enabled||!plan.unsupported.empty())plan.inherited=true;plan.vehicles=route.lanePlan.vehicles;plan.transforms=route.lanePlan.transforms;return plan;
+}
+inline void ApplyLaneDefaults(Data& data){for(auto& route:data.routes)route.lanePlan=LaneDefaults(data.cities,data.groups,route,&data.worlds);}
 inline std::string Trim(std::string s)
 {
     const auto a = s.find_first_not_of(" \t\r\n");
@@ -203,13 +269,13 @@ inline std::vector<double> Numbers(const std::string& s, bool& ok)
 }
 
 // One file's text into `data`; `file` names it in problems.
-inline void Read(const std::string& text, const std::string& file, Data& data)
+inline void Read(const std::string& text, const std::string& file, Data& data, bool privateFactoryGeometry = false)
 {
     ++data.files;
     std::map<std::string, std::map<std::string, std::string>> sections;
     std::vector<std::string> order;
     std::string current;
-    std::istringstream in(text);
+    std::istringstream in(privateFactoryGeometry && text.starts_with("\xef\xbb\xbf") ? text.substr(3) : text);
     std::string line;
     while (std::getline(in, line)) {
         if (const auto semi = line.find(';'); semi != std::string::npos) line.resize(semi);
@@ -234,7 +300,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
     };
     if (const auto f = sections.find("file"); f != sections.end()) {
         const auto e = f->second.find("enabled");
-        if (e != f->second.end() && Trim(e->second) == "0") return;  // the whole file switched off
+        if (!privateFactoryGeometry && e != f->second.end() && Trim(e->second) == "0") return;  // the whole file switched off
     }
     for (const auto& sec : order) {
         const auto& kv = sections[sec];
@@ -242,6 +308,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
         const std::string kind = sec.substr(0, dot), name = dot == std::string::npos ? std::string() : sec.substr(dot + 1);
         auto get = [&](const char* key) { const auto it = kv.find(key); return it == kv.end() ? std::string() : it->second; };
         if (kind == "file") continue;
+        if (privateFactoryGeometry && kind != "route" && kind != "link") continue;
         if (name.empty()) { bad(sec, "", "a section needs a name (kind.name)"); continue; }
         if (kind == "world") {
             if (!get("anchor").empty()) {
@@ -309,6 +376,20 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
                 if(!end || *end || end==density.c_str() || n<0 || n>fvolimits::kVehicles) { bad(sec,"density","expected an integer from 0 to "+std::to_string(fvolimits::kVehicles)); continue; }
                 r.schedule.allDayVehicles=int(n);
             }
+            const auto level = Lower(Trim(get("traffic_level")));
+            const auto ranges = get("traffic_ranges");
+            int selected = routeschedule::Saved;
+            for (int i = routeschedule::Quiet; i < routeschedule::LevelCount; ++i)
+                if (level == Lower(routeschedule::LevelName(i))) selected = i;
+            auto bands = r.schedule.trafficBands;
+            if (!level.empty() && level != "saved" && selected == routeschedule::Saved)
+                bad(sec, "traffic_level", "expected Quiet, Steady, Busy or Saved; using the saved schedule");
+            else if (!ranges.empty() && !routeschedule::ReadTrafficBands(ranges, bands))
+                bad(sec, "traffic_ranges", "expected three minimum/maximum pairs; using the saved schedule");
+            else {
+                r.schedule.trafficLevel = selected;
+                r.schedule.trafficBands = bands;
+            }
             if (r.ring) {
                 bool ok = true;
                 const auto c = Numbers(get("centre").empty() ? get("center") : get("centre"), ok);
@@ -339,6 +420,13 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
                     }
                 }
             }
+            if (!get("travel").empty() && (!routepolicy::Parse(Lower(Trim(get("travel"))), r.travel) || r.travel == routepolicy::Travel::Inherit)) { bad(sec,"travel","drive, hover or both"); continue; }
+            if (!get("corridor").empty() && (!Number(get("corridor"),r.corridor) || r.corridor<1 || r.corridor>200)) { bad(sec,"corridor","1..200 metres per lane"); continue; }
+            r.road=roadplan::Read(get("road_tiles"));r.spacePlan=splinekit::Read(get("space_plan"));r.lanePlan=laneplan::Read(get("lane_plan"));r.lanePlan.vehicles=lanevehicles::Read(get("lane_vehicles"));r.lanePlan.transforms=lanetransform::Read(get("lane_transforms"));r.journey=journeyplan::Read(get("journey_plan"));r.restrictions=trafficconstraints::Read(get("restrictions"));
+            // Field boxes and line ending (2026-11-06): text this build cannot read is kept, never a reason to skip the route.
+            roadplan::ReadBoxes(get("road_boxes"),r.road);r.end=routeend::Read(get("line_end"),get("line_arrive"));
+            if (!get("sections").empty() && (!routepolicy::ReadIni(get("sections"),r.sections) || r.ring || r.sections.size()!=r.points.size())) { bad(sec,"sections","one valid section rule per point required"); continue; }
+            r.trafficMetres = DemandLength(r);
             data.routes.push_back(r);
         }
         else if (kind == "exit") {
@@ -349,7 +437,9 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
             data.exits.push_back(e);
         }
         else if (kind == "place") {
-            Place p;
+            Place p;p.access=placeaccess::Read(get("access_plan"));
+            if(const auto extra=get("access_wires");extra.empty()||!placeaccess::ReadWires(extra,p.wires))p.wires=placeaccess::FromPlan(p.access);
+            else p.wires=placeaccess::Merge(p.access,p.wires);  // the single fields win for the first wire of each socket
             p.name = name; p.world = Lower(get("world")); p.exitName = Lower(get("near")); p.parked = Trim(get("parked")) == "1";
             bool ok = true;
             const auto v = Numbers(get("point"), ok);
@@ -409,7 +499,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
                     while (ids >> w) {
                         char* end = nullptr;
                         const unsigned long id = std::strtoul(w.c_str(), &end, 16);
-                        if (end && !*end && id) t.bases.push_back(unsigned(id)); else bad(sec, "vehicles", "not a form id: " + w);
+                        if (end && !*end && id) t.bases.push_back(MapId(unsigned(id))); else bad(sec, "vehicles", "not a form id: " + w);
                     }
                 }
             }
@@ -422,7 +512,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
         else if (kind == "link") {
             Link k;
             k.name = name; k.from = Lower(get("from")); k.to = Lower(get("to"));
-            if (k.from.empty() || k.to.empty() || k.from == k.to) { bad(sec, "from/to", "two different routes needed"); continue; }
+            if (k.from.empty() || k.to.empty()) { bad(sec, "from/to", "two route names needed"); continue; }
             if (!Number(get("at"), k.at)) { bad(sec, "at", "not a number"); continue; }
             const std::string end = Lower(Trim(get("to_at")));
             if (end == "end") k.toEnd = true;
@@ -430,6 +520,8 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
             if (!get("share").empty() && (!Number(get("share"), k.share) || k.share < 0 || k.share > 1)) { bad(sec, "share", "0 to 1"); continue; }
             if(!get("radius").empty()&&(!Number(get("radius"),k.radius)||k.radius<0||k.radius>200)){bad(sec,"radius","0..200 metres required");continue;}
             k.type = Lower(Trim(get("type")));
+            {double from=-1,to=-1;if((!get("from_lane").empty()&&!Number(get("from_lane"),from))||(!get("to_lane").empty()&&!Number(get("to_lane"),to))||from< -1||from>=laneplan::kMaxLanes||to< -1||to>=laneplan::kMaxLanes||from!=std::floor(from)||to!=std::floor(to)){bad(sec,"lane","lane identity -1..15 required");continue;}k.fromLane=int(from);k.toLane=int(to);}
+            if(k.from==k.to&&(k.fromLane<0||k.toLane<0||k.fromLane==k.toLane||((k.fromLane^k.toLane)&1)||k.toEnd||k.at==k.toAt||k.radius<=0)){bad(sec,"lanes","same-route connection needs distinct same-direction lanes, anchors and positive radius");continue;}
             if (k.type == "both") k.type.clear();
             if (!k.type.empty() && k.type != "exit" && k.type != "merge" && k.type != "crossing") { bad(sec, "type", "both, exit, merge or crossing; read as both"); k.type.clear(); }
             data.links.push_back(k);
@@ -446,10 +538,12 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
             num(sec, kv, "top", z.top);
             num(sec, kv, "speed", z.speed);
             z.radius = std::clamp(z.radius, 10.0, 2000.0); z.speed = std::clamp(z.speed, 2.0, 80.0);
+            z.restrictions=trafficconstraints::Read(get("restrictions"));num(sec,kv,"restriction_floor",z.restrictionFloor);num(sec,kv,"restriction_top",z.restrictionTop);
+            if(!std::isfinite(z.restrictionFloor)||!std::isfinite(z.restrictionTop)||z.restrictionFloor>z.restrictionTop){bad(sec,"restriction height","finite ordered height band required");z.restrictions.unsupported="invalid restriction height band: "+get("restrictions");}
             data.zones.push_back(z);
         }
         else if (kind == "city") {
-            City c;
+            City c;c.laneDefaults=laneplan::Read(get("lane_defaults"));c.restrictions=trafficconstraints::Read(get("restrictions"));
             c.world = Lower(get("world"));
             c.on = Trim(get("traffic")) != "0"; c.originals = Trim(get("originals")) != "0";
             double density = c.density, limit = c.limit;
@@ -459,7 +553,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
             data.cities.push_back(c);
         }
         else if (kind == "group") {
-            RouteGroup g;
+            RouteGroup g;g.laneDefaults=laneplan::Read(get("lane_defaults"));g.restrictions=trafficconstraints::Read(get("restrictions"));
             g.name = Lower(name); g.label = get("label").empty() ? name : get("label");
             if (!get("exclude").empty() && !FormIds(get("exclude"), g.exclude)) bad(sec, "exclude", "form ids in hex, comma between them");
             const auto same = std::find_if(data.groups.begin(), data.groups.end(), [&](const RouteGroup& o) { return o.name == g.name; });
@@ -475,6 +569,9 @@ inline void Read(const std::string& text, const std::string& file, Data& data)
 inline bool EditorFile(const std::string& file) { return Lower(file).rfind("editor_", 0) == 0; }
 inline void PreferEditor(Data& d)
 {
+    std::set<std::pair<std::string,std::string>> permanent;
+    for(const auto& r:d.routes)if(Lower(r.file).starts_with("permanent_"))permanent.insert({r.world,r.name});
+    std::erase_if(d.routes,[&](const Route& r){return !EditorFile(r.file)&&!Lower(r.file).starts_with("permanent_")&&permanent.count({r.world,r.name});});
     std::set<std::string> edited;
     for (const auto& r : d.routes) if (EditorFile(r.file)) edited.insert(r.name);
     d.routes.erase(std::remove_if(d.routes.begin(), d.routes.end(),
@@ -497,15 +594,19 @@ inline void PlaceWorld(Data& d, const std::string& name, const std::string& game
     d.worlds[name] = gameWorld;
     for (auto& r : d.routes) {
         if (r.world != name) continue;
+        splinekit::Transform(r.spacePlan,{},{shift.x,shift.y,shift.z});
+    lanetransform::Parent(r.lanePlan.transforms,lanetransform::Identity(),{},{shift.x,shift.y,shift.z});
         r.shape.cx += shift.x; r.shape.cy += shift.y; r.shape.z += shift.z;
         for (auto& p : r.points) { p.x += shift.x; p.y += shift.y; p.z += shift.z; }
+        for(auto& stop:r.journey.stops){stop.x+=shift.x;stop.y+=shift.y;stop.z+=shift.z;}
+        routeend::Shift(r.end,shift.x,shift.y,shift.z);
     }
     for (auto& p : d.places)
-        if (p.world == name) { p.at.x += shift.x; p.at.y += shift.y; p.at.z += shift.z; }
+        if (p.world == name) { p.at.x += shift.x; p.at.y += shift.y; p.at.z += shift.z;placeaccess::Move(p.access,shift.x,shift.y,shift.z);placeaccess::MoveWires(p.wires,shift.x,shift.y,shift.z); }
     for (auto& s : d.spawns)
         if (s.world == name) { s.at.x += shift.x; s.at.y += shift.y; s.at.z += shift.z; }
     for (auto& z : d.zones)
-        if (z.world == name) { z.at.x += shift.x; z.at.y += shift.y; z.at.z += shift.z; z.top += shift.z; }
+        if (z.world == name) { z.at.x += shift.x; z.at.y += shift.y; z.at.z += shift.z; z.top += shift.z;if(z.restrictionFloor>-1000000000)z.restrictionFloor+=shift.z;if(z.restrictionTop<1000000000)z.restrictionTop+=shift.z; }
 }
 
 // The world key of a [world.NAME] or of a ringroad.ini ring ("#" + its id), lower case; matched against the game's world.

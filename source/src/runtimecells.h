@@ -8,5 +8,6 @@ enum class Policy {AttachedCell,ReadyGridEntry};
 std::uintptr_t Cell(unsigned index,Policy policy);
 std::uintptr_t Attached(unsigned index);
 bool References(std::uintptr_t cell,std::uintptr_t*& data,std::uint32_t& count);
+bool InventoryReferences(std::uintptr_t cell,std::uintptr_t*& data,std::uint32_t& count);
 void Reset();
 }

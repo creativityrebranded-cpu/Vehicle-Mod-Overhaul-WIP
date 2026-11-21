@@ -17,7 +17,7 @@ namespace bindings
 {
 
 	// Once per frame (the vehicle task): bindings.ini changes, the controller's state.
-	void Tick(bool gameplay=true); // housekeeping samples; gameplay publishes queued events
+	void Tick(bool gameplay=true, bool world=true); // housekeeping samples; gameplay publishes queued events; world=false: no game reads
     void EndUpdate(); // end the shared gameplay-event batch
 	void ResetRuntime();
 	bool Triggered(Action a);

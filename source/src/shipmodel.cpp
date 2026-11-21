@@ -6,6 +6,16 @@
 #include "log.h"
 #include "telemetry.h"
 
+#if defined(SP_FEATURE_VEHICLE) && !defined(FVO_RELEASE)
+#include "farmover.h"
+#include "fvopaths.h"
+#include "playclock.h"
+#include "runtimeforms.h"
+#include "vehicleflight.h"
+#include "vehiclekeep.h"
+#include <unordered_set>
+#endif
+
 #include <Windows.h>
 
 #include <atomic>
@@ -179,7 +189,7 @@ namespace shipmodel
 		}
 
 		// Engine clone of one 3D tree (NiCloningProcess as the clone pools build it, FUN_140659c00); collision removed.
-		std::uintptr_t CloneTree(std::uintptr_t root, int* stripped)
+		std::uintptr_t CloneTree(std::uintptr_t root, int* stripped, bool makeVisible = true)
 		{
 			alignas(16) std::uint8_t cp[0x80] = {};
 			const auto cpp = reinterpret_cast<std::uintptr_t>(cp);
@@ -199,7 +209,7 @@ namespace shipmodel
 			if (stripped) {
 				*stripped += StripCollision(clone);
 			}
-			At<std::uint64_t>(clone, kFlags) &= ~1ull;
+			if (makeVisible) At<std::uint64_t>(clone, kFlags) &= ~1ull;
 			return clone;
 		}
 
@@ -518,6 +528,209 @@ namespace shipmodel
 			alignas(16) std::uint8_t data[0x80] = {};
 			VFn<void (*)(std::uintptr_t, void*)>(g.clone, kVUpdateDownward)(g.clone, data);
 		}
+
+#if defined(SP_FEATURE_VEHICLE) && !defined(FVO_RELEASE)
+		struct FarProbe {
+			std::uintptr_t clone = 0, parent = 0, world = 0;
+			unsigned donor = 0, run = 0, frames = 0, samples = 0;
+			bool keyDown = false, attempted = false, ready = false, active = false, faulted = false;
+			float scale = 1;
+			game::Vec3 origin{};
+			double heading = 0, distance = 0, elapsed = 0, totalMs = 0, worstMs = 0, maxError = 0;
+			ULONGLONG last = 0, reported = 0;
+		} g_far;
+		std::atomic_flag g_farUpdating = ATOMIC_FLAG_INIT;
+		std::atomic<bool> g_farReset{false};
+
+		bool CaptureFarProbe()
+		{
+			if (g_far.attempted) return g_far.ready;
+			const unsigned id = vehicleflight::OwnRoverId();
+			const auto donorRef = id ? runtimeforms::LookupChecked(id) : 0;
+			const auto donor = donorRef ? Root3D(donorRef) : 0;
+			if (!donor) {
+				logger::Write("OBS system=far.mover event=start_refused reason=player_rover_model_unloaded donor=%08X", id);
+				return false;
+			}
+			g_far.attempted = true;
+			g_far.donor = id;
+			g_far.scale = At<float>(donor, kWorldTranslate + 12);
+			std::unordered_set<std::uintptr_t> original;
+			bool incomplete = false;
+			Walk(donor, 0, 64, [&](std::uintptr_t node, int depth) {
+				original.insert(node);
+				incomplete |= depth == 64;
+			});
+			if (incomplete) {
+				logger::Write("OBS system=far.mover event=clone_refused donor=%08X reason=donor_tree_depth", id);
+				return false;
+			}
+			g_far.clone = CloneTree(donor, nullptr, false);
+			if (!g_far.clone) {
+				logger::Write("OBS system=far.mover event=clone_refused donor=%08X reason=clone_failed", id);
+				return false;
+			}
+			bool shared = false;
+			Walk(g_far.clone, 0, 64, [&](std::uintptr_t node, int depth) {
+				shared |= original.contains(node);
+				incomplete |= depth == 64;
+			});
+			if (shared || incomplete || At<std::uintptr_t>(g_far.clone, kParent)) {
+				logger::Write("OBS system=far.mover event=clone_refused donor=%08X reason=clone_not_independent", id);
+				return false;
+			}
+			const int stripped = StripCollision(g_far.clone);
+			int remaining = 0;
+			Walk(g_far.clone, 0, 64, [&](std::uintptr_t node, int) { remaining += At<std::uintptr_t>(node, kCollision) != 0; });
+			g_far.ready = remaining == 0 && std::isfinite(g_far.scale) && g_far.scale > .01f;
+			logger::Write("OBS system=far.mover event=clone donor=%08X ready=%d stripped=%d colliders=%d scale=%.3f",
+				id, int(g_far.ready), stripped, remaining, double(g_far.scale));
+			return g_far.ready;
+		}
+
+		void StopFarProbe(std::uintptr_t liveRoot, const char* why)
+		{
+			if (!g_far.active) return;
+			g_far.active = false;
+			At<std::uint64_t>(g_far.clone, kFlags) |= 1;
+			const bool detach = liveRoot && liveRoot == g_far.parent && At<std::uintptr_t>(g_far.clone, kParent) == liveRoot;
+			if (detach) VFn<void (*)(std::uintptr_t, std::uintptr_t)>(liveRoot, kVDetachChild)(liveRoot, g_far.clone);
+			g_far.parent = 0;
+			logger::Write("OBS system=far.mover event=stop run=%u reason=%s elapsed=%.2f frames=%u samples=%u mean_update_ms=%.4f worst_update_ms=%.4f max_pose_error_m=%.3f detached=%d",
+				g_far.run, why, g_far.elapsed, g_far.frames, g_far.samples, g_far.frames ? g_far.totalMs / g_far.frames : 0,
+				g_far.worstMs, g_far.maxError, int(detach));
+		}
+
+		bool StartFarProbe(std::uintptr_t player, std::uintptr_t root, std::uintptr_t world, ULONGLONG now)
+		{
+			float camera[3]{}, forward[3]{};
+			if (!root || !vehiclekeep::ReadCameraPose(camera, forward) || std::hypot(forward[0], forward[1]) < .2f) {
+				logger::Write("OBS system=far.mover event=start_refused reason=no_horizontal_camera_or_player_model");
+				return false;
+			}
+			if (!CaptureFarProbe()) return false;
+			if (At<std::uintptr_t>(g_far.clone, kParent)) {
+				logger::Write("OBS system=far.mover event=start_refused reason=previous_parent_still_attached");
+				return false;
+			}
+			g_far.origin = At<game::Vec3>(player, off::kRefPosition);
+			g_far.heading = std::atan2(forward[0], forward[1]);
+			const int requested = int(GetPrivateProfileIntW(L"diagnostics", L"farMoverDistance", farmover::rules::defaultDistance, fvopaths::Settings().c_str()));
+			g_far.distance = std::clamp(requested, farmover::rules::minDistance, farmover::rules::maxDistance);
+			const auto start = farmover::FlightArc(g_far.origin.x, g_far.origin.y, g_far.origin.z, g_far.heading, g_far.distance, 0);
+			float local[16]{};
+			if (!farmover::LocalTransform(reinterpret_cast<const float*>(root + kWorldRotate), start, g_far.scale, local)) {
+				logger::Write("OBS system=far.mover event=start_refused reason=invalid_parent_transform");
+				return false;
+			}
+			std::memcpy(reinterpret_cast<void*>(g_far.clone + kLocal), local, sizeof(local));
+			VFn<void (*)(std::uintptr_t, std::uintptr_t, char)>(root, kVAttachChild)(root, g_far.clone, 0);
+			if (At<std::uintptr_t>(g_far.clone, kParent) != root) {
+				logger::Write("OBS system=far.mover event=start_refused reason=attachment_failed");
+				return false;
+			}
+			g_far.parent = root;
+			g_far.world = world;
+			g_far.active = true;
+			g_far.elapsed = g_far.totalMs = g_far.worstMs = g_far.maxError = 0;
+			g_far.frames = g_far.samples = 0;
+			g_far.last = now;
+			g_far.reported = 0;
+			++g_far.run;
+			At<std::uint64_t>(g_far.clone, kFlags) &= ~1ull;
+			logger::Write("OBS system=far.mover event=start run=%u donor=%08X origin=%.2f,%.2f,%.2f target=%.2f,%.2f,%.2f distance_m=%.0f speed_mps=%.1f climb_mps=%.2f duration_s=%.1f scene_only=1 driver=0 chassis=0 thread=%lu",
+				g_far.run, g_far.donor, double(g_far.origin.x), double(g_far.origin.y), double(g_far.origin.z),
+				start.x, start.y, start.z, g_far.distance, farmover::rules::speed, farmover::rules::climb, farmover::rules::duration, GetCurrentThreadId());
+			return true;
+		}
+
+		void TickFarProbe(std::uintptr_t player, bool resetting)
+		{
+			if (g_far.faulted) return;
+			DWORD pid = 0;
+			GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+			const bool down = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+				(GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState(VK_F11) & 0x8000);
+			const bool pressed = down && !g_far.keyDown;
+			g_far.keyDown = down;
+			if (!pressed && !g_far.active) return;
+			const auto root = player ? AsNode(Root3D(player)) : 0;
+			const auto cell = player ? At<std::uintptr_t>(player, off::kRefParentCell) : 0;
+			const auto world = cell && !(At<std::uint8_t>(cell, off::kCellFlags) & 1) ? At<std::uintptr_t>(cell, off::kCellWorldspace) : 0;
+			if (resetting || !world || (g_far.active && (root != g_far.parent || world != g_far.world))) {
+				const char* reason = resetting ? "save_reset" : !world ? "left_exterior" : world != g_far.world ? "world_changed" : "parent_changed";
+				StopFarProbe(root, reason);
+				if (pressed) logger::Write("OBS system=far.mover event=start_refused reason=need_stable_exterior");
+				return;
+			}
+			const auto now = GetTickCount64();
+			const bool playing = playclock::Running();
+			if (pressed) {
+				if (g_far.active) { StopFarProbe(root, "toggle"); return; }
+				if (!playing) { logger::Write("OBS system=far.mover event=start_refused reason=play_paused"); return; }
+				if (!StartFarProbe(player, root, world, now)) return;
+			}
+			const double seconds = double(now - g_far.last) / 1000.0;
+			g_far.last = now;
+			if (!playing) return;
+			g_far.elapsed = farmover::Advance(g_far.elapsed, seconds, true);
+			const auto pose = farmover::FlightArc(g_far.origin.x, g_far.origin.y, g_far.origin.z, g_far.heading, g_far.distance, g_far.elapsed);
+			float local[16]{};
+			if (At<std::uintptr_t>(g_far.clone, kParent) != root ||
+				!farmover::LocalTransform(reinterpret_cast<const float*>(root + kWorldRotate), pose, g_far.scale, local)) {
+				StopFarProbe(root, "lost_attachment_or_transform");
+				return;
+			}
+			LARGE_INTEGER began{}, ended{};
+			QueryPerformanceCounter(&began);
+			std::memcpy(reinterpret_cast<void*>(g_far.clone + kLocal), local, sizeof(local));
+			alignas(16) std::uint8_t data[0x80] = {};  // same visual-only scene update as PlaceOnVehicle
+			VFn<void (*)(std::uintptr_t, void*)>(g_far.clone, kVUpdateDownward)(g_far.clone, data);
+			QueryPerformanceCounter(&ended);
+			static const double ticksPerMs = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return double(f.QuadPart) / 1000.0; }();
+			const double ms = (ended.QuadPart - began.QuadPart) / ticksPerMs;
+			const auto actual = At<game::Vec3>(g_far.clone, kWorldTranslate);
+			const double error = std::hypot(actual.x - pose.x, actual.y - pose.y, actual.z - pose.z);
+			if (!std::isfinite(error)) { StopFarProbe(root, "invalid_scene_pose"); return; }
+			++g_far.frames;
+			g_far.totalMs += ms;
+			g_far.worstMs = std::max(g_far.worstMs, ms);
+			g_far.maxError = std::max(g_far.maxError, error);
+			if (!g_far.reported || now - g_far.reported >= 1000 || g_far.elapsed >= farmover::rules::duration) {
+				g_far.reported = now;
+				++g_far.samples;
+				const auto pp = At<game::Vec3>(player, off::kRefPosition);
+				float eye[3]{}, forward[3]{};
+				const bool camera = vehiclekeep::ReadCameraPose(eye, forward);
+				const double dx = actual.x - eye[0], dy = actual.y - eye[1], dz = actual.z - eye[2], dist = std::hypot(dx, dy, dz);
+				const double angle = camera && dist > .01 ? std::acos(std::clamp((dx * forward[0] + dy * forward[1] + dz * forward[2]) / dist, -1.0, 1.0)) * 57.2957795 : -1.0;
+				logger::Write("OBS system=far.mover event=sample run=%u t=%.2f player_cell=%08X distance_m=%.1f target=%.2f,%.2f,%.2f scene=%.2f,%.2f,%.2f pose_error_m=%.3f yaw=%.2f pitch=%.3f camera_read=%d angle_deg=%.1f root_hidden=%d model_hidden=%d bound_radius_m=%.2f update_ms=%.4f thread=%lu",
+					g_far.run, g_far.elapsed, At<unsigned>(cell, off::kFormId), std::hypot(double(actual.x - pp.x), double(actual.y - pp.y)),
+					pose.x, pose.y, pose.z, double(actual.x), double(actual.y), double(actual.z), error, pose.heading, pose.pitch,
+					int(camera), angle, int(At<std::uint64_t>(root, kFlags) & 1), int(At<std::uint64_t>(g_far.clone, kFlags) & 1),
+					double(At<float>(g_far.clone, kBound + 12)), ms, GetCurrentThreadId());
+			}
+			if (g_far.elapsed >= farmover::rules::duration) StopFarProbe(root, "complete");
+		}
+
+		void GuardFarProbe(std::uintptr_t player, bool resetting)
+		{
+			__try { TickFarProbe(player, resetting); }
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				g_far.faulted = true;
+				logger::Write("OBS system=far.mover event=fault run=%u code=%08X", g_far.run, unsigned(GetExceptionCode()));
+				__try { StopFarProbe(0, "fault"); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+			}
+		}
+
+		void UpdateFarProbe(std::uintptr_t player)
+		{
+			// Standalone and core both call from existing game updates. An overlapping update skips without waiting.
+			if (g_farUpdating.test_and_set(std::memory_order_acquire)) return;
+			GuardFarProbe(player, g_farReset.exchange(false, std::memory_order_acq_rel));
+			g_farUpdating.clear(std::memory_order_release);
+		}
+#endif
 	}
 
 	void Show(bool show)
@@ -595,6 +808,9 @@ namespace shipmodel
 
 	void Reset()
 	{
+#if defined(SP_FEATURE_VEHICLE) && !defined(FVO_RELEASE)
+		g_farReset.store(true, std::memory_order_release);
+#endif
 		std::lock_guard lk(g_lock);
 		g_shared = Shared{};
 		g_shared.reset = true;
@@ -614,6 +830,9 @@ namespace shipmodel
 			// The player's 3D (and the body parts we hid) are gone with the load; keep nothing.
 			g = Local{};
 		}
+#if defined(SP_FEATURE_VEHICLE) && !defined(FVO_RELEASE)
+		UpdateFarProbe(player);
+#endif
 		const auto root = AsNode(Root3D(s.vehicleTarget ? s.vehicleTarget : player));
 		if (s.capturePilot && root) {
 			// The player as posed right now (seated): a frozen copy flown as the pilot.

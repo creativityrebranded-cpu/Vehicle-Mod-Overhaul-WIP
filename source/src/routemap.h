@@ -23,6 +23,7 @@ struct Camera {
     float stage[4]{0, 0, 1, 1}; // SurfaceMapState +0xA0: left, top, right, bottom (the movie's marker space)
     Vec3 focus, eye;          // rig +0x30, rig +0x50
     double mouseX = 0, mouseY = 0, width = 0, height = 0;  // the cursor in screen pixels and the screen size
+    bool frontOnly = false;   // perspective scene view; preserve the legacy map mapping
 };
 inline bool Finite(Vec3 p) { return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z); }
 inline double Row(const Camera& c, int r, Vec3 p) { const float* m = c.m + 4 * r; return m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3]; }
@@ -31,7 +32,9 @@ inline double Row(const Camera& c, int r, Vec3 p) { const float* m = c.m + 4 * r
 inline bool Screen01(const Camera& c, Vec3 p, double& x01, double& y01, double& depth)
 {
     if (!Finite(p)) return false;
-    const double w = std::fabs(Row(c, 3, p));
+    const double signedW = Row(c, 3, p);
+    if (c.frontOnly && signedW * Row(c, 3, c.focus) <= 0) return false;
+    const double w = std::fabs(signedW);
     if (!(w > 1e-5)) return false;
     const double inv = 1.0 / w, l = c.port[0], r = c.port[1], t = c.port[2], b = c.port[3];
     x01 = (r - l) * 0.5 * (Row(c, 0, p) * inv) + (l + r) * 0.5;
@@ -47,6 +50,85 @@ inline bool ToStage(const Camera& c, Vec3 p, Vec2& out, bool* inside = nullptr)
     out = { (c.stage[2] - c.stage[0]) * x01 + c.stage[0], (c.stage[3] - c.stage[1]) * (1.0 - y01) + c.stage[1] };
     if (inside) *inside = x01 >= 0 && x01 <= 1 && y01 >= 0 && y01 <= 1;
     return std::isfinite(out.x) && std::isfinite(out.y);
+}
+// The eye and view direction implied by the clip matrix itself (2026-11-04 run: the World Camera's transform row +0x90
+// read ~0.98 up while the view looked down, so a transform-based eye/forward disagreed with the matrix). Eye: the point
+// where rows 0, 1 and 3 are all zero. Forward: row 3's direction, signed so a point ahead has depth (row 2 / |w|) in
+// 0..1 (the other side falls outside it for both normal and reversed depth); if depth cannot tell, the side with w > 0.
+inline bool ViewFromMatrix(const Camera& c, Vec3& eye, Vec3& forward)
+{
+    const float* m = c.m;
+    const double a[3][3] = { { m[0], m[1], m[2] }, { m[4], m[5], m[6] }, { m[12], m[13], m[14] } };
+    const double r[3] = { -double(m[3]), -double(m[7]), -double(m[15]) };
+    auto det3 = [](const double q[3][3]) { return q[0][0] * (q[1][1] * q[2][2] - q[1][2] * q[2][1]) - q[0][1] * (q[1][0] * q[2][2] - q[1][2] * q[2][0]) + q[0][2] * (q[1][0] * q[2][1] - q[1][1] * q[2][0]); };
+    const double d = det3(a);
+    if (!(std::fabs(d) > 1e-12)) return false;
+    double out[3];
+    for (int k = 0; k < 3; ++k) { double q[3][3]; for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) q[i][j] = j == k ? r[i] : a[i][j]; out[k] = det3(q) / d; }
+    eye = { out[0], out[1], out[2] };
+    const double len = std::sqrt(a[2][0] * a[2][0] + a[2][1] * a[2][1] + a[2][2] * a[2][2]);
+    if (!(len > 1e-12) || !Finite(eye)) return false;
+    forward = { a[2][0] / len, a[2][1] / len, a[2][2] / len };
+    auto depthOk = [&](Vec3 p) { const double w = Row(c, 3, p); if (!(std::fabs(w) > 1e-9)) return false; const double z = Row(c, 2, p) / std::fabs(w); return z >= -1e-3 && z <= 1.001; };
+    const Vec3 plus{ eye.x + forward.x * 10, eye.y + forward.y * 10, eye.z + forward.z * 10 }, minus{ eye.x - forward.x * 10, eye.y - forward.y * 10, eye.z - forward.z * 10 };
+    const bool p = depthOk(plus), n = depthOk(minus);
+    if (n && !p) forward = { -forward.x, -forward.y, -forward.z };
+    else if (p == n && Row(c, 3, plus) < 0) forward = { -forward.x, -forward.y, -forward.z };
+    return true;
+}
+// Re-base a clip matrix so world point p is drawn as the matrix would draw p + shift (t' = t + R shift). Used when the
+// matrix's own eye is not at the camera's world position (camera-relative or other-origin rendering): shift = matrix
+// eye - world eye puts the matrix eye on the world eye, and everything else follows exactly.
+inline void ShiftMatrix(Camera& c, Vec3 shift)
+{
+    for (int r = 0; r < 4; ++r) c.m[4 * r + 3] = float(c.m[4 * r + 3] + c.m[4 * r] * shift.x + c.m[4 * r + 1] * shift.y + c.m[4 * r + 2] * shift.z);
+}
+// Photo view (frontOnly): a shape that crosses the camera plane is cut there instead of dropped. Planes, all
+// linear in world space so cutting in world space is exact: in front (w >= kNearW) and |ndc x|, |ndc y| <= kGuard
+// (keeps cut points to a few screen widths). The legacy map view is left as it was (input returned unchanged).
+constexpr double kNearW = 0.05, kGuard = 4.0;
+inline double ClipPlane(const Camera& c, int i, Vec3 p)
+{
+    const double s = Row(c, 3, c.focus) >= 0 ? 1.0 : -1.0, w = s * Row(c, 3, p);
+    switch (i) {
+    case 0: return w - kNearW;
+    case 1: return kGuard * w - Row(c, 0, p);
+    case 2: return kGuard * w + Row(c, 0, p);
+    case 3: return kGuard * w - Row(c, 1, p);
+    default: return kGuard * w + Row(c, 1, p);
+    }
+}
+inline std::vector<Vec3> ClipPolygon(const Camera& c, std::vector<Vec3> poly)
+{
+    if (!c.frontOnly) return poly;
+    for (int plane = 0; plane < 5 && !poly.empty(); ++plane) {
+        std::vector<Vec3> out;
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const Vec3 a = poly[i], b = poly[(i + 1) % poly.size()];
+            const double da = ClipPlane(c, plane, a), db = ClipPlane(c, plane, b);
+            if (da >= 0) out.push_back(a);
+            if ((da >= 0) != (db >= 0)) { const double t = da / (da - db); out.push_back({ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t }); }
+        }
+        poly = std::move(out);
+    }
+    return poly;
+}
+// The part of segment a-b that is in view; false when none of it is.
+inline bool ClipSegment(const Camera& c, Vec3& a, Vec3& b)
+{
+    if (!c.frontOnly) return true;
+    double t0 = 0, t1 = 1;
+    const Vec3 a0 = a, d{ b.x - a.x, b.y - a.y, b.z - a.z };
+    for (int plane = 0; plane < 5; ++plane) {
+        const double da = ClipPlane(c, plane, a0), db = ClipPlane(c, plane, b);
+        if (da < 0 && db < 0) return false;
+        if (da < 0) t0 = std::max(t0, da / (da - db));
+        else if (db < 0) t1 = std::min(t1, da / (da - db));
+    }
+    if (t0 > t1) return false;
+    a = { a0.x + d.x * t0, a0.y + d.y * t0, a0.z + d.z * t0 };
+    b = { a0.x + d.x * t1, a0.y + d.y * t1, a0.z + d.z * t1 };
+    return true;
 }
 inline Vec3 Cross(Vec3 a, Vec3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
 inline double Dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }

@@ -21,6 +21,9 @@
 #include <cmath>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
+#include <mutex>
+#include <vector>
 #include <cstdio>
 
 namespace loadedarea
@@ -744,6 +747,56 @@ namespace loadedarea
 		return g_driverSynced.load(std::memory_order_relaxed) != before;
 	}
 
+	// Who owns a ray-hit body (trace only; user 2026-11-07: "check the id of anything hit by rays and find out what it belongs to").
+	// Ray results carry the hit body id but no owner (prefetch RayHit.formId was never filled). Any thread asks; the main thread
+	// resolves with the same OwnerOf walk the wall pass uses (body +0x98 -> game 3D -> FindRef), up to 32 a frame; answers are
+	// cached per physics world (body ids are reused when the world changes). 0 = not resolved yet or no reference.
+	namespace {
+		std::mutex g_hitOwnLock;
+		std::unordered_map<std::uint32_t, std::uint32_t> g_hitOwner;  // body -> reference form id (0: none)
+		std::unordered_set<std::uint32_t> g_hitAsked; std::vector<std::uint32_t> g_hitQueue;
+		uptr g_hitWorld = 0;
+		std::uint32_t SafeOwnerOf(uptr world, std::uint32_t body)
+		{
+			__try { return OwnerOf(world, body); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+		void ResolveHitOwners()
+		{
+			const uptr world = g_world.load(std::memory_order_relaxed);
+			std::vector<std::uint32_t> todo;
+			{
+				std::lock_guard<std::mutex> lk(g_hitOwnLock);
+				if (world != g_hitWorld) { g_hitWorld = world; g_hitOwner.clear(); g_hitAsked.clear(); g_hitQueue.clear(); }
+				const std::size_t n = std::min<std::size_t>(32, g_hitQueue.size());
+				todo.assign(g_hitQueue.begin(), g_hitQueue.begin() + n); g_hitQueue.erase(g_hitQueue.begin(), g_hitQueue.begin() + n);
+			}
+			if (todo.empty() || !world || !g_findRef) return;
+			for (const auto body : todo) {
+				const std::uint32_t owner = SafeOwnerOf(world, body);
+				{ std::lock_guard<std::mutex> lk(g_hitOwnLock); g_hitOwner[body] = owner; }
+				logger::Write("OBS system=plan.hitbody body=%08X owner=%08X reason=%s", body, owner, owner ? "resolved_by_owner_walk" : "no_reference_owns_this_body");
+			}
+		}
+	}
+	std::uint32_t HitBodyOwner(std::uint32_t body)
+	{
+		if (!body || body == kNoBody) return 0;
+		std::lock_guard<std::mutex> lk(g_hitOwnLock);
+		if (const auto it = g_hitOwner.find(body); it != g_hitOwner.end()) return it->second;
+		if (g_hitQueue.size() < 512 && g_hitAsked.size() < 8192 && g_hitAsked.insert(body).second) g_hitQueue.push_back(body);
+		return 0;
+	}
+
+	bool HitBodyOwnerKnown(std::uint32_t body, std::uint32_t& owner)
+	{
+		owner = 0;
+		if (!body || body == kNoBody) return false;
+		std::lock_guard<std::mutex> lk(g_hitOwnLock);
+		if (const auto it = g_hitOwner.find(body); it != g_hitOwner.end()) { owner = it->second; return true; }
+		if (g_hitQueue.size() < 512 && g_hitAsked.size() < 8192 && g_hitAsked.insert(body).second) g_hitQueue.push_back(body);
+		return false;
+	}
+
 	bool IsWall(std::uint32_t bodyId)
 	{
 		if (bodyId == kNoBody) return false;
@@ -810,6 +863,7 @@ namespace loadedarea
 
 		static ULONGLONG bodiesAt = 0;
 		if (now - bodiesAt >= 250) { bodiesAt = now; RefreshBodies(); }
+		ResolveHitOwners();  // trace only: ray-hit body -> owning reference
 		WatchDrivers(drivers, jobs, now);
 		if (features::On(features::Id::WallPass)) KeepPersistent(now);
 		if (features::On(features::Id::WallPass)) SyncHeld(vehicles, drivers, jobs, now);

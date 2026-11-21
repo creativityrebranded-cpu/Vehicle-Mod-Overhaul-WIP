@@ -152,17 +152,45 @@ namespace context
 
 		bool VehicleFight(uptr player);
 
+		// Time-sliced actor scan (2026-11-04 stutter fix): the whole 8000-reference walk took ~30 ms in one frame every 2 s.
+		// One quarter of the attached cells per tick; only form ids are kept between ticks, and each is looked up again
+		// (the engine's own id lookup, already used by this mod) and re-checked before a rule acts on it.
+		struct CivilScan { bool active = false, combat = false; std::uint32_t next = 0, cells = 0; unsigned seen = 0; std::vector<std::uint32_t> ids; ULONGLONG startedAt = 0; };
+		CivilScan g_civilScan;
+		constexpr std::uint32_t kCivilSlices = 4;  // ticks are 500 ms: a full scan still completes every ~2 s
+		uptr RefById(std::uint32_t id) { return id ? reinterpret_cast<uptr (*)(std::uint32_t)>(game::Base() + addr::kLookupFormById)(id) : 0; }
+
 		void CivilRules(uptr player, ULONGLONG now)
 		{
-			if (now - g_civilAt < kCivilScanMs) return;
-			g_civilAt = now;
-			if (npcvehicles::IsInCombat(player) || VehicleFight(player) || npcvehicles::CivilJobs() >= kCivilMax) return;
 			const auto pp = PosOf(player);
+			if (!g_civilScan.active) {
+				if (now - g_civilAt < kCivilScanMs) return;
+				g_civilAt = now;
+				if (npcvehicles::IsInCombat(player) || VehicleFight(player) || npcvehicles::CivilJobs() >= kCivilMax) return;
+				g_civilScan = {};g_civilScan.active = true;g_civilScan.cells = modscene::GridCells();g_civilScan.startedAt = now;
+			}
+			{
+				auto& sc = g_civilScan;
+				const std::uint32_t slice = std::max<std::uint32_t>(1, (sc.cells + kCivilSlices - 1) / kCivilSlices);
+				std::vector<uptr> refs;
+				if (sc.seen < kActorLimit) modscene::ScanCellRange(sc.next, slice, refs, kActorLimit - sc.seen);
+				sc.next += slice;sc.seen += unsigned(refs.size());
+				for (const uptr r : refs) {
+					if (r == player || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r)) continue;
+					if (Dist(PosOf(r), pp) > kCivilRange) continue;
+					if (npcvehicles::IsInCombat(r)) { sc.combat = true; break; }  // somebody fights here: no civil traffic now
+					sc.ids.push_back(*reinterpret_cast<std::uint32_t*>(r + off::kFormId));
+				}
+				if (!sc.combat && sc.next < sc.cells && sc.seen < kActorLimit) return;  // the rest next tick
+				sc.active = false;
+				if (sc.combat) return;
+				if (logger::Verbose()) logger::Write("OBS system=context.civil event=scan_done refs=%u actors=%zu ms=%llu", sc.seen, sc.ids.size(), now - sc.startedAt);
+			}
+			if (npcvehicles::IsInCombat(player) || VehicleFight(player) || npcvehicles::CivilJobs() >= kCivilMax) return;
 			std::vector<uptr> actors;
-			for (const uptr r : modscene::LoadedRefs(kActorLimit)) {
-				if (r == player || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r)) continue;
-				if (Dist(PosOf(r), pp) > kCivilRange) continue;
-				if (npcvehicles::IsInCombat(r)) return;  // somebody fights here: no civil traffic now
+			for (const std::uint32_t id : g_civilScan.ids) {
+				const uptr r = RefById(id);
+				if (!r || r == player || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r) || Dist(PosOf(r), pp) > kCivilRange) continue;
 				actors.push_back(r);
 			}
 			// Transit (a shift change first: the package just changed).
@@ -506,6 +534,19 @@ extern "C" __declspec(dllexport) unsigned FVO_BaseOf(unsigned refId)
 		const std::uintptr_t ref = runtimeforms::Lookup(refId);
 		const std::uintptr_t base = ref ? *reinterpret_cast<const std::uintptr_t*>(ref + 0x98) : 0;
 		return base ? *reinterpret_cast<const std::uint32_t*>(base + off::kFormId) : 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// A reference's heading (rotation z: atan2(x, y), + turns right), 2026-11-05: Cruise picks the lane that runs the way the car faces.
+extern "C" __declspec(dllexport) int FVO_RefHeading(unsigned refId, double* heading)
+{
+	if (!heading) return 0;
+	__try {
+		const std::uintptr_t ref = runtimeforms::Lookup(refId);
+		if (!ref) return 0;
+		const float h = reinterpret_cast<const float*>(ref + off::kRefRotation)[2];
+		if (!std::isfinite(h)) return 0;
+		*heading = h; return 1;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }

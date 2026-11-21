@@ -1,4 +1,6 @@
 #include "routemap.h"
+#include "photoeditorinput.h"
+#include "inputownership.h"
 #include <cmath>
 #include <cstdio>
 
@@ -96,6 +98,71 @@ int main()
         const auto gem = Diamond(p, 4);
         check(gem.size() == 8 && Visible(gem, p, { 10, 20, 500 }).size() == 4, "a diamond from above: its four upper faces");
         check(Visible(gem, p, { 500, 500, 30 }).size() == 4, "and from the side: the four that face that way");
+    }
+    for(bool flip : {false,true}) {
+        auto c=MakeCamera({0,0,0},{0,10,0},.8,1.6,flip);
+        Vec2 p; c.frontOnly=true;
+        check(ToStage(c,{0,10,0},p),"photo front point projects with either matrix sign");
+        check(!ToStage(c,{0,-10,0},p),"photo behind point is rejected with either matrix sign");
+        c.frontOnly=false;
+        check(ToStage(c,{0,-10,0},p),"legacy map projection remains compatible");
+    }
+    {
+        using photoeditorinput::Block;
+        check(!Block(false,false,false,0,0,'W'),"closed photo editor leaves camera alone");
+        check(Block(true,false,false,0,0,'W'),"editing owns movement keys");
+        check(!Block(true,true,false,0,0,'W'),"camera hold passes movement keys");
+        check(Block(true,false,false,1,1,0xA00),"editing owns mouse look");
+        check(!Block(true,true,false,1,1,0xA00),"camera hold passes mouse look");
+        check(Block(true,false,false,2,4,0),"editing owns sticks");
+        check(!Block(true,true,false,2,4,0),"camera hold passes sticks");
+        check(Block(true,true,false,1,0,1),"RMB gesture must not lift camera");
+        check(!Block(true,true,true,1,0,1),"Ctrl RMB deliberately lifts camera");
+
+        check(Block(true,true,false,2,0,0x100)&&Block(true,false,false,2,0,0x100),"pad LB is the speed key, never the native tab switch");
+        check(!Block(false,false,false,2,0,0x100),"editor closed: LB stays native");
+        check(Block(true,true,false,0,0,' ')&&Block(true,true,false,0,0,'T')&&Block(true,true,false,0,0,0x1B)&&Block(true,true,false,0,0,0x26),"camera hold: Space, T, Esc, arrows never reach photo mode");
+        check(Block(true,true,false,2,0,0x1000)&&Block(true,true,false,2,0,0x8000)&&Block(true,true,false,2,0,0x200),"camera hold: pad A, Y, RB never reach photo mode");
+        check(!Block(true,true,false,0,0,'A')&&!Block(true,true,false,0,0,'D')&&!Block(true,true,false,1,0,0)&&!Block(true,true,false,1,0,8),"camera hold: A, D, LMB down, wheel pass");
+        check(Block(true,true,false,2,0,0x40),"L3 gesture must not toggle helmet");
+        check(!Block(true,true,false,2,0,9)&&!Block(true,true,false,2,0,10),"camera hold preserves triggers");
+        std::uint8_t owner=0;
+        check(!inputownership::Own(owner,true,true,false),"native camera key press delivered");
+        inputownership::Own(owner,true,false,true);
+        check(!inputownership::Own(owner,false,false,true),"native key release survives editing transition");
+        check(inputownership::Own(owner,true,true,true),"edit key press captured");
+        check(inputownership::Own(owner,false,false,false),"edit release remains captured after close");
+    }
+    for(bool flip : {false,true}) {
+        auto c=MakeCamera({0,0,0},{0,10,0},.8,1.6,flip);c.frontOnly=true;
+        const auto tri=ClipPolygon(c,{{0,20,0},{5,20,0},{0,-20,0}});
+        bool all=tri.size()>=3;Vec2 p;for(const auto& v:tri)all=all&&ToStage(c,v,p);
+        check(all,"photo triangle reaching behind the camera is cut, not dropped");
+        Vec3 a{0,-30,0},b{0,30,0};
+        check(ClipSegment(c,a,b)&&ToStage(c,a,p)&&ToStage(c,b,p)&&a.y>0,"segment through the camera is cut at its front part");
+        Vec3 d{0,-30,0},e{1,-40,0};
+        check(!ClipSegment(c,d,e),"segment wholly behind the camera is skipped");
+        c.frontOnly=false;
+        check(ClipPolygon(c,{{0,20,0},{5,20,0},{0,-20,0}}).size()==3,"legacy map shapes are left as they were");
+    }
+    for(bool flip : {false,true}) {
+        const Vec3 eye{-1057,1574,-146},focus{-1050,1600,-180};
+        auto c=MakeCamera(eye,focus,.8,16.0/9,flip);
+        Vec3 e,f;
+        check(ViewFromMatrix(c,e,f),"view recovered from the clip matrix");
+        check(std::fabs(e.x-eye.x)<1e-2&&std::fabs(e.y-eye.y)<1e-2&&std::fabs(e.z-eye.z)<1e-2,"matrix eye is the camera position");
+        const Vec3 want{focus.x-eye.x,focus.y-eye.y,focus.z-eye.z};const double l=std::sqrt(Dot(want,want));
+        check(Dot(f,{want.x/l,want.y/l,want.z/l})>.999,"matrix forward points at the view, either matrix sign");
+    }
+    for(bool flip : {false,true}) {
+        // A camera-relative matrix (eye at the origin) re-based onto the world eye draws world points where they are.
+        const Vec3 eye{-1057,1574,-146},focus{-1050,1600,-180};
+        auto world=MakeCamera(eye,focus,.8,16.0/9,flip);
+        auto rel=MakeCamera({0,0,0},{focus.x-eye.x,focus.y-eye.y,focus.z-eye.z},.8,16.0/9,flip);
+        Vec3 e,f;ViewFromMatrix(rel,e,f);
+        ShiftMatrix(rel,{e.x-eye.x,e.y-eye.y,e.z-eye.z});
+        Vec2 a,b;const Vec3 p{-1053,1681,-149};
+        check(ToStage(world,p,a)&&ToStage(rel,p,b)&&std::fabs(a.x-b.x)<.5&&std::fabs(a.y-b.y)<.5,"re-based camera-relative matrix draws the route where it was built");
     }
     std::printf("routemap: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

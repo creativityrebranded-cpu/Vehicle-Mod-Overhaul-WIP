@@ -1,4 +1,5 @@
 #include "passenger.h"
+#include "inputgate.h"
 #include "bindings.h"
 
 #include "addresses.h"
@@ -17,6 +18,7 @@
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <string>
 #include <cstdint>
 #include <intrin.h>
 
@@ -41,19 +43,15 @@ namespace passenger
 
 		constexpr double kTaxiStop = 6.0;                      // m: the taxi holds this close over the marker
 		constexpr ULONGLONG kArriveMs = 2500;                  // near the marker this long: arrived, the player is let out
-		constexpr ULONGLONG kWheelMs = 1000;                   // hold the key this long: take the wheel
 
 		std::atomic<std::uint32_t> g_riding{ 0 };
 		bool g_arrived = false;
 		ULONGLONG g_nearSince = 0, g_downAt = 0;
-		bool g_wheelAsked = false;
 		bool g_exitPending = false;  // the player asked to get out while the vehicle moved: retried until it is at rest
-		struct Wheel
-		{
-			int stage = 0;                                     // 1 seat the player as driver, 2 seat the NPC as passenger
-			ULONGLONG at = 0;
-			std::uint32_t vehicle = 0, npc = 0;
-		} g_wheel;
+		// Passenger control (2026-11-17, the user: "rather than doing any of these we can just take control directly / we dont need to swap
+		// seats / at least whilst in vehicle"): hold G in the passenger seat and your driving keys go to the vehicle's autopilot as the
+		// player's own command (vehicleflight Command::kManual), the NPC staying at the wheel. Replaces the take-the-wheel seat swap.
+		struct Control { bool on = false; int travel = 0, gear = 2; bool refusedSaid = false, holdSaid = false; ULONGLONG adoptAt = 0; } g_ctrl;
 		int g_key = 0;
 		bool g_keyDown = false;
 		double g_lead = 50.0;
@@ -157,28 +155,6 @@ namespace passenger
 			return best;
 		}
 
-		// Seats the NPC after a take-wheel swap in the vehicle's companion seat: the game's interaction build, the seat set before it completes.
-		int SeatCompanionForNpc(uptr player, uptr vehicle, uptr seatKw)
-		{
-            if(environment::EntrySite(vehicle).verdict!=environment::Verdict::Safe)return 0;
-			uptr link = 0;
-			__try {
-				EngineFn<void (*)(uptr, uptr, uptr*)>(kSeatLink)(player, vehicle, &link);
-				if (!link) return 0;
-				At<uptr>(link, 0x20) = seatKw;
-				EngineFn<void (*)(uptr)>(kSeatFinish)(player);
-				auto* rc = reinterpret_cast<volatile long*>(link + 8);
-				if (_InterlockedDecrement(rc) == 0) {
-					auto** vt = *reinterpret_cast<void***>(link);
-					reinterpret_cast<void (*)(uptr, int)>(vt[0])(link, 1);
-				}
-				return 1;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
-				return -1;
-			}
-		}
-
 		bool EndSeat(uptr actor)
 		{
 			__try {
@@ -249,47 +225,73 @@ namespace passenger
 			notify::Show("Passenger: out");
 		}
 
-		// Take the wheel: the driver steps out, the player is seated as the driver, then the NPC takes the companion seat.
-		void StartWheel(uptr player, uptr vehicle)
+		void ControlOff(const char* why)
 		{
-            if(environment::BoardingSite(vehicle).verdict!=environment::Verdict::Safe){notify::Show("Stop at a safe site before swapping seats");return;}
-			const std::uint32_t vid = At<std::uint32_t>(vehicle, off::kFormId);
-			const uptr seat = PassengerSeat(vehicle);
-			const std::uint32_t npc = npcvehicles::TakeDriver(vid);
-			if (!npc) {
-				notify::Show("Nobody to swap with");
-				logger::Write("Passenger: take the wheel: no NPC drives %08X", vid);
-				return;
-			}
-			EndSeat(player);
-			g_riding = 0;
-			g_wheel = { 1, GetTickCount64() + 300, vid, npc };
-			logger::Write("Passenger: take the wheel of %08X: driver %08X out, your seat ended; you drive next (passenger seat %08X)", vid, npc,
-				seat ? At<std::uint32_t>(seat, off::kFormId) : 0);
+			if (!g_ctrl.on) return;
+			g_ctrl = Control{};
+			logger::Write("Passenger: your control of the vehicle ended (%s)", why);
+			notify::Show("The driver has control");
 		}
-
-		void WheelTick(uptr player, ULONGLONG now)
+		// One command a frame while you drive from the passenger seat (the command lasts 250 ms: if this stops, the autopilot resumes).
+		void ControlTick(uptr vehicle, std::uint32_t id)
 		{
-			if (now < g_wheel.at) return;
-			const uptr vehicle = RefById(g_wheel.vehicle);
-			if (!vehicle) { g_wheel = Wheel{}; return; }
-			if (g_wheel.stage == 1) {
-				const bool ok = npcvehicles::SeatPlayerDriver(vehicle);
-				logger::Write("Passenger: you take the wheel of %08X -> %s", g_wheel.vehicle, ok ? "seated as the driver" : "NOT seated");
-				notify::Show(ok ? "You have the wheel" : "Could not take the wheel");
-				g_wheel.stage = ok ? 2 : 0;
-				g_wheel.at = now + 800;
+			const int pilot = npcvehicles::PilotFor(id);
+			if (!pilot) {  // the driver has no autopilot job (its trip ended): it gets one again, then your control starts
+				const ULONGLONG t0 = GetTickCount64();
+				if (!g_ctrl.adoptAt) {
+					g_ctrl.adoptAt = t0;
+					if (!npcvehicles::StartSeatedForPassenger(vehicle)) ControlOff("nobody drives it");
+				}
+				else if (t0 - g_ctrl.adoptAt > 5000) ControlOff("the driver did not take its autopilot in 5 s");
 				return;
 			}
-			const uptr npc = RefById(g_wheel.npc);
-			const uptr seat = PassengerSeat(vehicle);
-			if (npc && seat && !VehicleOf(npc)) {
-				const int r = SeatCompanionForNpc(npc, vehicle, seat);  // the same seat build, for the NPC
-				logger::Write("Passenger: NPC %08X into the passenger seat of %08X -> %d (game says it is in %08X)", g_wheel.npc, g_wheel.vehicle, r,
-					VehicleOf(npc) ? At<std::uint32_t>(VehicleOf(npc), off::kFormId) : 0);
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			if (!vehicleflight::PilotActive(pilot)) {  // a resting job: its autopilot holds here so your command has something to steer
+				vehicleflight::PilotFly(pilot, vehicle, vp.x, vp.y, 3.0, 0, true);
+				if (!g_ctrl.holdSaid) { g_ctrl.holdSaid = true; logger::Write("Passenger: pilot %d of %08X was not flying; it holds here under your control", pilot, id); }
 			}
-			(void)player;
-			g_wheel = Wheel{};
+			const bool f = Focused();
+			const int kW = controlmap::KeyFor("Vehicle", "VehicleAccel", 'W'), kS = controlmap::KeyFor("Vehicle", "VehicleBrake", 'S');
+			const int kA = controlmap::KeyFor("Vehicle", "VehicleTurnLeft", 'A'), kD = controlmap::KeyFor("Vehicle", "VehicleTurnRight", 'D');
+			const bool fwd = f && bindings::Held(bindings::Action::Accelerate, kW), back = f && bindings::Held(bindings::Action::Brake, kS);
+			const bool left = f && bindings::Held(bindings::Action::TurnLeft, kA), right = f && bindings::Held(bindings::Action::TurnRight, kD);
+			const bool up = f && (bindings::Held(bindings::Action::LiftUp, VK_SPACE) || bindings::Held(bindings::Action::VerticalBoost, VK_SPACE));
+			const bool down = f && bindings::Held(bindings::Action::LiftDown, 'C');
+			const bool boost = f && bindings::Held(bindings::Action::Boost, VK_LSHIFT);
+			if (f && bindings::Triggered(bindings::Action::Gear)) { g_ctrl.gear = g_ctrl.gear % 4 + 1; logger::Write("Passenger: gear %d", g_ctrl.gear); notify::Show(("Gear " + std::to_string(g_ctrl.gear)).c_str()); }
+			vehicleflight::DriveInput now{};
+			const bool onWheels = vehicleflight::DriveFor(id, now);
+			// Hovering: it flies through your own hover model (vehicleflight::PlayerHands), exactly as your own vehicle does; on its
+			// wheels (or switching to them) your keys reach the game's own driving through the command below.
+			if (!onWheels && g_ctrl.travel != 2) vehicleflight::PlayerHands(pilot, g_ctrl.gear);
+			if (f && bindings::Triggered(bindings::Action::HoverToggle)) {
+				g_ctrl.travel = onWheels ? 1 : 2;
+				logger::Write("Passenger: you switch %08X to %s", id, g_ctrl.travel == 1 ? "hover" : "its wheels");
+				notify::Show(g_ctrl.travel == 1 ? "Hover" : "Wheels");
+			}
+			vehicleflight::Command c;
+			c.set = vehicleflight::Command::kManual | vehicleflight::Command::kThrottle | vehicleflight::Command::kSteer | vehicleflight::Command::kYaw |
+				vehicleflight::Command::kGear | vehicleflight::Command::kBoost;
+			c.gear = g_ctrl.gear;
+			c.boost = boost;
+			c.throttle = fwd ? 1.0 : back ? -1.0 : 0.0;
+			c.steer = (right ? 1.0 : 0.0) - (left ? 1.0 : 0.0);
+			c.yawRate = 1.2 * c.steer;
+			if (up || down) { c.set |= vehicleflight::Command::kVertical; c.vertical = up ? 5.0 : -5.0; }
+			// Switching to its wheels from the air: it comes down to the ground first (00:31 run: it stayed 15 m up "held low").
+			else if (g_ctrl.travel == 2 && !onWheels) { c.set |= vehicleflight::Command::kVertical; c.vertical = -4.0; }
+			if (g_ctrl.travel) { c.set |= vehicleflight::Command::kTravel; c.travel = g_ctrl.travel; }
+			c.holdMs = 250;
+			const bool taken = vehicleflight::PilotCommand(pilot, c);
+			if (!taken && !g_ctrl.refusedSaid) { g_ctrl.refusedSaid = true; logger::Write("Passenger: pilot %d of %08X refused your command (not on autopilot yet)", pilot, id); }
+			if (taken) g_ctrl.refusedSaid = false;
+			static ULONGLONG said = 0;
+			const ULONGLONG t = GetTickCount64();
+			if (t - said >= 2000) {
+				said = t;
+				logger::Write("Passenger: driving %08X from the passenger seat (pilot %d, %s): throttle %+.0f steer %+.0f vertical %+.0f",
+					id, pilot, onWheels ? "wheels" : "hover", c.throttle, c.steer, (c.set & vehicleflight::Command::kVertical) ? c.vertical : 0.0);
+			}
 		}
 
 		void BoardTo(uptr player, uptr vehicle);
@@ -316,6 +318,7 @@ namespace passenger
 		}
 	}
 	std::uint32_t RidingVehicle() { return g_riding.load(); }
+	bool Controlling() { return g_riding.load() && g_ctrl.on; }
 	std::uintptr_t PassengerSeatKeyword(std::uintptr_t vehicle) { return vehicle ? PassengerSeat(vehicle) : 0; }
 	bool FinishPassengerSeat(std::uintptr_t player, std::uintptr_t vehicle)
 	{
@@ -398,19 +401,15 @@ namespace passenger
 		if (!player) return;
         g_key='G';
         const bool press=bindings::Triggered(bindings::Action::RideAlong);
-        const bool exit=bindings::Triggered(bindings::Action::PassengerExit);
-        const bool wheel=bindings::Triggered(bindings::Action::TakeWheel);
+        const bool toggle=bindings::Triggered(bindings::Action::PassengerExit);  // G in the passenger seat: take / give back control
 		const ULONGLONG now = GetTickCount64();
-		if (g_wheel.stage) {
-			WheelTick(player, now);
-			return;
-		}
 		const std::uint32_t riding = g_riding.load();
 		if (riding) {
 			const uptr vehicle = RefById(riding);
 			if (!vehicle || VehicleOf(player) != vehicle) {
 				if(vehicle)vehicleflight::EndTargetSession(vehicle);
 				g_riding = 0;
+				g_ctrl = Control{};
 				logger::Write("Passenger: no longer in %08X (the game ended the seat)", riding);
 				return;
 			}
@@ -421,14 +420,13 @@ namespace passenger
 				return;
 			}
             // 2026-10-28 (the user: "g didn't work" in the passenger seat; no exit or take-the-wheel line in the log): when the
-            // bindings do not take input there, G is read directly: tap = out, hold 0.5 s = take the wheel.
-            static bool gDown = false, gHeld = false;
-            static ULONGLONG gAt = 0;
-            bool rawExit = false, rawWheel = false;
-            const bool rawG = !bindings::Allowed() && Focused() && (GetAsyncKeyState('G') & 0x8000) != 0;
-            if (rawG && !gDown) { gAt = now; gHeld = false; logger::Write("Passenger: G pressed (bindings not taking input here; read directly)"); }
-            if (rawG && gDown && !gHeld && now - gAt >= 500) { gHeld = true; rawWheel = true; }
-            if (!rawG && gDown && !gHeld) rawExit = true;
+            // bindings do not take input there, G is read directly (a tap, on release).
+            static bool gDown = false;
+            bool rawToggle = false;
+            // While you have control your keys are a driver's (bindings.cpp Situation), so G is read here to give it back.
+            const bool rawG = (!bindings::Allowed() || g_ctrl.on) && inputgate::ModKeysAllowed() && Focused() && (GetAsyncKeyState('G') & 0x8000) != 0;
+            if (rawG && !gDown && !g_ctrl.on) logger::Write("Passenger: G pressed (bindings not taking input here; read directly)");
+            if (!rawG && gDown) rawToggle = true;
             gDown = rawG;
             // The game's own exit (E) refused in the passenger seat ("obstructed"): still seated 1.5 s after the key went up -> out
             // our way, as with G.
@@ -441,13 +439,20 @@ namespace passenger
             eDown = eNow;
             const bool refused = eUpAt && now - eUpAt >= 1500;
             if (refused) { eUpAt = 0; logger::Write("Passenger: the game's exit did not let you out of %08X in 1.5 s", riding); }
-            if(wheel||rawWheel){StartWheel(player,vehicle);return;}
-            if(exit||rawExit||refused){GetOut(player,refused?"the game's exit refused":"passenger exit command",true);return;}
+            if(refused){ControlOff("getting out");GetOut(player,"the game's exit refused",true);return;}
+            // G (2026-11-17, the user: "pressing G in a vehicle ... swap [control] if [a driver] exists otherwise does nothing / pressing G
+            // again takes it back / that's all"): no seat change; leaving is the game's own hold E.
+            if(toggle||rawToggle){
+                if(g_ctrl.on)ControlOff("G: control back to the driver");
+                else if(npcvehicles::PilotFor(riding)||npcvehicles::HasDriver(riding)){g_ctrl=Control{};g_ctrl.on=true;logger::Write("Passenger: G: you take control of %08X",riding);notify::Show("You have control");}
+                else logger::Write("Passenger: G: nobody drives %08X; nothing to take",riding);
+            }
             if (g_exitPending) {
                 static ULONGLONG retryAt = 0;
                 if (now - retryAt >= 500) { retryAt = now; GetOut(player, "asked earlier, now at rest", true); }
                 return;
             }
+			if (g_ctrl.on) ControlTick(vehicle, riding);  // your keys drive it; the NPC stays at the wheel
 			if (!npcvehicles::PilotFor(riding) && !npcvehicles::HasDriver(riding)) GetOut(player, "the driver left");
 			return;
 		}
@@ -476,5 +481,6 @@ namespace passenger
 	{
 		g_riding = 0;
 		g_keyDown = false;
+		g_ctrl = Control{};
 	}
 }

@@ -1,5 +1,15 @@
+#include "networkpreview.h"
+#include "crash.h"  // breadcrumbs: the F7 editor's work inside the game's movie advance (2026-11-11 06:01:56 UI crash right after Test)
+#include "laneline.h"
+#include "drivecontrols.h"
+#include "routecache.h"
+#include "populationinspect.h"
+#include "traffichealthapi.h"  // card FR1: Health's model verdicts on the Types cards
 #include "routeedit.h"
 #include "trafficprofile.h"
+#include "permanentroutes.h"
+#include "panelpaging.h"
+#include "editorcontext.h"
 #include "pilotlayout.h"
 #include "routeeditor.h"
 #include "routeclearance.h"
@@ -8,7 +18,24 @@
 #include "routefiles.h"
 #include "routemap.h"
 #include "trafficroute.h"
+#include "roadmigrate.h"
+#include "f7layers.h"
+#include "f7dock.h"
+#include "fieldbox.h"
+#include "tilebox.h"
+#include "roadvisual.h"
+#include "planview.h"
+#include "routeitems.h"   // card RI-2: what each item in a field does to cars (F7 reader)
+#include "planframe.h"
+#include "modscene.h"
+#include "runtimeforms.h"
+#include <cstdarg>
+#include "routesurvey_run.h"
+#include "autoroute.h"
+#include <shlobj.h>
+#include "trafficinitial.h"
 #include "trafficlinks.h"
+#include "trafficinspect.h"
 #include "strokefont.h"
 
 #include <array>
@@ -16,11 +43,13 @@
 #include "addresses.h"
 #include "inputgate.h"
 #include "trafficpool.h"
+#include "spawnrule.h"
 #include "fvopaths.h"
 #include "game.h"
 #include "log.h"
 #include "environment.h"
 #include "navmap.h"
+#include "roadfit.h"
 #include "cellbake.h"
 #include "vehicle_probe.h"
 #include "prefetch.h"
@@ -147,6 +176,136 @@ namespace routeedit
 		using Message_t = std::uint64_t (*)(uptr, void*);
 		Update_t g_updateOriginal = nullptr;
 		Message_t g_messageOriginal = nullptr;
+        // PhotoModeMenu primary vtable, slot 8, pinned 1.16.244.
+        constexpr std::uint32_t kRvaPhotoVtbl=0x04C85A18, kRvaPhotoMessage=0x015FF900;
+        Message_t g_photoOriginal=nullptr;
+        std::atomic<uptr> g_photoMenu{0},g_photoMovie{0};
+        std::atomic<bool> g_photoOpen{false};
+        std::atomic<unsigned> g_photoSession{0}; // +1 each time photo mode opens
+        // One-key Traffic Manager (user, 2026-11-04): F8 in play enters photo mode with the editor open;
+        // F8 with the editor open closes it and leaves photo mode (moved from F7, which the UI uses: user, 2026-11-04). Requests run on the main tick (PhotoKeyTick).
+        std::atomic<bool> g_editorOnPhotoOpen{false},g_photoExitAsk{false};
+        std::atomic<ULONGLONG> g_photoAskAt{0};
+        constexpr std::uint32_t kRvaPhotoTryOpen=0x015FE5C0; // FUN_1415fe5c0: the game's own photo entry (its checks + "unavailable" message)
+        constexpr std::uint32_t kRvaPhotoName=0x015FDA20;    // FUN_1415fda20: BSFixedString "PhotoModeMenu"
+        // Camera speed boost (user, 2026-11-04: "way too slow ... 5x speed if button held"). INI settings
+        // fPhotoModeCameraTranslationSpeed / fPhotoModeCameraSpaceTranslationSpeed (Setting objects, float value at +0x8),
+        // read every frame by the photo camera update FUN_140FAC050. Scaled only while the key is held, restored on release/close.
+        constexpr std::uint32_t kRvaPhotoSpeed=0x05F0E070,kRvaPhotoSpaceSpeed=0x05F0E170;
+        // User, 2026-11-04: "default 15x in the mode and shift should be 30x", then both x5 again (75x / 150x). Outside the editor Shift stays 5x.
+        constexpr float kPhotoBoost=5.0f,kEditorSpeed=75.0f,kEditorBoost=150.0f;
+        float g_photoSpeedMul=1.0f;float g_photoSpeedBase=0,g_photoSpaceBase=0;bool g_photoBoosted=false;
+        uptr g_rangeState=0;float g_rangeBase=0;  // photo camera range widened while editing (PhotoRange)
+        // Sets the photo camera speed to mul x the game's own value (1 = the game's value back).
+        void PhotoSpeed(float mul){
+            if(mul==g_photoSpeedMul)return;
+            __try{
+                float& speed=*reinterpret_cast<float*>(game::Base()+kRvaPhotoSpeed+8);
+                float& space=*reinterpret_cast<float*>(game::Base()+kRvaPhotoSpaceSpeed+8);
+                if(g_photoSpeedMul==1.0f){
+                    if(!(std::isfinite(speed)&&speed>0&&speed<1e5f&&std::isfinite(space)&&space>0&&space<1e7f)){
+                        logger::Write("OBS routeedit.photo event=speed_refused reason=unexpected_speed speed=%g space=%g",speed,space);return;}
+                    g_photoSpeedBase=speed;g_photoSpaceBase=space;
+                }
+                if(g_photoSpeedBase>0){speed=g_photoSpeedBase*mul;space=g_photoSpaceBase*mul;}
+                logger::Write("OBS routeedit.photo event=speed mul=%.0f speed=%g space=%g",mul,speed,space);
+            }__except(EXCEPTION_EXECUTE_HANDLER){logger::Write("OBS routeedit.photo event=speed_failed reason=exception");return;}
+            g_photoSpeedMul=mul;g_photoBoosted=mul!=1.0f;if(mul==1.0f)g_photoSpeedBase=0;
+        }
+        void PhotoBoost(bool on){if(!on)PhotoSpeed(1.0f);}
+        bool g_photoHost=false;
+        std::mutex g_workLock;
+        std::uint64_t PhotoMessageDetour(uptr menu,void* msg){
+            const auto type=*reinterpret_cast<const std::uint32_t*>(static_cast<const char*>(msg)+8);
+            crash::Crumb("f7 photo message begin",int(type));
+            const auto result=g_photoOriginal(menu,msg);
+            crash::Crumb("f7 photo message end",int(type));
+            if(type==2){g_photoOpen=false;inputgate::PhotoEditor(false,false);PhotoBoost(false);g_rangeState=0;g_rangeBase=0;}  // range is re-set on the next entry
+            else {
+                g_photoMenu=menu;g_photoMovie=*reinterpret_cast<uptr*>(menu+0x88);
+                if(type==0){g_photoOpen=true;g_photoSession.fetch_add(1);}
+            }
+            return result;
+        }
+        // Why the last photo camera read failed (traced once a second with counts; 0 = read).
+        enum PhotoMiss { kMissNone, kMissClosed, kMissNoPlayerCamera, kMissNotPhotoState, kMissNoWorldCamera, kMissNoCursor, kMissNotFinite, kMissBadView, kMissFault, kMissCount };
+        const char* const kPhotoMissName[kMissCount]={"read","photo_closed","no_player_camera","not_photo_state","no_world_camera","no_cursor","not_finite","bad_view","fault"};
+        int g_photoMiss=kMissNone;
+        routemap::Vec3 g_photoEyeT;  // the World Camera transform's position (world space of the route data)
+        routemap::Vec3 g_photoEyeM;  // the eye the raw clip matrix implies
+        bool g_photoRebased=false;   // the matrix was re-based onto g_photoEyeT this read
+        uptr g_photoState=0;         // PlayerCamera's photo state (+0x220), as last read
+        // Camera range while the Traffic Manager is open (user, 2026-11-04: "camera has limits on how far it'll allow me
+        // to go"). The photo camera state keeps its radius at +0x1BC (set on entry by FUN_140FAB090 from
+        // fPhotoModeCameraLandedRange 85 m / SpaceRange 300 m) and FUN_140FAC050 clamps the camera to it around +0x1B0
+        // every frame. Widened to kEditorRange while editing, put back when the editor closes; a new photo visit re-sets it.
+        constexpr float kEditorRange=3000.0f;
+        void PhotoRange(bool wide){
+            const uptr state=g_photoState;
+            if(wide){
+                if(!state||g_rangeState==state)return;
+                __try{
+                    float& range=*reinterpret_cast<float*>(state+0x1BC);
+                    if(!(std::isfinite(range)&&range>=1.0f&&range<1e6f)){logger::Write("OBS routeedit.photo event=range_refused reason=unexpected_range range=%g",range);g_rangeState=state;g_rangeBase=-1;return;}
+                    g_rangeBase=range;g_rangeState=state;if(range<kEditorRange)range=kEditorRange;
+                    logger::Write("OBS routeedit.photo event=range_wide from=%.0f to=%.0f",g_rangeBase,range);
+                }__except(EXCEPTION_EXECUTE_HANDLER){logger::Write("OBS routeedit.photo event=range_failed reason=exception");g_rangeState=0;}
+                return;
+            }
+            if(!g_rangeState)return;
+            if(g_rangeBase>0&&g_photoOpen.load()){
+                __try{*reinterpret_cast<float*>(g_rangeState+0x1BC)=g_rangeBase;logger::Write("OBS routeedit.photo event=range_restored range=%.0f",g_rangeBase);}
+                __except(EXCEPTION_EXECUTE_HANDLER){logger::Write("OBS routeedit.photo event=range_restore_failed reason=exception");}
+            }
+            g_rangeState=0;g_rangeBase=0;
+        }
+        bool CapturePhoto(routemap::Camera& c){
+            g_photoMiss=kMissFault;
+            __try {
+                if(!g_photoOpen.load()){g_photoMiss=kMissClosed;return false;}
+                const uptr playerCamera=*reinterpret_cast<const uptr*>(game::Base()+addr::kPlayerCameraPtr);
+                if(!playerCamera){g_photoMiss=kMissNoPlayerCamera;return false;}
+                const uptr state=*reinterpret_cast<const uptr*>(playerCamera+0x10);
+                if(!state||state!=*reinterpret_cast<const uptr*>(playerCamera+0x220)){g_photoMiss=kMissNotPhotoState;return false;}
+                // World Camera: created/attached by FUN_14083E9A0, not the surface-map rig.
+                const uptr scene=*reinterpret_cast<const uptr*>(game::Base()+0x05FB08E8);
+                const uptr camera=scene?*reinterpret_cast<const uptr*>(scene+0x80):0;
+                if(!camera){g_photoMiss=kMissNoWorldCamera;return false;}
+                std::memcpy(c.m,reinterpret_cast<const void*>(camera+0x180),sizeof c.m);
+                std::memcpy(c.port,reinterpret_cast<const void*>(camera+0x1E4),sizeof c.port);
+                // Eye and view direction come from the clip matrix itself, so "in front", clipping and projection agree.
+                // The transform's position is kept only for the trace (how far it runs ahead of the matrix while moving).
+                const float* eyeT=reinterpret_cast<const float*>(camera+0xB0);
+                g_photoEyeT={eyeT[0],eyeT[1],eyeT[2]};
+                g_photoState=state;
+                routemap::Vec3 eye,forward;
+                if(!routemap::ViewFromMatrix(c,eye,forward)){g_photoMiss=kMissBadView;return false;}
+                // User, 2026-11-04: the path sat somewhere else and moved with the camera. If the matrix's eye is not where the
+                // camera is in the world (the route data's space), the matrix is measured from another origin: re-base it on
+                // the camera's world position. A gap under 2 m is ordinary frame-to-frame lag and is left alone.
+                g_photoEyeM=eye;
+                const routemap::Vec3 gap{eye.x-g_photoEyeT.x,eye.y-g_photoEyeT.y,eye.z-g_photoEyeT.z};
+                g_photoRebased=routemap::Finite(g_photoEyeT)&&std::sqrt(routemap::Dot(gap,gap))>2.0;
+                if(g_photoRebased){
+                    routemap::ShiftMatrix(c,gap);
+                    if(!routemap::ViewFromMatrix(c,eye,forward)){g_photoMiss=kMissBadView;return false;}
+                }
+                c.eye=eye;c.focus={eye.x+forward.x*10,eye.y+forward.y*10,eye.z+forward.z*10};
+                c.frontOnly=true;
+                const uptr cursor=*reinterpret_cast<const uptr*>(game::Base()+kRvaCursor);
+                if(!cursor){g_photoMiss=kMissNoCursor;return false;}
+                c.mouseX=*reinterpret_cast<const float*>(cursor+0x60);
+                c.mouseY=*reinterpret_cast<const float*>(cursor+0x64);
+                c.width=*reinterpret_cast<const float*>(cursor+0x70);
+                c.height=*reinterpret_cast<const float*>(cursor+0x74);
+                g_photoMiss=kMissNotFinite;
+                for(float v:c.m)if(!std::isfinite(v))return false;
+                for(float v:c.port)if(!std::isfinite(v))return false;
+                if(!(c.width>0&&c.height>0&&routemap::Finite(c.eye)&&routemap::Finite(c.focus)))return false;
+                if(!(std::fabs(routemap::Row(c,3,c.focus))>1e-5)){g_photoMiss=kMissBadView;return false;}
+                g_photoMiss=kMissNone;return true;
+            } __except(EXCEPTION_EXECUTE_HANDLER){g_photoMiss=kMissFault;return false;}
+        }
 		std::atomic<uptr> g_menu{ 0 }, g_movie{ 0 };
 
 		struct Snap { routemap::Camera cam; ULONGLONG at = 0; };
@@ -214,7 +373,7 @@ namespace routeedit
 
 		void MapUpdateDetour(uptr state, uptr a2, float dt)
 		{
-			ApplyOrbit(state);
+			// Surface map is read-only; retain its native camera controls.
 			g_updateOriginal(state, a2, dt);
 			if (g_captureFailed.load()) return;
 			routemap::Camera c;
@@ -291,7 +450,7 @@ namespace routeedit
 			const bool ok = WriteFile(h, text.data(), DWORD(text.size()), &written, nullptr) && written == text.size() && FlushFileBuffers(h);
 			CloseHandle(h);
 			if (!ok) { DeleteFileW(tmp.c_str()); why = "writing " + Narrow(tmp) + " failed"; return false; }
-			if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) CopyFileW(path.c_str(), bak.c_str(), FALSE);
+			if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES&&!CopyFileW(path.c_str(),bak.c_str(),FALSE)){DeleteFileW(tmp.c_str());why="cannot back up "+Narrow(path);return false;}
 			if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
 				DeleteFileW(tmp.c_str());
 				why = "replacing " + Narrow(path) + " failed (error " + std::to_string(GetLastError()) + ")";
@@ -304,7 +463,7 @@ namespace routeedit
 
 		// ---- Editor state (only the star map movie's thread touches it) ----
 		// Route (2026-10-30, Traffic Manager stage 2): the whole route at once: drag moves it, its handle turns it, the wheel raises it.
-		enum class Mode { Select, Drop, Drag, Landing, Spawn, Connect, Route, Shape, Zone };
+		enum class Mode { Select, Drop, Drag, Landing, Spawn, Connect, Route, Shape, Zone, AccessEntry, AccessExit, LanePlace, KitPlace };
 		// Ctrl+click (2026-10-31): anything placed can join one selection. Found again by id, so it survives other things being added or removed; a point by its place in the open route.
 		enum : int { kPickPoint = 1, kPickLanding, kPickSpawn, kPickZone, kPickLink, kPickRoute };
 		struct Pick { int kind = 0; std::string id; int index = -1; };
@@ -314,7 +473,8 @@ namespace routeedit
 			switch (m) { case Mode::Drop: return "Add"; case Mode::Drag: return "Move"; case Mode::Landing: return "Land"; case Mode::Spawn: return "Spawn spot"; case Mode::Connect: return "Link"; case Mode::Route: return "Route"; case Mode::Shape: return "Shape"; case Mode::Zone: return "Zone"; default: return "Select"; }
 		}
 		// What the map shows (the View menu, stage 2). Session only.
-		struct View { bool others = true, flow = true, stems = true, numbers = true, names = true, spots = true; };
+		struct View { bool others = true, flow = true, stems = true, numbers = true, names = true, spots = true, volumes=true; };
+        struct LanePick {std::string route;int section=-1,lane=-1;std::uint64_t identity=0;int Resolve(const laneplan::Plan& plan)const{if(!identity)return section;const auto found=std::find(plan.sectionIds.begin(),plan.sectionIds.end(),identity);return found==plan.sectionIds.end()?-2:int(found-plan.sectionIds.begin());}bool operator==(const LanePick&)const=default;};
 		// A whole-route drag in progress (Route tool): 1 move, 2 turn. The draft changes once, on release (one undo step).
 		struct RouteDrag { int kind = 0; trafficdata::Route base, preview; routeeditor::Point centre{}; routemap::Vec3 start{}; double a0 = 0, turned = 0; };
 		// A route of another file (game coordinates; anchored cities placed with the addon's shift).
@@ -329,7 +489,8 @@ namespace routeedit
 			int draftIndex = -1;                    // the route the draft replaces; -1: a new route
 			int route = -1, point = -1;             // selection (route index in file.routes, point in the shown route)
 			std::vector<trafficdata::RouteGroup> routeGroups, routeGroupsSaved;  // VehicleGroups.ini: Save writes it, Cancel puts it back
-			int ruleScope = 0;                      // the vehicle rules sheet is for: 0 the route, 1 the group ruleGroup, 2 all routes
+			int ruleLane=-1;
+            int ruleScope = 0;                      // the vehicle rules sheet is for: 0 the route, 1 the group ruleGroup, 2 all routes
 			std::string ruleGroup;
 			int namingGroup = 0;                    // the name being typed is for: 0 a route, 1 a new group, 2 the group ruleGroup
 			std::vector<Pick> picks;                // Ctrl+click: read through PicksNow. The fields here stay the one the panel shows.
@@ -367,7 +528,13 @@ namespace routeedit
 			ULONGLONG tickAt = 0;
 			// Stage 2 panel: which folded groups are open, an open toolbar menu
 			// (0 none, 1 More, 2 View), what the map shows, and the Route tool's drag.
-			int sheet = 0, typePage = 0;  // a sheet over the panel: 1 vehicle rules, 2 time rules, 3 city
+			int sheet = 0, typePage = 0;  // 5 lane design, 6 movement, 7 dimensions
+            std::map<std::string,std::string> permanentFiles;std::string permanentDeleteId;ULONGLONG permanentDeleteAt=0;
+            int laneScope=0,laneFocus=-1;
+            int panelPage=0;std::string panelContext;
+            int kitTarget=0,kitProfile=0,kitVertex=0;double kitStep=1;
+            int inspectIndex=0,journeyIndex=0,restrictionScope=0,populationIndex=0;double accessHeight=0;
+            std::vector<LanePick> lanePicks;double laneMoveSide=0,laneMoveHeight=0;drive::Shape previewShape;bool envelopePreview=false;int previewDestination=0;double signalPreviewSeconds=0;bool showLivePaths=false;std::vector<trafficdata::Vec> itineraryPreview;std::string itineraryExplanation;
 			int zone = -1;                // selected keep-out or slow zone (file.zones)
 			// The Shape tool: which shape, and its centre once the first click has placed it.
 			routeeditor::Shape shape = routeeditor::Shape::Circle;
@@ -388,7 +555,7 @@ namespace routeedit
 			bool padCursor = false;
 			double padX = 0, padY = 0, mouseWasX = -1, mouseWasY = -1;
 			ULONGLONG padAt = 0;
-			int groups = 1, lastGroup = 0, menu = 0;  // groups: a bit per open group (1 Flow, 2 Position, 4 Rules, 8 Problems); several may be open
+			int groups = 0, lastGroup = 0, menu = 0;  // groups: a bit per open group (1 Flow, 2 Position, 4 Rules, 8 Problems); several may be open
 			View view;
 			RouteDrag routeDrag;
 			// 3D placement (2026-10-30, the user: points are hard to place in 3D): right-drag turns the map; Alt while moving a point
@@ -397,6 +564,31 @@ namespace routeedit
 			double orbitX = 0, orbitY = 0, altY = 0, altZ = 0, altPpm = 1;
 			float orbitYaw0 = 0, orbitPitch0 = 45;
 		} g_ed;
+        editorcontext::State g_context;
+        bool g_contextPanel=true,g_contextDirectory=false,g_contextReplace=false;
+        std::string g_contextObserved,g_contextText,g_contextNumberKey;
+        bool g_roadPanel=true,g_roadAll=false;int g_roadDivider=0,g_roadLane=0;
+        // Three-layer F7: open group, nearest point (pinned = g_ed.point), next-click shape, pending link-shape choice, highlighted panel row.
+        std::map<std::string,std::vector<bool>> g_wireUnknownDraw;
+        // Arrange (like FVO's HUD layout edit): toolbar, dock, side panel and messages can be dragged; saved to f7layout.ini.
+        struct F7Offset{double dx=0,dy=0;};std::array<F7Offset,4> g_f7Offset{};std::array<editorcontext::Rect,4> g_f7AreaRect{};
+        std::map<std::string,std::pair<double,double>>& g_f7NodeOffsets(){static std::map<std::string,std::pair<double,double>> offsets;return offsets;}  // Node view display offsets
+        void SaveF7Layout();void LoadF7Layout();void F7WirePanel();bool F7WireAction(int id);bool g_f7NodeView=false;
+        bool g_f7Arrange=false;int g_f7ArrangeDrag=-1;double g_f7GrabX=0,g_f7GrabY=0;F7Offset g_f7GrabFrom;
+        int g_f7Group=0,g_f7Nearest=-1,g_f7NextPrim=0,g_f7LinkPrompt=-1,g_f7Highlight=-1,g_f7FieldPage=0;bool g_f7Divider=false;double g_f7Clock=0;
+        int g_contextNumber=-1,g_contextDrag=0,g_contextMenuPage=0,g_contextCategory=-1;
+        std::vector<std::pair<int,std::string>> g_contextLinks;
+        bool g_contextPlace=false;routefiles::File g_contextPlaceBase;
+        double g_contextDragX=0,g_contextDragY=0;
+        lanetransform::Vec g_contextDragCentre;
+        std::map<std::string,trafficdata::Route> g_contextPreview,g_contextDragBase;
+        std::vector<editorcontext::Rect> g_contextRects;
+        bool ContextLaneStep(lanetransform::Vec delta,double turn=0,double scale=1);
+        bool ContextAction(int id,const routemap::Camera& c);
+        bool DockAction(int id,const routemap::Camera& c);bool DockTyping();  // the F7 dock (docklayout.inl)
+        constexpr int kTrafficLevelPick = 21620, kTrafficRanges = 21625, kTrafficBandStep = 21630;
+        bool TextEntryActive(){return g_ed.naming||g_contextNumber>=0||DockTyping();}
+
 		// What is under a point (3D placement): the first surface below it from a ray (a roof, a bridge or the ground), else the
 		// nav map / baked terrain; and whether something is above it (covered: under a roof or bridge; buried: inside the ground).
 		struct Surface { double below = 0, above = 0; bool known = false, rays = false, rough = false, covered = false, buried = false; ULONGLONG at = 0; };  // above: the top of what covers it; rays: a ray hit answered (kept); rough: terrain data only, no buildings
@@ -433,20 +625,24 @@ namespace routeedit
 		trafficdata::Route ToTd(const routefiles::Route& r, const std::string& world)
 		{
 			trafficdata::Route t;
+            t.restrictions=r.restrictions;t.journey=r.journey;t.lanePlan=r.lanePlan;t.spacePlan=r.spacePlan;t.road=r.road;t.end=r.end;t.travel=r.travel;t.sections=r.sections;t.corridor=r.corridor;
 			t.name = r.id; t.label = r.label; t.world = r.world.empty() ? world : r.world; t.ring = r.ring; t.shape = r.shape;
 			t.tilt = r.tilt; t.tiltToward = r.tiltToward; t.points = r.points; t.rounding=r.rounding; t.closed = r.closed; t.removed = r.removed;
 			t.lanes = r.lanes; t.speed = r.speed; t.width = r.width; t.schedule = r.schedule; t.test = r.test; t.color = r.color; t.exclude = r.exclude; t.role = r.role; t.group = r.group;
+            if(!t.lanePlan.enabled&&t.lanePlan.unsupported.empty()){auto city=g_ed.file.city;city.world=t.world;t.lanePlan=trafficdata::LaneDefaults({city},g_ed.routeGroups,t);}
 			return t;
 		}
 		routefiles::Route FromTd(const trafficdata::Route& t)
 		{
 			routefiles::Route r;
-			r.id = t.name; r.label = t.label; r.points = t.points; r.rounding=t.rounding; r.closed = t.closed; r.lanes = t.lanes; r.speed = t.speed;
+            r.id = t.name; r.label = t.label; r.points = t.points; r.rounding=t.rounding;r.restrictions=t.restrictions;r.journey=t.journey;r.spacePlan=t.spacePlan;r.road=t.road;r.end=t.end;r.lanePlan=t.lanePlan.inherited?laneplan::Plan{}:t.lanePlan;r.lanePlan.vehicles=t.lanePlan.vehicles;r.lanePlan.transforms=t.lanePlan.transforms;r.travel=t.travel;r.sections=t.sections;r.corridor=t.corridor; r.closed = t.closed; r.lanes = t.lanes; r.speed = t.speed;
 			r.width = t.width; r.schedule = t.schedule; r.test = t.test; r.color = t.color; r.exclude = t.exclude; r.role = t.role; r.group = t.group;
 			r.world = t.world == EditorKey() ? std::string() : t.world;
 			r.ring = t.ring; r.shape = t.shape; r.tilt = t.tilt; r.tiltToward = t.tiltToward; r.removed = t.removed;
 			return r;
 		}
+        bool AddonAuthoring(unsigned bit){using Query=unsigned (*)();const auto addon=GetModuleHandleW(L"FVO_Traffic.dll");const auto query=addon?reinterpret_cast<Query>(GetProcAddress(addon,"FVO_Traffic_AuthoringCapabilitiesV1")):nullptr;return query&&(query()&bit)!=0;}
+        const trafficroute::Line& EditorLine(const trafficdata::Route& route){static routecache::Cache cache;const auto found=g_contextPreview.find(route.name);return cache.Get(found==g_contextPreview.end()?route:found->second);}
 		// An editor route that can be drawn and edited here (not a removal marker, its world placed in the player's world).
 		bool Usable(const routefiles::Route& r) { return !r.removed && !g_ed.unplaced.count(r.id); }
 		bool IsOriginal(const routefiles::Route& r) { return r.id.rfind("ed_", 0) != 0; }  // an edited or removed original
@@ -501,7 +697,11 @@ namespace routeedit
 		}
 		void Move(routefiles::Route& r, const trafficdata::Vec& s, double sign)
 		{
+            splinekit::Transform(r.spacePlan,{},{sign*s.x,sign*s.y,sign*s.z});
+    lanetransform::Parent(r.lanePlan.transforms,lanetransform::Identity(),{},{sign*s.x,sign*s.y,sign*s.z});
 			for (auto& p : r.points) { p.x += sign * s.x; p.y += sign * s.y; p.z += sign * s.z; }
+            for(auto& stop:r.journey.stops){stop.x+=sign*s.x;stop.y+=sign*s.y;stop.z+=sign*s.z;}
+            routeend::Shift(r.end,sign*s.x,sign*s.y,sign*s.z);  // an arrive place moves with its anchored city
 			r.shape.cx += sign * s.x; r.shape.cy += sign * s.y; r.shape.z += sign * s.z;
 		}
 		// File coordinates -> game coordinates for every editor route whose world is placed here (now or later).
@@ -579,15 +779,18 @@ namespace routeedit
 			}
 			const std::string keep = g_ed.other >= 0 && g_ed.other < int(g_ed.others.size()) ? g_ed.others[std::size_t(g_ed.other)].name : std::string();
 			for (const auto& [name, shift] : ShiftsHere()) trafficdata::PlaceWorld(d, name, g_ed.world, shift);
-			g_ed.others.clear(); g_ed.other = -1;
+			g_ed.permanentFiles.clear();for(const auto& r:d.routes)if(trafficdata::Lower(r.file).starts_with("permanent_")&&trafficdata::SameWorld(d,r.world,g_ed.world))g_ed.permanentFiles[r.name]=r.file;
+            trafficdata::PreferEditor(d);
+            g_ed.others.clear(); g_ed.other = -1;
 			g_ed.othersHaveTraffic = !d.traffic.empty();
 			std::set<std::string> mine;  // edited or removed here: the editor's version is the one that counts
 			for (const auto& r : g_ed.file.routes) mine.insert(r.id);
 			if (g_ed.draft) mine.insert(g_ed.draft->Value().name);
-			for (const auto& r : d.routes) {
+            trafficdata::ApplyLaneDefaults(d);
+            for (const auto& original : d.routes) {auto r=original;if(trafficdata::SameWorld(d,r.world,g_ed.world)){auto city=g_ed.file.city;city.world=r.world;auto candidate=r;if(candidate.lanePlan.inherited){const auto models=candidate.lanePlan.vehicles;const auto transforms=candidate.lanePlan.transforms;candidate.lanePlan={};candidate.lanePlan.vehicles=models;candidate.lanePlan.transforms=transforms;}const auto preferred=trafficdata::LaneDefaults({city},g_ed.routeGroups,candidate);if(preferred.enabled||!preferred.unsupported.empty())r.lanePlan=preferred;}
 				if (!trafficdata::SameWorld(d, r.world, g_ed.world) || mine.count(r.name)) continue;
 				if (r.name == keep) g_ed.other = int(g_ed.others.size());
-				g_ed.others.push_back({ r.name, r.file, trafficroute::Build(r), r.ring, r });
+				g_ed.others.push_back({ r.name, r.file, EditorLine(r), r.ring, r });
 			}
 			g_ed.othersData = std::move(d);
 			g_ed.othersData.routes.clear();
@@ -673,6 +876,23 @@ namespace routeedit
 			for (const auto& w : s.windows) t += (t.empty() ? "" : ", ") + Clock(w.start) + "-" + Clock(w.end) + " x" + std::to_string(w.vehicles);
 			return t;
 		}
+        std::string TrafficLevelText(const routeschedule::Schedule& s) {
+            if (!routeschedule::HasLevel(s)) return "Saved";
+            const auto band = s.trafficBands[s.trafficLevel];
+            return std::string(routeschedule::LevelName(s.trafficLevel)) + " " + std::to_string(band.low) + "-" + std::to_string(band.high) + "/km";
+        }
+        bool EditTrafficBand(int level, bool upper, double value) {
+            if (!std::isfinite(value) || !EnsureDraft()) return false;
+            auto r = g_ed.draft->Value();
+            auto& band = r.schedule.trafficBands[level];
+            const int n = int(std::lround(std::clamp(value, 0.0, double(fvolimits::kVehicles))));
+            const int before = upper ? band.high : band.low;
+            if (upper) band.high = std::max(n, band.low);
+            else band.low = std::min(n, band.high);
+            if (before != (upper ? band.high : band.low)) g_ed.draft->Edit(r);
+            Status(std::string(routeschedule::LevelName(level)) + " range " + std::to_string(band.low) + "-" + std::to_string(band.high) + " (Save keeps it)");
+            return true;
+        }
 		// Warnings that never block a save; the blocking problems are routeeditor::Validate's.
 		std::vector<std::string> Warnings(const trafficdata::Route& r)
 		{
@@ -714,10 +934,11 @@ namespace routeedit
 		{
 			std::string text;
 			trafficdata::Data d;
-			if (ReadText(GroupsPath(), text)) trafficdata::Read(text, "VehicleGroups.ini", d);
+			try{for(const auto& file:std::filesystem::directory_iterator(TrafficDir()))if(file.is_regular_file()&&trafficpermanent::Name(file.path())&&ReadText(file.path().wstring(),text)&&trafficpermanent::Owned(text))trafficdata::Read(text,file.path().filename().string(),d);}catch(const std::exception& error){Status(std::string("Shared groups could not be loaded: ")+error.what());}
+            if (ReadText(GroupsPath(), text)) trafficdata::Read(text, "VehicleGroups.ini", d);
 			g_ed.routeGroups = d.groups; g_ed.routeGroupsSaved = d.groups;
 		}
-		void Save()
+		void Save(bool permanent=false)
 		{
 			trafficprofile::Guard files(trafficprofile::Mutex());
 			const auto profile = TrafficDir();
@@ -730,7 +951,8 @@ namespace routeedit
 					Status(std::string("Not saved: ") + routeschedule::IssueText(issue));
 					return;
 				}
-				const auto r = FromTd(g_ed.draft->Value());
+				if(g_ed.draft->Value().spacePlan.enabled){const auto& geometry=EditorLine(g_ed.draft->Value());if(geometry.error){Status("Not saved: "+(geometry.detailError.empty()?std::string(geometry.error):geometry.detailError));return;}}
+                auto r = FromTd(g_ed.draft->Value());if(permanent){r.lanePlan=g_ed.draft->Value().lanePlan;r.lanePlan.inherited=false;}
 				if (g_ed.draftIndex >= 0 && g_ed.draftIndex < int(next.routes.size())) next.routes[std::size_t(g_ed.draftIndex)] = r;
 				else { next.routes.push_back(r); g_ed.draftIndex = int(next.routes.size()) - 1; }
 				g_ed.shifts[r.id] = g_ed.draftShift;
@@ -740,9 +962,9 @@ namespace routeedit
 			for (auto& r : disk.routes) if (const auto it = g_ed.shifts.find(r.id); it != g_ed.shifts.end() && !r.removed) Move(r, it->second, -1);
 			for (auto* list : { &disk.landings, &disk.spawns })
 				for (auto& sp : *list)
-					if (const auto it = g_ed.spotShifts.find(sp.id); it != g_ed.spotShifts.end()) { sp.at.x -= it->second.x; sp.at.y -= it->second.y; sp.at.z -= it->second.z; }
+					if (const auto it = g_ed.spotShifts.find(sp.id); it != g_ed.spotShifts.end()) { sp.at.x -= it->second.x; sp.at.y -= it->second.y; sp.at.z -= it->second.z;placeaccess::Move(sp.access,-it->second.x,-it->second.y,-it->second.z); }
 			for (auto& z : disk.zones)
-				if (const auto it = g_ed.spotShifts.find(z.name); it != g_ed.spotShifts.end()) { z.at.x -= it->second.x; z.at.y -= it->second.y; z.at.z -= it->second.z; z.top -= it->second.z; }
+				if (const auto it = g_ed.spotShifts.find(z.name); it != g_ed.spotShifts.end()) { z.at.x -= it->second.x; z.at.y -= it->second.y; z.at.z -= it->second.z; z.top -= it->second.z;if(z.restrictionFloor>-1000000000)z.restrictionFloor-=it->second.z;if(z.restrictionTop<1000000000)z.restrictionTop-=it->second.z; }
 			const std::wstring path = profile + L"\\" + Wide(g_ed.fileName);
 			std::string existing;
 			if (ReadText(path, existing) && existing.find(kSignature) == std::string::npos) {
@@ -753,7 +975,21 @@ namespace routeedit
 			disk.traffic = next.traffic;
 			CreateDirectoryW(profile.c_str(), nullptr);
 			std::string why;
-			if (!WriteAtomic(path, routefiles::Format(disk), why)) { Status("Not saved: " + why); return; }
+			std::string published;
+            if(permanent){
+                if(!g_ed.draft||g_ed.draftIndex<0||g_ed.draftIndex>=int(disk.routes.size())){Status("Select a route to save across playthroughs.");return;}
+                const auto selected=disk.routes[std::size_t(g_ed.draftIndex)];const auto shared=trafficprofile::PermanentDir();if(shared.empty()){Status("Permanent save unavailable: shared storage could not be opened.");return;}
+                const auto known=g_ed.permanentFiles.find(selected.id);auto name=known==g_ed.permanentFiles.end()?trafficpermanent::FileName(g_ed.world):known->second;auto target=shared+L"\\"+Wide(name);std::string previous;
+                {std::string text;if(known==g_ed.permanentFiles.end()&&ReadText(target,text)&&trafficpermanent::Disabled(text)){name=trafficpermanent::Live(name);target=shared+L"\\"+Wide(name);logger::Write("OBS system=f7.permanent event=beside_disabled_file file=%s reason=old_shared_file_is_switched_off",name.c_str());}}
+                try{const bool exists=std::filesystem::exists(target);if(exists&&!ReadText(target,previous))throw std::runtime_error("Could not read existing shared entry");auto entry=permanentroutes::Parse(previous,name,known==g_ed.permanentFiles.end()?g_ed.world:std::string());auto context=g_ed.othersData;context.worlds[EditorKey()]=g_ed.world;for(const auto& group:g_ed.routeGroups){auto at=std::find_if(context.groups.begin(),context.groups.end(),[&](const auto& old){return old.name==group.name;});if(at==context.groups.end())context.groups.push_back(group);else *at=group;}permanentroutes::Put(entry,selected,context,disk.links);if(!std::any_of(context.traffic.begin(),context.traffic.end(),[&](const auto& rule){return trafficdata::SameWorld(context,rule.world,g_ed.world);}))entry.file.traffic=true;
+                    if(!WriteAtomic(target,permanentroutes::Format(entry),why)){Status("Not permanently saved: "+why);return;}published=selected.id;
+                }catch(const std::exception& error){Status(std::string("Not permanently saved: ")+error.what());return;}
+                if(!trafficprofile::RefreshPermanent(why)){Status("Shared route saved, but current working copy could not refresh: "+why);return;}
+                // The published route now comes from the shared overlay. Ordinary
+                // edits can subsequently create an explicit save-local override.
+                std::erase_if(disk.routes,[&](const auto& route){return route.id==published;});std::erase_if(next.routes,[&](const auto& route){return route.id==published;});disk.traffic=false;next.traffic=false;
+            }
+            if (!WriteAtomic(path, routefiles::Format(disk), why)) { Status((published.empty()?"Not saved: ":"Shared route saved; local override could not be removed: ")+why); return; }
 			if (routefiles::FormatGroups(g_ed.routeGroups) != routefiles::FormatGroups(g_ed.routeGroupsSaved)) {
 				if (!WriteAtomic(profile + L"\\VehicleGroups.ini", routefiles::FormatGroups(g_ed.routeGroups), why)) { Status("Routes saved, but not the route groups: " + why); return; }
 				g_ed.routeGroupsSaved = g_ed.routeGroups;
@@ -763,8 +999,10 @@ namespace routeedit
 			g_ed.file = next; g_ed.saved = next;
 			g_ed.draft.reset(); g_ed.draftIndex = -1; g_ed.route = route;
 			LoadOthers();
-			Status("Saved " + g_ed.fileName + ": traffic takes it up by itself: vehicles finish their lap and land before they change route. X clears everything and starts over.");
+			if(!published.empty()){g_ed.route=-1;for(std::size_t i=0;i<g_ed.others.size();++i)if(g_ed.others[i].name==published){g_ed.other=int(i);break;}Status("Permanent Save: selected route is shared across playthroughs. Normal edits stay local; Permanent Delete removes the shared copy.");return;}
+            Status("Saved " + g_ed.fileName + ": traffic takes it up by itself: vehicles finish their lap and land before they change route. X clears everything and starts over.");
 		}
+        void PermanentDelete(){trafficprofile::Guard files(trafficprofile::Mutex());if(TrafficDir()!=g_ed.profileDir){Status("Playthrough changed: reopen the menu.");return;}trafficdata::Route scratch;const auto* route=Shown(scratch);if(!route)return;const auto known=g_ed.permanentFiles.find(route->name);if(known==g_ed.permanentFiles.end()){Status("This route has no shared permanent copy.");return;}const auto now=GetTickCount64();if(g_ed.permanentDeleteId!=route->name||now-g_ed.permanentDeleteAt>3000){g_ed.permanentDeleteId=route->name;g_ed.permanentDeleteAt=now;Status("Permanent Delete removes this route's shared copy across playthroughs. Click again within 3 seconds; local overrides and old snapshots remain.");return;}const auto shared=trafficprofile::PermanentDir();if(shared.empty())return;const auto target=shared+L"\\"+Wide(known->second);std::string text,why;try{if(!ReadText(target,text))throw std::runtime_error("Could not read shared entry");auto entry=permanentroutes::Parse(text,known->second,{});if(!permanentroutes::Erase(entry,route->name)){Status("Shared copy was already removed.");return;}if(!WriteAtomic(target,permanentroutes::Format(entry),why)){Status("Permanent Delete failed: "+why);return;}if(!trafficprofile::RefreshPermanent(why)){Status("Shared copy deleted; current view could not refresh: "+why);return;}g_ed.permanentDeleteAt=0;g_ed.permanentDeleteId.clear();LoadOthers();Status("Shared permanent copy deleted across playthroughs. Existing local overrides remain save-specific.");}catch(const std::exception& error){Status(std::string("Permanent Delete failed: ")+error.what());}}
 		void Cancel()
 		{
 			g_ed.picks.clear(); g_ed.massUndo.clear(); g_ed.massRedo.clear(); g_ed.groupDrag = 0;
@@ -779,7 +1017,8 @@ namespace routeedit
 		void NewRoute()
 		{
 			if (g_ed.draft) { Status("Save or Cancel the open route first"); return; }
-			routefiles::Route r;
+			routefiles::Route r;r.travel=routepolicy::Travel::Both;
+            r.schedule.trafficLevel = routeschedule::Quiet;
 			r.label = "Route " + std::to_string(g_ed.file.routes.size() + 1);
 			r.id = routefiles::NewId(r.label, TakenIds());
 			g_ed.draft.emplace(ToTd(r, routefiles::WorldKey(g_ed.world)));
@@ -949,6 +1188,44 @@ namespace routeedit
 			std::lock_guard lk(g_groundLock);
 			if (g_groundAsks.size() < 32) g_groundAsks.push_back(a);
 		}
+		// PL-1 (2026-11-07, user: "I want it where the mouse is"): the first surface along the cursor's line. The draw path posts the line
+		// each frame and reads the last answer; the main frame task casts it (GroundTick). A click casts its own line at once (CursorSurface).
+		struct CursorProbe { float from[3]{}, to[3]{}; ULONGLONG askedAt = 0, answeredAt = 0; bool pending = false, hit = false; double x = 0, y = 0, z = 0; };
+		std::mutex g_cursorLock; CursorProbe g_cursor;
+		bool CursorLine(const routemap::Camera& c, float from[3], float to[3])
+		{
+			routemap::Vec3 o, d;
+			if (!routemap::MouseRay(c, o, d)) return false;
+			double t = 3000.0;
+			if (d.z < -1e-6) t = std::min(t, (c.focus.z - 1500.0 - o.z) / d.z);  // down to 1.5 km under the map's centre, as AskGround
+			if (!std::isfinite(t) || t <= 0) return false;
+			from[0] = float(o.x); from[1] = float(o.y); from[2] = float(o.z);
+			to[0] = float(o.x + t * d.x); to[1] = float(o.y + t * d.y); to[2] = float(o.z + t * d.z);
+			return true;
+		}
+		void AskCursor(const routemap::Camera& c)
+		{
+			float a[3], b[3]; if (!CursorLine(c, a, b)) return;
+			std::lock_guard lk(g_cursorLock);
+			for (int k = 0; k < 3; ++k) { g_cursor.from[k] = a[k]; g_cursor.to[k] = b[k]; }
+			g_cursor.askedAt = GetTickCount64(); g_cursor.pending = true;
+		}
+		// The last answer, if it is fresh (the cursor moves: a stale answer would put the ball where the mouse was).
+		bool CursorAnswer(routemap::Vec3& at)
+		{
+			std::lock_guard lk(g_cursorLock);
+			if (!g_cursor.hit || !g_cursor.answeredAt || GetTickCount64() - g_cursor.answeredAt > 250) return false;
+			at = { g_cursor.x, g_cursor.y, g_cursor.z }; return true;
+		}
+		// At a click: the line now, cast at once (DropPoint already casts its own rays this way, DownRay). 1 hit, 0 nothing, -1 no ray.
+		int CursorSurface(const routemap::Camera& c, routemap::Vec3& at)
+		{
+			float a[3], b[3]; if (!CursorLine(c, a, b)) return -1;
+			prefetch::RayHit h;
+			if (vehicle_probe::CastNow(a, b, 0x22806, h) != 1) return CursorAnswer(at) ? 1 : -1;  // no direct ray here: the main task's last answer
+			if (!h.hit || !std::isfinite(h.x) || !std::isfinite(h.y) || !std::isfinite(h.z)) return 0;
+			at = { h.x, h.y, h.z }; return 1;
+		}
 		// Map movie's thread: answered asks move their point or spot.
 		void ApplyGround()
 		{
@@ -1052,26 +1329,39 @@ namespace routeedit
 				}
 			}
 			routemap::Vec3 at;
-			if (!routemap::MouseAt(c, z, at)) { Status("The cursor's ray does not reach that height; move the cursor or the camera"); return; }
+			// PL-1: not inserting on a segment: the point goes on the first surface under the cursor, kGroundLift above it (the deck, not
+			// the ground or water beneath). No surface answer: the plane placement and ground lift below, as before.
+			bool onSurface = false;
+			if (!split) { routemap::Vec3 hp; const int got = CursorSurface(c, hp);
+				logger::Write("OBS routeedit.place event=surface_under_cursor hit=%d at=%.1f,%.1f,%.1f reason=%s", got, got == 1 ? hp.x : 0.0, got == 1 ? hp.y : 0.0, got == 1 ? hp.z : 0.0,
+					got == 1 ? "placed_on_the_surface_the_mouse_points_at" : got == 0 ? "nothing_under_the_cursor_plane_placement" : "no_ray_plane_placement");
+				if (got == 1) { at = { hp.x, hp.y, hp.z + kGroundLift }; onSurface = true; } }
+			if (!onSurface && !routemap::MouseAt(c, z, at)) { Status("The cursor's ray does not reach that height; move the cursor or the camera"); return; }
 			// The spot's own height when the terrain there is known (never under it), then the point check.
 			// (It keeps the height it inherited: heights jumped 167, -13, 132, -13 from one click to the next, by where the ground happened to be known.)
-			if (double ground = 0; !split && (DownRay(at.x, at.y, at.z + 1500.0, at.z - 1500.0, ground) == 1 || TerrainAt(at.x, at.y, at.z, ground)) &&
+			if (double ground = 0; !split && !onSurface && (DownRay(at.x, at.y, at.z + 1500.0, at.z - 1500.0, ground) == 1 || TerrainAt(at.x, at.y, at.z, ground)) &&
 				routeeditor::PlacedHeight(at.z, ground, kGroundLift) != at.z) {
 				routemap::Vec3 lifted;
 				if (routemap::MouseAt(c, ground + kGroundLift, lifted)) at = lifted; else at.z = ground + kGroundLift;
 			}
 			if (const char* why = PointProblem(at.x, at.y, at.z)) { Refused("New point", at.x, at.y, at.z, why); return; }
 			const std::size_t oldCount = r.points.size();
+            routepolicy::Insert(r.sections,oldCount,after);
+            roadplan::Insert(r.road,after);splinekit::Insert(r.spacePlan,after,{at.x,at.y,at.z});laneplan::Insert(r.lanePlan,after);
             if(!r.rounding.empty()){r.rounding.resize(oldCount,0);r.rounding.insert(r.rounding.begin()+std::ptrdiff_t(after),0);}
 			r.points.insert(r.points.begin() + std::ptrdiff_t(after), { at.x, at.y, at.z });
 			g_ed.draft->Edit(r);
 			LinksPointInserted(r.name, after, oldCount);
 			g_ed.point = int(after);
+            if(r.road.enabled&&g_f7NextPrim>0){r.road.primitives.resize(r.points.size());r.road.primitives[after]={g_f7NextPrim,roadplan::DefaultParam(g_f7NextPrim)};if(g_f7NextPrim!=roadplan::Flat&&r.road.height<=0)r.road.height=5;
+                if(roadplan::Valid(r.road))g_ed.draft->Amend(r);logger::Write("OBS system=f7.primitive point=%d from=carried to=%s scope=new_point",int(after)+1,roadplan::KindName(g_f7NextPrim));}
+            if(r.road.enabled && after>1){g_f7LinkPrompt=int(after)-1;g_f7Group=0;Status("Join shape at the preceding marker: 1 rounded bend, 2 sharp join, 3 taper.");}
 			if (!split) AskGround(0, r.name, at.x, at.y, c);  // onto what is under the cursor (a point between two keeps their height)
 			char b[128]; std::snprintf(b, sizeof b, "Point %d %s at (%.0f, %.0f), height %.0f m", g_ed.point + 1, split ? "added between two points" : "added",
 				at.x, at.y, at.z);
 			Status(b);
 		}
+		void AutoWires(const std::string& id);
 		void AddSpot(const routemap::Camera& c, int kind)
 		{
 			routemap::Vec3 at;
@@ -1092,6 +1382,7 @@ namespace routeedit
 			list.push_back(s);
 			g_ed.spotKind = kind; g_ed.spot = int(list.size()) - 1;
 			AskGround(kind, s.id, at.x, at.y, c);
+			if (kind == 1) AutoWires(s.id);  // a new landing is wired to the nearest route (spec 7b)
 			Status(std::string(kind == 1 ? "Landing" : "Spawn") + " spot added; finding the ground under the cursor (" + std::to_string(int(at.z)) +
 				" m for now). Save to keep it.");
 		}
@@ -1147,7 +1438,9 @@ namespace routeedit
 		template <class R> void MoveWholeRoute(R& r, const routeeditor::GroupMove& m)
 		{
 			if (r.ring) { routeeditor::Apply(m, r.shape.cx, r.shape.cy, r.shape.z); r.shape.radius *= m.factor; return; }
-			for (auto& p : r.points) routeeditor::Apply(m, p.x, p.y, p.z);
+			splinekit::Transform(r.spacePlan,{m.cx,m.cy,0},{m.dx,m.dy,m.dz},m.radians,m.factor);
+    lanetransform::Parent(r.lanePlan.transforms,lanetransform::Multiply(lanetransform::Rotation(2,m.radians),{m.factor,0,0,0,m.factor,0,0,0,1}),{m.cx,m.cy,0},{m.dx,m.dy,m.dz},m.factor);
+            for (auto& p : r.points) routeeditor::Apply(m, p.x, p.y, p.z);
 			if (m.factor != 1) for (auto& q : r.rounding) if (q > 0) q = std::clamp(q * m.factor, 5.0, 200.0);
 		}
 		bool DraftTouched()
@@ -1384,6 +1677,9 @@ namespace routeedit
 		}
 		void ChangeZ(double dz)
 		{
+            if(ContextLaneStep({0,0,dz}))return;
+            if(g_ed.sheet==19&&g_ed.draft&&g_ed.draft->Value().spacePlan.enabled){auto r=g_ed.draft->Value();auto& p=r.spacePlan;if(p.handles.size()!=r.points.size()||r.points.empty())return;const auto i=std::min(std::size_t(std::max(0,g_ed.point)),r.points.size()-1);auto lane=std::find_if(p.lanes.begin(),p.lanes.end(),[&](const auto& l){return l.lane==g_ed.laneFocus;});auto& h=lane==p.lanes.end()?p.handles[i]:lane->anchors[i].handle;if(g_ed.kitTarget==0){if(lane==p.lanes.end())r.points[i].z+=dz;else lane->anchors[i].point.z+=dz;}else {auto v=g_ed.kitTarget==1?h.incoming:h.outgoing;v.z+=dz;splinekit::SetHandle(h,g_ed.kitTarget==1,v);}g_ed.draft->Edit(r);Status("Toolkit target height changed; the map placement plane follows this Z.");return;}
+
 			if (Many()) { routeeditor::GroupMove m; m.dz = dz; GroupStep(m, "Height"); return; }
 			if (g_ed.zone >= 0 && g_ed.zone < int(g_ed.file.zones.size())) {
 				auto& z = g_ed.file.zones[std::size_t(g_ed.zone)];
@@ -1423,6 +1719,7 @@ namespace routeedit
 			const double l = std::hypot(fx, fy);
 			if (l < 1e-3) { fx = 0; fy = 1; } else { fx /= l; fy /= l; }  // straight down: north is forward
 			const double dx = side * fy + ahead * fx, dy = -side * fx + ahead * fy;
+            if(ContextLaneStep({dx,dy,0}))return;
 			if (Many()) { routeeditor::GroupMove m; m.dx = dx; m.dy = dy; GroupStep(m, "Move"); return; }
 			char b[128];
 			if (g_ed.zone >= 0 && g_ed.zone < int(g_ed.file.zones.size())) {
@@ -1467,8 +1764,8 @@ namespace routeedit
 		// The line of a route by name (editor routes as saved, or the open draft; others read-only) and whether it is a ring.
 		bool LineOf(const std::string& name, trafficroute::Line& line, bool& ring)
 		{
-			if (g_ed.draft && g_ed.draft->Value().name == name) { line = trafficroute::Build(g_ed.draft->Value()); ring = g_ed.draft->Value().ring; return true; }
-			for (const auto& r : g_ed.file.routes) if (r.id == name && Usable(r)) { line = trafficroute::Build(ToTd(r, "")); ring = r.ring; return true; }
+			if (g_ed.draft && g_ed.draft->Value().name == name) { line = EditorLine(g_ed.draft->Value()); ring = g_ed.draft->Value().ring; return true; }
+			for (const auto& r : g_ed.file.routes) if (r.id == name && Usable(r)) { line = EditorLine(ToTd(r, "")); ring = r.ring; return true; }
 			for (const auto& o : g_ed.others) if (o.name == name) { line = o.line; ring = o.ring; return true; }
 			return false;
 		}
@@ -1532,7 +1829,7 @@ namespace routeedit
 				}
 			};
 			for (const auto& o : g_ed.others) test(o.name, o.line, o.ring);
-			for (const auto& r : g_ed.file.routes) if (Usable(r)) test(r.id, trafficroute::Build(ToTd(r, "")), r.ring);
+			for (const auto& r : g_ed.file.routes) if (Usable(r)) test(r.id, EditorLine(ToTd(r, "")), r.ring);
 			return best < 16;
 		}
 		void Connect(const routemap::Camera& c, double mx, double my)
@@ -1667,14 +1964,17 @@ namespace routeedit
 
 		// ---- Drawing ----
 		// Text is drawn as line strokes (strokefont.h): the movie's fonts drew boxes. Panel text is redrawn only when it changes.
-		struct TextItem { std::string text; double x, y; unsigned color; std::size_t chars; bool map; double unit = 0; };  // unit 0: kUnit
+		struct TextItem { std::string text; double x, y; unsigned color; std::size_t chars; bool map; double unit = 0; bool outline = true; };  // DRAW-1: outline false = one pass  // unit 0: kUnit
 		// Stage 2 styles: 0 panel button, 1 toolbar tool, 2 folded group header, 3 list row, 4 menu item, 5 segment, 6 problems badge, 7 delete.
-		struct Button { int id; double x, y, w, h; std::string text; bool active, enabled; std::string key; int style = 0; std::string value; unsigned swatch = 0; };
+		struct Button { int id; double x, y, w, h; std::string text; bool active, enabled; std::string key; int style = 0; std::string value; unsigned swatch = 0; int nav = 0; };  // nav (F7 dock): 1 goes to another level, 2 goes up
 		struct Box { double x, y, w, h; unsigned fill; double alpha; unsigned line = 0; double lineAlpha = 0; };
+        struct UiPolygon{std::vector<std::pair<double,double>> points;unsigned color=0;double alpha=.25;};
 		struct Ui {
 			uptr movie = 0;
 			bool built = false, failed = false;
-			Value layer, lines, panel, cover, panelText, mapText;
+			Value layer, lines, volumes, panel, cover, panelText, mapText, pointer;  // pointer: photo-mode cursor, drawn last (on top)
+			Value flow; bool flowOk = false;  // DRAW-1: the moving flow markers on their own sprite (just above lines), so the still map is not resent each frame
+            std::string volumeSignature;bool volumeDirty=true;
 			std::vector<TextItem> items;
 			std::string panelSig;
 			double width = 1920, height = 1080;
@@ -1684,10 +1984,38 @@ namespace routeedit
 			bool calibrated = false, calX = false, calY = false;
 			double refScreenX = -1, refScreenY = -1, refLocalX = 0, refLocalY = 0;
 			std::vector<Button> buttons;
-			std::vector<Box> boxes;             // stage 2: row backgrounds and swatches, drawn before the buttons
+			std::vector<UiPolygon> polygons;std::vector<Box> boxes;             // stage 2: row backgrounds and swatches, drawn before the buttons
 			double barX = 494, barY = 50, barW = 0, barH = 44, menuX = 0, menuY = 0, menuW = 0, menuH = 0;
-		} g_ui;
+        };
+        // Stable addresses: managed GFx Values must never move between movies.
+        Ui g_hostUi[2];
+        Ui* g_currentUi=&g_hostUi[0];
+#define g_ui (*g_currentUi)
+        struct NativePhotoChild {Value clip;bool visible=true;};
+        NativePhotoChild g_photoChildren[64];
+        int g_photoChildCount=0;
+        void PhotoChrome(uptr menu,bool hide){
+            if(!g_photoHost)return;
+            if(!hide){
+                for(int i=0;i<g_photoChildCount;++i){auto& child=g_photoChildren[i];
+                    SetMember(child.clip,"visible",Bool(child.visible));Release(child.clip);}
+                g_photoChildCount=0;return;
+            }
+            if(g_photoChildCount)return;
+            const auto& root=*reinterpret_cast<const Value*>(menu+0x58);
+            double count=0;if(!GetNumber(root,"numChildren",count)||count>64)return;
+            for(int i=0;i<int(count);++i){
+                auto& child=g_photoChildren[g_photoChildCount];const Value index[]={Num(i)};
+                if(!InvokeR(root,"getChildAt",index,1,&child.clip)||!IsObject(child.clip)){Release(child.clip);continue;}
+                if(child.clip.object==g_ui.layer.object){Release(child.clip);continue;}
+                Value visible;if(GetMember(child.clip,"visible",&visible)&&(visible.type&0x8F)==kBool)child.visible=visible.boolean;
+                Release(visible);SetMember(child.clip,"visible",Bool(false));++g_photoChildCount;
+            }
+        }
 
+		struct PenOp { std::uint8_t k = 0, n = 0; double a[6]{}; bool operator==(const PenOp& o) const { if (k != o.k || n != o.n) return false; for (int i = 0; i < n; ++i) if (a[i] != o.a[i]) return false; return true; } };
+		struct PenTape { const char* name = ""; std::vector<PenOp> last; ULONGLONG logAt = 0; std::uint64_t frames = 0, sent = 0, recorded = 0, calls = 0, culled = 0, thinned = 0; };
+		PenTape g_tapeLines{ "lines" }, g_tapePanel{ "panel" }, g_tapeCover{ "cover" }, g_tapeMapText{ "map_text" };
 		bool NewSprite(uptr movie, const Value& parent, Value& out, bool mouse)
 		{
 			if (!CreateObject(movie, &out, "flash.display.Sprite", nullptr, 0)) return false;
@@ -1703,17 +2031,22 @@ namespace routeedit
 			SetMember(g_ui.layer, "name", Str("FvoRouteEditor"));
 			SetMember(g_ui.layer, "mouseChildren", Bool(true));
 			// cover (absorbs map clicks while dropping / dragging), route lines, panel (absorbs clicks on the buttons), text
-			if (!NewSprite(movie, g_ui.layer, g_ui.cover, true) || !NewSprite(movie, g_ui.layer, g_ui.lines, false) ||
+			if (!NewSprite(movie, g_ui.layer, g_ui.cover, true) || !NewSprite(movie, g_ui.layer, g_ui.volumes, false) || !NewSprite(movie, g_ui.layer, g_ui.lines, false) || !((g_ui.flowOk = NewSprite(movie, g_ui.layer, g_ui.flow, false)), true) ||
 				!NewSprite(movie, g_ui.layer, g_ui.panel, true) || !NewSprite(movie, g_ui.layer, g_ui.panelText, false) ||
 				!NewSprite(movie, g_ui.layer, g_ui.mapText, false)) return false;
+            if(!NewSprite(movie,g_ui.layer,g_ui.pointer,false))logger::Write("OBS routeedit.photo event=pointer_layer_failed; the drawn pointer is unavailable");
 			Value stage;
 			if (GetMember(root, "stage", &stage) && IsObject(stage)) { GetNumber(stage, "stageWidth", g_ui.width); GetNumber(stage, "stageHeight", g_ui.height); }
 			Release(stage);
 			g_ui.ax = g_ui.width; g_ui.ay = g_ui.height;
 			logger::Write("Route editor: overlay added to the star map movie (stage %.0f x %.0f)", g_ui.width, g_ui.height);
+			for (auto* t : { &g_tapeLines, &g_tapePanel, &g_tapeCover, &g_tapeMapText }) t->last.clear();  // DRAW-1: new sprites start empty, so the next frame is always sent
+			logger::Write("OBS system=f7.draw event=flow_layer ok=%d reason=%s", g_ui.flowOk ? 1 : 0, g_ui.flowOk ? "flow_markers_on_own_sprite" : "sprite_failed_flow_drawn_on_lines");
+			logger::Write("OBS system=f7.draw event=font face=future advance_px=%.2f height_px=%.1f reason=readable_ui_20261111", double(f7layers::kLetterPx), strokefont::kHeight * (f7layers::kLetterPx / strokefont::kAdvance));  // kUnit is declared below; same value by its static_assert
 			return true;
 		}
-		constexpr double kUnit = 1.5;       // px per stroke-font grid unit: letters 9 px high, 8.25 px apart
+		constexpr double kUnit = 1.5;       // px per stroke-font grid unit: letters 9 px high, 9 px apart (Future face, 2026-11-11)
+		static_assert(strokefont::kAdvance * kUnit == f7layers::kLetterPx, "f7layers::kLetterPx must match the editor's letter advance");
 		constexpr double kButtonW = 124;    // a label of 11 letters and its key (Layout)
 		constexpr double kLine = 16;        // px between text lines
 		// Queues one line of text (top-left x, y), cut to `width`; map labels are redrawn every frame, panel text on change.
@@ -1721,23 +2054,67 @@ namespace routeedit
 		{
 			g_ui.items.push_back({ text, x, y + 5, color, strokefont::Fit(width, unit), map, unit });
 		}
-		double TextWidth(const std::string& t, double unit = kUnit) { return double(t.size()) * strokefont::kAdvance * unit; }  // 8.25 px a letter at kUnit
+		// DRAW-1: a short map note drawn in one pass (no dark outline): half the strokes of a map label.
+		void MapNote(const std::string& text, double x, double y, unsigned color, double width = 300) { g_ui.items.push_back({ text, x, y + 5, color, strokefont::Fit(width, kUnit), true, kUnit, false }); }
+		double TextWidth(const std::string& t, double unit = kUnit) { return double(t.size()) * strokefont::kAdvance * unit; }  // 9 px a letter at kUnit
+		// DRAW-1 (2026-11-07, user: "Yes, build all four"): a Pen with a tape records the frame's Graphics calls instead of sending each to Flash.
+		// When the Pen ends, the recording is compared with the last frame's: identical (camera still, nothing changed) = no Flash call at all,
+		// the sprite keeps last frame's drawing; different = clear and send. With cull on, stroke pieces wholly outside the visible layer area
+		// (64 px margin) and circles outside it are dropped; with thin > 0, stroke points nearer than thin px to the last drawn point are skipped
+		// (each run's last point always drawn). Fills are sent unchanged. Pens without a tape behave exactly as before.
 		struct Pen {
 			Value g;
 			bool ok = false;
+			PenTape* tape = nullptr; double thin = 0; bool cull = false;
+			std::vector<PenOp> ops; bool inFill = false, down = false, pend = false; double px = 0, py = 0, lx = 0, ly = 0, qx = 0, qy = 0; std::uint64_t culled = 0, thinned = 0;
 			explicit Pen(const Value& sprite) { ok = GetMember(sprite, "graphics", &g) && IsObject(g); }
-			~Pen() { Release(g); }
+			Pen(const Value& sprite, PenTape* t, double thinPx, bool cullOff) : Pen(sprite) { tape = t; thin = thinPx; cull = cullOff; if (t) ops.reserve(t->last.size() + 64); }
+			~Pen() { if (tape) Finish(); Release(g); }
 			Pen(const Pen&) = delete;
 			Pen& operator=(const Pen&) = delete;
-			void Clear() { if (ok) Invoke(g, "clear", nullptr, 0); }
-			void Style(double w, unsigned c, double a) { const Value s[] = { Num(w), Num(c), Num(a) }; Invoke(g, "lineStyle", s, 3); }
-			void NoLine() { Invoke(g, "lineStyle", nullptr, 0); }
-			void Move(double x, double y) { const Value p[] = { Num(x), Num(y) }; Invoke(g, "moveTo", p, 2); }
-			void Line(double x, double y) { const Value p[] = { Num(x), Num(y) }; Invoke(g, "lineTo", p, 2); }
-			void Fill(unsigned c, double a) { const Value f[] = { Num(c), Num(a) }; Invoke(g, "beginFill", f, 2); }
-			void End() { Invoke(g, "endFill", nullptr, 0); }
-			void Rect(double x, double y, double w, double h) { const Value r[] = { Num(x), Num(y), Num(w), Num(h) }; Invoke(g, "drawRect", r, 4); }
-			void Circle(double x, double y, double r) { const Value c[] = { Num(x), Num(y), Num(r) }; Invoke(g, "drawCircle", c, 3); }
+			enum : std::uint8_t { kClear, kStyle, kNoLine, kMove, kLine, kFill, kEnd, kRect, kCircle, kRound };
+			void Send(const PenOp& o) {
+				Value v[6]; for (int i = 0; i < o.n; ++i) v[i] = Num(o.a[i]);
+				static const char* const names[]{ "clear", "lineStyle", "lineStyle", "moveTo", "lineTo", "beginFill", "endFill", "drawRect", "drawCircle", "drawRoundRect" };
+				Invoke(g, names[o.k], o.n ? v : nullptr, o.n);
+			}
+			void Put(std::uint8_t k, std::initializer_list<double> a) { PenOp o; o.k = k; for (double x : a) o.a[o.n++] = x; if (tape) ops.push_back(o); else if (k != kClear || ok) Send(o); }
+			// the visible layer area: screen fractions 0..1 map to ax*f+bx and ay*(1-f)+by (Local)
+			bool Outside(double x0, double y0, double x1, double y1) const {
+				const double m = 64, l = std::min(g_ui.bx, g_ui.bx + g_ui.ax) - m, r = std::max(g_ui.bx, g_ui.bx + g_ui.ax) + m, t = std::min(g_ui.by, g_ui.by + g_ui.ay) - m, b = std::max(g_ui.by, g_ui.by + g_ui.ay) + m;
+				return std::max(x0, x1) < l || std::min(x0, x1) > r || std::max(y0, y1) < t || std::min(y0, y1) > b;
+			}
+			void Flush() { if (pend && down) { Put(kLine, { qx, qy }); lx = qx; ly = qy; } pend = false; }
+			void Clear() { if (tape) { ops.clear(); down = pend = inFill = false; } else Put(kClear, {}); }
+			void Style(double w, unsigned c, double a) { Flush(); Put(kStyle, { w, double(c), a }); }
+			void NoLine() { Flush(); Put(kNoLine, {}); }
+			void Move(double x, double y) {
+				if (!tape || inFill || (!cull && thin <= 0)) { Put(kMove, { x, y }); px = lx = x; py = ly = y; down = true; pend = false; return; }
+				Flush(); px = x; py = y; down = false;  // the move is sent with the first piece that shows
+			}
+			void Line(double x, double y) {
+				if (!tape || inFill || (!cull && thin <= 0)) { Put(kLine, { x, y }); px = lx = x; py = ly = y; return; }
+				if (cull && Outside(px, py, x, y)) { Flush(); down = false; px = x; py = y; ++culled; return; }
+				if (!down) { Put(kMove, { px, py }); lx = px; ly = py; down = true; }
+				if (thin > 0 && std::hypot(x - lx, y - ly) < thin) { pend = true; qx = x; qy = y; px = x; py = y; ++thinned; return; }
+				Put(kLine, { x, y }); lx = x; ly = y; pend = false; px = x; py = y;
+			}
+			void Fill(unsigned c, double a) { Flush(); inFill = true; Put(kFill, { double(c), a }); }
+			void End() { Flush(); inFill = false; Put(kEnd, {}); }
+			void Rect(double x, double y, double w, double h) { Flush(); Put(kRect, { x, y, w, h }); }
+			void Circle(double x, double y, double r) { Flush(); if (tape && cull && Outside(x - r, y - r, x + r, y + r)) { ++culled; return; } Put(kCircle, { x, y, r }); }
+			void RoundRect(double x, double y, double w, double h, double e) { Flush(); Put(kRound, { x, y, w, h, e, e }); }
+			void Finish() {
+				Flush(); auto& t = *tape; ++t.frames; t.recorded += ops.size(); t.culled += culled; t.thinned += thinned;
+				const bool same = ops.size() == t.last.size() && std::equal(ops.begin(), ops.end(), t.last.begin());
+				if (!same && ok) { Send(PenOp{}); for (const auto& o : ops) Send(o); ++t.sent; t.calls += ops.size() + 1; t.last.swap(ops); }
+				const ULONGLONG now = GetTickCount64();
+				if (now - t.logAt >= 5000) {
+					if (t.logAt && t.frames) logger::Write("OBS system=f7.draw layer=%s frames=%llu redrawn=%llu kept=%llu ops_per_frame=%.0f flash_calls_per_frame=%.0f culled_per_frame=%.0f thinned_per_frame=%.0f reason=recorded_then_sent_only_when_changed",
+						t.name, t.frames, t.sent, t.frames - t.sent, double(t.recorded) / t.frames, double(t.calls) / t.frames, double(t.culled) / t.frames, double(t.thinned) / t.frames);
+					t.logAt = now; t.frames = t.sent = t.recorded = t.calls = t.culled = t.thinned = 0;
+				}
+			}
 		};
 		void DrawText(Pen& pen, const TextItem& t, bool outline)
 		{
@@ -1759,9 +2136,9 @@ namespace routeedit
 			for (const auto& t : g_ui.items)
 				if (!t.map) { sig += t.text; sig += '\x1f'; sig += std::to_string(int(t.x)) + "," + std::to_string(int(t.y)) + "," + std::to_string(t.color) + "," + std::to_string(int(t.unit * 10)) + ";"; }
 			{
-				Pen map(g_ui.mapText);
+				Pen map(g_ui.mapText, &g_tapeMapText, 0, true);  // DRAW-1: sent only when changed; letters off screen dropped, never thinned
 				map.Clear();
-				for (const auto& t : g_ui.items) if (t.map) DrawText(map, t, true);
+				for (const auto& t : g_ui.items) if (t.map) DrawText(map, t, t.outline);
 			}
 			if (sig != g_ui.panelSig) {
 				Pen panel(g_ui.panelText);
@@ -1837,13 +2214,14 @@ namespace routeedit
 			for (const auto& o : g_ed.others) routes.push_back(o.route);
 			std::vector<std::vector<trafficpool::RushPlace>> per;
 			for (const auto& r : routes) {
-				const auto d = routeschedule::Evaluate(r.schedule, known, minute);
+				const auto d = routeschedule::Evaluate(r.schedule, known, minute, trafficdata::DemandLength(r));
 				if (!d.active) continue;
-				const auto line = trafficroute::Build(r);
+				const auto line = EditorLine(r);
 				const double span = line.Span();
 				if (line.Count() < 2 || span <= 0) continue;
 				const int lanes = std::clamp(r.lanes, 1, 2), n = std::clamp(d.vehicles, 1, fvolimits::kVehicles);  // the route's own count (2026-10-29: was 6 at most)
 				std::vector<trafficpool::RushPlace> list;
+                if(r.lanePlan.enabled) {for(const auto& p:trafficinitial::Route(r,n))list.push_back({p.at.x,p.at.y,p.at.z,p.heading});per.push_back(std::move(list));continue;}
 				for (int j = 0; j < n; ++j) {
 					const int lane = j % lanes;
 					const double u = span * (j + 0.5) / n, dir = lane == 1 ? -1.0 : 1.0;
@@ -1872,49 +2250,18 @@ namespace routeedit
 				secretunpause::RefusedForCombat();
 				return;
 			}
-			bool changed = false;
-			for (auto& l : g_ed.file.landings) if (!l.parked) { l.parked = true; changed = true; }
-			if (changed) Save();
 			const auto places = LanePlaces();
-			trafficpool::Rush(places.data(), int(places.size()));
-			logger::Write("Route editor: start / swap: %zu lane place(s) on the active routes", places.size());
 			g_ed.loading = true;
 			g_ed.loadingAt = GetTickCount64();
 			g_ed.filledAt = 0;
 			// The world runs behind the panel so placed traffic is checked, seated and armed (never in combat).
 			secretunpause::Begin();
+			trafficpool::Rush(places.data(), int(places.size()));
+			logger::Write("Route editor: start / swap: %zu lane place(s) on the active routes", places.size());
 			logger::Write("Route editor: start / swap traffic model (%zu landing spot(s) as parking)", g_ed.file.landings.size());
 		}
 
-		enum Id {
-			kNew = 1, kSave, kCancel, kDeleteRoute, kPrevRoute, kNextRoute, kSelect, kDrop, kDrag, kLanding, kSpawn,
-			kZUp, kZDown, kReverse, kDeletePoint, kLoop, kUndo, kRedo, kWays, kSpeedDown, kSpeedUp, kVehDown, kVehUp,
-			kSchedule, kStartDown, kStartUp, kEndDown, kEndUp, kTest, kTimeDown, kTimeUp, kTimeLive, kClose, kConnect, kShareDown, kShareUp,
-			kEditOriginal, kRadiusDown, kRadiusUp, kBake, kMoveLeft, kMoveRight, kMoveForward, kMoveBack, kStartSwap, kRoundPoint, kRoundDown, kRoundUp, kRename, kColor,
-			// Stage 2 (2026-10-30): the Route tool, the toolbar menus, the folded groups and the panel's two-way choices.
-			kRouteTool, kMoreMenu, kViewMenu, kCopy, kMirror, kGroupFlow, kGroupPosition, kGroupRules, kProblems,
-			kRouteUp, kRouteDown, kTurnLeft, kTurnRight, kOneWay, kTwoWay, kLoopOn, kLoopOff, kAllDay, kByHours, kSharp, kRounded,
-			// Traffic Manager V1 (2026-10-30): vehicle rules.
-			kVehicleRules, kAllowAll, kSheetBack, kTypesMore, kSplit, kJoin, kRestore,
-			kJunctionBoth, kJunctionExit, kJunctionMerge, kJunctionCross, kJunctionSuggest,
-			kShapeTool, kZoneTool, kTimeRules, kByWords, kWordsAdd, kBlendQuick, kBlendGentle, kBlendSlow, kRoleNext,
-			kCity, kCityOn, kCityOff, kDensityDown, kDensityUp, kLimitDown, kLimitUp, kOriginalsOn, kOriginalsOff,
-			kPlaceDone, kLayoutSingle, kLayoutRow, kLayoutBays, kLayoutRing, kSpacesDown, kSpacesUp, kAreaTurnDown, kAreaTurnUp,
-			kPurposeTaxi, kPurposeDepot, kPurposeStop, kStayShort, kStayLong, kStayNeeded, kFullQueue, kFullCircle, kFullOn, kWhoParks,
-			kZoneKeep, kZoneSlow, kZoneSizeDown, kZoneSizeUp, kZoneTopDown, kZoneTopUp, kZoneSpeedDown, kZoneSpeedUp,
-			kGroupNext, kGroupSheet, kGroupNew, kGroupRename, kGroupDelete,
-			kSizeDown, kSizeUp, kShapeADown, kShapeAUp, kShapeBDown, kShapeBUp, kShapeCDown, kShapeCUp,
-			kReadme,
-			kDayRow = 5000,    // + 4 x a zone of the day: earlier, later, next word, remove
-			kLevelBase = 5500, // + 2 x a word: less, more
-			kPlaceRow = 5600,  // + a line of the places list (landing areas, then zones)
-			kShapeBase = 5900, // + a shape; the last is parallel lanes
-			kGroupRow = 6000,  // + 0 all routes, + 1 + a group (route groups sheet)
-			kProblemShow = 4000, kProblemFix = 4500,  // + a problem's place in the list
-			kTypeBase = 3000,  // + a vehicle type in the vehicle rules sheet
-			kRowBase = 1000,   // + index in the routes list (editor routes, then the other files' routes)
-			kViewBase = 2000,  // + View item
-		};
+        #include "editoractions.h"
 		// Keyboard shortcuts (2026-10-29, the user: "keyboard shortcuts for the traffic menu controls and they should show beside them").
 		// Letters the map does not use while the editor holds it (inputgate: only Tab, Esc, WASD and the arrows reach the map); never
 		// number keys or the in-game test keys , . / '. Shown beside each tool and button; Ctrl and the older keys (Insert, Delete,
@@ -1941,16 +2288,18 @@ namespace routeedit
 		// ---- Stage 2 layout (2026-10-30, the user approved notes/traffic-manager-mockup): a toolbar over the map, and a short
 		// panel on the right that shows only what is selected. Its groups fold to one line (one open at a time); the key
 		// hints show only the tool in use. Drawn with the overlay's own lines and stroke font (the SWF panel is untested).
-		constexpr double kPanelW = 380;
+		constexpr double kPanelW = 412;  // 2026-11-11: was 380; 32 px more keeps 42 letters a line at the Future face's 9 px a letter
 		constexpr double kInner = kPanelW - 28;      // content width
 		constexpr double kLabelW = 130;              // a row's label cell
 		constexpr unsigned kTeal = 0x6FE0D0, kText = 0xDFE7EE, kDim = 0x8C9AAB, kAmber = 0xF2B04E, kCoral = 0xE8705C, kRowA = 0x27303F, kRowB = 0x1A2331;
 		constexpr unsigned kClearanceRed = 0xFF5555;
-		double PanelX() { return g_ui.width - kPanelW - 12; }
-		bool OverPanel(double x, double y) { return x >= PanelX() && x <= PanelX() + kPanelW && y >= 12 && y <= g_ui.panelBottom; }
+		constexpr double kLaneNoneFit = 2.5, kLaneAllFit = 3.5;  // m of lane: the smallest traffic hull (~2.2 m) plus margin; the widest common hulls
+		double PanelX() { return std::clamp(g_ui.width - kPanelW - 12 + g_f7Offset[2].dx, 12.0, std::max(12.0, g_ui.width - kPanelW - 12)); }
+		bool OverPanel(double x, double y) { for(const auto& r:g_contextRects)if(r.Contains(x,y))return true;return g_contextPanel&&x >= PanelX() && x <= PanelX() + kPanelW && y >= 12 && y <= g_ui.panelBottom; }
 		bool OverUi(double x, double y)
 		{
 			if (OverPanel(x, y)) return true;
+            for(const auto& b:g_ui.buttons)if(x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h)return true;
 			if (x >= g_ui.barX && x <= g_ui.barX + g_ui.barW && y >= g_ui.barY && y <= g_ui.barY + g_ui.barH) return true;
 			return g_ed.menu && x >= g_ui.menuX && x <= g_ui.menuX + g_ui.menuW && y >= g_ui.menuY && y <= g_ui.menuY + g_ui.menuH;
 		}
@@ -2016,18 +2365,23 @@ namespace routeedit
 			for (const unsigned id : t.ids) if (!trafficdata::InList(list, id)) return false;
 			return !t.ids.empty();
 		}
-		bool TypeLeftOut(const trafficdata::Route& r, const VehicleType& t) { return TypeIn(r.exclude, t); }
+		bool LaneVehicleRulesAvailable(){const auto addon=GetModuleHandleW(L"FVO_Traffic.dll");using Query=int (*)();const auto query=addon?reinterpret_cast<Query>(GetProcAddress(addon,"FVO_Traffic_LaneVehicleRulesV1")):nullptr;return query&&query()==1;}
+        std::string VehicleScopeText(){return g_ed.ruleLane<0?"Whole route":std::string((g_ed.ruleLane&1)?"Reverse lane ":"Forward lane ")+std::to_string(g_ed.ruleLane/2+1);}
+        const std::vector<unsigned>& VehicleLocalList(const trafficdata::Route& r){if(g_ed.ruleLane<0)return r.exclude;const auto* rule=lanevehicles::Find(r.lanePlan.vehicles,g_ed.ruleLane);static const std::vector<unsigned> empty;return rule?rule->exclude:empty;}
+        std::string VehicleLocalGroup(const trafficdata::Route& r){if(g_ed.ruleLane<0)return r.group;const auto* rule=lanevehicles::Find(r.lanePlan.vehicles,g_ed.ruleLane);return rule?rule->group:std::string();}
+        bool TypeLeftOut(const trafficdata::Route& r, const VehicleType& t) { return TypeIn(VehicleLocalList(r), t); }
 		// Left out from above: "group" or "all routes", or nothing.
 		std::string TypeAbove(const trafficdata::Route& r, const VehicleType& t)
 		{
-			for (const auto& g : g_ed.routeGroups) if (g.name == trafficdata::GlobalGroup() && TypeIn(g.exclude, t)) return "left out for all routes";
+			if(g_ed.ruleLane>=0){const auto group=VehicleLocalGroup(r);if(!group.empty()&&std::none_of(g_ed.routeGroups.begin(),g_ed.routeGroups.end(),[&](const auto& candidate){return candidate.name==group;}))return "lane group unavailable; held";if(TypeIn(r.exclude,t))return "excluded by route";for(const auto& g:g_ed.routeGroups)if(g.name==VehicleLocalGroup(r)&&TypeIn(g.exclude,t))return "excluded by lane group "+g.label;}
+            for (const auto& g : g_ed.routeGroups) if (g.name == trafficdata::GlobalGroup() && TypeIn(g.exclude, t)) return "left out for all routes";
 			for (const auto& g : g_ed.routeGroups) if (!r.group.empty() && g.name == r.group && TypeIn(g.exclude, t)) return "left out by " + g.label;
 			return {};
 		}
 		std::string VehicleRulesText(const trafficdata::Route& r)
 		{
 			const auto all = trafficdata::AllLeftOut(g_ed.routeGroups, r);
-			if (all.empty()) return "All types";
+			if (all.empty()) return r.lanePlan.vehicles.lanes.empty()?"All types":"Route: all types; lane rules set";
 			const auto& types = VehicleTypesHere();
 			int out = 0;
 			for (const auto& t : types) if (TypeIn(all, t)) ++out;
@@ -2049,7 +2403,7 @@ namespace routeedit
 		{
 			if (name.empty()) return "None";
 			const auto* g = GroupByName(name);
-			return g ? g->label : "None";
+			return g ? g->label : "Missing: "+name;
 		}
 		// The list the vehicle rules sheet is showing when it is not a route's; made when first needed.
 		trafficdata::RouteGroup* RuleTarget()
@@ -2067,6 +2421,112 @@ namespace routeedit
 		// ---- Problems with one-click fixes (2026-10-30, Traffic Manager V1) ----
 		// kind: 0 none, 1 set points a and b to z, 2 set point b to z, 3 remove point b, 4 round point a, 5 set point a to z, 6 move a and b up by z.
 		struct Problem { std::string text, fix; int kind = 0, a = -1, b = -1; double z = 0; bool clearanceWarning = false; };
+		// ---- Road fitting (2026-11-05, plan step 4: fix the route data with tools instead of code). One survey per route shape, redone
+		// when the route changes or every 10 s (the nav map fills in as the camera moves). It reads only the nav map the editor already
+		// has (no new engine calls); a long road samples every few stations so one survey stays under ~40k map questions. ----
+		struct FitCache { std::string key; ULONGLONG at = 0; bool ok = false; roadfit::Survey survey; roadfit::Snap snap; roadfit::Fit fit; std::vector<roadfit::Overlap> overlaps; std::vector<roadfit::Corner> corners; int roadLanes = 1; double width = 0; };
+		FitCache g_fit;
+		bool RouteFits(const trafficdata::Route& r, const char* what);
+		std::string FitKey(const trafficdata::Route& r)
+		{
+			std::string k = r.name; char b[80];
+			for (const auto& p : r.points) { std::snprintf(b, sizeof b, "|%.2f,%.2f,%.2f", p.x, p.y, p.z); k += b; }
+			std::snprintf(b, sizeof b, "#%.2f/%.2f/%d/%.2f/%d/%d/%.2f/%.2f", r.road.width, r.road.median, int(r.road.dividers.size()), r.corridor, r.lanes, int(r.road.enabled), r.road.edgeLeft, r.road.edgeRight); k += b;
+			for (const double v : r.rounding) { std::snprintf(b, sizeof b, "r%.1f", v); k += b; }
+			return k;
+		}
+		const FitCache& RoadFit(const trafficdata::Route& r, bool fresh = false)
+		{
+			const auto key = FitKey(r); const ULONGLONG now = GetTickCount64();
+			if (!fresh && g_fit.ok && g_fit.key == key && now - g_fit.at < 10000) return g_fit;
+			g_fit = {}; g_fit.key = key; g_fit.at = now; g_fit.ok = true;
+			if (r.ring || r.points.size() < 2) return g_fit;
+			if (r.travel == routepolicy::Travel::Drive || r.road.enabled) g_fit.corners = roadfit::Corners(r);
+			if (!r.road.enabled) return g_fit;
+			const auto& line = EditorLine(r);
+			if (line.error || line.road.empty()) { logger::Write("OBS system=routeedit.fit event=skipped route=%s reason=%s", r.name.c_str(), line.error ? line.error : "no_road_stations"); return g_fit; }
+			g_fit.width = r.road.width > 0 ? r.road.width : r.corridor * std::clamp(r.lanes, 1, 2);
+			g_fit.roadLanes = r.road.dividers.empty() ? std::clamp(r.lanes, 1, 2) : int(r.road.dividers.size()) + 1;
+			const double across = (g_fit.width + 12) / roadfit::kStep + 1;
+			const int stride = std::max(1, int(std::ceil(double(line.road.size()) * across / 40000.0)));
+			auto ground = [](double x, double y, double z, double* g) { const auto m = navmap::At(x, y, z); if (!m.haveGround) return false; *g = m.ground; return true; };
+			// A solid counts only where a measured ray hit lies within ~0.4 m (navmap cells are 4 m: a whole cell is far too coarse
+			// for a railing). Collision object boxes are left out: on roads they are whole deck pieces (see vehicleflight map).
+			auto solid = [](double x, double y, double lo, double hi) { const auto m = navmap::At(x, y, (lo + hi) * .5); if (!m.blocked) return false; double hz = 0; return navmap::HitNear(x, y, lo, hi, roadfit::kStep * 1.5, &hz); };
+			g_fit.survey = roadfit::Measure(r, line, ground, solid, 6.0, stride);
+			g_fit.snap = roadfit::SnapPoints(r, g_fit.survey);
+			g_fit.fit = roadfit::FitWidth(g_fit.survey);
+			g_fit.overlaps = roadfit::Overlaps(g_fit.survey, g_fit.roadLanes > 1 ? r.road.median : 0);
+			logger::Write("OBS system=routeedit.fit event=survey route=%s stations=%d stride=%d deck_known=%d solid_samples=%d snap_moved=%d snap_largest=%.2f fit_ok=%d fit_width=%.2f fit_median=%.2f fit_edge_left=%.2f fit_edge_right=%.2f edge_seen=%d/%d measured=%d railing_at=%d width=%.2f median=%.2f overlaps=%d corners=%d",
+				r.name.c_str(), int(g_fit.survey.stations.size()), stride, g_fit.survey.deckKnown, g_fit.survey.solidSamples, g_fit.snap.moved, g_fit.snap.largest,
+				int(g_fit.fit.ok), g_fit.fit.width, g_fit.fit.median, g_fit.fit.edgeLeft, g_fit.fit.edgeRight, g_fit.fit.edgeSeenLeft, g_fit.fit.edgeSeenRight, g_fit.fit.measured, g_fit.fit.railingAt, g_fit.width, r.road.median, int(g_fit.overlaps.size()), int(g_fit.corners.size()));
+			return g_fit;
+		}
+		// The fit's problems for the panel: Drive corners, deck height, lane width against the railings, lanes overlapping solids.
+		void FitProblems(const trafficdata::Route& r, std::vector<Problem>& out)
+		{
+			const auto& f = RoadFit(r);
+			char b[200];
+			for (const auto& c : f.corners) {
+				if (c.turnDeg > 120 && c.radius <= 0) continue;  // already reported as a sharp turn
+				std::snprintf(b, sizeof b, "Corner at point %d is too tight to drive: %.0f deg turn, radius %.0f m (cars need %.0f m)", c.point + 1, c.turnDeg, c.radius, roadfit::kMinRadius);
+				out.push_back({ b, "Round it", 4, c.point, -1 });
+			}
+			if (!r.road.enabled) return;
+			if (f.snap.moved > 0 && f.snap.largest >= .3) {
+				int first = -1; for (std::size_t i = 0; i < f.snap.changed.size(); ++i) if (f.snap.changed[i]) { first = int(i); break; }
+				std::snprintf(b, sizeof b, "Road floor is up to %.1f m off the measured deck (%d of %d points)", f.snap.largest, f.snap.moved, int(r.points.size()));
+				out.push_back({ b, "Snap road to deck", 7, first, -1 });
+			}
+			if (f.fit.ok) {
+				const bool widthOff = std::fabs(f.fit.width - f.width) > .5;
+				const bool medianOff = f.roadLanes > 1 && f.fit.median > 0 && std::fabs(f.fit.median - r.road.median) > .3;
+				// Edge bands are suggested only where a railing was measured near that edge (0 = none).
+				const bool edgeOff = (f.fit.edgeLeft > 0 && std::fabs(f.fit.edgeLeft - r.road.edgeLeft) > .3) || (f.fit.edgeRight > 0 && std::fabs(f.fit.edgeRight - r.road.edgeRight) > .3);
+				if (widthOff || medianOff || edgeOff) {
+					std::string edges; if (f.fit.edgeLeft > 0) edges += ", left edge " + routefiles::Num(f.fit.edgeLeft) + " m"; if (f.fit.edgeRight > 0) edges += ", right edge " + routefiles::Num(f.fit.edgeRight) + " m";
+					std::snprintf(b, sizeof b, "Lanes don't match the railings: road %.1f m, measured %.1f m%s%s", f.width, f.fit.width,
+						medianOff ? (", middle railing " + routefiles::Num(f.fit.median) + " m").c_str() : "", edges.c_str());
+					out.push_back({ b, "Fit lanes to road", 8, 0, -1 });
+				}
+				if (f.roadLanes < 2 && f.fit.median > 0) out.push_back({ "A railing runs down the middle: make it two lanes with a divider", "", 0, 0, -1, 0, true });
+			}
+			for (std::size_t k = 0; k < f.overlaps.size() && k < 3; ++k) {
+				const auto& o = f.overlaps[k];
+				std::snprintf(b, sizeof b, "Lane overlaps a solid at point %d (%.1f m %s of the centre line)", o.point + 1, std::fabs(o.across), o.across >= 0 ? "left" : "right");
+				out.push_back({ b, "", 0, o.point, -1, 0, true });
+			}
+			if (f.overlaps.size() > 3) out.push_back({ std::to_string(f.overlaps.size() - 3) + " more lane overlaps (red rings in the view)", "", 0, -1, -1, 0, true });
+		}
+		// Apply a fit to the open route (Problems fix or More menu). Undo brings it back; nothing is written until Save.
+		bool ApplyFit(int kind)
+		{
+			if (!EnsureDraft()) return false;
+			auto r = g_ed.draft->Value();
+			if (!r.road.enabled) { Status("Road tools need a road (Field) on this route"); return false; }
+			const auto& f = RoadFit(r, true);
+			if (kind == 7) {
+				if (!f.snap.moved) { Status(f.survey.deckKnown ? "Road floor already sits on the measured deck" : "No deck measured yet: move the camera along the road so the map fills in, then try again"); return false; }
+				for (std::size_t i = 0; i < r.points.size() && i < f.snap.z.size(); ++i) if (f.snap.changed[i]) r.points[i].z = f.snap.z[i];
+				const int moved = f.snap.moved, open = f.snap.unmeasured; const double largest = f.snap.largest;
+				g_ed.draft->Edit(r);
+				logger::Write("OBS system=routeedit.fit event=snap route=%s moved=%d unmeasured=%d largest=%.2f", r.name.c_str(), moved, open, largest);
+				Status("Snapped " + std::to_string(moved) + " points onto the measured deck (largest change " + routefiles::Num(largest) + " m" + (open ? ", " + std::to_string(open) + " not measured" : std::string()) + "). Undo brings it back; Save keeps it.");
+				return true;
+			}
+			if (!f.fit.ok) { Status("No railings or walls measured beside this road yet: move the camera along it, then try again"); return false; }
+			const double was = f.width, wasMedian = r.road.median, width = f.fit.width, median = f.fit.median; const int lanes = f.roadLanes;
+			const double wasEdgeL = r.road.edgeLeft, wasEdgeR = r.road.edgeRight, edgeL = f.fit.edgeLeft, edgeR = f.fit.edgeRight;
+			r.road.width = width;
+			if (lanes > 1 && median > 0) r.road.median = median;
+			if (edgeL > 0) r.road.edgeLeft = edgeL;   // only where a railing was measured near that edge; otherwise the band stays as it was (0 = none)
+			if (edgeR > 0) r.road.edgeRight = edgeR;
+			if (!RouteFits(r, "Fit lanes")) return false;
+			g_ed.draft->Edit(r);
+			logger::Write("OBS system=routeedit.fit event=fit route=%s width=%.2f->%.2f median=%.2f->%.2f edge_left=%.2f->%.2f edge_right=%.2f->%.2f edge_seen=%d/%d lanes=%d measured=%d", r.name.c_str(), was, width, wasMedian, r.road.median, wasEdgeL, r.road.edgeLeft, wasEdgeR, r.road.edgeRight, f.fit.edgeSeenLeft, f.fit.edgeSeenRight, lanes, f.fit.measured);
+			Status("Fitted to the railings: road " + routefiles::Num(was) + " -> " + routefiles::Num(width) + " m" + (lanes > 1 && median > 0 ? ", red divider " + routefiles::Num(median) + " m" : std::string()) + (edgeL > 0 ? ", left edge " + routefiles::Num(wasEdgeL) + " -> " + routefiles::Num(edgeL) + " m" : std::string()) + (edgeR > 0 ? ", right edge " + routefiles::Num(wasEdgeR) + " -> " + routefiles::Num(edgeR) + " m" : std::string()) + ". Undo brings it back; Save keeps it.");
+			return true;
+		}
 		// Where a segment crosses another route (on the map), the two heights there: true when found.
 		bool CrossAt(const trafficdata::Vec& a, const trafficdata::Vec& b, const trafficdata::Vec& c, const trafficdata::Vec& d, double& ha, double& hc, double* xAt = nullptr, double* yAt = nullptr)
 		{
@@ -2098,7 +2558,7 @@ namespace routeedit
 			std::vector<Problem> out;
 			if (r.ring) {
 				if (deep) {
-					const auto line = trafficroute::Build(r);
+					const auto line = EditorLine(r);
 					for (int i = 0; i < 32; ++i) {
 						const auto at = trafficroute::At(line, 0, trafficroute::Length(line) * i / 32.0);
 						const auto m = navmap::At(at.x, at.y, at.z);
@@ -2138,6 +2598,7 @@ namespace routeedit
 					out.push_back({ b, "Round it", 4, i, -1 });
 				}
 			}
+			if (deep) FitProblems(r, out);
 			// Keep-out zones: a stretch below a zone's top inside its circle (sampled, the ends too).
 			for (const auto& z : g_ed.file.zones) {
 				if (z.slow) continue;
@@ -2189,7 +2650,7 @@ namespace routeedit
 			for (std::size_t k = 0; k < g_ed.file.routes.size(); ++k) {
 				const auto& o = g_ed.file.routes[k];
 				if ((g_ed.draft && int(k) == g_ed.draftIndex) || (!g_ed.draft && int(k) == g_ed.route) || !Usable(o) || o.id == r.name) continue;
-				others.push_back({ o.label.empty() ? o.id : o.label, trafficroute::Build(ToTd(o, EditorKey())) });
+				others.push_back({ o.label.empty() ? o.id : o.label, EditorLine(ToTd(o, EditorKey())) });
 				otherIds.push_back(o.id);
 			}
 			for (std::size_t k = 0; k < g_ed.others.size(); ++k)
@@ -2219,6 +2680,7 @@ namespace routeedit
 		}
 		void FixProblem(const Problem& pb)
 		{
+			if (pb.kind == 7 || pb.kind == 8) { ApplyFit(pb.kind); return; }
 			if (!pb.kind || !EnsureDraft()) return;
 			auto r = g_ed.draft->Value();
 			const int n = int(r.points.size());
@@ -2272,12 +2734,17 @@ namespace routeedit
 			static const unsigned colors[routeschedule::kWords] = { 0x2A3442, 0x2F6F69, 0x46A79C, 0xF2B04E, 0xE8705C };
 			return colors[std::clamp(word, 0, routeschedule::kWords - 1)];
 		}
-		std::string RouteVehicles(const trafficdata::Route& r) { if (!r.schedule.zones.empty()) return std::to_string(r.schedule.peak); return std::to_string(r.schedule.allDay ? r.schedule.allDayVehicles : r.schedule.windows.empty() ? 0 : r.schedule.windows.front().vehicles); }
+		std::string RouteVehicles(const trafficdata::Route& r) {
+            if (routeschedule::HasLevel(r.schedule)) return std::to_string(routeschedule::PeakVehicles(r.schedule, trafficdata::TrafficLength(r)));
+            if (!r.schedule.zones.empty()) return std::to_string(r.schedule.peak);
+            return std::to_string(r.schedule.allDay ? r.schedule.allDayVehicles : r.schedule.windows.empty() ? 0 : r.schedule.windows.front().vehicles);
+        }
 		// One layout of everything; returns the panel's bottom. maxRows: lines of the routes list; open: the groups drawn open.
 		double LayoutPass(const trafficdata::Route* shown, bool timeKnown, int minute, int maxRows, int open)
 		{
 			auto& b = g_ui.buttons;
-			b.clear(); g_ui.boxes.clear(); g_panelText.clear();
+			double contextContentTop=78;
+            b.clear();g_ui.polygons.clear(); g_ui.boxes.clear(); g_panelText.clear();
 			auto text = [&](const std::string& t, double x, double y, double w, unsigned color, double unit = kUnit) { g_panelText.push_back({ t, x, y, w, color, unit }); };
 			auto button = [&](int id, double x, double y, double w, double h, const std::string& t, bool active, bool enabled, int style, const std::string& value = {}, unsigned swatch = 0) {
 				b.push_back({ id, x, y, w, h, t, active, enabled, KeyOf(id), style, value, swatch });
@@ -2286,27 +2753,31 @@ namespace routeedit
 			const Mode m = g_ed.mode;
 
 			// -- the toolbar, over the map at the top left of the free area --
-			g_ui.barX = std::max(24.0, g_ui.width * 494.0 / 1920.0); g_ui.barY = 50;
+			g_ui.barX = std::clamp(std::max(24.0, g_ui.width * 494.0 / 1920.0) + g_f7Offset[0].dx, 12.0, std::max(12.0, g_ui.width - 400)); g_ui.barY = std::clamp(50 + g_f7Offset[0].dy, 12.0, std::max(12.0, g_ui.height - 60));
 			{
-				const double w = 70, h = g_ui.barH, gap = 8;
+				const double w = std::clamp((PanelX()-g_ui.barX-16)/8,44.0,70.0), h = g_ui.barH, gap = 8;
 				double x = g_ui.barX;
 				auto tool = [&](int id, const char* label, bool active, bool enabled) { button(id, x, g_ui.barY, w, h, label, active, enabled, 1); x += w; };
 				tool(kSelect, "Select", m == Mode::Select, true);
 				tool(kDrop, "Add", m == Mode::Drop, true);
 				tool(kDrag, "Move", m == Mode::Drag, true);
 				tool(kRouteTool, "Route", m == Mode::Route, true);
-				tool(kConnect, "Link", m == Mode::Connect, true);
+				// Secondary tool remains in More and keeps its keyboard binding.
 				const double shapeX = x;
-				tool(kShapeTool, "Shape", m == Mode::Shape || g_ed.menu == 3, true);
-				tool(kLanding, "Land", m == Mode::Landing, true);
-				tool(kZoneTool, "Zone", m == Mode::Zone, true);
+				// Secondary tool remains in More and keeps its keyboard binding.
+				// Secondary tool remains in More and keeps its keyboard binding.
+				// Secondary tool remains in More and keeps its keyboard binding.
 				x += gap;
 				tool(kUndo, "Undo", false, draft || !g_ed.massUndo.empty());
 				tool(kRedo, "Redo", false, draft || !g_ed.massRedo.empty());
 				tool(kMoreMenu, "More", g_ed.menu == 1, true);
 				const double viewX = x;
 				tool(kViewMenu, "View", g_ed.menu == 2, true);
+				tool(kContextBrowse, "Routes", g_context.surface == editorcontext::Surface::Browse, true);
+				tool(kF7NodeView, "Nodes", g_f7NodeView, true);
+				tool(kF7Arrange, "Arrange", g_f7Arrange, true);
 				g_ui.barW = x - g_ui.barX;
+				g_f7AreaRect[0] = { g_ui.barX, g_ui.barY, g_ui.barW, g_ui.barH };
 				// -- the open menu, under its button --
 				g_ui.menuW = 0; g_ui.menuH = 0;
 				if (g_ed.menu) {
@@ -2323,23 +2794,32 @@ namespace routeedit
 						item(kShapeBase + 5, "Parallel lanes", route && !ring && !draft, "beside the route");
 					}
 					else if (g_ed.menu == 1) {
+                        item(kConnect,"Link",true);item(kShapeTool,"Shape",true);item(kLanding,"Landing",true);item(kZoneTool,"Zone",true);
 						item(kCopy, "Copy route", route && !draft, "beside it");
 						item(kMirror, "Mirror", route && !ring, "left - right");
+						item(kRoadSnap, "Snap road to deck", route && !ring, "measured surface");
+						item(kRoadFit, "Fit lanes to road", route && !ring, "railings set width");
 						item(kReverse, "Reverse direction", route && !ring);
 						item(kEditOriginal, "Edit this original", !draft && g_ed.route < 0 && g_ed.other >= 0);
 						item(kDeleteRoute, "Delete route", route || (g_ed.route >= 0 && g_ed.route < int(g_ed.file.routes.size())), "click twice");
 						item(kSplit, "Disconnect", true, "at a point or junction");
 						item(kJoin, "Merge routes", true, "selected, or nearest");
 						item(kGroupSheet, "Route groups", true, "vehicle rules for many");
+                        item(kKitOpen,"3D spline toolkit",route,"handles, lane paths and profiles");
+                        item(kInspectMovement,"Inspect movement",route,"active journey and controller");
+                        item(kNetworkPreview,"Network preview",route,"itinerary, signals and live paths");
+                        item(kPopulationSheet,"Population readiness",true,"existing pairs and wait reasons");
+                        item(kJourneySheet,"Journey sequence",route,"stops, dwell and repeat");
+                        item(kRestrictionSheet,"Enforced rules",route,"travel, speed and closures");
 						item(kRestore, "Restore original", g_ed.route >= 0 && g_ed.route < int(g_ed.file.routes.size()) && IsOriginal(g_ed.file.routes[std::size_t(g_ed.route)]) && !g_ed.file.routes[std::size_t(g_ed.route)].removed, "drops your edits");
-						item(kStartSwap, "Reset traffic", !draft, "clears all, then new");
+						item(kStartSwap, "Prepare traffic", !draft, "apply traffic settings");
 					}
 					else {
 						const View& v = g_ed.view;
 						auto flag = [&](int i, const char* label, bool on) { item(kViewBase + i, std::string(on ? "[x] " : "[ ] ") + label, true); };
 						flag(0, "Other routes", v.others); flag(1, "Vehicles", v.flow); flag(2, "Height lines", v.stems);
 						flag(3, "Point numbers", v.numbers); flag(4, "Route names", v.names); flag(5, "Spots and junctions", v.spots);
-						item(kViewBase + 6, "Reset map angle", true, "R-drag turns");
+						item(kViewBase + 6, "Camera controls", true, "Hold RMB / L3");
 					}
 					g_ui.menuH = y - g_ui.menuY;
 				}
@@ -2350,7 +2830,7 @@ namespace routeedit
 			double y = 12;
 			text("TRAFFIC MANAGER", x0, y + 12, 300, 0xFFFFFF, 2.3);
 			text(g_ed.world, x0, y + 40, 210, kDim);
-			text("F7 close", px + kPanelW - 14 - TextWidth("F7 close"), y + 12, 80, kDim);
+			text("F8 close", px + kPanelW - 14 - TextWidth("F8 close"), y + 12, 80, kDim);
 			button(kReadme, px + kPanelW - 14 - 128, y + 34, 64, 22, "Readme", false, true, 0);
 			button(kCity, px + kPanelW - 14 - 60, y + 34, 60, 22, "City", g_ed.sheet == 3, true, 0);
 			y += 66;
@@ -2393,7 +2873,54 @@ namespace routeedit
 			};
 
 			const bool areaOn = AreaOn(), zoneOn = ZoneOn();
-			if (g_ed.sheet == 3) {
+            if(g_ed.sheet==15&&AreaOn()){
+                const auto& bay=g_ed.file.landings[std::size_t(g_ed.spot)];const auto& access=bay.access;section("Parking paths",bay.id,kTeal);const bool edit=access.unsupported.empty();
+                if(!edit)line("Unsupported access plan retained.",kAmber);
+                action("Entrance route",access.entryRoute.empty()?"Unbound":RouteTitle(access.entryRoute),kAccessEntryRoute,"Next",edit);
+                action("Entrance lane",access.entryLane<0?"Any compatible":std::to_string(access.entryLane+1),kAccessEntryLane,"Next",edit);
+                action("Entrance points",std::to_string(access.entrance.size()),kAccessEntry,"Draw",edit);
+                action("Entrance","",kAccessUndoEntry,"Remove last",edit&&!access.entrance.empty());
+                action("Departure route",access.exitRoute.empty()?"Unbound":RouteTitle(access.exitRoute),kAccessExitRoute,"Next",edit);
+                action("Departure lane",access.exitLane<0?"Any compatible":std::to_string(access.exitLane+1),kAccessExitLane,"Next",edit);
+                action("Departure points",std::to_string(access.departure.size()),kAccessExit,"Draw",edit);
+                action("Departure","",kAccessUndoExit,"Remove last",edit&&!access.departure.empty());
+                stepper("New point Z",kAccessHeightDown,routefiles::Num(g_ed.accessHeight),kAccessHeightUp,edit);
+                stepper("Path width",kAccessWidthDown,routefiles::Num(access.width)+" m",kAccessWidthUp,edit);
+                stepper("Clearance",kAccessClearanceDown,routefiles::Num(access.height)+" m",kAccessClearanceUp,edit);
+                line("Draw points in travel order. Entrance ends at the reserved bay; departure begins there. Route anchors use the selected lanes.",kDim);
+                button(kAccessDone,x0,y,kInner,24,"Back",true,true,0);y+=32;
+            }
+            else if(g_ed.sheet==14){
+                section("Population readiness","cached observations",kTeal);const auto addon=GetModuleHandleW(L"FVO_Traffic.dll");const auto query=addon?reinterpret_cast<FvoPopulationQueryV1>(GetProcAddress(addon,"FVO_Traffic_PopulationV1")):nullptr;FvoPopulationInspectV1 row;
+                if(!query)line("Readiness inspection unavailable in this addon.",kAmber);
+                else if(!query(g_ed.populationIndex,&row))line("No current fleet observation. It updates on the existing traffic tick.",kDim);
+                else{char ids[80];std::snprintf(ids,sizeof ids,"Vehicle %08X / driver %08X",row.vehicle,row.driver);line(row.name,kText);line(ids,kText);line(row.reason,kAmber);line("Observation age: "+routefiles::Num((GetTickCount64()-row.at)*.001)+" s",kDim);line(std::string("Staged: ")+(row.staged?"yes":"no")+" / armed: "+(row.armed?"yes":"no"),kText);line(std::string("Pending vehicle: ")+(row.vehiclePending?"yes":"no")+" / driver: "+(row.driverPending?"yes":"no"),kText);}
+                action("Fleet slot",std::to_string(g_ed.populationIndex+1),kPopulationNext,"Next",true);line("Inspection reads existing state and does not repair or create vehicles.",kDim);button(kLaneBack,x0,y,kInner,24,"Back",true,true,0);y+=32;
+            }
+            else if(g_ed.sheet==13){
+                trafficconstraints::Rules rules;const trafficconstraints::Rules* selected=nullptr;trafficdata::Route scratch;
+                if(g_ed.restrictionScope==1)selected=&g_ed.file.city.restrictions;
+                else if(g_ed.restrictionScope==3&&ZoneOn())selected=&g_ed.file.zones[std::size_t(g_ed.zone)].restrictions;
+                else if(g_ed.restrictionScope==2){const auto* group=g_ed.ruleScope==2?GroupByName(trafficdata::GlobalGroup()):GroupByName(g_ed.ruleGroup);if(group)selected=&group->restrictions;}
+                else if(const auto* route=Shown(scratch))selected=&route->restrictions;
+                if(selected)rules=*selected;
+                section("Enforced rules",g_ed.restrictionScope==1?"World":g_ed.restrictionScope==2?"Group":g_ed.restrictionScope==3?"Zone":"Route",kTeal);
+                const bool editable=rules.unsupported.empty();
+                if(!editable)line("Unsupported rules retained; editing disabled.",kAmber);
+                action("Permitted travel",trafficconstraints::Modes(rules.modes),kRestrictionModes,"Change",editable);
+                action("Closure",trafficconstraints::Closure(rules.closure),kRestrictionClosure,"Change",editable);
+                stepper("Maximum speed",kRestrictionSpeedDown,rules.speed?routefiles::Num(rules.speed)+" m/s":"Inherit",kRestrictionSpeedUp,editable);
+                action("Flight floor",routefiles::Num(rules.minHeight)+" m",kRestrictionFloor,"+1 / reset",editable);
+                action("Flight ceiling",routefiles::Num(rules.maxHeight)+" m",kRestrictionCeiling,"-5 / reset",editable);
+                action("Admission starts",rules.start<0?"All day":Clock(rules.start),kRestrictionWindow,"+1 hour",editable);
+                action("Admission ends",rules.end<0?"All day":Clock(rules.end),kRestrictionEnd,"+1 hour",editable&&rules.start>=0);
+                action("Lane changes",rules.noLaneChange?"Prohibited":"Allowed by connection",kRestrictionNoChange,"Change",editable);
+                if(g_ed.restrictionScope==3&&ZoneOn()){const auto& zone=g_ed.file.zones[std::size_t(g_ed.zone)];action("Zone lower Z",zone.restrictionFloor<=-1000000000?"Unbounded":routefiles::Num(zone.restrictionFloor),kRestrictionZoneFloor,"+5 / reset",editable);action("Zone upper Z",zone.restrictionTop>=1000000000?"Unbounded":routefiles::Num(zone.restrictionTop),kRestrictionZoneTop,"+5 / reset",editable);}
+                line("Restrictions combine across world, all-routes group, group and route. A narrower rule cannot relax a parent.",kDim);
+                line("Drain stops new journeys; occupied plans finish. Hold brakes existing traffic. Save applies the draft.",kDim);
+                button(kRestrictionBack,x0,y,kInner,24,"Back",true,true,0);y+=32;
+            }
+            else if (g_ed.sheet == 3) {
 				// City settings: everything on this world's routes.
 				const auto& city = g_ed.file.city;
 				section("City traffic", "every route here", kTeal);
@@ -2401,6 +2928,9 @@ namespace routeedit
 				stepper("Density", kDensityDown, std::to_string(city.density) + "%", kDensityUp, city.on);
 				stepper("Vehicle limit (256 pilot slots)", kLimitDown, std::to_string(city.limit), kLimitUp, city.on);
 				choice("Original routes", { { kOriginalsOn, "Use", city.originals }, { kOriginalsOff, "Leave out", !city.originals } }, city.on);
+                action("Enforced rules","",kRestrictionCity,"Edit",true);
+                action("Lane defaults",city.laneDefaults.enabled?"World preset":"Legacy",kWorldDefaultsFromRoute,"Use selected",shown&&shown->lanePlan.enabled);
+                action("Lane defaults","",kWorldDefaultsClear,"Clear",city.laneDefaults.enabled||!city.laneDefaults.unsupported.empty());
 				line(!city.on ? "No new traffic flies here. Vehicles in the air finish their lap and land." :
 					"Density scales every route's vehicles. The limit is the most at once. Originals are routes from other files.", kDim);
 				button(kSheetBack, x0, y, kInner, 24, "Back", true, true, 0);
@@ -2437,7 +2967,7 @@ namespace routeedit
 				if (total > maxRows) { text(std::to_string(total - maxRows) + " more: O / P go through them", x0, y + 2, kInner, kDim); y += 18; }
 				button(kNew, x0 - 4, y, kInner + 8, 22, "+ New route", false, !draft, 3, "N");
 				y += 26;
-				button(kStartSwap, x0, y, kInner, 26, "Reset traffic", g_ed.loading, !draft, 0);
+				button(kStartSwap, x0, y, kInner, 26, "Prepare traffic", g_ed.loading, !draft, 0);
 				y += 34;
 			}
 			// Places: one line each until clicked (the user: landing areas shrink to one line after Done).
@@ -2458,8 +2988,16 @@ namespace routeedit
 			}
 
 			const bool groupSheet = g_ed.sheet == 4 || (g_ed.sheet == 1 && g_ed.ruleScope != 0);
-			if (Many() && !groupSheet) {
+			if (Many() && !groupSheet && g_ed.sheet<5) {
 				section(PicksWords(), "", 0xFFE15A);
+                if (g_ed.draft && !g_ed.draft->Value().ring) {
+                    action("Selected stretches", "Travel mode", kSectionTravelNext, "Change", true);
+                    action("Road control", "At stretch end", kRoadRuleNext, "Change", true);
+                    stepper("Stretch speed",kSectionSpeedDown,"5 m/s steps",kSectionSpeedUp,true);
+                    stepper("Right of way",kPriorityDown,"Priority",kPriorityUp,true);
+                    action("Signal phase","15 second steps",kSignalPhaseNext,"Change",true);
+                    line("Only stretches with both endpoints selected change. Gaps keep their rules.",kDim);
+                }
 				line("A change below goes to all of that kind. Moving, height, turn, size and delete go to all. Ctrl+click adds or removes one.", kDim);
 				button(kJoin, x0, y, 150, 24, "Merge routes", false, true, 0);
 				button(kSplit, x0 + kInner - 150, y, 150, 24, "Disconnect", false, true, 0);
@@ -2491,7 +3029,10 @@ namespace routeedit
 				const auto& list = target ? target->exclude : none;
 				section(g_ed.ruleScope == 2 ? std::string("All routes") : target ? target->label : std::string("Group"), "vehicle rules", kTeal);
 				line(g_ed.ruleScope == 2 ? "Click a type to leave it out of every route, on every planet." : "Click a type to leave it out of every route in this group.", kDim);
-				const auto& types = VehicleTypesHere();
+				action("Enforced rules","",kRestrictionGroup,"Edit",true);
+                action("Lane defaults",target&&target->laneDefaults.enabled?"Group preset":"World / legacy",kGroupDefaultsFromRoute,"Use selected",shown&&shown->lanePlan.enabled);
+                action("Lane defaults","",kGroupDefaultsClear,"Clear",target&&(target->laneDefaults.enabled||!target->laneDefaults.unsupported.empty()));
+                const auto& types = VehicleTypesHere();
 				if (types.empty()) line("No vehicle types found yet: they are read once the game has loaded its vehicles.", kAmber);
 				constexpr int kPerPage = 14;
 				const int pages = std::max(1, (int(types.size()) + kPerPage - 1) / kPerPage);
@@ -2518,12 +3059,21 @@ namespace routeedit
 				// A landing area, open until Done (then one line in Places).
 				const auto& a = g_ed.file.landings[std::size_t(g_ed.spot)];
 				section("Landing " + std::to_string(g_ed.spot + 1), AreaWords(a), 0x7CFF8A);
+                action("Entrance / departure","",kPlaceAccess,"Edit",true);
 				char deg[24]; std::snprintf(deg, sizeof deg, "%.0f deg", a.turn);
 				stepper("Turn", kAreaTurnDown, deg, kAreaTurnUp, a.layout != "single");
 				choice("Layout", { { kLayoutSingle, "Single", a.layout == "single" }, { kLayoutRow, "Row", a.layout == "row" }, { kLayoutBays, "Bays", a.layout == "bays" }, { kLayoutRing, "Ring", a.layout == "ring" } }, true);
 				stepper("Spaces", kSpacesDown, std::to_string(a.layout == "single" ? 1 : a.spaces), kSpacesUp, a.layout != "single");
 				char z[24]; std::snprintf(z, sizeof z, "%.0f m", a.at.z);
 				stepper("Height", kZDown, z, kZUp, true);
+                const auto index=routepolicy::Segment(shown->points.size(),shown->closed,double(g_ed.point),0);
+                const auto rule=routepolicy::Resolve(shown->travel,shown->sections,index);
+                action("Next stretch",routepolicy::Name(rule.travel),kSectionTravelNext,"Change",true);
+                static const char* controls[]={"Uncontrolled","Yield","Stop","Signal"};
+                action("Road control",controls[int(rule.control)],kRoadRuleNext,"Change",true);
+                { char speed[32];std::snprintf(speed,sizeof speed,rule.speed>0?"%.0f m/s":"Route speed",rule.speed);stepper("Stretch speed",kSectionSpeedDown,speed,kSectionSpeedUp,true); }
+                stepper("Right of way",kPriorityDown,std::to_string(rule.priority),kPriorityUp,true);
+                if(rule.control==routepolicy::Control::Signal)action("Signal phase",std::to_string(int(rule.signalOffset))+" s",kSignalPhaseNext,"Change",true);
 				stepper("Left / right", kMoveLeft, "5 m", kMoveRight, true);
 				stepper("Back / forward", kMoveBack, "5 m", kMoveForward, true);
 				text("Occupancy rules", x0, y + 2, kInner, kTeal); y += 22;
@@ -2537,6 +3087,7 @@ namespace routeedit
 				y += 32;
 			}
 			else if (zoneOn) {
+                action("Enforced rules","",kRestrictionZone,"Edit",true);
 				const auto& z = g_ed.file.zones[std::size_t(g_ed.zone)];
 				section("Zone " + std::to_string(g_ed.zone + 1), ZoneWords(z), z.slow ? kAmber : kCoral);
 				choice("Kind", { { kZoneKeep, "Keep out", !z.slow }, { kZoneSlow, "Slow", z.slow } }, true);
@@ -2556,7 +3107,7 @@ namespace routeedit
 			}
 			// The selected route: its name, any problems, then the three folded groups.
 			else if (shown) {
-				const auto lineOf = trafficroute::Build(*shown);
+				const auto lineOf = EditorLine(*shown);
 				char info[64];
 				std::snprintf(info, sizeof info, ring ? "ring, %.1f km" : "%zu pts, %.1f km", shown->points.size(), trafficroute::Length(lineOf) / 1000.0);
 				section(shown->label.empty() ? shown->name : shown->label, info, 0xFFFFFF);
@@ -2590,7 +3141,7 @@ namespace routeedit
 					y += 4;
 				}
 
-				const auto d = routeschedule::Evaluate(shown->schedule, timeKnown, minute);
+				const auto d = routeschedule::Evaluate(shown->schedule, timeKnown, minute, trafficdata::DemandLength(*shown));
 				const auto [lo, hi] = routeeditor::HeightRange(*shown);
 				char hr[48];
 				if (std::lround(lo) == std::lround(hi)) std::snprintf(hr, sizeof hr, "%.0f m", lo); else std::snprintf(hr, sizeof hr, "%.0f-%.0f m", lo, hi);
@@ -2603,11 +3154,187 @@ namespace routeedit
 					y += 26;
 					return isOpen;
 				};
-				if (g_ed.sheet == 1) {
+                contextContentTop=y;
+                if(g_ed.sheet==19||g_ed.sheet==20){
+                    #include "splinepanel.inl"
+                }
+                else if(((g_ed.sheet>=5&&g_ed.sheet<=9)||g_ed.sheet==16||g_ed.sheet==17)) {
+                    const int selectedSection=shown->ring||!g_ed.laneScope?-1:int(routepolicy::Segment(shown->points.size(),shown->closed,std::max(0,g_ed.point),0));
+                    const auto s=laneplan::Resolve(shown->lanePlan,selectedSection,g_ed.laneFocus);
+                    std::vector<laneplan::Settings> selectedValues;
+                    auto collect=[&](const trafficdata::Route& r){
+                        if(!g_ed.lanePicks.empty()&&std::none_of(g_ed.lanePicks.begin(),g_ed.lanePicks.end(),[&](const LanePick& p){return p.route==r.name;}))return;
+                        if(g_ed.laneScope&&!g_ed.lanePicks.empty()){for(const auto& p:g_ed.lanePicks)if(p.route==r.name){const int section=p.Resolve(r.lanePlan);if(section>=-1)selectedValues.push_back(laneplan::Resolve(r.lanePlan,section,p.lane));}return;}
+                        if(g_ed.laneScope&&!r.ring){std::set<int> points;for(const auto& p:PicksNow())if(p.kind==kPickPoint&&p.id==r.name)points.insert(p.index);
+                            if(r.points.size()<2)return;
+                            if(points.size()>=2){for(std::size_t i=0;i<(r.closed?r.points.size():r.points.size()-1);++i)if(points.count(int(i))&&points.count(int((i+1)%r.points.size())))selectedValues.push_back(laneplan::Resolve(r.lanePlan,int(i),g_ed.laneFocus));}
+                            else if(r.name==shown->name&&g_ed.point>=0)selectedValues.push_back(laneplan::Resolve(r.lanePlan,selectedSection,g_ed.laneFocus));
+                        }else selectedValues.push_back(laneplan::Resolve(r.lanePlan,-1,g_ed.laneFocus));
+                    };
+                    collect(*shown);for(const auto& p:PicksNow())if(p.kind==kPickRoute&&p.id!=shown->name){const int index=RouteIndex(p.id);if(index>=0)collect(ToTd(g_ed.file.routes[index],EditorKey()));}
+                    for(const auto& r:g_ed.file.routes)if(r.id!=shown->name&&std::any_of(g_ed.lanePicks.begin(),g_ed.lanePicks.end(),[&](const LanePick& p){return p.route==r.id;}))collect(ToTd(r,EditorKey()));
+                    auto mixed=[&](laneplan::Field field){if(selectedValues.empty())return false;const auto first=laneplan::Value(selectedValues.front(),field);return std::any_of(selectedValues.begin(),selectedValues.end(),[&](const auto& value){return std::fabs(laneplan::Value(value,field)-first)>1e-9;});};
+                    section(g_ed.sheet==5?"Design lanes":g_ed.sheet==6?"Movement rules":g_ed.sheet==7?"Lane dimensions":g_ed.sheet==8?"Drive and flight":g_ed.sheet==16?"Lane placement":g_ed.sheet==17?"Vehicle envelope":"Height limits",shown->lanePlan.enabled?"custom":"legacy",kTeal);
+                    action("Scope",g_ed.laneScope?(g_ed.lanePicks.empty()?"Selected stretches":"Selected lane sections"):"Whole selected routes",kLaneScope,"Change",!shown->ring);
+                    action("Lane",g_ed.laneFocus<0?"All lanes":std::string((g_ed.laneFocus&1)?"Reverse ":"Forward ")+std::to_string(g_ed.laneFocus/2+1),kLaneFocus,"Next",true);
+                    action("Vehicle rules","Lane / route exclusions",kLaneVehicleRules,"Set",LaneVehicleRulesAvailable());
+                    auto value=[&](laneplan::Field field,const char* label,const std::string& text,bool enabled=true){stepper(label,kLaneEditBase+int(field)*2,mixed(field)?"Mixed":text,kLaneEditBase+int(field)*2+1,enabled);};
+                    if(!shown->lanePlan.unsupported.empty())line("Unsupported lane record preserved; editing disabled.",kAmber);
+                    else if(g_ed.sheet==5) {
+                        action("Preset",shown->lanePlan.inherited?"Inherited preset":"Road / Hover / Mixed",kLanePreset,"Next",true);
+                        action("Parent defaults","",kLaneUseDefaults,"Use",true);
+                        value(laneplan::Forward,"Forward lanes",std::to_string(s.forward),g_ed.laneFocus<0);
+                        value(laneplan::Reverse,"Reverse lanes",std::to_string(s.reverse),g_ed.laneFocus<0);
+                        value(laneplan::Width,"Lane width",routefiles::Num(s.profile.width)+" m");
+                        value(laneplan::Height,"Clearance",routefiles::Num(s.profile.height)+" m");
+                        action("Cross-section",mixed(laneplan::Shape)?"Mixed":laneplan::Name(s.profile.shape),kLaneDimensions,"Edit",true);
+                        action("Movement",mixed(laneplan::Authority)?"Mixed":laneplan::Name(s.movement),kLaneRules,"Set",true);
+                        action("Placement / bends","",kLanePlacement,"Edit",true);
+                        action("Vehicle envelope","",kLaneEnvelope,"Preview",true);
+                        action("Lane volumes",g_ed.view.volumes?"Visible":"Hidden",kLaneVolumes,"Change",true);
+                    } else if(g_ed.sheet==6) {
+                        action("Drive and flight",travelrules::Name(travelrules::Mode(s.rules.mode)),kLaneTravelRules,"Set",true);
+                        value(laneplan::Travel,"Travel",routepolicy::Name(s.travel));
+                        value(laneplan::Authority,"Movement",laneplan::Name(s.movement));
+                        value(laneplan::Static,"Static obstacles",laneplan::Name(s.obstacles));
+                        value(laneplan::Moving,"Other vehicles",laneplan::Name(s.moving));
+                        value(laneplan::People,"People",laneplan::Name(s.people));
+                        value(laneplan::Recovery,"Recovery",s.recovery?"Approved actions":"Hold lane");
+                        line("Physics and native validity remain active.",kDim);
+                    } else if(g_ed.sheet==7) {
+                        value(laneplan::Shape,"Cross-section",laneplan::Name(s.profile.shape));
+                        value(laneplan::Radius,"Corner radius",routefiles::Num(s.profile.radius)+" m");
+                        value(laneplan::TopWidth,"Top width",routefiles::Num(s.profile.topWidth)+" m",s.profile.shape==lanevolume::Shape::Trapezoid);
+                        value(laneplan::Gap,"Lane gap",routefiles::Num(s.gap)+" m",g_ed.laneFocus<0);
+                        value(laneplan::Offset,"Side offset",routefiles::Num(s.profile.offset)+" m");
+                        value(laneplan::Elevation,"Height offset",routefiles::Num(s.profile.elevation)+" m");
+                        value(laneplan::Bank,"Bank",routefiles::Num(s.profile.bank*180/lanevolume::kPi)+" deg");
+                        value(laneplan::Taper,"Transition",routefiles::Num(s.taper)+" m");
+                    } else if(g_ed.sheet==16){
+                        value(laneplan::Offset,"Side offset",routefiles::Num(s.profile.offset)+" m");value(laneplan::Elevation,"Height offset",routefiles::Num(s.profile.elevation)+" m");
+                        value(laneplan::Bank,"Bank",routefiles::Num(s.profile.bank*180/lanevolume::kPi)+" deg");value(laneplan::Taper,"Blend distance",routefiles::Num(s.taper)+" m");
+                        action("Move selected volume","",kLaneMoveMap,"Place on map",true);
+                        if(!shown->ring&&g_ed.point>=0){const auto index=std::size_t(g_ed.point);const double radius=index<shown->rounding.size()?shown->rounding[index]:0;stepper("Route corner radius",kRoundDown,routefiles::Num(radius)+" m",kRoundUp,true);}
+                        line("Side and height move the driving path with the visible volume. Blend distance joins adjacent sections.",kDim);
+                        line("Route corner radius rounds the path. Cross-section corner radius rounds its enclosing shape.",kDim);
+                    } else if(g_ed.sheet==17){
+                        stepper("Preview width",kEnvelopeWidthDown,routefiles::Num(g_ed.previewShape.halfWidth*2)+" m",kEnvelopeWidthUp,true);
+                        stepper("Preview length",kEnvelopeLengthDown,routefiles::Num(g_ed.previewShape.halfLength*2)+" m",kEnvelopeLengthUp,true);
+                        stepper("Preview height",kEnvelopeHeightDown,routefiles::Num(g_ed.previewShape.height)+" m",kEnvelopeHeightUp,true);
+                        action("Swept footprint",g_ed.envelopePreview?"Visible":"Hidden",kLaneEnvelope,"Change",true);
+                        const double scale=std::min(260.0/std::max(s.profile.width,g_ed.previewShape.halfWidth*2),95.0/std::max(s.profile.height,g_ed.previewShape.height));
+                        UiPolygon shape;shape.color=kTeal;for(const auto& point:lanevolume::Section(s.profile,8))shape.points.push_back({x0+kInner*.5+point.x*scale,y+100-point.y*scale});g_ui.polygons.push_back(std::move(shape));
+                        const double bottom=s.profile.height*.5-g_ed.previewShape.originAbove;
+                        const bool fits=lanevolume::Contains(s.profile,g_ed.previewShape.halfWidth,bottom)&&lanevolume::Contains(s.profile,g_ed.previewShape.halfWidth,bottom+g_ed.previewShape.height);
+                        UiPolygon model;model.color=fits?0xF4F7FA:kClearanceRed;model.alpha=.5;for(const auto& point:std::vector<std::pair<double,double>>{{-g_ed.previewShape.halfWidth,bottom},{g_ed.previewShape.halfWidth,bottom},{g_ed.previewShape.halfWidth,bottom+g_ed.previewShape.height},{-g_ed.previewShape.halfWidth,bottom+g_ed.previewShape.height}})model.points.push_back({x0+kInner*.5+point.first*scale,y+100-point.second*scale});g_ui.polygons.push_back(std::move(model));y+=112;
+                        line(fits?"Cross-section fits this authored preview envelope.":"Preview envelope exceeds this cross-section.",fits?kDim:kClearanceRed);
+                        line("Map footprints follow the shared curve; red shows a kinematic fit failure. Native steering needs gameplay validation.",kDim);
+                    } else if(g_ed.sheet==8) {
+                        value(laneplan::ModeRule,"Travel mode",travelrules::Name(travelrules::Mode(s.rules.mode)));
+                        value(laneplan::BypassRule,"Obstruction",travelrules::Name(travelrules::Bypass(s.rules.bypass)));
+                        value(laneplan::SettleTime,"Settle time",routefiles::Num(s.rules.settleSeconds)+" s");
+                        action("Surface / height","Limits",kLaneHeightRules,"Set",true);
+                        line("Drive-only never takes off.",kDim);
+                        line("Surface-first may use an approved bypass.",kDim);
+                        line("Unknown support or clearance holds the vehicle.",kDim);
+                    } else if(g_ed.sheet==9) {
+                        value(laneplan::MinHeight,"Hover minimum",routefiles::Num(s.rules.minHeight)+" m");
+                        value(laneplan::MaxHeight,"Hover maximum",routefiles::Num(s.rules.maxHeight)+" m");
+                        value(laneplan::HoverHeight,"Preferred hover",routefiles::Num(s.rules.hoverHeight)+" m");
+                        value(laneplan::SupportRange,"Surface search",routefiles::Num(s.rules.supportRange)+" m");
+                        line("Hover heights: underside above support.",kDim);
+                        line("Surface search: distance from authored height.",kDim);
+                    }
+                    action("Inheritance","Clear selected overrides",kLaneReset,"Reset",shown->lanePlan.enabled);
+                    button(kLaneBack,x0,y,kInner,24,"Back",true,true,0);y+=32;
+                }
+                else if(g_ed.sheet==18){
+                    section("Network preview","pure geometry / cached live paths",kTeal);
+                    const auto index=g_ed.file.landings.empty()?0:std::min(std::size_t(std::max(0,g_ed.previewDestination)),g_ed.file.landings.size()-1);
+                    action("Destination",g_ed.file.landings.empty()?"No places":g_ed.file.landings[index].id,kPreviewDestination,"Next",!g_ed.file.landings.empty());
+                    action("Itinerary","",kPreviewTrace,"Trace",!g_ed.file.landings.empty());
+                    if(!g_ed.itineraryExplanation.empty())line(g_ed.itineraryExplanation,kDim);
+                    const auto sectionIndex=routepolicy::Segment(shown->points.size(),shown->closed,std::max(0,g_ed.point),std::max(0,g_ed.laneFocus));const auto rule=routepolicy::Resolve(shown->travel,shown->sections,sectionIndex);
+                    action("Signal preview",routefiles::Num(g_ed.signalPreviewSeconds)+" s",kPreviewSignalNext,"+1",true);
+                    line(rule.control==routepolicy::Control::Signal?(roadnetwork::Green(rule,g_ed.signalPreviewSeconds)?"Selected signal: green":"Selected signal: red"):rule.control==routepolicy::Control::Stop?"Selected stretch: stop":rule.control==routepolicy::Control::Yield?"Selected stretch: yield":"Selected stretch: uncontrolled",rule.control==routepolicy::Control::Signal&&!roadnetwork::Green(rule,g_ed.signalPreviewSeconds)?kClearanceRed:kTeal);
+                    action("Live path / holds",g_ed.showLivePaths?"Visible":"Hidden",kPreviewLivePaths,"Change",true);
+                    line("Teal is the planned itinerary. Live paths are cached guidance: yellow turns, red holds. A preview does not prove steering or measured clearance.",kDim);
+                    button(kLaneBack,x0,y,kInner,24,"Back",true,true,0);y+=32;
+                }
+                else if(g_ed.sheet==11) {
+                    const auto& plan=shown->journey;
+                    section("Journey sequence", "Stops use saved world positions", kTeal);
+                    if(!plan.unsupported.empty())line("Unsupported record retained; editing disabled.",kAmber);
+                    action("Sequence",plan.enabled?"Enabled":"Disabled",kJourneyEnable,"Change",plan.unsupported.empty()&&!plan.stops.empty());
+                    action("At last stop",plan.loop?"Repeat sequence":"Complete journey",kJourneyLoop,"Change",plan.unsupported.empty());
+                    action("Selected route point","",kJourneyAdd,"Add stop",plan.unsupported.empty()&&!shown->ring&&g_ed.point>=0);
+                    if(!plan.stops.empty()){
+                        const auto index=std::min(std::size_t(std::max(0,g_ed.journeyIndex)),plan.stops.size()-1);const auto& stop=plan.stops[index];
+                        action("Stop",std::to_string(index+1)+" / "+std::to_string(plan.stops.size()),kJourneyNext,"Next",true);
+                        line("Position: "+routefiles::Num(stop.x)+", "+routefiles::Num(stop.y)+", "+routefiles::Num(stop.z),kDim);
+                        action("Dwell",routefiles::Num(stop.dwell)+" seconds",kJourneyDwellUp,"+5",true);
+                        action("Dwell","",kJourneyDwellDown,"-5",stop.dwell>0);
+                        action("Order","",kJourneyEarlier,"Earlier",index>0);
+                        action("Order","",kJourneyLater,"Later",index+1<plan.stops.size());
+                        action("Stop","",kJourneyRemove,"Remove",true);
+                        action("Stage actions","",kJourneyActions,"Edit",true);
+                    }
+                    line("Each leg must have a connected route. Unreachable sequences wait.",kDim);
+                    line("Dwell starts only after arrival and stopping. Save keeps this draft.",kDim);
+                    button(kLaneBack,x0,y,kInner,24,"Back",true,true,0);y+=32;
+                }
+                else if(g_ed.sheet==12) {
+                    const auto& plan=shown->journey;section("Journey stage actions","Conditions retain vehicle ownership",kTeal);
+                    if(!plan.stops.empty()){
+                        const auto index=std::min(std::size_t(std::max(0,g_ed.journeyIndex)),plan.stops.size()-1);const auto& stop=plan.stops[index];
+                        action("Stage",std::to_string(index+1),kJourneyNext,"Next",true);
+                        action("Wait for",journeyplan::Name(stop.wait),kJourneyWait,"Change",true);
+                        if(stop.wait==journeyplan::Wait::Trigger){action("Trigger",std::to_string(stop.trigger),kJourneyTrigger,"Next",true);action("Live vehicles","",kJourneyRelease,"Release trigger",true);}
+                        action("Timeout",stop.timeout?routefiles::Num(stop.timeout)+" s":"No timeout",kJourneyTimeout,"+30 / reset",true);
+                        action("On timeout",stop.fallback==-1?"Hold":stop.fallback==-2?"End at stop":"Go to stage "+std::to_string(stop.fallback+1),kJourneyFallback,"Change",true);
+                        action("Speed cap",stop.speed?routefiles::Num(stop.speed)+" m/s":"Route speed",kJourneySpeedUp,"+1",true);
+                        action("Speed cap","",kJourneySpeedDown,"-1",stop.speed>0);
+                        action("Travel request",travelrules::Name(travelrules::Mode(stop.mode)),kJourneyMode,"Change",true);
+                        line("Travel requests remain limited by route permissions and clearance.",kDim);
+                        line("Timeout starts after arrival. Hold never silently skips a stage.",kDim);
+                    }
+                    button(kJourneySheet,x0,y,kInner,24,"Back",true,true,0);y+=32;
+                }
+                else if(g_ed.sheet==10) {
+                    section("Inspect movement","live observations",kTeal);
+                    const auto addon=GetModuleHandleW(L"FVO_Traffic.dll");
+                    const auto query=addon?reinterpret_cast<FvoTrafficInspectQueryV1>(GetProcAddress(addon,"FVO_Traffic_InspectV1")):nullptr;
+                    FvoTrafficInspectV1 observed;
+                    if(!query)line("Traffic inspection is unavailable in this addon.",kAmber);
+                    else if(!query(shown->name.c_str(),g_ed.inspectIndex,&observed))line("No active journey at this selection. Next cycles.",kDim);
+                    else {
+                        const auto detailsQuery=reinterpret_cast<FvoTrafficInspectQueryV2>(GetProcAddress(addon,"FVO_Traffic_InspectV2"));FvoTrafficInspectV2 details;
+                        if(detailsQuery&&detailsQuery(shown->name.c_str(),g_ed.inspectIndex,&details)){line(details.waitReason,kAmber);line(details.restriction,kDim);if(details.olderPlan)line("Using an occupied earlier plan until safe handover.",kAmber);if(details.draining)line("Draining: new assignments are closed.",kDim);}
+                        char vehicleText[32];std::snprintf(vehicleText,sizeof vehicleText,"%08X",observed.vehicle);
+                        line(std::string("Vehicle ")+vehicleText+" / lane "+std::to_string(observed.lane+1),kText);
+                        line(std::string("Journey: ")+trafficroute::Name(trafficroute::Leg(observed.leg)),kText);
+                        line(std::string("Destination: ")+observed.destination,kText);
+                        line("Measured speed: "+routefiles::Num(observed.speed)+" m/s",kText);
+                        line("Journey age: "+routefiles::Num((GetTickCount64()-observed.at)*.001)+" s",kDim);
+                        trafficinspect::Control control;
+                        if(trafficinspect::Read(observed.vehicle,control)){
+                            line("Requested speed: "+routefiles::Num(control.askedSpeed)+" m/s",kText);
+                            line("Lane error: "+routefiles::Num(control.laneError)+" m",kText);
+                            line(std::string("Controller: ")+(control.owner==1?"lane":control.owner==2?"general":control.owner==3?"hold":"none"),kText);
+                            line(std::string("Reason: ")+control.reason,kAmber);
+                            line("Control age: "+routefiles::Num((GetTickCount64()-control.at)*.001)+" s",kDim);
+                        }else line("No controller observation available yet.",kDim);
+                    }
+                    action("Vehicle",std::to_string(g_ed.inspectIndex+1),kInspectNext,"Next",true);
+                    button(kLaneBack,x0,y,kInner,24,"Back",true,true,0);y+=32;
+                }
+                else if (g_ed.sheet == 1) {
 					// Vehicle rules: every type is allowed; a click leaves one out of this route (and lets it back on).
-					section("Vehicle rules", VehicleRulesText(*shown), kTeal);
-					line("Click a type to leave it out of this route; click again to let it back on.", kDim);
-					action("Group", GroupLabel(shown->group), kGroupNext, "Change", true);
+					section("Vehicle rules", VehicleScopeText(), kTeal);
+                    action("Applies to",VehicleScopeText(),kVehicleScope,"Change",LaneVehicleRulesAvailable());
+					line("Checked = allowed. Click to exclude locally.", kDim);
+                    line("Route, group and global exclusions still apply.",kDim);
+					action(g_ed.ruleLane>=0?"Vehicle group":"Route group", GroupLabel(VehicleLocalGroup(*shown)), kGroupNext, "Change", true);
 					action("Route groups", "", kGroupSheet, "Open", true);
 					const auto& types = VehicleTypesHere();
 					if (types.empty()) line("No vehicle types found yet: they are read once the game has loaded its vehicles.", kAmber);
@@ -2621,12 +3348,28 @@ namespace routeedit
 						y += 22;
 					}
 					y += 6;
-					const double bw = (kInner - 12) / 3;
-					button(kAllowAll, x0, y, bw, 24, "Allow all", false, !shown->exclude.empty(), 0);
-					button(kTypesMore, x0 + bw + 6, y, bw, 24, pages > 1 ? "Page " + std::to_string(g_ed.typePage + 1) + "/" + std::to_string(pages) : "More", false, pages > 1, 0);
-					button(kSheetBack, x0 + 2 * (bw + 6), y, bw, 24, "Back", true, true, 0);
-					y += 32;
+					button(kAllowAll,x0,y,kInner,24,"Clear local exclusions",false,!VehicleLocalList(*shown).empty(),0);y+=30;
+                    const double bw=(kInner-6)/2;
+                    button(kTypesMore,x0,y,bw,24,pages>1?"Types "+std::to_string(g_ed.typePage+1)+" / "+std::to_string(pages):"More types",false,pages>1,0);
+                    button(kSheetBack,x0+bw+6,y,bw,24,"Back",true,true,0);y+=32;
 				}
+                else if (g_ed.sheet == 21) {
+                    const auto& s = shown->schedule;
+                    section("Traffic levels", TrafficLevelText(s), kTeal);
+                    choice("Level", { { kTrafficLevelPick, "Saved", !routeschedule::HasLevel(s) },
+                        { kTrafficLevelPick + 1, "Quiet", s.trafficLevel == routeschedule::Quiet },
+                        { kTrafficLevelPick + 2, "Steady", s.trafficLevel == routeschedule::Steady },
+                        { kTrafficLevelPick + 3, "Busy", s.trafficLevel == routeschedule::Busy } }, true);
+                    for (int level = routeschedule::Quiet; level < routeschedule::LevelCount; ++level) {
+                        const auto band = s.trafficBands[level];
+                        const int id = kTrafficBandStep + level * 4;
+                        stepper(std::string(routeschedule::LevelName(level)) + " min/km", id, std::to_string(band.low), id + 1, true);
+                        stepper(std::string(routeschedule::LevelName(level)) + " max/km", id + 2, std::to_string(band.high), id + 3, true);
+                    }
+                    line("All day uses the midpoint. Scheduled routes keep their hours.", kDim);
+                    button(kSheetBack, x0, y, kInner, 24, "Back", true, true, 0);
+                    y += 32;
+                }
 				else if (g_ed.sheet == 2) {
 					// Time rules: all day, one stretch of hours, or the day in zones of busy words (the user's design).
 					const auto& s = shown->schedule;
@@ -2654,7 +3397,7 @@ namespace routeedit
 						}
 						button(kWordsAdd, x0, y, 150, 22, "+ Add a change", false, n < 6, 0);
 						y += 28;
-						stepper("Most vehicles", kVehDown, std::to_string(s.peak), kVehUp, true);
+						stepper("Saved peak", kVehDown, std::to_string(s.peak), kVehUp, true);
 						for (int w = 1; w < routeschedule::kWords; ++w) stepper(routeschedule::WordName(w), kLevelBase + w * 2, std::to_string(s.levels[w]) + "%", kLevelBase + w * 2 + 1, true);
 						choice("Blend", { { kBlendQuick, "Quick", s.blend == 10 }, { kBlendGentle, "Gentle", s.blend == 30 }, { kBlendSlow, "Slow", s.blend == 60 } }, true);
 					}
@@ -2662,6 +3405,7 @@ namespace routeedit
 						const auto& w = s.windows.front();
 						stepper("Starts", kStartDown, Clock(w.start), kStartUp, true);
 						stepper("Ends", kEndDown, Clock(w.end), kEndUp, true);
+                        stepper("Saved count", kVehDown, std::to_string(w.vehicles), kVehUp, true);
 					}
 					const std::string at2 = timeKnown ? Clock(minute) : std::string("--:--");
 					stepper(g_ed.previewHour >= 0 ? "Preview time" : "Live time", kTimeDown, at2, kTimeUp, true);
@@ -2691,12 +3435,15 @@ namespace routeedit
 					y += 4;
 				}
 				if (group(kGroupFlow, 0, "Flow", std::string(speed) + ", " + RouteVehicles(*shown) + " veh, " + (shown->lanes > 1 ? "two way" : "one way"))) {
+                    action("Lanes",!shown->lanePlan.unsupported.empty()?"Unsupported lane data":Many()?"Selected routes":shown->lanePlan.enabled?std::to_string(shown->lanePlan.base.forward)+" forward, "+std::to_string(shown->lanePlan.base.reverse)+" reverse":"Legacy layout",kLaneDesign,"Design",true);
 					stepper("Speed", kSpeedDown, speed, kSpeedUp, true);
-					stepper("Vehicles", kVehDown, RouteVehicles(*shown), kVehUp, true);
+                    action("Travel",routepolicy::Name(shown->travel),kTravelNext,"Change",true);
+                    { char width[32];std::snprintf(width,sizeof width,"%.0f m per lane",shown->corridor);stepper("Lane width",kCorridorDown,width,kCorridorUp,true); }
+					action("Traffic level", TrafficLevelText(shown->schedule), kTrafficRanges, "Set", true);
 					choice("Direction", { { kOneWay, "One way", shown->lanes <= 1 }, { kTwoWay, "Two way", shown->lanes > 1 } }, true);
 					choice("Path", { { kLoopOn, "Loop", shown->closed }, { kLoopOff, "Open", !shown->closed } }, !ring);
 					if (ring) { char rr[32]; std::snprintf(rr, sizeof rr, "%.0f m", shown->shape.radius); stepper("Ring radius", kRadiusDown, rr, kRadiusUp, true); }
-					action("Role", shown->role == "taxi" ? "Taxi" : shown->role == "cargo" ? "Cargo" : shown->role == "patrol" ? "Patrol" : "Civilian", kRoleNext, "Change", true);
+					// Role row hidden 2026-11-11 (user: "for now remove route role"); the stored role and kRoleNext stay as they were.
 					y += 4;
 				}
 				if (group(kGroupPosition, 1, "Position", hr)) {
@@ -2733,7 +3480,7 @@ namespace routeedit
 			else { section("No route selected", ""); line(g_ed.file.routes.empty() ? "Press + New route, or click a route on the map." : "Click a route on the map or in the list.", kDim); y += 4; }
 
 			// What else is selected: a point, a junction or a spot.
-			if (areaOn || zoneOn || groupSheet) {}
+			if (areaOn || zoneOn || groupSheet || g_ed.sheet>=5) {}
 			else if (shown && !ring && g_ed.point >= 0 && g_ed.point < int(shown->points.size())) {
 				const auto& p = shown->points[std::size_t(g_ed.point)];
 				char at[48]; std::snprintf(at, sizeof at, "%.0f, %.0f", p.x, p.y);
@@ -2741,13 +3488,13 @@ namespace routeedit
 				if (const auto& under = SurfaceUnder(p.x, p.y, p.z); under.known) {
 					char up[96];
 					if (under.buried) {
-						std::snprintf(up, sizeof up, "%.0f m inside the ground: raise it", under.below - p.z);
-						line(up, kCoral);
+						std::snprintf(up, sizeof up, "%.0f m under a solid surface; check clearance", under.below - p.z);
+						line(up, kClearanceRed);
 					}
 					else {
 						std::snprintf(up, sizeof up, under.rough ? "About %.0f m above the terrain (buildings not loaded)" : "%.0f m above the surface under it", p.z - under.below);
 						line(up, kDim);
-						if (under.covered) line("Under a roof or a bridge: vehicles may hit it", kAmber);
+						if (under.covered) line("Under a roof or a bridge: check clearance", kClearanceRed);
 					}
 				}
 				else line("Ground unknown here", kAmber);
@@ -2773,6 +3520,9 @@ namespace routeedit
 				}
 				char share[16]; std::snprintf(share, sizeof share, "%d%%", int(std::lround(k.share * 100)));
 				stepper("Share turning", kShareDown, share, kShareUp, true);
+                auto laneName=[](int lane){return lane<0?std::string("Any eligible"):std::string((lane&1)?"Reverse ":"Forward ")+std::to_string(lane/2+1);};
+                stepper("From lane",kLinkLaneFromDown,laneName(k.fromLane),kLinkLaneFromUp,true);
+                stepper("To lane",kLinkLaneToDown,laneName(k.toLane),kLinkLaneToUp,true);
 				choice("Corner", { { kSharp, "Sharp", k.radius <= 0 }, { kRounded, "Round", k.radius > 0 } }, true);
 				if (k.radius > 0) { char rr[24]; std::snprintf(rr, sizeof rr, "%.0f m", k.radius); stepper("Corner radius", kRoundDown, rr, kRoundUp, true); }
 				button(kDeletePoint, x0, y, 150, 24, "Remove junction", false, true, 0); y += 32;
@@ -2791,7 +3541,16 @@ namespace routeedit
 			}
 
 			}  // the city sheet or the routes
-			// Footer: Test, Cancel, Save.
+			// Remove browser/summary prefix when a focused sheet is open.
+            if(g_context.surface!=editorcontext::Surface::Browse&&g_ed.sheet&&contextContentTop>78){
+                const double shift=contextContentTop-78;
+                auto retain=[&](double& at){if(at<78)return true;if(at<contextContentTop)return false;at-=shift;return true;};
+                std::erase_if(b,[&](Button& item){return item.style!=1&&item.style!=4&&!retain(item.y);});
+                std::erase_if(g_ui.boxes,[&](Box& item){return !retain(item.y);});
+                std::erase_if(g_panelText,[&](auto& item){return !retain(item.y);});
+                for(auto& polygon:g_ui.polygons)for(auto& point:polygon.points)point.second-=shift;y-=shift;
+            }
+            // Footer: Test, Cancel, Save.
 			g_ui.boxes.push_back({ px, y - 4, kPanelW, 1, 0x3A4658, 1 });
 			{
 				const double w = (kInner - 12) / 3;
@@ -2799,21 +3558,26 @@ namespace routeedit
 				button(kCancel, x0 + w + 6, y + 6, w, 30, "Cancel", false, true, 0);
 				button(kSave, x0 + 2 * (w + 6), y + 6, w, 30, "Save", true, true, 0);
 				y += 46;
+                const double sharedWidth=(kInner-6)/2;button(kPermanentSave,x0,y,sharedWidth,28,"Permanent Save",false,route,0);button(kPermanentDelete,x0+sharedWidth+6,y,sharedWidth,28,"Permanent Delete",false,shown&&g_ed.permanentFiles.count(shown->name),0);y+=36;
+                line("Save: this save. Permanent: selected route, all playthroughs.",kDim);
 			}
 			g_ui.panelBottom = std::min(y, g_ui.height - 140);
 			return y;
 		}
 		// Everything has to fit above the map's own buttons: first fewer lines in the routes list, then only the group opened last stays open.
-		void Layout(const trafficdata::Route* shown, bool timeKnown, int minute)
-		{
-			const double room = g_ui.height - 140;
-			if (LayoutPass(shown, timeKnown, minute, 8, g_ed.groups) <= room) return;
-			if (LayoutPass(shown, timeKnown, minute, 4, g_ed.groups) <= room) return;
-			// A sheet or an open place needs the room more than the lists do.
-			if ((g_ed.sheet || AreaOn() || ZoneOn()) && LayoutPass(shown, timeKnown, minute, 0, g_ed.groups) <= room) return;
-			g_ed.groups &= 1 << g_ed.lastGroup;
-			LayoutPass(shown, timeKnown, minute, 4, g_ed.groups);
-		}
+        void FitPanel(double bottom,const trafficdata::Route* shown){
+            const auto context=std::to_string(g_ed.sheet)+"/"+(shown?shown->name:std::string())+"/"+std::to_string(g_ed.spot)+"/"+std::to_string(g_ed.zone);if(context!=g_ed.panelContext){g_ed.panelContext=context;g_ed.panelPage=0;}
+            const double limit=g_ui.height-140;if(bottom<=limit){g_ed.panelPage=0;return;}
+            const auto test=std::find_if(g_ui.buttons.begin(),g_ui.buttons.end(),[](const Button& b){return b.id==kTest;});if(test==g_ui.buttons.end())return;
+            const double first=78,footer=test->y-6,footerHeight=bottom-footer,newFooter=limit-footerHeight,capacity=std::max(130.0,newFooter-36-first);std::vector<panelpaging::Interval> rows;
+            auto add=[&](double y,double height){if(y>=first&&y<footer)rows.push_back({y,std::min(footer,y+height)});};
+            for(const auto& b:g_ui.buttons)if(b.style!=1&&b.style!=4)add(b.y,b.h);for(const auto& box:g_ui.boxes)add(box.y,box.h);for(const auto& t:g_panelText)add(t.y,15);for(const auto& polygon:g_ui.polygons)if(!polygon.points.empty()){double lo=polygon.points.front().second,hi=lo;for(auto p:polygon.points){lo=std::min(lo,p.second);hi=std::max(hi,p.second);}add(lo,hi-lo+1);}
+            const auto cuts=panelpaging::Cuts(first,footer,capacity,rows);const int pages=std::max(1,int(cuts.size())-1);g_ed.panelPage=std::clamp(g_ed.panelPage,0,pages-1);const double begin=cuts[g_ed.panelPage],end=cuts[g_ed.panelPage+1],offset=begin-first,footerOffset=newFooter-footer;
+            auto place=[&](double& y){if(y<first)return true;if(y>=footer){y+=footerOffset;return true;}if(y<begin-1e-6||y>=end-1e-6)return false;y-=offset;return true;};
+            auto project=[]<class T>(std::vector<T>& items,auto&& transform){std::vector<T> visible;for(auto item:items)if(transform(item))visible.push_back(std::move(item));items.swap(visible);};project(g_ui.buttons,[&](Button& b){return b.style==1||b.style==4||place(b.y);});project(g_ui.boxes,[&](Box& box){return place(box.y);});project(g_panelText,[&](auto& t){return place(t.y);});project(g_ui.polygons,[&](UiPolygon& polygon){if(polygon.points.empty())return true;double lo=polygon.points.front().second;for(auto p:polygon.points)lo=std::min(lo,p.second);double at=lo;if(!place(at))return false;for(auto& p:polygon.points)p.second+=at-lo;return true;});
+            const double x=PanelX()+14,y=newFooter-32;g_ui.buttons.push_back({kPanelPrevious,x,y,64,24,"Previous",false,g_ed.panelPage>0,"",0});g_ui.buttons.push_back({kPanelNext,x+kInner-64,y,64,24,"Next",false,g_ed.panelPage+1<pages,"",0});g_panelText.push_back({"Page "+std::to_string(g_ed.panelPage+1)+" / "+std::to_string(pages),x+78,y+4,kInner-156,kDim,kUnit});g_ui.panelBottom=limit;
+        }
+        void Layout(const trafficdata::Route* shown,bool timeKnown,int minute){const double room=g_ui.height-140;double bottom=LayoutPass(shown,timeKnown,minute,8,g_ed.groups);if(bottom>room)bottom=LayoutPass(shown,timeKnown,minute,4,g_ed.groups);if(bottom>room&&(g_ed.sheet||AreaOn()||ZoneOn()))bottom=LayoutPass(shown,timeKnown,minute,0,g_ed.groups);if(bottom>room){g_ed.groups&=1<<g_ed.lastGroup;bottom=LayoutPass(shown,timeKnown,minute,0,g_ed.groups);}FitPanel(bottom,shown);}
 
 		// Schedule edits on the open draft: one window (start, end, vehicles) or all day.
 		routeschedule::Window& FirstWindow(trafficdata::Route& r)
@@ -2873,6 +3637,7 @@ namespace routeedit
 		// Clockwise as seen from above (Route turn +); the draft turns about its centre.
 		void TurnRoute(double clockwise)
 		{
+            if(ContextLaneStep({},-clockwise*kDeg))return;
 			if (Many()) { routeeditor::GroupMove m = AboutMiddle(); m.radians = -clockwise * kDeg; g_ed.groupTurn = clockwise; GroupStep(m, "Turn"); g_ed.groupTurn = 0; return; }
 			if (!EnsureDraft()) return;
 			if (g_ed.draft->Value().ring) { Status("A ring looks the same turned: move it, or change its radius under Flow"); return; }
@@ -2895,6 +3660,7 @@ namespace routeedit
 		// Any route bigger or smaller about its centre, seen from above (2026-10-30, the user); heights and points kept.
 		void ScaleRoute(double factor)
 		{
+            if(ContextLaneStep({},0,factor))return;
 			if (Many()) { routeeditor::GroupMove m = AboutMiddle(); m.factor = factor; GroupStep(m, "Size", true); return; }
 			if (!EnsureDraft()) return;
 			const auto next = routeeditor::Scaled(g_ed.draft->Value(), factor);
@@ -2907,6 +3673,7 @@ namespace routeedit
 		// One step of a shape's own value: a, b or c as the panel lists them.
 		void ShapeStep(char value, double sign, bool big)
 		{
+            if(g_ed.draft&&!splinekit::Empty(g_ed.draft->Value().spacePlan)){Status("Freeform route: use spline handles or lane transforms to reshape it. Its legacy shape data is retained.");return;}
 			if (!EnsureDraft()) return;
 			const auto r = g_ed.draft->Value();
 			const auto v = routeeditor::ReadShape(r);
@@ -3008,7 +3775,7 @@ namespace routeedit
 						else { k->to = t.route; k->toEnd = t.index == lastOf(t.route); k->toAt = k->toEnd ? 0 : double(t.index); }
 					}
 				}
-				if (!drop && k->from == k->to) drop = true;
+				if (!drop && k->from == k->to && (k->fromLane<0||k->toLane<0||k->fromLane==k->toLane||k->at==k->toAt)) drop = true;
 				if (drop) { k = links.erase(k); ++dropped; }
 				else ++k;
 			}
@@ -3119,7 +3886,9 @@ namespace routeedit
 			std::vector<trafficdata::Route> in{ g_ed.draft->Value() };
 			for (std::size_t i = 1; i < ids.size(); ++i) in.push_back(ToTd(g_ed.file.routes[std::size_t(RouteIndex(ids[i]))], EditorKey()));
 			auto merged = routeeditor::MergeRoutes(in);
+            if(!merged.valid){Status(merged.error);return;}
 			PushSnap();
+            for(auto& link:g_ed.file.links)for(std::size_t i=0;i<ids.size()&&i<merged.reversed.size();++i)if(merged.reversed[i]){if(link.from==ids[i]&&link.fromLane>=0)link.fromLane^=1;if(link.to==ids[i]&&link.toLane>=0)link.toLane^=1;}
 			g_ed.draft->Edit(merged.route);
 			g_ed.massUndo.back().draftChanged = true;
 			g_ed.massUndo.back().depth = DraftDepth();
@@ -3196,6 +3965,7 @@ namespace routeedit
 			t.name = routefiles::NewId(t.label, TakenIds());
 			t.world = EditorKey(); t.ring = false; t.speed = 25; t.width = 20; t.lanes = 1;
 			t.schedule = routeschedule::Schedule{ true, 2, {} };
+            t.schedule.trafficLevel = routeschedule::Quiet;
 			t.closed = g_ed.shape != routeeditor::Shape::Helix;
 			t.points = routeeditor::ShapePoints(g_ed.shape, centre, radius, 0, &t.rounding);
 			if (!RouteFits(t, routeeditor::ShapeName(g_ed.shape))) { g_ed.shapeAt = false; return; }
@@ -3304,7 +4074,7 @@ namespace routeedit
 			if (at < 0) { Status("This new route is open: Save or Cancel it"); return; }
 			if (g_ed.draft && at == g_ed.draftIndex) return;
 			if (g_ed.draft) { Status("Save or Cancel the open route first"); return; }
-			g_ed.sheet = 0;
+			g_ed.sheet = 0;g_context.Select("route");g_ed.lanePicks.clear();
 			const int mine = int(g_ed.file.routes.size());
 			if (at >= ListTotal()) return;
 			g_ed.point = -1; g_ed.spot = -1; g_ed.link = -1;
@@ -3325,9 +4095,9 @@ namespace routeedit
 		// new button only has to be listed here. Move, height, turn, size and delete are not here: they go to everything selected (GroupStep).
 		int ReplayKind(int id)
 		{
-			if (g_ed.ruleScope != 0 && (id == kAllowAll || (id >= kTypeBase && id < kTypeBase + 1000))) return 0;  // a group's list, not the routes'
+			if ((g_ed.ruleScope != 0||g_ed.ruleLane>=0) && (id == kAllowAll ||id==kGroupNext|| (id >= kTypeBase && id < kTypeBase + 1000))) return 0;  // a group's list, not the routes'
 			switch (id) {
-			case kSpeedDown: case kSpeedUp: case kVehDown: case kVehUp: case kOneWay: case kTwoWay: case kLoopOn: case kLoopOff: case kRoleNext: case kColor: case kReverse:
+			case kTravelNext: case kCorridorDown: case kCorridorUp: case kSpeedDown: case kSpeedUp: case kVehDown: case kVehUp: case kOneWay: case kTwoWay: case kLoopOn: case kLoopOff: case kRoleNext: case kColor: case kReverse:
 			case kAllDay: case kByHours: case kSchedule: case kByWords: case kWordsAdd: case kBlendQuick: case kBlendGentle: case kBlendSlow: case kStartDown: case kStartUp: case kEndDown: case kEndUp:
 			case kGroupNext: case kAllowAll: case kRadiusDown: case kRadiusUp:case kShapeADown: case kShapeAUp: case kShapeBDown: case kShapeBUp: case kShapeCDown: case kShapeCUp:
 				return kPickRoute;
@@ -3347,6 +4117,78 @@ namespace routeedit
 		}
 		void ShowReadme();
 		void Press(int id, const routemap::Camera& c);
+		// Basic road editor (2026-11-05 strip, the user: "leaving only the basic tools for making a road ... basic basic"). Only these
+		// tools exist; every other button, key and menu is gone (the code is archived in notes/strip-20261105/). Route files keep every
+		// field they had: an edit changes only what these tools touch.
+		// Primitives restored (2026-11-06, the user: restore the traffic addon from its primitives; anything that combines more than one
+		// feature stays off). Each is one setting or one action on one route, with existing code: cars on the route, reverse, copy,
+		// mirror, colour, the More menu that holds those, stretch travel / speed, lane count and divider width, Permanent Save /
+		// Delete, Readme. Still off (combinations): places / landings, zones, links / junctions, priority, signals, time rules, groups,
+		// journeys, restrictions, lane design sheets, shapes, problems, city sheet, kit / splines.
+		bool PrimitiveTool(int id)
+		{
+			switch (id) {
+			case kVehDown: case kVehUp: case kReverse: case kCopy: case kMirror: case kColor: case kMoreMenu:
+			case kSectionTravelNext: case kSectionSpeedDown: case kSectionSpeedUp:
+			case 9508: case kF7FieldMedian:  // Field panel: lane count, divider width
+			case kPermanentSave: case kPermanentDelete: case kReadme:
+				return true;
+			default:
+				return false;
+			}
+		}
+		// Card R1 (2026-11-08, notes/f7-restore-20261108/CHANGE_CARDS.md; the user: "I need everything in places built, then problem
+		// list and readme for each of the headings, and nodes and route extras too"): the editor actions the F7 dock's restored menus
+		// press. Composite features, back because the user asked for them by name. Editor only: the traffic runtime still reads no
+		// landing, zone or junction. Still off: priority, signals, time rules, groups, journeys, restrictions, lane design sheets, the
+		// city sheet, kit / splines, spawn spots.
+		bool RestoredTool(int id)
+		{
+			if (id >= kPlaceDone && id <= kWhoParks) return true;                 // landing area: Done, layout, spaces, turn, purpose, stay, full, who
+			if (id >= kZoneKeep && id <= kZoneSpeedUp) return true;               // zone: kind, radius, top, speed
+			if (id >= kJunctionBoth && id <= kJunctionSuggest) return true;       // junction type and its suggestion
+			if (id >= kPlaceAccess && id <= kAccessDone) return true;             // the landing's entrance and departure paths
+			if (id >= kLinkLaneFromDown && id <= kLinkLaneToUp) return true;      // junction lanes
+			if (id >= kShapeBase && id < kShapeBase + 6) return true;             // shapes, parallel lanes
+			switch (id) {
+			case kLanding: case kZoneTool: case kConnect: case kShapeTool: case kShareDown: case kShareUp:
+			case kMoveLeft: case kMoveRight: case kMoveForward: case kMoveBack:
+			case kRoleNext: case kSizeDown: case kSizeUp: case kSplit: case kJoin: case kEditOriginal: case kRestore:
+			case kF7NodeView:
+				return true;
+			default:
+				return false;
+			}
+		}
+		bool BasicTool(int id)
+		{
+            if ((id >= kTrafficLevelPick && id < kTrafficLevelPick + 1 + routeschedule::LevelCount) ||
+                (id >= kTrafficBandStep && id < kTrafficBandStep + routeschedule::LevelCount * 4)) return true;
+			switch (id) {
+			case kNew: case kSave: case kCancel: case kDeleteRoute: case kPrevRoute: case kNextRoute: case kSelect: case kDrop: case kDrag:
+			case kRouteTool: case kUndo: case kRedo: case kDeletePoint: case kZUp: case kZDown: case kClose:
+			case kSpeedDown: case kSpeedUp: case kTravelNext: case kCorridorDown: case kCorridorUp: case kOneWay: case kTwoWay: case kWays:
+			case kLoop: case kLoopOn: case kLoopOff: case kRouteUp: case kRouteDown: case kTurnLeft: case kTurnRight: case kRename:
+			case kRoundPoint: case kRoundDown: case kRoundUp: case kSharp: case kRounded: case kGroupFlow: case kGroupPosition:
+			case kPanelPrevious: case kPanelNext: case kF7FieldWidth: case kContextBack: case kStartSwap:  // X is back with traffic (2026-11-06)
+				return true;
+            case kTrafficRanges: return true;
+            case kSheetBack: return g_ed.sheet == 21;
+			default: break;
+			}
+			return PrimitiveTool(id) || RestoredTool(id) || (id >= kRowBase - 1 && id < kRowBase + 1000);  // the routes list
+		}
+		void BasicFilter()
+		{
+			std::erase_if(g_ui.buttons, [](const Button& b) { return !BasicTool(b.id); });
+		}
+		bool BasicRefused(int id)
+		{
+			if (BasicTool(id)) return false;
+			static int told = 0;
+			if (told < 40) { ++told; logger::Write("OBS system=routeedit.basic event=refused id=%d reason=not_a_basic_tool", id); }
+			return true;
+		}
 		bool g_replaying = false;
 		bool Replay(int id, const routemap::Camera& c)
 		{
@@ -3450,13 +4292,73 @@ namespace routeedit
 			Status(kind == kPickPoint ? std::to_string(done) + " of the selected points now rounded" : "All " + std::to_string(done) + ": " + g_ed.status);
 			return true;
 		}
+		#include "laneedit.inl"
+        #include "splineedit.inl"
 		void Press(int id, const routemap::Camera& c)
 		{
+			if (DockAction(id, c)) return;  // the F7 dock's own buttons (docklayout.inl); every other id as before
+            if (id >= kTrafficLevelPick && id < kTrafficLevelPick + 1 + routeschedule::LevelCount) {
+                if (EnsureDraft()) {
+                    auto r = g_ed.draft->Value();
+                    const int level = id - kTrafficLevelPick - 1;
+                    if (r.schedule.trafficLevel != level) {
+                        r.schedule.trafficLevel = level;
+                        g_ed.draft->Edit(r);
+                    }
+                    Status("Traffic level: " + TrafficLevelText(r.schedule) + " (Save keeps it)");
+                    logger::Write("OBS system=routeedit.traffic_level route=%s level=%s peak=%d",
+                        r.name.c_str(), routeschedule::LevelName(level), routeschedule::PeakVehicles(r.schedule, trafficdata::DemandLength(r)));
+                }
+                return;
+            }
+            if (id >= kTrafficBandStep && id < kTrafficBandStep + routeschedule::LevelCount * 4) {
+                if (EnsureDraft()) {
+                    const int field = id - kTrafficBandStep, level = field / 4;
+                    const bool upper = field % 4 >= 2;
+                    const auto band = g_ed.draft->Value().schedule.trafficBands[level];
+                    EditTrafficBand(level, upper, (upper ? band.high : band.low) + (field % 2 ? 1 : -1));
+                }
+                return;
+            }
+			if (BasicRefused(id)) { Status("Basic road editor: that tool is not part of it."); return; }
+			if (PrimitiveTool(id)) logger::Write("OBS system=routeedit.primitive event=press id=%d", id);
+			if (RestoredTool(id)) logger::Write("OBS system=routeedit.restored event=press id=%d reason=f7_restore_r1", id);
+            if(id==kCancel||id==kSave){if(g_contextPlace)g_ed.file=g_contextPlaceBase;g_contextPlace=false;g_contextNumber=-1;g_contextDrag=0;g_contextPreview.clear();g_contextDragBase.clear();}
+            if(id==kRoadSnap||id==kRoadFit){g_ed.menu=0;ApplyFit(id==kRoadSnap?7:8);return;}
+            if(ContextAction(id,c))return;
+            if(g_ed.sheet>=5&&id==kDeletePoint){Status("Lane design: use lane counts or Reset for the selected lane rules. Back returns to point editing.");return;}
+            if(id==kRouteTool||id==kReverse||id==kSplit||id==kJoin||id==kCancel||id==kDeleteRoute||id==kUndo||id==kRedo||id==kDrop||id==kNew||id==kRestore||id==kShapeTool)g_ed.lanePicks.clear();
+            if(KitAction(id)||LaneAction(id))return;
 			if (!g_replaying && Replay(id, c)) return;
 			const bool shiftHeld = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 			if (id == kSelect || id == kDrop || id == kDrag || id == kRouteTool || id == kConnect) { g_ed.spot = -1; g_ed.zone = -1; }  // a route tool goes back to the route
 			if (id == kLanding) g_ed.zone = -1;
 			switch (id) {
+            case kTravelNext: {
+                EditRoute([](trafficdata::Route& r){r.travel=routepolicy::Travel((int(r.travel)+1)%3);},"Route travel rule changed");break;
+            }
+            case kCorridorDown: case kCorridorUp: {
+                if(!EnsureDraft())break;auto r=g_ed.draft->Value();r.corridor=std::clamp(r.corridor+(id==kCorridorUp?1:-1),1.0,200.0);g_ed.draft->Edit(r);Status("Lane corridor width changed (Save to keep it)");break;
+            }
+            case kSectionTravelNext: case kRoadRuleNext: case kSectionSpeedDown: case kSectionSpeedUp: case kPriorityDown: case kPriorityUp: case kSignalPhaseNext: {
+                if(!EnsureDraft()||g_ed.draft->Value().ring)break;
+                auto r=g_ed.draft->Value();const std::size_t n=r.points.size();r.sections.resize(n);
+                std::set<int> selected;for(const auto& p:PicksNow())if(p.kind==kPickPoint&&IsDraftRoute(p.id))selected.insert(p.index);
+                std::vector<std::size_t> stretches;
+                if(selected.size()>=2){for(std::size_t i=0;i<(r.closed?n:n?n-1:0);++i)if(selected.count(int(i))&&selected.count(int((i+1)%n)))stretches.push_back(i);}
+                else if(g_ed.point>=0&&n>=2)stretches.push_back(routepolicy::Segment(n,r.closed,g_ed.point,0));
+                if(stretches.empty()){Status("Select adjacent points to change the stretch between them");break;}
+                const auto first=r.sections[stretches.front()];
+                for(auto i:stretches) {
+                    if(id==kSectionTravelNext)r.sections[i].travel=routepolicy::Travel((int(first.travel)+2)%4-1);
+                    else if(id==kRoadRuleNext)r.sections[i].control=routepolicy::Control((int(first.control)+1)%4);
+                    else if(id==kSectionSpeedDown||id==kSectionSpeedUp)r.sections[i].speed=std::clamp((first.speed>0?first.speed:r.speed)+(id==kSectionSpeedUp?5:-5),0.0,150.0);
+                    else if(id==kPriorityDown||id==kPriorityUp)r.sections[i].priority=std::clamp(first.priority+(id==kPriorityUp?1:-1),-100,100);
+                    else r.sections[i].signalOffset=std::fmod(first.signalOffset+15,first.signalPeriod);
+                }
+                g_ed.draft->Edit(r);
+                Status(id==kSectionTravelNext?std::string("Selected stretches: ")+routepolicy::Name(r.sections[stretches.front()].travel):"Selected stretch rule changed (Save to keep it)");break;
+            }
 			case kJunctionBoth: case kJunctionExit: case kJunctionMerge: case kJunctionCross: case kJunctionSuggest: {
 				if (g_ed.link < 0 || g_ed.link >= int(g_ed.file.links.size())) break;
 				auto& k = g_ed.file.links[std::size_t(g_ed.link)];
@@ -3467,6 +4369,7 @@ namespace routeedit
 			case kShapeTool: g_ed.menu = g_ed.menu == 3 ? 0 : 3; break;
 			case kZoneTool: g_ed.mode = Mode::Zone; g_ed.spot = -1; Status("Zone: click the map to place a keep-out or slow zone, or click one to change it"); break;
 			case kTimeRules: g_ed.sheet = 2; break;
+            case kTrafficRanges: g_ed.sheet = 21; break;
 			case kCity: g_ed.sheet = g_ed.sheet == 3 ? 0 : 3; g_ed.file.cityWritten = true; break;
 			case kPlaceDone: g_ed.spot = -1; g_ed.zone = -1; Status("Done: it is one line under Places now. Save keeps your changes."); break;
 			case kRoleNext: {
@@ -3568,33 +4471,38 @@ namespace routeedit
 				Status("Zone " + std::to_string(g_ed.zone + 1) + ": " + ZoneWords(z) + " (Save to keep it)");
 				break;
 			}
-			case kVehicleRules: g_ed.sheet = 1; g_ed.ruleScope = 0; g_ed.typePage = 0; g_types.clear(); Status("Vehicle rules: click a type to leave it out of this route"); break;
-			case kSheetBack: if (g_ed.sheet == 1 && g_ed.ruleScope != 0) { g_ed.sheet = 4; g_ed.ruleScope = 0; } else g_ed.sheet = 0; break;
-			case kGroupSheet: g_ed.sheet = 4; g_ed.ruleScope = 0; g_types.clear(); break;
+			case kLaneVehicleRules: if(!LaneVehicleRulesAvailable()){Status("Lane vehicle rules are unavailable in the attached traffic addon; route rules remain available");break;}g_ed.ruleLane=g_ed.laneFocus>=0?g_ed.laneFocus:0;g_ed.ruleScope=0;g_ed.sheet=1;g_ed.typePage=0;g_types.clear();Status("Vehicle rules: "+VehicleScopeText()+"; parent exclusions still apply");break;
+            case kVehicleScope: {if(!LaneVehicleRulesAvailable()){g_ed.ruleLane=-1;break;}trafficdata::Route scratch;if(const auto* r=Shown(scratch)){const auto line=trafficroute::Build(*r);const auto lanes=trafficroute::Lanes(line,r->lanes);const auto at=std::find(lanes.begin(),lanes.end(),g_ed.ruleLane);g_ed.ruleLane=at==lanes.end()?(lanes.empty()?-1:lanes.front()):at+1==lanes.end()?-1:*(at+1);Status("Vehicle rules: "+VehicleScopeText());}break;}
+            case kVehicleRules: g_ed.ruleLane=-1;g_ed.sheet = 1; g_ed.ruleScope = 0; g_ed.typePage = 0; g_types.clear(); Status("Vehicle rules: click a type to leave it out of this route"); break;
+			case kSheetBack: g_ed.ruleLane=-1;if (g_ed.sheet == 1 && g_ed.ruleScope != 0) { g_ed.sheet = 4; g_ed.ruleScope = 0; } else g_ed.sheet = 0; break;
+			case kGroupSheet: g_ed.ruleLane=-1;g_ed.sheet = 4; g_ed.ruleScope = 0; g_types.clear(); break;
 			case kGroupNew: g_ed.naming = true; g_ed.namingGroup = 1; g_ed.nameBuf.clear(); Status("New group: type its name and press Enter"); break;
 			case kGroupRename: g_ed.naming = true; g_ed.namingGroup = 2; g_ed.nameBuf = GroupLabel(g_ed.ruleGroup); Status("Rename the group: type its name and press Enter"); break;
 			case kGroupDelete: {
 				const ULONGLONG nowMs = GetTickCount64();
-				if (nowMs - g_ed.confirmDeleteAt > 3000) { g_ed.confirmDeleteAt = nowMs; Status("Delete group '" + GroupLabel(g_ed.ruleGroup) + "'? Its routes stay and just leave the group. Click again within 3 s"); break; }
+				if (nowMs - g_ed.confirmDeleteAt > 3000) { g_ed.confirmDeleteAt = nowMs; Status("Delete group '" + GroupLabel(g_ed.ruleGroup) + "'? Its routes and lanes stay and just leave the group. Click again within 3 s"); break; }
 				g_ed.confirmDeleteAt = 0;
 				const std::string gone = g_ed.ruleGroup, label = GroupLabel(gone);
 				g_ed.routeGroups.erase(std::remove_if(g_ed.routeGroups.begin(), g_ed.routeGroups.end(), [&](const trafficdata::RouteGroup& g) { return g.name == gone; }), g_ed.routeGroups.end());
-				for (auto& r : g_ed.file.routes) if (r.group == gone) r.group.clear();
-				if (g_ed.draft && g_ed.draft->Value().group == gone) { auto r = g_ed.draft->Value(); r.group.clear(); g_ed.draft->Edit(r); }
+				auto leave=[&](auto& route){bool changed=false;if(route.group==gone){route.group.clear();changed=true;}for(auto& rule:route.lanePlan.vehicles.lanes)if(rule.group==gone){rule.group.clear();changed=true;}return changed;};
+                for(auto& route:g_ed.file.routes)leave(route);
+                if(g_ed.draft){auto route=g_ed.draft->Value();if(leave(route))g_ed.draft->Edit(route);}
 				g_ed.sheet = 4; g_ed.ruleScope = 0;
-				Status("Group '" + label + "' deleted; its routes on this planet left it. Save keeps it.");
+				Status("Group '" + label + "' deleted; its routes and lanes on this planet left it. Save keeps it.");
 				break;
 			}
 			case kGroupNext: {
 				if (!EnsureDraft()) break;
 				auto r = g_ed.draft->Value();
 				const auto choosable = ChoosableGroups();
-				if (choosable.empty()) { Status("No groups yet: open Route groups and make one"); break; }
+				if(!r.lanePlan.vehicles.unsupported.empty()){Status("Unsupported lane vehicle rules preserved; editing disabled");break;}
+                if (choosable.empty()) { Status("No groups yet: open Route groups and make one"); break; }
 				std::size_t at = choosable.size();
-				for (std::size_t k = 0; k < choosable.size(); ++k) if (choosable[k]->name == r.group) at = k;
-				r.group = at == choosable.size() ? choosable[0]->name : at + 1 < choosable.size() ? choosable[at + 1]->name : std::string();
+				for (std::size_t k = 0; k < choosable.size(); ++k) if (choosable[k]->name == VehicleLocalGroup(r)) at = k;
+				const auto nextGroup=at == choosable.size() ? choosable[0]->name : at + 1 < choosable.size() ? choosable[at + 1]->name : std::string();
+                if(g_ed.ruleLane>=0)lanevehicles::Edit(r.lanePlan.vehicles,g_ed.ruleLane).group=nextGroup;else r.group=nextGroup;
 				g_ed.draft->Edit(r);
-				Status("Group: " + GroupLabel(r.group) + " (Save to keep it)");
+				Status(VehicleScopeText()+" group: " + GroupLabel(nextGroup) + " (Save to keep it)");
 				break;
 			}
 			case kTypesMore: ++g_ed.typePage; break;
@@ -3603,7 +4511,7 @@ namespace routeedit
 			case kRestore: RestoreOriginal(); break;
 			case kAllowAll:
 				if (g_ed.ruleScope != 0) { if (auto* target = RuleTarget()) { target->exclude.clear(); Status("Every vehicle type is allowed again for " + (g_ed.ruleScope == 2 ? std::string("all routes") : target->label) + " (Save to keep it)"); } break; }
-				if (EnsureDraft()) { auto r = g_ed.draft->Value(); r.exclude.clear(); g_ed.draft->Edit(r); Status("Every vehicle type may fly this route again (Save to keep it)"); }
+				if (EnsureDraft()) { auto r = g_ed.draft->Value();if(!r.lanePlan.vehicles.unsupported.empty()){Status("Unsupported lane vehicle rules preserved; editing disabled");break;}if(g_ed.ruleLane>=0)lanevehicles::Edit(r.lanePlan.vehicles,g_ed.ruleLane).exclude.clear();else r.exclude.clear(); g_ed.draft->Edit(r); Status("Local exclusions cleared; parent exclusions still apply (Save to keep it)"); }
 				break;
 			case kRouteTool: g_ed.mode = Mode::Route; Status("Route: drag the map to move the whole route, drag the round handle to turn it, wheel near its centre to raise or lower it, Ctrl+wheel there to size it"); break;
 			case kMoreMenu: g_ed.menu = g_ed.menu == 1 ? 0 : 1; break;
@@ -3693,6 +4601,10 @@ namespace routeedit
 			}
 			case kNew: NewRoute(); break;
 			case kSave: Save(); break;
+            case kPanelPrevious: g_ed.panelPage=std::max(0,g_ed.panelPage-1);break;
+            case kPanelNext: ++g_ed.panelPage;break;
+            case kPermanentSave: if(EnsureDraft())Save(true);break;
+            case kPermanentDelete: PermanentDelete();break;
 			case kReadme: ShowReadme(); break;
 			case kCancel: Cancel(); break;
 			case kDeleteRoute: DeleteRoute(); break;
@@ -3777,11 +4689,14 @@ namespace routeedit
 				break;
 			}
 			case kTest:
+				crash::Crumb("f7 test begin (key)",0);
 				if (EnsureDraft()) {
 					auto r = g_ed.draft->Value(); r.test = true; g_ed.draft->Edit(r);
 					Save();
+					crash::Crumb("f7 test saved (key)",g_ed.draft?0:1);
 					if (!g_ed.draft) Status("Test requested: the next free vehicle with a driver near the route flies it once (see the log's 'test route' lines)");
 				}
+				crash::Crumb("f7 test end (key)",0);
 				break;
 			case kTimeDown: case kTimeUp: {
 				double h = g_ed.previewHour;
@@ -3812,7 +4727,18 @@ namespace routeedit
 					Status("Ring radius " + std::to_string(int(r.shape.radius)) + " m");
 				}
 				break;
-			case kConnect: g_ed.mode = Mode::Connect; Status("Link: click another route's line to join the nearer end of this route to it (the selected end if one is selected)"); break;
+			case kConnect:
+                if(g_ed.lanePicks.size()==2){
+                    const auto a=g_ed.lanePicks[0],b=g_ed.lanePicks[1];trafficroute::Line line;bool ring=false;
+                    if(a.route!=b.route||a.lane<0||b.lane<0||a.lane==b.lane||((a.lane^b.lane)&1)||a.section==b.section||!LineOf(a.route,line,ring)||ring){Status("Lane change: select two sections on different same-direction lanes of one path.");break;}
+                    const double from=line.ToLine(a.section),to=line.ToLine(b.section);
+                    const double distance=trafficroute::DistanceAlong(line,a.lane,from,to);
+                    if(!std::isfinite(distance)||distance<12||distance>500){Status("Lane change needs 12-500 m in the lane's travel direction.");break;}
+                    PushSnap();routefiles::Link link;std::set<std::string> taken;for(const auto& k:g_ed.file.links)taken.insert(k.id);
+                    link.id=routefiles::NewId("lane change",taken);link.from=link.to=a.route;link.at=a.section;link.toAt=b.section;link.fromLane=a.lane;link.toLane=b.lane;link.radius=10;link.share=1;link.type="exit";g_ed.file.links.push_back(link);g_ed.link=int(g_ed.file.links.size()-1);g_ed.lanePicks.clear();
+                    Status("Directed lane-change curve added. It waits for a clear destination gap. Save keeps it.");break;
+                }
+                g_ed.mode = Mode::Connect; Status("Link: click another route's line to join the nearer end of this route to it (the selected end if one is selected)"); break;
             case kRoundPoint:case kRoundDown:case kRoundUp:{
                 const bool junction=g_ed.link>=0&&g_ed.link<int(g_ed.file.links.size());
                 double current=0;
@@ -3904,21 +4830,23 @@ namespace routeedit
 					if (k < int(types.size()) && EnsureDraft()) {
 						auto r = g_ed.draft->Value();
 						const auto& t = types[std::size_t(k)];
-						const bool out = TypeLeftOut(r, t);
+						if(!r.lanePlan.vehicles.unsupported.empty()){Status("Unsupported lane vehicle rules preserved; editing disabled");break;}
+                        const bool out = TypeLeftOut(r, t);
+                        auto& exclusions=g_ed.ruleLane>=0?lanevehicles::Edit(r.lanePlan.vehicles,g_ed.ruleLane).exclude:r.exclude;
 						for (const unsigned tid : t.ids) {
-							const auto at = std::find(r.exclude.begin(), r.exclude.end(), tid);
-							if (out && at != r.exclude.end()) r.exclude.erase(at);
-							else if (!out && at == r.exclude.end()) r.exclude.push_back(tid);
+							const auto at = std::find(exclusions.begin(), exclusions.end(), tid);
+							if (out && at != exclusions.end()) exclusions.erase(at);
+							else if (!out && at == exclusions.end()) exclusions.push_back(tid);
 						}
-						std::sort(r.exclude.begin(), r.exclude.end());
+						std::sort(exclusions.begin(), exclusions.end());
 						g_ed.draft->Edit(r);
-						Status(t.name + (out ? " may fly this route again" : " is left out of this route") + " (Save to keep it)");
+						Status(t.name + (out ? " local exclusion cleared for " : " excluded from ")+VehicleScopeText() + " (Save to keep it)");
 					}
 				}
 				else if (id >= kRowBase - 1 && id < kViewBase) { g_ed.zone = -1; SelectRow(id - kRowBase); }
 				else if (id == kViewBase + 6) {  // the game's own starting angle: yaw 0, pitch 45
-					g_orbitYaw = 0; g_orbitPitch = 45; g_orbitOnce = true;
-					Status("Map angle reset. Right-drag on the map turns and tilts it.");
+					if(!g_photoHost){g_orbitYaw = 0; g_orbitPitch = 45; g_orbitOnce = true;}
+					Status("Hold RMB: mouse look + WASD (75x speed); Ctrl+RMB up, LMB down; Shift 150x. Hold controller L3: sticks move/look, triggers change height, LB 150x.");
 				}
 				else if (id >= kViewBase && id < kViewBase + 6) {
 					auto& v = g_ed.view;
@@ -4024,10 +4952,10 @@ namespace routeedit
 				}
 				return false;
 			};
-			if (!hit.kind && g_ed.draft && onLine(trafficroute::Build(g_ed.draft->Value()))) { hit.kind = kPickRoute; hit.id = g_ed.draft->Value().name; }
+			if (!hit.kind && g_ed.draft && onLine(EditorLine(g_ed.draft->Value()))) { hit.kind = kPickRoute; hit.id = g_ed.draft->Value().name; }
 			for (std::size_t k = 0; k < g_ed.file.routes.size() && !hit.kind; ++k) {
 				const auto& r = g_ed.file.routes[k];
-				if (Usable(r) && onLine(trafficroute::Build(ToTd(r, EditorKey())))) { hit.kind = kPickRoute; hit.id = r.id; }
+				if (Usable(r) && onLine(EditorLine(ToTd(r, EditorKey())))) { hit.kind = kPickRoute; hit.id = r.id; }
 			}
 			for (std::size_t k = 0; k < g_ed.others.size() && !hit.kind; ++k) {
 				if (onLine(g_ed.others[k].line)) { hit.kind = kPickRoute; hit.id = MakeOriginalMine(int(k)); }
@@ -4059,8 +4987,15 @@ namespace routeedit
 		}
 		void ClickMap(const routemap::Camera& c, double mx, double my)
 		{
-			g_ed.picks.clear();  // a plain click ends a selection
+            if(g_ed.mode==Mode::KitPlace){if(!EnsureDraft())return;auto route=g_ed.draft->Value();auto& plan=route.spacePlan;if(!plan.enabled||plan.handles.size()!=route.points.size()||route.points.empty())return;const auto i=std::min(std::size_t(std::max(0,g_ed.point)),route.points.size()-1);auto lane=std::find_if(plan.lanes.begin(),plan.lanes.end(),[&](const auto& p){return p.lane==g_ed.laneFocus;});auto& h=lane==plan.lanes.end()?plan.handles[i]:lane->anchors[i].handle;const splinekit::Vec anchor=lane==plan.lanes.end()?splinekit::Vec{route.points[i].x,route.points[i].y,route.points[i].z}:lane->anchors[i].point;const auto target=g_ed.kitTarget==0?anchor:splinekit::Add(anchor,g_ed.kitTarget==1?h.incoming:h.outgoing);routemap::Vec3 at;if(!routemap::MouseAt(c,target.z,at))return;if(g_ed.kitTarget==0){if(lane==plan.lanes.end())route.points[i]={at.x,at.y,at.z};else lane->anchors[i].point=at;}else splinekit::SetHandle(h,g_ed.kitTarget==1,splinekit::Sub(at,anchor));PushSnap();g_ed.draft->Edit(route);g_ed.massUndo.back().draftChanged=true;g_ed.massUndo.back().depth=DraftDepth();g_ed.mode=Mode::Select;Status("3D target placed. Z is preserved at the selected plane.");return;}
+            if(g_ed.mode==Mode::LanePlace){trafficdata::Route scratch;const auto* route=Shown(scratch);if(!route)return;const auto& line=EditorLine(*route);int lane=g_ed.laneFocus,section=g_ed.point;for(const auto& pick:g_ed.lanePicks)if(pick.route==route->name){lane=pick.lane;section=pick.section;break;}if(lane<0){const auto lanes=trafficroute::Lanes(line,route->lanes);if(lanes.empty())return;lane=lanes.front();}const double u=section>=0?line.ToLine(section+.5):0;const auto p=trafficroute::At(line,lane,u),q=trafficroute::At(line,lane,trafficroute::LeadU(line,lane,u,1,false,false));routemap::Vec3 at;if(!routemap::MouseAt(c,p.z,at))return;const double length=std::hypot(q.x-p.x,q.y-p.y);if(length<1e-6)return;g_ed.laneMoveSide=((at.x-p.x)*(q.y-p.y)-(at.y-p.y)*(q.x-p.x))/length*trafficroute::Direction(lane);g_ed.laneMoveHeight=0;LaneAction(kLanePlaceApply);g_ed.mode=Mode::Select;return;}
+			g_ed.lanePicks.clear();g_ed.picks.clear();  // a plain click ends a selection
 			switch (g_ed.mode) {
+            case Mode::AccessEntry:case Mode::AccessExit:{
+                if(!AreaOn())return;auto& access=g_ed.file.landings[std::size_t(g_ed.spot)].access;if(!access.unsupported.empty())return;
+                auto& path=g_ed.mode==Mode::AccessEntry?access.entrance:access.departure;if(path.size()>=128){Status("Parking path has 128 points; remove one before adding.");return;}
+                routemap::Vec3 at;if(!routemap::MouseAt(c,g_ed.accessHeight,at))return;PushSnap();path.push_back({at.x,at.y,at.z});Status("Parking path point added at the selected height. Save keeps it.");return;
+            }
 			case Mode::Drop:
 				// A click on a point selects it, as in Select: Drop stays on after a route is started, so this added a second point on top. Insert still drops anywhere.
 				if (const int p = PointAt(c, mx, my, 14); p >= 0) {
@@ -4124,7 +5059,7 @@ namespace routeedit
 			};
 			for (std::size_t k = 0; k < g_ed.file.routes.size(); ++k) {
 				const auto& r = g_ed.file.routes[k];
-				if (!Usable(r) || !onLine(trafficroute::Build(ToTd(r, EditorKey())))) continue;
+				if (!Usable(r) || !onLine(EditorLine(ToTd(r, EditorKey())))) continue;
 				g_ed.route = int(k); g_ed.other = -1; g_ed.point = -1; g_ed.spot = -1;
 				Status("Route '" + r.label + "'" + (IsOriginal(r) ? " (your version of an original; Del route reverts it)" : ""));
 				return;
@@ -4222,6 +5157,7 @@ namespace routeedit
 		// Moves what is selected: a zone, a spot, a route's point, else the whole route. The map's own keys are held while Alt is down.
 		void HubMove(double dx, double dy, double dz)
 		{
+            if(ContextLaneStep({dx,dy,dz}))return;
 			if (Many()) {
 				if (!g_ed.hubOn) { g_ed.hubOn = true; g_ed.hubKind = 4; GroupBegin(); }
 				routeeditor::GroupMove m; m.dx = dx; m.dy = dy; m.dz = dz; GroupLive(m);
@@ -4326,16 +5262,278 @@ namespace routeedit
 			}
 		} g_keys;
 
+        #include "lanevisual.inl"
+        #include "contextedit.inl"
+        #include "docklayout.inl"
+        #include "routeitems.inl"
+        #include "placewires.inl"
+        #include "nodeview.inl"
+
+        routecache::Cache g_roadDrawCache;  // shared by DrawRoadTiles and DrawRouteFacts: one compile per route key
+        // Draw authored road tiles in the same world projection as their route markers.
+        void DrawRoadTiles(Pen& pen, const routemap::Camera& camera,
+                           const trafficdata::Route& route, double height)
+        {
+            if (route.ring || route.points.size() < 2) return;
+            // Photo view: a face reaching behind the camera is cut at it, not dropped (routemap::ClipPolygon).
+            const auto face = [&](std::initializer_list<routemap::Vec3> vertices,
+                                  unsigned color, double alpha) {
+                const auto poly = routemap::ClipPolygon(camera, std::vector<routemap::Vec3>(vertices));
+                if (poly.size() < 3) return;
+                double x[16], y[16];
+                int count = 0;
+                for (const auto& vertex : poly) {
+                    if (count >= 16 || !Local(camera, vertex, x[count], y[count])) return;
+                    ++count;
+                }
+                {   // DRAW-1: a face wholly off the visible area, or under 1.5 px both ways, is not sent
+                    double x0 = x[0], x1 = x[0], y0 = y[0], y1 = y[0]; for (int i = 1; i < count; ++i) { x0 = std::min(x0, x[i]); x1 = std::max(x1, x[i]); y0 = std::min(y0, y[i]); y1 = std::max(y1, y[i]); }
+                    if (pen.tape && pen.cull && (pen.Outside(x0, y0, x1, y1) || (x1 - x0 < 1.5 && y1 - y0 < 1.5))) { ++pen.culled; return; }
+                }
+                pen.NoLine();
+                pen.Fill(color, alpha);
+                pen.Move(x[0], y[0]);
+                for (int i = 1; i < count; ++i) pen.Line(x[i], y[i]);
+                pen.Line(x[0], y[0]);
+                pen.End();
+            };
+            const auto& compiled=g_roadDrawCache.Get(route);
+            const auto& stations=compiled.road;
+            if(compiled.error||stations.size()<2)return;
+            const std::size_t tileCount=std::max<std::size_t>(1,route.points.size()-(route.closed?0:1));
+            const auto raise=[height](routemap::Vec3 p){p.z+=height;return p;};
+            const auto point=[](trafficdata::Vec p){return routemap::Vec3{p.x,p.y,p.z};};
+            const auto count=stations.size()-(route.closed?0:1);
+            for(std::size_t i=0;i<count;++i){
+                const auto& a=stations[i];const auto& b=stations[(i+1)%stations.size()];
+                const auto al=point(a.left),ar=point(a.right),bl=point(b.left),br=point(b.right);
+                // 2026-11-19: the floor is tinted by the tile's travel (hover keeps the old blue; drive green; both violet).
+                const unsigned tint=roadvisual::TravelTint(roadvisual::TileTravel(route,roadvisual::TileOf(compiled.ToSource(double(i)),tileCount)));
+                face({al,bl,br,ar},tint,.35);
+                if(height>0){
+                    face({al,bl,raise(bl),raise(al)},tint,.25);
+                    face({ar,br,raise(br),raise(ar)},tint,.25);
+                    face({raise(al),raise(bl),raise(br),raise(ar)},tint,.25);
+                    // Only external end caps: adjacent prisms share their boundary without an internal face.
+                    if(!route.closed&&i==0)face({ar,al,raise(al),raise(ar)},tint,.25);
+                    if(!route.closed&&i+1==count)face({bl,br,raise(br),raise(bl)},tint,.25);
+                }
+                // Red dividers. With a width (median) it is a solid block: its real width across, the road's height tall
+                // (1 m on a roofless road) - user, 2026-11-04: "I only saw a plane of the red, not as a block" (a 10 m
+                // median on Roadrunner was drawn as one thin wall, so its width could not be seen).
+                for(std::size_t d=1;d+1<a.boundaries.size()&&d<b.boundaries.size();++d){double ax,ay,bx,by;
+                    if(route.road.median>0){
+                        auto band=[&](const auto& st,double sign){const double ux=st.left.x-st.right.x,uy=st.left.y-st.right.y,l=std::max(1e-6,std::hypot(ux,uy)),g=route.road.median*.5*sign;
+                            return trafficdata::Vec{st.boundaries[d].x+ux/l*g,st.boundaries[d].y+uy/l*g,st.boundaries[d].z};};
+                        const double tall=height>0?height:1.0;
+                        const auto up=[tall](routemap::Vec3 p){p.z+=tall;return p;};
+                        const auto A0=point(band(a,-1)),A1=point(band(a,1)),B0=point(band(b,-1)),B1=point(band(b,1));
+                        face({A0,B0,B1,A1},0xE93452,.50);
+                        face({up(A0),up(B0),up(B1),up(A1)},0xE93452,.45);
+                        face({A0,B0,up(B0),up(A0)},0xE93452,.40);
+                        face({A1,B1,up(B1),up(A1)},0xE93452,.40);
+                        if(!route.closed&&i==0)face({A0,A1,up(A1),up(A0)},0xE93452,.40);
+                        if(!route.closed&&i+1==count)face({B0,B1,up(B1),up(B0)},0xE93452,.40);
+                    }else if(height>0){
+                        face({point(a.boundaries[d]),point(b.boundaries[d]),point(b.tops[d]),point(a.tops[d])},0xE93452,.65);
+                    }else{
+                        auto p0=point(a.boundaries[d]),p1=point(b.boundaries[d]);
+                        if(routemap::ClipSegment(camera,p0,p1)&&Local(camera,p0,ax,ay)&&Local(camera,p1,bx,by)){
+                            pen.Style(2,0xE93452,.95);pen.Move(ax,ay);pen.Line(bx,by);
+                        }
+                    }
+                }
+                // Edge no-go bands (amber, unlike the red dividers): a solid block along the outer boundary, set only when the road has an edge width.
+                if(route.road.edgeLeft>0||route.road.edgeRight>0){
+                    const double tall=height>0?height:1.0;const auto up=[tall](routemap::Vec3 p){p.z+=tall;return p;};
+                    auto edge=[&](const auto& st,std::size_t k,double sign,double w){const double ux=st.left.x-st.right.x,uy=st.left.y-st.right.y,l=std::max(1e-6,std::hypot(ux,uy));
+                        return trafficdata::Vec{st.boundaries[k].x+ux/l*w*sign,st.boundaries[k].y+uy/l*w*sign,st.boundaries[k].z};};
+                    auto block=[&](std::size_t k,double sign,double w){
+                        // inside a bend the offset may not reach past the bend's radius (trafficroute::BandReach), so the band stays one piece around rounded corners
+                        const double wa=trafficroute::BandReach(stations,route.closed,i,k==0,w),wb=trafficroute::BandReach(stations,route.closed,(i+1)%stations.size(),k==0,w);
+                        const auto A0=point(a.boundaries[k]),B0=point(b.boundaries[k]),A1=point(edge(a,k,sign,wa)),B1=point(edge(b,k,sign,wb));
+                        face({A0,B0,B1,A1},0xF2A93B,.50);face({up(A0),up(B0),up(B1),up(A1)},0xF2A93B,.45);
+                        face({A1,B1,up(B1),up(A1)},0xF2A93B,.40);face({A0,B0,up(B0),up(A0)},0xF2A93B,.40);};
+                    if(route.road.edgeRight>0&&!a.boundaries.empty()&&a.boundaries.size()==b.boundaries.size())block(0,1,route.road.edgeRight);
+                    if(route.road.edgeLeft>0&&a.boundaries.size()>1&&a.boundaries.size()==b.boundaries.size())block(a.boundaries.size()-1,-1,route.road.edgeLeft);
+                }
+            }
+        }
+
+        // ---- 2026-11-19 (user: "anything that affects the route I need to see on that overlay how it affects it") ----
+        // One small arrowhead pointing the way a lane runs, in screen space at world point p (q is a point further along the lane's travel).
+        void DrawChevron(Pen& pen, const routemap::Camera& c, routemap::Vec3 p, routemap::Vec3 q, unsigned color)
+        {
+            double x, y, ax, ay;
+            if (!Local(c, p, x, y) || !Local(c, q, ax, ay)) return;
+            if (pen.tape && pen.cull && pen.Outside(x - 6, y - 6, x + 6, y + 6)) { ++pen.culled; return; }
+            double dx = ax - x, dy = ay - y; const double l = std::hypot(dx, dy);
+            if (l < 1e-3) return;
+            dx /= l; dy /= l;
+            pen.Style(1.7, color, .92);
+            pen.Move(x - dx * 5 - dy * 4, y - dy * 5 + dx * 4); pen.Line(x + dx * 3, y + dy * 3); pen.Line(x - dx * 5 + dy * 4, y - dy * 5 - dx * 4);
+            pen.NoLine();
+        }
+        // What the selected route's settings do to it, drawn on the map and photo view for the shown route only: the road's true footprint
+        // for routes without road tiles (lane corridor x lanes, as the runtime uses), lane direction arrows, lane numbers, solids hatch, a
+        // short tag beside every tile that differs from the plain road (travel, want speed, solids, box, join, divider, stop / yield / signal),
+        // the line end, a one-line summary and a legend. Tinting by travel is in DrawRoadTiles. Cost: stations once a frame, arrows capped.
+        void DrawRouteFacts(Pen& pen, uptr movie, const routemap::Camera& c, const trafficdata::Route& r, const trafficroute::Line& line)
+        {
+            (void)movie; if (!r.ring && r.points.size() < 2) return;
+            const double vl = std::min(g_ui.bx, g_ui.bx + g_ui.ax), vr = std::max(g_ui.bx, g_ui.bx + g_ui.ax), vt = std::min(g_ui.by, g_ui.by + g_ui.ay), vb = std::max(g_ui.by, g_ui.by + g_ui.ay);
+            static std::vector<double> lens; static std::vector<roadvisual::Stop> stops, hatch;
+            roadvisual::LegendFlags legend;
+            const bool road = !r.ring && r.road.enabled;
+            const std::size_t tiles = r.ring ? 0 : std::max<std::size_t>(1, r.points.size() - (r.closed ? 0 : 1));
+            int arrows = 0, tags = 0; double footprint = 0; int laneCount = 1;
+            auto lerp = [](routemap::Vec3 a, routemap::Vec3 b, double t) { return routemap::Vec3{ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t }; };
+            auto vec = [](const trafficdata::Vec& v) { return routemap::Vec3{ v.x, v.y, v.z }; };
+            if (road) {
+                const auto& compiled = g_roadDrawCache.Get(r);
+                const auto& st = compiled.road;
+                if (compiled.error || st.size() < 2 || st[0].boundaries.size() < 2) return;
+                const std::size_t segs = st.size() - (r.closed ? 0 : 1);
+                const int lanes = int(st[0].boundaries.size()) - 1; laneCount = lanes;
+                footprint = DockRoadWidth(r);
+                auto laneMid = [&](const auto& s, int k) { return lerp(vec(s.boundaries[std::size_t(k)]), vec(s.boundaries[std::size_t(k) + 1]), .5); };
+                auto same = [&](std::size_t i) { return st[i].boundaries.size() == st[(i + 1) % st.size()].boundaries.size() && int(st[i].boundaries.size()) == lanes + 1; };
+                lens.assign(segs, 0.0); bool solids = false;
+                for (std::size_t i = 0; i < segs; ++i) { const auto a = lerp(vec(st[i].left), vec(st[i].right), .5), b = lerp(vec(st[(i + 1) % st.size()].left), vec(st[(i + 1) % st.size()].right), .5); lens[i] = std::hypot(b.x - a.x, b.y - a.y, b.z - a.z); }
+                for (std::size_t t = 0; t < tiles; ++t) {
+                    const auto tr = roadvisual::TileTravel(r, t);
+                    (tr == routepolicy::Travel::Drive ? legend.drive : tr == routepolicy::Travel::Both ? legend.both : legend.hover) = true;
+                    solids = solids || roadvisual::SolidsAllowed(r, t);
+                }
+                legend.solids = solids; legend.edges = r.road.edgeLeft > 0 || r.road.edgeRight > 0; legend.dividers = lanes > 1;
+                roadvisual::StopsAlong(lens, 30, 15, 150, stops);
+                for (const auto& s : stops) {
+                    const std::size_t i = s.segment, j = (i + 1) % st.size(); if (!same(i)) continue;
+                    for (int k = 0; k < lanes; ++k) {
+                        const auto a = laneMid(st[i], k), b = laneMid(st[j], k); const double dir = roadplan::Direction(r.road, k, lanes) > 0 ? 1 : -1;
+                        const auto p = lerp(a, b, s.t); const auto q = lerp(p, dir > 0 ? b : a, .5);
+                        DrawChevron(pen, c, p, q, k == g_roadLane && lanes > 1 ? 0x72F3D2 : roadvisual::kArrow); ++arrows;
+                    }
+                }
+                if (solids) {  // a diagonal hatch over the floor of tiles that allow solids
+                    roadvisual::StopsAlong(lens, 14, 7, 300, hatch);
+                    pen.Style(1.2, roadvisual::kHatch, .7);
+                    for (const auto& s : hatch) {
+                        const std::size_t i = s.segment, j = (i + 1) % st.size(); if (!roadvisual::SolidsAllowed(r, roadvisual::TileOf(compiled.ToSource(double(i)), tiles))) continue;
+                        const double t1 = std::min(1.0, s.t + .25);
+                        auto a = lerp(vec(st[i].right), vec(st[j].right), s.t), b = lerp(vec(st[i].left), vec(st[j].left), t1); double ax, ay, bx, by;
+                        if (routemap::ClipSegment(c, a, b) && Local(c, a, ax, ay) && Local(c, b, bx, by)) { pen.Move(ax, ay); pen.Line(bx, by); }
+                    }
+                    pen.NoLine();
+                }
+                if (lanes > 1 && same(0)) for (int k = 0; k < lanes; ++k) {  // lane numbers at the start, as the dock numbers them (right edge first)
+                    double x, y; if (Local(c, lerp(laneMid(st[0], k), laneMid(st[1 % st.size()], k), .4), x, y)) MapNote("L" + std::to_string(k + 1) + (roadplan::Direction(r.road, k, lanes) > 0 ? "" : " <"), x + 5, y - 15, k == g_roadLane ? 0x72F3D2 : 0xDFE7EE, 60);
+                }
+                for (std::size_t t = 0; t < tiles && tags < 24; ++t) {  // a tag at the middle of every tile that is not the plain road
+                    const auto tag = roadvisual::TileTag(r, t); if (tag.empty()) continue;
+                    const auto& a = r.points[t]; const auto& b = r.points[(t + 1) % r.points.size()]; double x, y;
+                    if (!Local(c, { (a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2 }, x, y) || x < vl || x > vr || y < vt || y > vb) continue;
+                    MapNote("Tile " + std::to_string(t + 1) + ": " + tag, x + 8, y + 8, roadvisual::TravelTint(roadvisual::TileTravel(r, t)), 440); ++tags;
+                }
+            }
+            else if (!line.error && line.lane.size() >= 1 && line.Count() >= 2) {
+                // Routes without road tiles: the footprint the runtime really uses (each lane's corridor around its line), and which way each lane runs.
+                legend.hover = r.travel == routepolicy::Travel::Hover; legend.drive = r.travel == routepolicy::Travel::Drive; legend.both = r.travel == routepolicy::Travel::Both;
+                const auto avail = trafficroute::Lanes(line, std::clamp(r.lanes, 1, 2)); const int n = line.Count();
+                laneCount = int(avail.size()); footprint = r.ring ? r.corridor : tilebox::LaneSpanWidth(r);
+                const bool volumes = line.plan.enabled || trafficroute::Spatial(line);  // lane volumes draw their own body
+                const int stride = std::max(1, n / 160); const unsigned tint = roadvisual::TravelTint(r.travel);
+                for (std::size_t rank = 0; rank < avail.size(); ++rank) {
+                    const int lane = avail[rank]; if (lane < 0 || lane >= int(line.lane.size()) || int(line.lane[std::size_t(lane)].size()) < n) continue;
+                    const auto& pts = line.lane[std::size_t(lane)];
+                    if (!volumes && !(r.ring && rank > 0)) {
+                        const double half = std::max(.5, r.corridor * .5);
+                        auto side = [&](int i, double sgn) {
+                            const int p = r.ring || line.closed ? (i + n - stride) % n : std::max(0, i - stride), q = line.closed ? (i + stride) % n : std::min(n - 1, i + stride);
+                            const double dx = pts[std::size_t(q)].x - pts[std::size_t(p)].x, dy = pts[std::size_t(q)].y - pts[std::size_t(p)].y, l = std::max(1e-6, std::hypot(dx, dy));
+                            return routemap::Vec3{ pts[std::size_t(i)].x - dy / l * half * sgn, pts[std::size_t(i)].y + dx / l * half * sgn, pts[std::size_t(i)].z };
+                        };
+                        for (int i = 0; i < n; i += stride) {
+                            int j = i + stride; if (j >= n) { if (!line.closed) { if (i == n - 1) break; j = n - 1; } else j = 0; }
+                            if (j == i) break;
+                            const routemap::Vec3 q[4]{ side(i, 1), side(j, 1), side(j, -1), side(i, -1) };
+                            MapFace(pen, c, q, 4, tint, .22);
+                            { double ax, ay, bx, by; routemap::Vec3 a = q[0], b = q[1];
+                                pen.Style(1, tint, .55); if (routemap::ClipSegment(c, a, b) && Local(c, a, ax, ay) && Local(c, b, bx, by)) { pen.Move(ax, ay); pen.Line(bx, by); } a = q[3]; b = q[2];
+                                if (routemap::ClipSegment(c, a, b) && Local(c, a, ax, ay) && Local(c, b, bx, by)) { pen.Move(ax, ay); pen.Line(bx, by); } pen.NoLine(); }
+                            if (j == 0 || j == n - 1) break;
+                        }
+                    }
+                    lens.assign(std::size_t(line.closed ? n : n - 1), 0.0);
+                    for (int i = 0; i < int(lens.size()); ++i) { const auto& a = pts[std::size_t(i)]; const auto& b = pts[std::size_t((i + 1) % n)]; lens[std::size_t(i)] = std::hypot(b.x - a.x, b.y - a.y, b.z - a.z); }
+                    roadvisual::StopsAlong(lens, 30, 15 + 5.0 * double(rank), 150, stops);
+                    const double dir = trafficroute::Direction(line, lane) > 0 ? 1 : -1;
+                    for (const auto& s : stops) { const std::size_t i = s.segment, j = (i + 1) % std::size_t(n); const auto a = vec(pts[i]), b = vec(pts[j]); const auto p = lerp(a, b, s.t);
+                        DrawChevron(pen, c, p, lerp(p, dir > 0 ? b : a, .5), roadvisual::kArrow); ++arrows; }
+                    if (avail.size() > 1 && !r.ring) { double x, y; if (Local(c, lerp(vec(pts[0]), vec(pts[1]), .4), x, y)) MapNote("L" + std::to_string(rank + 1) + (dir > 0 ? "" : " <"), x + 5, y - 15, 0xDFE7EE, 60); }
+                }
+            }
+            // The line end: Stop is a red bar across the end, Arrive a ring where the car lands (green; yellow when it parks) joined to the end by a line.
+            if (!r.ring && !r.closed && r.end.end != routeend::Pass && r.points.size() >= 2) {
+                const auto& e = r.points.back(); const auto& pv = r.points[r.points.size() - 2]; double x, y, px, py;
+                if (Local(c, { e.x, e.y, e.z }, x, y) && Local(c, { pv.x, pv.y, pv.z }, px, py)) {
+                    double dx = x - px, dy = y - py; const double l = std::max(1e-6, std::hypot(dx, dy)); dx /= l; dy /= l;
+                    pen.Style(3.5, r.end.end == routeend::Stop ? 0xE8705C : 0x7CFF8A, .95); pen.Move(x - dy * 14, y + dx * 14); pen.Line(x + dy * 14, y - dx * 14); pen.NoLine();
+                    MapNote(r.end.end == routeend::Stop ? "END: stop" : "END: arrive", x + 10, y + 6, r.end.end == routeend::Stop ? 0xE8705C : 0x7CFF8A, 120);
+                    if (r.end.end == routeend::Arrive && r.end.hasPlace) {
+                        double gx, gy;
+                        if (Local(c, { r.end.place.x, r.end.place.y, r.end.place.z }, gx, gy)) {
+                            const unsigned col = r.end.place.park ? 0xFFE15A : 0x7CFF8A;
+                            pen.Style(1.5, col, .7); pen.Move(x, y); pen.Line(gx, gy); pen.NoLine();
+                            pen.Style(2.5, col, 1); pen.Circle(gx, gy, 11); pen.NoLine();
+                            MapNote(r.end.place.park ? "arrive + park" : "arrive", gx + 14, gy - 6, col, 120);
+                        }
+                    }
+                }
+            }
+            // One line about the route's own settings beside its first point, and the legend in the map's corner.
+            {
+                const auto& f = r.ring ? trafficdata::Vec{ r.shape.cx, r.shape.cy, r.shape.z } : r.points.front(); double x, y;
+                if (Local(c, { f.x, f.y, f.z }, x, y) && x >= vl && x <= vr && y >= vt && y <= vb) {
+                    char b[200]; std::snprintf(b, sizeof b, "%s, %.0f m/s, %d lane%s, width %.1f m, %s", roadvisual::TravelWord(r.travel), r.speed, laneCount, laneCount == 1 ? "" : "s", footprint, r.ring ? "ring" : r.closed ? "loop" : "open");
+                    MapNote(b, x + 12, y - 46, 0xBFD9E8, 520);
+                }
+                legend.boxes = g_dock.on && g_dock.level == f7dock::Tile;
+                const auto text = roadvisual::Legend(legend);
+                if (!text.empty()) MapNote(text, vl + 14, vb - 34, 0xBFD9E8, std::max(200.0, std::min(900.0, vr - vl - 28)));
+            }
+            static ULONGLONG factsLogAt = 0; static std::string factsRoute;
+            if (factsRoute != r.name || GetTickCount64() - factsLogAt >= 5000) { factsRoute = r.name; factsLogAt = GetTickCount64();
+                logger::Write("OBS system=f7.draw event=route_facts route=%s road=%d ring=%d lanes=%d footprint_m=%.1f arrows=%d tile_tags=%d travel=%s reason=settings_visible_on_map", r.name.c_str(), road ? 1 : 0, r.ring ? 1 : 0, laneCount, footprint, arrows, tags, roadvisual::TravelWord(r.travel)); }
+        }
 		void DrawRoute(Pen& pen, const routemap::Camera& c, const trafficroute::Line& line, unsigned color, double width, double alpha)
 		{
+            if((line.plan.enabled||trafficroute::Spatial(line))&&g_ed.view.volumes){if(width<9)DrawLaneVolumes(pen,c,line,color,alpha);return;}
 			const int n = line.Count();
 			if (n < 2) return;
 			pen.Style(width, color, alpha);
-			// the middle of the two lanes
+			// The middle of the two lanes; a one-lane road has only lane 0, so its line is lane 0 itself (2026-11-11: a 1-lane road
+			// built one lane sample and this read lane[1] past the end: 0xC0000005 in DrawRoute every frame, editor off).
+			const bool pair = line.lane.size() >= 2 && int(line.lane[1].size()) >= n;
+			const auto& second = line.lane[pair ? 1 : 0];
+			{ static std::string told; if (!pair && told != line.routeName) { told = line.routeName; logger::Write("OBS system=f7.draw event=route_line route=%s lanes=%d reason=one_lane_drawn_on_lane_0", line.routeName.c_str(), int(line.lane.size())); } }
 			bool down = false;
 			const int count = line.closed ? n + 1 : n;
+			if (c.frontOnly) {
+				// Photo view: each segment is cut at the camera, so a road passing under and behind the view stays drawn.
+				auto mid = [&](int i) { const auto& a = line.lane[0][std::size_t(i % n)]; const auto& b = second[std::size_t(i % n)]; return routemap::Vec3{ (a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2 }; };
+				for (int i = 0; i + 1 < count; ++i) {
+					auto a = mid(i), b = mid(i + 1); const auto bEnd = b;
+					double ax, ay, bx, by;
+					if (!routemap::ClipSegment(c, a, b) || !Local(c, a, ax, ay) || !Local(c, b, bx, by)) { down = false; continue; }
+					if (!down) pen.Move(ax, ay);
+					pen.Line(bx, by);
+					down = b.x == bEnd.x && b.y == bEnd.y && b.z == bEnd.z;  // the next segment continues only from an uncut end
+				}
+				return;
+			}
 			for (int i = 0; i < count; ++i) {
-				const auto& a = line.lane[0][std::size_t(i % n)]; const auto& b = line.lane[1][std::size_t(i % n)];
+				const auto& a = line.lane[0][std::size_t(i % n)]; const auto& b = second[std::size_t(i % n)];
 				double x, y;
 				if (!Local(c, { (a.x + b.x) / 2, (a.y + b.y) / 2, (a.z + b.z) / 2 }, x, y)) { down = false; continue; }
 				if (down) pen.Line(x, y); else pen.Move(x, y);
@@ -4350,29 +5548,58 @@ namespace routeedit
 		{
 			const double length = trafficroute::Length(line), span = line.Span();
 			if (length < 1 || span <= 0 || vehicles <= 0 || lanes < 1) return;
-			const double run = std::fmod(g_ed.phase * speed, length) / length * span, step = 3.0 / length * span;
+            const auto available=trafficroute::Lanes(line,lanes);if(available.empty())return;
+            std::vector<double> laneLengths;
+            for(int lane:available){double total=0;const auto& points=line.lane[lane];for(int i=0;i<int(points.size())-(line.closed?0:1);++i){const auto& a=points[i];const auto& b=points[(i+1)%points.size()];total+=std::hypot(b.x-a.x,b.y-a.y,b.z-a.z);}laneLengths.push_back(total);}
 			pen.Style(1, 0x07110F, 0.9);
 			pen.Fill(color, 1);
 			for (int k = 0; k < vehicles; ++k) {
-				const int lane = k % lanes;
-				const double dir = lane ? -1.0 : 1.0;
-				const double u = std::fmod(std::fmod(span * (double(k) / vehicles) + dir * run, span) + span, span);
+				const int rank=k%int(available.size()),lane=available[rank];const double actualLength=laneLengths[rank];if(actualLength<1)continue;
+				const double dir = trafficroute::Direction(line,lane);
+                const int inLane=(vehicles+int(available.size())-1-rank)/int(available.size());
+                const double metres=std::fmod(std::fmod(actualLength*(double(k/int(available.size()))+.5)/inLane+dir*g_ed.phase*speed,actualLength)+actualLength,actualLength);
+                const double u=trafficinitial::AtMetres(line,lane,metres);if(!trafficroute::Available(line,lane,u))continue;
 				const auto p = trafficroute::At(line, lane, u);
-				const auto q = trafficroute::At(line, lane, std::fmod(u + dir * step + span, span));
-				double x, y, ax, ay;
+				const auto q = trafficroute::At(line, lane, trafficroute::LeadU(line,lane,u,3,false,false));
+	                if(g_ed.envelopePreview){
+                    const auto& shape=g_ed.previewShape;const double yaw=std::atan2(q.x-p.x,q.y-p.y),ux=std::sin(yaw),uy=std::cos(yaw),rx=uy,ry=-ux;
+                    FvoLaneGuidanceV1 corridor;corridor.halfWidth=trafficroute::SettingsAt(line,u,lane).profile.width*.5;
+                    const double start=trafficroute::LeadU(line,lane,u,shape.halfLength+5,true,false);
+                    for(int i=0;i<64;++i){const double d=i*.75;const auto at=trafficroute::At(line,lane,trafficroute::LeadU(line,lane,start,d,false,false));corridor.points[corridor.count++]={at.x,at.y,at.z};if(d>2*shape.halfLength+10)break;}
+                    std::vector<trafficdata::Vec> corners;bool fits=shape.height<=trafficroute::SettingsAt(line,u,lane).profile.height;
+                    for(const auto& corner:std::vector<std::pair<double,double>>{{shape.halfLength,shape.halfWidth},{shape.halfLength,-shape.halfWidth},{-shape.halfLength,-shape.halfWidth},{-shape.halfLength,shape.halfWidth}}){trafficdata::Vec point{p.x+ux*corner.first+rx*corner.second,p.y+uy*corner.first+ry*corner.second,p.z};corners.push_back(point);if(laneline::Project(corridor,point.x,point.y,point.z).distance>corridor.halfWidth)fits=false;}
+                    pen.Style(1.5,fits?0xF4F7FA:kClearanceRed,.9);pen.Fill(fits?color:kClearanceRed,.14);bool down=false;double firstX=0,firstY=0;for(const auto& point:corners){double px=0,py=0;if(!Local(c,{point.x,point.y,point.z},px,py)){down=false;break;}if(!down){firstX=px;firstY=py;pen.Move(px,py);down=true;}else pen.Line(px,py);}if(down)pen.Line(firstX,firstY);pen.End();pen.Style(1,0x07110F,.9);
+                }
+			double x, y, ax, ay;
 				if (!Local(c, { p.x, p.y, p.z }, x, y) || !Local(c, { q.x, q.y, q.z }, ax, ay)) continue;
 				double dx = ax - x, dy = ay - y;
 				const double l = std::hypot(dx, dy);
 				if (l < 1e-6) { dx = 1; dy = 0; } else { dx /= l; dy /= l; }
-				pen.Move(x + dx * 8, y + dy * 8);
-				pen.Line(x - dx * 5 - dy * 5, y - dy * 5 + dx * 5);
-				pen.Line(x - dx * 2.5, y - dy * 2.5);
-				pen.Line(x - dx * 5 + dy * 5, y - dy * 5 - dx * 5);
-				pen.Line(x + dx * 8, y + dy * 8);
+                auto vertex=[&](double along,double across,bool first=false){const double px=x+dx*along-dy*across,py=y+dy*along+dx*across;if(first)pen.Move(px,py);else pen.Line(px,py);};
+                pen.Fill(color,1);vertex(7,2.5,true);vertex(5,4);vertex(-6,4);vertex(-7,2.5);vertex(-7,-2.5);vertex(-6,-4);vertex(5,-4);vertex(7,-2.5);vertex(7,2.5);pen.End();
+                // Front windscreen identifies the nose without direction arrows.
+                pen.Fill(0x102D3B,1);vertex(4,2.8,true);vertex(1.5,2.8);vertex(1.5,-2.8);vertex(4,-2.8);vertex(4,2.8);pen.End();
 			}
 			pen.End();
 			pen.NoLine();
 		}
+        void DrawAccessPlan(Pen& pen,const routemap::Camera& camera,const routefiles::Spot& bayIn,const placeaccess::Plan& plan){
+            auto bay=bayIn;bay.access=plan;
+            if(!placeaccess::Valid(bay.access))return;
+            for(bool entering:{true,false}){const auto& points=entering?bay.access.entrance:bay.access.departure;if(points.empty())continue;const auto& route=entering?bay.access.entryRoute:bay.access.exitRoute;int lane=entering?bay.access.entryLane:bay.access.exitLane;trafficroute::Line line;bool ring=false;trafficdata::Vec anchor{points[entering?0:points.size()-1].x,points[entering?0:points.size()-1].y,points[entering?0:points.size()-1].z};
+                if(LineOf(route,line,ring)){if(lane<0)lane=trafficroute::PickLane(line,LanesOf(route),0);if(lane>=0)anchor=trafficroute::At(line,lane,trafficroute::Nearest(line,lane,anchor.x,anchor.y));}
+                const auto path=placeaccess::Path(bay.access,entering,entering?placeaccess::Point{anchor.x,anchor.y,anchor.z}:placeaccess::Point{bay.at.x,bay.at.y,bay.at.z},entering?placeaccess::Point{bay.at.x,bay.at.y,bay.at.z}:placeaccess::Point{anchor.x,anchor.y,anchor.z});std::vector<trafficdata::Vec> raw;for(const auto& point:path)raw.push_back({point.x,point.y,point.z});std::vector<double> radii(raw.size(),std::min(5.0,bay.access.width));if(!radii.empty())radii.front()=radii.back()=0;const auto curve=routecurve::Build(raw,radii,false);
+                std::vector<lanevolume::Station> stations;lanevolume::Profile profile;profile.width=bay.access.width;profile.height=bay.access.height;profile.elevation=-profile.height*.5;for(const auto& point:curve.points)stations.push_back({{point.x,point.y,point.z},profile});const auto mesh=lanevolume::Build(stations,false,lanevolume::Frame::Transport,2);if(!mesh)continue;
+                pen.NoLine();for(const auto& face:mesh.triangles){double x[3],y[3];bool visible=true;for(int i=0;i<3;++i)if(!Local(camera,mesh.vertices[face[i]],x[i],y[i]))visible=false;if(!visible)continue;pen.Fill(entering?0x7CFF8A:0xFFD27C,.12);pen.Move(x[0],y[0]);pen.Line(x[1],y[1]);pen.Line(x[2],y[2]);pen.Line(x[0],y[0]);pen.End();}pen.NoLine();
+            }
+        }
+        // Every landing wire, drawn one at a time; unknown stretches of auto-built wires marked red.
+        void DrawParkingAccess(Pen& pen,const routemap::Camera& camera,const routefiles::Spot& bay){
+            const auto wires=placeaccess::Merge(bay.access,bay.wires);if(wires.empty()){DrawAccessPlan(pen,camera,bay,bay.access);return;}
+            for(std::size_t n=0;n<wires.size();++n){const auto& w=wires[n];placeaccess::Plan plan=bay.access;plan.entrance.clear();plan.departure.clear();plan=placeaccess::Compose(plan,w.socket==0?&w:nullptr,w.socket==1?&w:nullptr);DrawAccessPlan(pen,camera,bay,plan);
+                const auto it=g_wireUnknownDraw.find(bay.id+"#"+std::to_string(n));if(it==g_wireUnknownDraw.end())continue;
+                for(std::size_t k=0;k<w.path.size()&&k<it->second.size();++k)if(it->second[k]){double x,y;if(Local(camera,{w.path[k].x,w.path[k].y,w.path[k].z},x,y)){pen.Style(2,kClearanceRed,1);pen.Circle(x,y,6);pen.NoLine();}}}
+        }
 		// The route's name beside its start.
 		void RouteName(uptr movie, const routemap::Camera& c, const trafficroute::Line& line, const std::string& name, unsigned color)
 		{
@@ -4442,7 +5669,7 @@ namespace routeedit
 
 		// A route point drawn as a small lit ball (2026-10-30, the user: "the points don't have 3D shapes"): sized by its distance from the
 		// camera, on a stem down to the surface under it, with a footprint on that surface and a tick every 25 m of height. The stem is
-		// amber when something covers the point (a roof or a bridge) and red when the point is inside the ground.
+		// red when a solid surface covers the point (including a roof or bridge).
 		struct Ball { unsigned light, dark; };
 		double BallRadius(const routemap::Camera& c, const routemap::Vec3& p, bool big)
 		{
@@ -4502,7 +5729,7 @@ namespace routeedit
 			if (!s) return {};
 			if (!s->known) return "  (ground unknown here)";
 			char b[48];
-			if (s->buried) std::snprintf(b, sizeof b, "  (%.0f m inside the ground)", s->below - z);
+			if (s->buried) std::snprintf(b, sizeof b, "  (%.0f m under a surface)", s->below - z);
 			else std::snprintf(b, sizeof b, s->covered ? "  (%.0f m up, under a roof)" : s->rough ? "  (about %.0f m up)" : "  (%.0f m up)", z - s->below);
 			return b;
 		}
@@ -4571,43 +5798,6 @@ namespace routeedit
 			double x = 0, y = 0;
 			if (Local(c, p, x, y)) { pen.Fill(color, alpha); pen.Circle(x, y, 3); pen.End(); }
 		}
-		// Can a panel of our own be a real SWF? (settings.ini [routeedit] swfTest=1, 2026-10-30, the user's option 1.) Two small red squares, one per path tried, loaded into the
-		// map's movie by the same Flash calls a panel would use; 3 s later the log says what arrived. Off unless asked for.
-		struct SwfTest { Value loader[2]; bool started = false, told = false; ULONGLONG at = 0; } g_swf;
-		void SwfTestTick(uptr movie)
-		{
-			static int asked = -1;
-			if (asked < 0) asked = GetPrivateProfileIntW(L"routeedit", L"swfTest", 0, fvopaths::Settings().c_str());
-			if (!asked || g_swf.told) return;
-			const char* const paths[2] = { "FVO_UITest.swf", "Interface/FVO_UITest.swf" };
-			if (!g_swf.started) {
-				g_swf.started = true; g_swf.at = GetTickCount64();
-				for (int i = 0; i < 2; ++i) {
-					Value request;
-					const Value url[] = { Str(paths[i]) };
-					if (!CreateObject(movie, &request, "flash.net.URLRequest", url, 1)) { logger::Write("Route editor: SWF test: no URLRequest"); return; }
-					if (!CreateObject(movie, &g_swf.loader[i], "flash.display.Loader", nullptr, 0)) { logger::Write("Route editor: SWF test: no Loader"); Release(request); return; }
-					SetMember(g_swf.loader[i], "x", Num(520.0 + i * 140.0)); SetMember(g_swf.loader[i], "y", Num(120.0));
-					const Value child[] = { Arg(g_swf.loader[i]) };
-					const bool added = Invoke(g_ui.layer, "addChild", child, 1);
-					const Value request1[] = { Arg(request) };
-					const bool loading = Invoke(g_swf.loader[i], "load", request1, 1);
-					logger::Write("Route editor: SWF test: %s: added %d, load called %d", paths[i], added ? 1 : 0, loading ? 1 : 0);
-					Release(request);
-				}
-				return;
-			}
-			if (GetTickCount64() - g_swf.at < 3000) return;
-			g_swf.told = true;
-			for (int i = 0; i < 2; ++i) {
-				double got = -1, total = -1;
-				Value info, content;
-				if (IsObject(g_swf.loader[i]) && GetMember(g_swf.loader[i], "contentLoaderInfo", &info) && IsObject(info)) { GetNumber(info, "bytesLoaded", got); GetNumber(info, "bytesTotal", total); }
-				const bool has = IsObject(g_swf.loader[i]) && GetMember(g_swf.loader[i], "content", &content) && IsObject(content);
-				logger::Write("Route editor: SWF test: %s: %.0f of %.0f bytes, content %s", paths[i], got, total, has ? "LOADED" : "none");
-				Release(info); Release(content);
-			}
-		}
 
 		void Hide()
 		{
@@ -4638,13 +5828,13 @@ namespace routeedit
 		{
 			g_ed.menu = 0;
 			if (!ShowGameMessage("Traffic Manager - Readme",
-				"Press F7 on the local map to open or close the Traffic Manager. Select a route on the map or in the route list.\n\n"
+				"Press F8 to open the Traffic Manager (it opens photo mode for you); press F8 again to close it and leave photo mode. Hold right mouse (controller: left stick click) to move the camera. Select a route in the view or in the route list.\n\n"
 				"Use New route to make a route, then the point and shape tools to draw its path. Select an existing route to edit it. Set its height, speed, lanes and vehicle count; use Time rules for its schedule.\n\n"
 				"Save (Ctrl+S) applies route edits; Cancel discards unsaved edits. Red structure warnings do not block routes. Use Test route to check clearance.\n\n"
-				"City controls local traffic and density. Reset traffic replaces the current traffic; finish or cancel your route edits first, and leave combat before resetting.\n\n"
+				"City controls local traffic and density. Prepare traffic applies the current setup. Finish or cancel your route edits and leave combat first.\n\n"
 				"Save your game to keep its routes, groups and traffic settings. Loading an older game save restores its setup. Other playthroughs start with installed defaults.\n\n"
 				"Autopilot near a traffic zone follows its path. Reopen this Readme whenever you need it."))
-				Status("Could not open the Readme. Close and reopen the local map, then try again.");
+				Status("Could not open the Readme. Close and reopen photo mode, then try again.");
 		}
 		int g_mapOpenFrames = 0;
 		void FirstMapMessage(bool focused)
@@ -4660,28 +5850,106 @@ namespace routeedit
 			if (value != 0.f) return;
 			value = 1.f;
 			const bool shown = ShowGameMessage("Traffic Manager",
-				"You can manage traffic routes for this planet from the local map. The routes you create decide where vehicles fly, and traffic is generated along them.\n\n"
-				"Press F7 while on the local map to open the Traffic Manager, then create or edit a route.\n\n"
+				"You can manage traffic routes for this planet from photo mode. The routes you create decide where vehicles fly, and traffic is generated along them.\n\n"
+				"Press F8 to open the Traffic Manager in photo mode, then create or edit a route. F8 again takes you back to the game.\n\n"
 				"Autopilot near a traffic zone will follow the same path.");
 			logger::Write("Route editor: first-time Traffic Manager message %s", shown ? "shown" : "could not be shown");
 		}
 
+        void MapOverview(uptr movie,const routemap::Camera& c){
+            const bool editorOn=g_ed.on;
+            char world[201]{};
+            if(!FVO_WorldName(world,sizeof world)){Hide();return;}
+            if(!g_ed.loaded||g_ed.world!=world||g_ed.profileDir!=TrafficDir()){Open();g_ed.on=editorOn;}
+            if(GetTickCount64()-g_ed.othersAt>3000)LoadOthers();
+            g_ui.items.clear();g_ui.buttons.clear();
+            Pen lines(g_ui.lines,&g_tapeLines,3,true),panel(g_ui.panel,&g_tapePanel,0,false),cover(g_ui.cover,&g_tapeCover,0,false),volumes(g_ui.volumes);  // DRAW-1
+            if(g_ui.flowOk){Pen flowClear(g_ui.flow);flowClear.Clear();}  // DRAW-1: no markers left from the photo editor
+            lines.Clear();panel.Clear();cover.Clear();volumes.Clear();
+            SetMember(g_ui.layer,"mouseEnabled",Bool(false));SetMember(g_ui.layer,"mouseChildren",Bool(false));
+            auto draw=[&](const trafficdata::Route& route,int index){
+                const auto line=EditorLine(route);const auto color=RouteColor(route,index);
+                DrawRoute(lines,c,line,color,2,.75);
+                RouteName(movie,c,line,route.label.empty()?route.name:route.label,color);
+            };
+            int index=0;
+            // Saved working routes, never an uncommitted drag preview.
+            for(const auto& route:g_ed.saved.routes)if(Usable(route))draw(ToTd(route,""),index++);
+            for(const auto& other:g_ed.others)draw(other.route,index++);
+            for(const auto& spot:g_ed.saved.landings)DrawPadMark(lines,c,{spot.at.x,spot.at.y,spot.at.z},7,spot.turn,{0x97E06A,0x2E7A3A},.85);
+            for(const auto& spot:g_ed.saved.spawns)DrawConeMark(lines,c,{spot.at.x,spot.at.y,spot.at.z},6,{0xC58BFF,0x5B349A},.85);
+            FlushText();
+        }
+
 		void WorkBody(uptr menu, uptr movie)
 		{
 			routemap::Camera c;
-			const bool open = Snapshot(c);
-			const bool focused = Focused();
-			static std::uint32_t padWas = 0;
-			const std::uint32_t pad = focused ? bindings::PadState() : 0, freshPad = pad & ~padWas;
+			bool open = g_photoHost ? CapturePhoto(c) : Snapshot(c);
+            if(g_photoHost){
+                // A single failed camera read used to hide the whole editor for that frame (2026-11-04 video: the editor and the
+                // game's photo panel took turns several times a second). While photo mode is still open, the last good camera
+                // carries the editor through gaps up to 300 ms; every miss is counted by reason and traced once a second.
+                static routemap::Camera lastGood;static ULONGLONG lastGoodAt=0,reportAt=0;
+                static unsigned misses[kMissCount]{},held=0,reads=0,rebased=0;static double driftMax=0;
+                const ULONGLONG nowMs=GetTickCount64();
+                if(open){
+                    ++reads;lastGood=c;lastGoodAt=nowMs;
+                    // Drift probe: metres between the matrix's eye and the transform's position. Near 0 when still; a gap that
+                    // grows with speed means the matrix lags the moving camera (the overlay then trails the scene).
+                    driftMax=std::max(driftMax,std::sqrt((g_photoEyeM.x-g_photoEyeT.x)*(g_photoEyeM.x-g_photoEyeT.x)+(g_photoEyeM.y-g_photoEyeT.y)*(g_photoEyeM.y-g_photoEyeT.y)+(g_photoEyeM.z-g_photoEyeT.z)*(g_photoEyeM.z-g_photoEyeT.z)));
+                    if(g_photoRebased)++rebased;
+                    static int lastMode=-1;
+                    if(lastMode!=int(g_photoRebased)){lastMode=int(g_photoRebased);
+                        logger::Write("OBS routeedit.photo event=matrix_origin mode=%s matrix_eye=%.2f,%.2f,%.2f world_eye=%.2f,%.2f,%.2f",g_photoRebased?"rebased":"world",
+                            g_photoEyeM.x,g_photoEyeM.y,g_photoEyeM.z,g_photoEyeT.x,g_photoEyeT.y,g_photoEyeT.z);}
+                }
+                else{
+                    ++misses[g_photoMiss<kMissCount?g_photoMiss:kMissFault];
+                    if(g_photoOpen.load()&&lastGoodAt&&nowMs-lastGoodAt<=300){c=lastGood;open=true;++held;}
+                }
+                if(nowMs-reportAt>=1000&&(reads||held||misses[kMissNotPhotoState]||misses[kMissNoWorldCamera]||misses[kMissNoCursor]||misses[kMissNotFinite]||misses[kMissBadView]||misses[kMissFault])){
+                    reportAt=nowMs;
+                    logger::Write("OBS routeedit.photo event=camera reads=%u rebased=%u held=%u miss_state=%u miss_world_camera=%u miss_cursor=%u miss_finite=%u miss_view=%u miss_fault=%u eye_gap_m=%.2f eye=%.1f,%.1f,%.1f fwd=%.3f,%.3f,%.3f port=%.3f,%.3f,%.3f,%.3f screen=%.0fx%.0f",
+                        reads,rebased,held,misses[kMissNotPhotoState],misses[kMissNoWorldCamera],misses[kMissNoCursor],misses[kMissNotFinite],misses[kMissBadView],misses[kMissFault],driftMax,
+                        lastGood.eye.x,lastGood.eye.y,lastGood.eye.z,(lastGood.focus.x-lastGood.eye.x)/10,(lastGood.focus.y-lastGood.eye.y)/10,(lastGood.focus.z-lastGood.eye.z)/10,
+                        lastGood.port[0],lastGood.port[1],lastGood.port[2],lastGood.port[3],lastGood.width,lastGood.height);
+                    reads=held=rebased=0;driftMax=0;for(auto& m:misses)m=0;
+                }
+            }
+            const bool appFocused=Focused();
+            const auto rawPad=appFocused?bindings::PadState():0;
+            const bool navigating=g_photoHost&&g_ed.on&&appFocused&&!g_ed.loading&&!TextEntryActive()&&!g_ed.dragging&&!g_ed.routeDrag.kind&&
+                (((GetAsyncKeyState(VK_RBUTTON)&0x8000)!=0)||(rawPad&bindlogic::kLS));
+            // Do not turn a camera button held across release of the gesture into
+            // a route click/shortcut. Native releases still pass through inputgate.
+            static bool resumePending=false;
+            if(navigating)resumePending=true;
+            else if(resumePending){
+                bool held=rawPad!=0;
+                for(int key=1;key<256&&!held;++key)
+                    if(key!=VK_F8&&(GetAsyncKeyState(key)&0x8000))held=true;
+                if(!held)resumePending=false;
+            }
+            const bool focused=appFocused&&!navigating&&!resumePending;
+			static std::uint32_t padWas = 0, padWasForToggle=0;
+			const std::uint32_t pad = focused ? rawPad : 0, freshPad = pad & ~padWas;
 			padWas = pad;
-			if (!open) { Hide(); g_ed.dragging = false; g_mapOpenFrames = 0; g_ed.orbiting = false; g_orbitOn = false; return; }
+            // Shift (any time in photo mode) or pad LB while holding the camera: 5x camera speed.
+            if(g_photoHost){
+                // Held for 200 ms after the key goes up, so one press is one boost (the 20:10 run toggled on/off within 40 ms).
+                static ULONGLONG boostSeen=0;const ULONGLONG boostNow=GetTickCount64();
+                if(appFocused&&!TextEntryActive()&&((GetAsyncKeyState(VK_SHIFT)&0x8000)!=0||(navigating&&(rawPad&bindlogic::kLB))))boostSeen=boostNow;
+                const bool held=open&&boostSeen&&boostNow-boostSeen<200;
+                PhotoSpeed(!open?1.0f:g_ed.on?(held?kEditorBoost:kEditorSpeed):(held?kPhotoBoost:1.0f));
+            }
+			if (!open) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);PhotoRange(false);} Hide(); g_ed.dragging = false; g_mapOpenFrames = 0; g_ed.orbiting = false; g_orbitOn = false; return; }
 			// The Traffic Manager comes with the Traffic Addon (2026-10-30, the user): without it no traffic would fly these routes, so no F7, no hint and no first-time
 			// message. The message's flag stays unset, so someone who adds the addon later still gets it.
-			if (!trafficpool::AddonAttached()) { Hide(); g_ed.dragging = false; return; }
+			if (!trafficpool::AddonAttached()) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);} Hide(); g_ed.dragging = false; return; }
 			const auto profile = TrafficDir();
-			if (profile.empty()) { Hide(); return; }
+			if (profile.empty()) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);} Hide(); return; }
 			if (g_ed.loaded && g_ed.profileDir != profile) { g_ed = Editor{}; g_mapOpenFrames = 0; }
-			FirstMapMessage(focused);
+			if(g_photoHost)FirstMapMessage(focused);
 			// Our values belong to one movie; they are forgotten only after it is destroyed (MovieGone), never overwritten
 			// while still linked into a live movie.
 			if (!g_ui.movie) g_ui.movie = movie;
@@ -4701,23 +5969,63 @@ namespace routeedit
 					Invoke(root, "setChildIndex", args, 2);
 				}
 			}
-			double lx = 0, ly = 0;
-			const bool haveMouse = GetNumber(g_ui.layer, "mouseX", lx) && GetNumber(g_ui.layer, "mouseY", ly);
-			if (haveMouse && !g_ed.padCursor) Calibrate(c, lx, ly);
-			if ((g_keys.Pressed(VK_F7, focused) || (freshPad & bindlogic::kRS)) && !g_ed.loading) {  // right stick click: open and close on a pad
-				if (g_ed.on) { g_ed.on = false; g_ed.dragging = false; g_ed.naming = false; logger::Write("Route editor: closed%s", g_ed.draft ? " (the open route is kept until you save or cancel)" : ""); }
-				else Open();
-			}
-			g_ui.items.clear();
-			Pen lines(g_ui.lines), panel(g_ui.panel), cover(g_ui.cover);
+			if(!g_photoHost){MapOverview(movie,c);return;}
+            // Photo mode captures the physical mouse for look. Use its raw deltas
+            // for our cursor while editing; never require the native cursor to move.
+            static double photoX=.5,photoY=.5;
+            int cursorDx=0,cursorDy=0;inputgate::TakePhotoMouse(cursorDx,cursorDy);
+            // Pointer: the original tracking from raw mouse counts (restored 2026-11-04 after following the game's cursor value
+            // pinned the pointer to the screen centre). The user's complaint was only order: the arrow showed under the editor's
+            // panels. The game's arrow is drawn in its own menu layer under photo mode, which the overlay cannot reorder, so the
+            // editor draws its pointer itself as the topmost item of its own layer (the pointer sprite is added last).
+            if(!navigating&&g_ed.on){photoX=std::clamp(photoX+cursorDx/c.width,0.0,1.0);photoY=std::clamp(photoY+cursorDy/c.height,0.0,1.0);}
+            {Pen pointer(g_ui.pointer);pointer.Clear();
+             if(g_ed.on&&!navigating&&pointer.ok){
+                const double px=photoX*g_ui.width,py=photoY*g_ui.height;
+                pointer.Style(1.5,0x07110F,.9);pointer.Fill(0xF4F7FA,1);
+                pointer.Move(px,py);pointer.Line(px,py+18);pointer.Line(px+5,py+13);pointer.Line(px+9,py+21);pointer.Line(px+12,py+19.5);pointer.Line(px+8,py+12);pointer.Line(px+14,py+12);pointer.Line(px,py);pointer.End();}
+             SetMember(g_ui.pointer,"visible",Bool(g_ed.on&&!navigating));}
+            g_ui.ax=g_ui.width;g_ui.ay=g_ui.height;g_ui.bx=g_ui.by=0;g_ui.calibrated=true;
+            double lx=photoX*g_ui.width,ly=photoY*g_ui.height;
+            c.mouseX=photoX*c.width;c.mouseY=photoY*c.height;
+            const bool haveMouse=!navigating&&!resumePending;
+            // Every photo-mode visit starts with the editor closed (the open draft is kept),
+            // so entering photo mode to take a picture never lands in the editor.
+            static unsigned photoSessionSeen=0;
+            const unsigned photoSession=g_photoSession.load();
+            const bool newPhotoVisit=photoSessionSeen!=photoSession;photoSessionSeen=photoSession;
+            // Always read F8 so the press that entered photo mode is used up here, not seen as a second press.
+            const bool f7=g_keys.Pressed(VK_F8, appFocused);  // the Traffic Manager key (F8)
+            const bool rs=((rawPad & ~padWasForToggle) & bindlogic::kRS)!=0;  // right stick click: open and close on a pad
+            auto closeEditor=[&]{ g_ed.on = false; g_ed.dragging = false; g_ed.naming = false;if(g_contextPlace)g_ed.file=g_contextPlaceBase;g_contextPlace=false;g_contextNumber=-1;g_contextDrag=0;g_contextPreview.clear();g_contextDragBase.clear(); logger::Write("Route editor: closed%s", g_ed.draft ? " (the open route is kept until you save or cancel)" : ""); };
+            if(newPhotoVisit){
+                const bool wanted=g_editorOnPhotoOpen.exchange(false);
+                if(g_ed.loading){}
+                else if(wanted){if(!g_ed.on)Open();logger::Write("OBS routeedit.photo event=entered_by_f8 editor=%d",g_ed.on?1:0);}
+                else if(g_ed.on){logger::Write("OBS routeedit.photo event=visit_closes_editor draft=%d",g_ed.draft?1:0);closeEditor();}
+            }
+            else if((f7||rs)&&!g_ed.loading){
+                if(g_ed.on){closeEditor();
+                    if(f7){g_photoExitAsk=true;logger::Write("OBS routeedit.photo event=f8_exit_requested");}}
+                else Open();
+            }
+			padWasForToggle=rawPad;
+            PhotoChrome(menu,g_ed.on);
+            PhotoRange(g_ed.on);
+            inputgate::PhotoEditor(g_ed.on&&appFocused,navigating);
+            g_ui.items.clear();
+			Pen lines(g_ui.lines, &g_tapeLines, 3, true), panel(g_ui.panel, &g_tapePanel, 0, false), cover(g_ui.cover, &g_tapeCover, 0, false);  // DRAW-1: recorded, sent only when changed
 			lines.Clear(); panel.Clear(); cover.Clear();
-			if (!g_ed.on) {
+			std::optional<Pen> flowPen; if (g_ui.flowOk) { flowPen.emplace(g_ui.flow); flowPen->Clear(); } Pen& flow = flowPen ? *flowPen : lines;  // DRAW-1
+			SetMember(g_ui.volumes,"visible",Bool(g_ed.on));
+            if (!g_ed.on) {
+                g_ui.volumeSignature.clear();
 				g_ed.orbiting = false; g_orbitOn = false;
-				Text(movie, "F7  Traffic routes", g_ui.width - 232, 24, 0xBFD9E8, 220, true);
+				Text(movie, "F8  Traffic routes", g_ui.width - 232, 24, 0xBFD9E8, 220, true);
 				FlushText();
 				return;
 			}
-			inputgate::HoldMapForEditor();  // the map's own clicks and action keys are off while the editor is open
+			/* PhotoEditor owns the input gate; native camera controls pass only during the hold gesture. */  // the map's own clicks and action keys are off while the editor is open
 			const ULONGLONG now = GetTickCount64();
 			if (g_ed.tickAt) g_ed.phase += std::min<ULONGLONG>(now - g_ed.tickAt, 100) / 1000.0;
 			g_ed.tickAt = now;
@@ -4725,50 +6033,58 @@ namespace routeedit
 
 			// ---- the traffic model restart's loading panel (no other input until it is done) ----
 			if (g_ed.loading) {
-				inputgate::HoldMapAll();
+				/* Photo editor already owns native input. */
 				const auto st = trafficpool::RushStatus();
 				// Positions filled while the world runs: keep the panel (and the running world) until the placed vehicles near
 				// the player are released to their autopilots, at most 8 s, then the map pauses again.
-				const bool settling = !st.active && now - g_ed.loadingAt > 800 && secretunpause::Active() &&
+				const bool sharedWindow=spawnrule::IsPreparation(st.phase);
+				const bool settling = !sharedWindow && !st.active && now - g_ed.loadingAt > 800 && secretunpause::Active() &&
 					(g_ed.filledAt ? now - g_ed.filledAt < 8000 && vehiclediag::StagedLoaded() > 0 : (g_ed.filledAt = now, true));
-				if (st.active && now - g_ed.loadingAt > 50000) {
-					// The paused map gave the restart no frames: it is still asked for and runs as soon as the map closes.
+				if (st.phase==int(spawnrule::Preparation::TimedOut) || (!sharedWindow&&st.active&&now-g_ed.loadingAt>50000)) {
 					g_ed.loading = false;
 					secretunpause::End("panel time limit");
-					Status("Traffic is still filling toward your rules; remaining positions continue when ready and out of sight");
+					Status("Traffic preparation reached its time limit. Remaining positions stay in your target.");
 				}
-				else if (!st.active && now - g_ed.loadingAt > 800 && !settling) {
+				else if (st.phase==int(spawnrule::Preparation::CoverLost)) {
+                    g_ed.loading=false;
+                    secretunpause::End("preparation cover unavailable");
+                    Status("Traffic preparation lost its cover. Remaining positions stay in your target.");
+                }
+                else if (!st.active && (sharedWindow || now - g_ed.loadingAt > 800) && !settling) {
 					g_ed.loading = false;
 					const bool ran = secretunpause::Active();
 					secretunpause::End("traffic armed");
 					if (st.total == 0) {
-						Status("No traffic spots are known in this world yet: add landing spots, close the map once (traffic reads them), then press Reset traffic again");
+						Status("No traffic spots are known in this world yet: add landing spots, close the map once, then press Prepare traffic again");
 						goto loaded;
 					}
 					char b[260];
-					std::snprintf(b, sizeof b, "Traffic reset: every vehicle cleared, %d of %d route positions filled from new%s. %s",
+					std::snprintf(b, sizeof b, "Traffic prepared: %d of %d positions currently hold pairs%s. %s",
 						st.placed, st.total, st.skipped ? (", " + std::to_string(st.skipped) + " blocked: check route positions or creation failures").c_str() : "",
 						ran ? "Pilots start as models become ready." : "Pilots start when the world runs and models are ready.");
 					Status(b);
 				loaded:;
 				}
 				else {
-					const double w = 560, h = 150, x = (g_ui.width - w) / 2, y = (g_ui.height - h) / 2;
-					panel.NoLine(); panel.Fill(0x0B1620, 0.92); panel.Rect(x, y, w, h); panel.End();
-					panel.Style(2, 0x4FE3FF, 1); panel.Move(x, y); panel.Line(x + w, y); panel.Line(x + w, y + h); panel.Line(x, y + h); panel.Line(x, y); panel.NoLine();
+					// One rounded card: title, progress, counts, then one note (the cause when lanes are too narrow).
+					const std::string note = NarrowLaneNote();
+					const double w = 600, h = 176, x = (g_ui.width - w) / 2, y = (g_ui.height - h) / 2;
+					panel.NoLine(); panel.Fill(0x1B222B, 0.94); panel.RoundRect(x, y, w, h, 20); panel.End();
+					panel.Style(1, 0x4FE3FF, 0.55); panel.RoundRect(x, y, w, h, 20); panel.NoLine();
 					const int dots = int(g_ed.phase * 3) % 4;
-					Text(movie, std::string("RESETTING TRAFFIC") + std::string(std::size_t(dots), '.'), x + 24, y + 22, 0xFFFFFF, w - 48);
+					Text(movie, std::string("Preparing traffic") + std::string(std::size_t(dots), '.'), x + 28, y + 22, 0xFFFFFF, w - 56);
 					char b[160];
-					// Start/Swap cold start: every scheduled route position gets its vehicle under this panel (2026-10-29).
-					if (g_ed.filledAt) std::snprintf(b, sizeof b, "Traffic taking off: %d vehicle(s) waiting for their pilots", vehiclediag::StagedLoaded());
-					else std::snprintf(b, sizeof b, "Clearing every vehicle and placing new ones: %d of %d positions", st.placed, st.total);
-					Text(movie, b, x + 24, y + 54, 0xD8E4EC, w - 48);
-					std::snprintf(b, sizeof b, "Placed now %d, deferred %d", st.made, st.skipped);
-					Text(movie, b, x + 24, y + 76, 0x9AA4AE, w - 48);
+					if(st.phase==int(spawnrule::Preparation::Settling))std::snprintf(b,sizeof b,"Waiting for nearby pilots");
+                    else if (g_ed.filledAt) std::snprintf(b, sizeof b, "Taking off: %d vehicle(s) waiting for pilots", vehiclediag::StagedLoaded());
+					else std::snprintf(b, sizeof b, "%d of %d positions filled", st.placed, st.total);
+					Text(movie, b, x + 28, y + 56, 0xD8E4EC, w - 56);
 					const double f = st.total > 0 ? std::clamp(double(st.placed) / st.total, 0.0, 1.0) : 0.0;
-					panel.Fill(0x22384A, 1); panel.Rect(x + 24, y + 104, w - 48, 14); panel.End();
-					panel.Fill(0x4FE3FF, 1); panel.Rect(x + 24, y + 104, (w - 48) * f, 14); panel.End();
-					Text(movie, "Blocked positions remain part of your target; check the result count", x + 24, y + 124, 0x9AA4AE, w - 48);
+					panel.Fill(0x2A3644, 1); panel.RoundRect(x + 28, y + 84, w - 56, 10, 10); panel.End();
+					if (f > 0) { panel.Fill(0x4FE3FF, 1); panel.RoundRect(x + 28, y + 84, std::max(10.0, (w - 56) * f), 10, 10); panel.End(); }
+					std::snprintf(b, sizeof b, "Placed now %d   Waiting %d", st.made, st.skipped);
+					Text(movie, b, x + 28, y + 106, 0x9AA4AE, w - 56);
+					Text(movie, note.empty() ? std::string("Positions not filled yet stay in your target.") : note, x + 28, y + 136, note.empty() ? 0x9AA4AEu : 0xF2B04Eu, w - 56);
+					if (!note.empty()) { static std::string told; if (told != note) { told = note; logger::Write("OBS system=traffic.reset event=blocked reason=lane_too_narrow note=\"%s\"", note.c_str()); } }
 					FlushText();
 					return;
 				}
@@ -4798,15 +6114,17 @@ namespace routeedit
 			const bool shift = focused && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
 			const bool mouseDown = focused && ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (pad & bindlogic::kA));
 			// The Alt key hub: WASD belongs to the editor while Alt is down, so the map stays still.
-			const bool altHeld = focused && !g_ed.naming && (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-			const bool hubTurn = altHeld && shift;
-			if (altHeld) inputgate::HoldMapAll();
+			const bool altHeld = focused && !TextEntryActive() && (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+			const bool hubTurn = !g_photoHost && altHeld && shift;
+			// Alt editing already owns native input.
 			static bool wasDown = false;
 			const bool click = mouseDown && !wasDown, release = !mouseDown && wasDown;
 			wasDown = mouseDown;
 			if (click) CommitName();
+            const bool numericThisFrame=g_contextNumber>=0||DockTyping();ContextNumberInput(focused);
+            DockSync();DockKeys(focused,ctrl);  // the F7 dock: follow other changes, typed values, Esc up a level, Home / End
 			if (g_ed.naming) {
-				inputgate::HoldMapAll();  // Esc cancels the name instead of leaving the map
+				/* Photo editor already owns native input. */  // Esc cancels the name instead of leaving the map
 				for (int vk = 'A'; vk <= 'Z'; ++vk) if (g_keys.Pressed(vk, focused) && g_ed.nameBuf.size() < 32) g_ed.nameBuf.push_back(char(shift ? vk : vk - 'A' + 'a'));
 				for (int vk = '0'; vk <= '9'; ++vk) if (g_keys.Pressed(vk, focused) && g_ed.nameBuf.size() < 32) g_ed.nameBuf.push_back(char(vk));
 				if (g_keys.Pressed(VK_SPACE, focused) && g_ed.nameBuf.size() < 32) g_ed.nameBuf.push_back(' ');
@@ -4821,16 +6139,16 @@ namespace routeedit
 				bool wheelNear = false;
 				trafficdata::Route wheelScratch;
 				const auto* wheelRoute = Shown(wheelScratch);
-				if (!g_ed.naming && wheelRoute && !wheelRoute->ring && g_ed.point >= 0 && g_ed.point < int(wheelRoute->points.size()) && haveMouse) {
+				if (!TextEntryActive() && wheelRoute && !wheelRoute->ring && g_ed.point >= 0 && g_ed.point < int(wheelRoute->points.size()) && haveMouse) {
 					const auto& q = wheelRoute->points[std::size_t(g_ed.point)];
 					double px = 0, py = 0;
 					wheelNear = g_ed.dragging || (Local(c, { q.x, q.y, q.z }, px, py) && std::hypot(px - lx, py - ly) < 70);
 				}
 				// The Route tool (stage 2): near the route's centre or its handle the wheel raises or lowers the whole route; elsewhere it zooms the map.
-				const bool routeWheel = !g_ed.naming && g_ed.mode == Mode::Route && wheelRoute && haveMouse && !OverUi(lx, ly) && !g_ed.routeDrag.kind && NearRouteHandle(c, *wheelRoute, lx, ly);
+				const bool routeWheel = !TextEntryActive() && g_ed.mode == Mode::Route && wheelRoute && haveMouse && !OverUi(lx, ly) && !g_ed.routeDrag.kind && NearRouteHandle(c, *wheelRoute, lx, ly);
 				// Near the selected landing area the wheel turns it; near the selected zone it sizes it.
 				bool placeWheel = false, placeHeight = g_ed.placeKind != 0;
-				if (!g_ed.naming && haveMouse && !OverUi(lx, ly)) {
+				if (!TextEntryActive() && haveMouse && !OverUi(lx, ly)) {
 					double sx = 0, sy = 0;
 					if (g_ed.mode == Mode::Drag && g_ed.spot >= 0) {  // the Move tool: the wheel sets the height of what is selected, as for a point
 						const auto& list = g_ed.spotKind == 1 ? g_ed.file.landings : g_ed.file.spawns;
@@ -4840,7 +6158,7 @@ namespace routeedit
 					else if (AreaOn() && g_ed.mode == Mode::Landing) { const auto& a = g_ed.file.landings[std::size_t(g_ed.spot)].at; placeWheel = Local(c, { a.x, a.y, a.z }, sx, sy) && std::hypot(sx - lx, sy - ly) < 90; }
 					else if (ZoneOn() && g_ed.mode == Mode::Zone) { const auto& z = g_ed.file.zones[std::size_t(g_ed.zone)]; placeWheel = Local(c, { z.at.x, z.at.y, z.slow ? z.at.z : z.top }, sx, sy) && std::hypot(sx - lx, sy - ly) < 90; }
 				}
-				inputgate::WheelForEditor(wheelNear || routeWheel || placeWheel || placeHeight);
+				inputgate::WheelForEditor(focused && (wheelNear || routeWheel || placeWheel || placeHeight));
 				if (const int notches = inputgate::TakeWheel(); notches && (wheelNear || routeWheel || placeWheel || placeHeight)) {
 					const double dz = notches * (shift ? 25.0 : 5.0);
 					if (g_ed.placeKind) { g_ed.placeAt.z += dz; g_ed.placeMoved = true; SetPlace(g_ed.placeAt); }
@@ -4853,7 +6171,7 @@ namespace routeedit
 				}
 				// The rest of the pad: B steps back, X tests, Y is View, LB / RB go through the routes, Start saves, View undoes; LT / RT turn a landing area,
 				// size a zone or change a junction's share.
-				if (freshPad && !g_ed.naming) {
+				if (freshPad && !TextEntryActive()) {
 					if (freshPad & bindlogic::kB) {
 						if (g_ed.menu) g_ed.menu = 0;
 						else if (g_ed.sheet) g_ed.sheet = 0;
@@ -4874,15 +6192,15 @@ namespace routeedit
 						else if (g_ed.link >= 0) ChangeShare(up ? 0.05 : -0.05);
 					}
 				}
-				if ((freshPad & (bindlogic::kDUp | bindlogic::kDDown)) && !g_ed.naming && (AreaOn() || ZoneOn())) ChangeZ((freshPad & bindlogic::kDUp) ? kHeightLevel : -kHeightLevel);
-				else if (freshPad && !g_ed.naming && wheelRoute && g_ed.mode == Mode::Route) {
+				if ((freshPad & (bindlogic::kDUp | bindlogic::kDDown)) && !TextEntryActive() && (AreaOn() || ZoneOn())) ChangeZ((freshPad & bindlogic::kDUp) ? kHeightLevel : -kHeightLevel);
+				else if (freshPad && !TextEntryActive() && wheelRoute && g_ed.mode == Mode::Route) {
 					// The Route tool on a controller: D-pad up / down a 25 m level, left / right a 15 degree turn.
 					if (freshPad & bindlogic::kDUp) RaiseRoute(kHeightLevel);
 					if (freshPad & bindlogic::kDDown) RaiseRoute(-kHeightLevel);
 					if (freshPad & bindlogic::kDLeft) TurnRoute(-15);
 					if (freshPad & bindlogic::kDRight) TurnRoute(15);
 				}
-				else if (freshPad && !g_ed.naming && wheelRoute) {
+				else if (freshPad && !TextEntryActive() && wheelRoute) {
 					const int n = int(wheelRoute->points.size());
 					if ((freshPad & bindlogic::kDLeft) && n) { g_ed.point = g_ed.point <= 0 ? n - 1 : g_ed.point - 1; g_ed.spot = -1; }
 					if ((freshPad & bindlogic::kDRight) && n) { g_ed.point = (g_ed.point + 1) % n; g_ed.spot = -1; }
@@ -4895,7 +6213,7 @@ namespace routeedit
 			// Turning the map (see ApplyOrbit): right-drag on the map, left-right turns it, up-down tilts it.
 			{
 				static bool rightWas = false;
-				const bool right = focused && haveMouse && !g_ed.naming && ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 || hubTurn);
+				const bool right = !g_photoHost && focused && haveMouse && !TextEntryActive() && ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 || hubTurn);
 				if (right && !rightWas && (hubTurn || !OverUi(lx, ly))) {
 					static bool told = false;
 					g_ed.orbiting = true; g_ed.orbitX = lx; g_ed.orbitY = ly; g_ed.orbitYaw0 = g_mapYaw.load(); g_ed.orbitPitch0 = g_mapPitch.load();
@@ -4919,19 +6237,36 @@ namespace routeedit
 				}
 				g_orbitOn = g_ed.orbiting;
 			}
-			if (click && haveMouse) {
+			// Arrange: drag an area by its body, Reset on its chip; the Arrange button itself still works.
+			bool arrangeTook = false;
+			if (g_f7Arrange && haveMouse) {
+				const Button* over = ButtonAt(lx, ly);
+				if (click && !(over && over->id == kF7Arrange)) for (int a = 0; a < 4; ++a) { const auto r = g_f7AreaRect[std::size_t(a)]; if (r.w <= 0 || !r.Contains(lx, ly)) continue;
+					arrangeTook = true;
+					if (lx > r.x + r.w - 70 && ly < r.y + 24) { g_f7Offset[std::size_t(a)] = {}; SaveF7Layout(); logger::Write("OBS system=f7.arrange event=reset area=%d", a); }
+					else { g_f7ArrangeDrag = a; g_f7GrabX = lx; g_f7GrabY = ly; g_f7GrabFrom = g_f7Offset[std::size_t(a)]; }
+					break; }
+				if (g_f7ArrangeDrag >= 0 && mouseDown) { auto& o = g_f7Offset[std::size_t(g_f7ArrangeDrag)]; o.dx = g_f7GrabFrom.dx + (lx - g_f7GrabX); o.dy = g_f7GrabFrom.dy + (ly - g_f7GrabY); arrangeTook = true; }
+				if (g_f7ArrangeDrag >= 0 && (release || !mouseDown)) { logger::Write("OBS system=f7.arrange event=moved area=%d dx=%.0f dy=%.0f", g_f7ArrangeDrag, g_f7Offset[std::size_t(g_f7ArrangeDrag)].dx, g_f7Offset[std::size_t(g_f7ArrangeDrag)].dy); g_f7ArrangeDrag = -1; SaveF7Layout(); }
+			}
+			if (!arrangeTook && g_f7NodeView && haveMouse && !(click && ButtonAt(lx, ly)) && NodeViewMouse(c, lx, ly, click, mouseDown, release, ctrl)) arrangeTook = true;
+			if (!arrangeTook && click && haveMouse && g_contextNumber<0) {
 				const Button* hitButton = ButtonAt(lx, ly);
 				if (!hitButton) g_ed.menu = 0;  // a click outside an open menu closes it and still does what it clicked
+				if (!hitButton && g_dock.on && DockClick(c, lx, ly, ctrl, shift)) {}  // the dock's selection rules and its cube
+				else
 				if (const Button* b = hitButton) {
 					const int id = b->id;
 					const bool enabled = b->enabled;
 					const int style = b->style;
 					const std::string label = b->text;
-					if (enabled) Press(id, c);
+					if(enabled&&!ContextStartDrag(id,c,lx,ly)) Press(id, c);
 					else if (style != 3) Status("'" + label + "' is not available now");
 					// Menus close after a choice; View's ticks stay open so several can be changed.
-					if (id != kMoreMenu && id != kViewMenu && id != kShapeTool && !(id >= kViewBase && id < kViewBase + 6)) g_ed.menu = 0;  // Reset map angle closes it
+					if (id != 9016 && id != 9017 && id != kMoreMenu && id != kViewMenu && id != kShapeTool && !(id >= kViewBase && id < kViewBase + 6)) g_ed.menu = 0;  // Reset map angle closes it
 				}
+                else if(!OverUi(lx,ly)&&g_ed.mode==Mode::Drag&&!g_ed.lanePicks.empty()&&ContextStartDrag(kContextMove,c,lx,ly)) {}
+                else if(!OverUi(lx,ly)&&g_ed.mode==Mode::Select&&PointAt(c,lx,ly,12)<0&&PickLaneVolume(c,lx,ly,ctrl)) {}
 				else if (ctrl && !altHeld && !OverUi(lx, ly) && PickClick(c, lx, ly)) {}
 				else if (!OverUi(lx, ly) && StartPlaceDrag(c, lx, ly)) {}
 				else if (g_ed.mode == Mode::Route && !OverUi(lx, ly) && Many()) {
@@ -4961,7 +6296,8 @@ namespace routeedit
 					else ClickMap(c, lx, ly);
 				}
 			}
-			if (g_ed.dragging && g_ed.draft) {
+			ContextDragTick(c,lx,ly,mouseDown,release);DockMouseTick(lx,ly,mouseDown,release);
+            if (g_ed.dragging && g_ed.draft) {
 				routemap::Vec3 at;
 				// Alt held while moving a point: straight up and down with the mouse (2026-10-30, 3D placement); let go of Alt to move it across again.
 				const bool alt = focused && g_ed.point >= 0 && (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
@@ -5084,7 +6420,7 @@ namespace routeedit
 					}
 				}
 			}
-			if (!g_ed.naming) {
+			if (!TextEntryActive()&&!numericThisFrame) {
 				// Ctrl first, so Ctrl+Y (redo) is not also taken as Y (View).
 				const bool keyZ = g_keys.Pressed('Z', focused), keyY = g_keys.Pressed('Y', focused), keyS = g_keys.Pressed('S', focused);
 				if (ctrl && !altHeld && keyZ && UndoAny()) Status("Undone");
@@ -5094,22 +6430,47 @@ namespace routeedit
 				if (!ctrl && !altHeld && keyZ) Press(kZoneTool, c);
 				(void)keyS;
 			}
-			if (!g_ed.naming) for (const auto& k : kShortcuts)
+			if (!TextEntryActive()&&!numericThisFrame) for (const auto& k : kShortcuts)
 				if (g_keys.Pressed(k.vk, focused) && !ctrl && !altHeld) {
 					const Button* b = nullptr;
 					for (const auto& o : g_ui.buttons) if (o.id == k.id) b = &o;
 					if (b && !b->enabled) Status(std::string("'") + b->text + "' is not available now");
 					else Press(k.id, c);
 				}
-			if (!g_ed.naming) {
+			if (!TextEntryActive()&&!numericThisFrame) {
 			if (g_keys.Pressed(VK_INSERT, focused)) DropPoint(c);
-			if (g_keys.Pressed(VK_DELETE, focused)) {
+			if (g_f7NodeView && g_keys.Pressed(VK_RETURN, focused) && g_nodePicks.size() >= 2) MakeRouteFromPicks();  // Node view: Enter makes the picked route
+			if (g_f7NodeView && g_keys.Pressed(VK_ESCAPE, focused) && !g_nodePicks.empty()) { g_nodePicks.clear(); Status("Picks cleared."); }
+			if (g_keys.Pressed(VK_DELETE, focused) && !(g_f7NodeView && NodeViewDelete())) {
 				// Del removes the selected point, spot or junction; with only a route selected it deletes the route (asked first, as the button).
 				const bool part = g_ed.point >= 0 || g_ed.spot >= 0 || ZoneOn() || (g_ed.link >= 0 && g_ed.link < int(g_ed.file.links.size()));
 				if (!part && (g_ed.draft || g_ed.route >= 0 || g_ed.other >= 0)) DeleteRoute(); else DeleteSelected();
 			}
-			if (g_keys.Pressed(VK_PRIOR, focused) || g_keys.Pressed(VK_OEM_6, focused)) ChangeZ(shift ? 25 : 5);
-			if (g_keys.Pressed(VK_NEXT, focused) || g_keys.Pressed(VK_OEM_4, focused)) ChangeZ(shift ? -25 : -5);
+			if (g_keys.Pressed(VK_PRIOR, focused) || (!ctrl && g_keys.Pressed(VK_OEM_6, focused))) ChangeZ(shift ? 25 : 5);
+			if (g_keys.Pressed(VK_NEXT, focused) || (!ctrl && g_keys.Pressed(VK_OEM_4, focused))) ChangeZ(shift ? -25 : -5);
+			// Three-layer F7 keys (spec section 3). Number keys only choose a shape (1-5) or a join shape (1-3).
+			if (!altHeld) {
+				for (int k = 1; k <= 5; ++k) if (!ctrl && (g_keys.Pressed('0' + k, focused) || g_keys.Pressed(VK_NUMPAD0 + k, focused))) {
+					if (g_f7LinkPrompt >= 0) { if (k <= 3) ContextAction(kF7LinkBase + k, c); else Status("Join shape: 1 rounded bend, 2 sharp join, 3 taper."); }
+					else ContextAction(kF7PrimBase + k, c);
+				}
+				if (ctrl) {
+					trafficdata::Route keyScratch; const auto* kr = Shown(keyScratch);
+					if (kr && !kr->ring && kr->points.size() > 1) {
+						const auto t = roadplan::DividerAt(kr->road, std::size_t(std::max(0, g_roadDivider)), F7Tile(*kr));
+						const double step = shift ? 5 : 1;
+						if (g_keys.Pressed('J', focused) || g_keys.Pressed('L', focused)) { ContextField(12, t.swing * 100 + (g_keys.Pressed('L', focused) ? 5 : -5) * step); logger::Write("OBS system=f7.key action=swing divider=%d", g_roadDivider + 1); }
+						if (g_keys.Pressed('I', focused) || g_keys.Pressed('K', focused)) { ContextField(13, std::clamp(t.tilt + (g_keys.Pressed('I', focused) ? 2.5 : -2.5) * step, -75.0, 75.0)); logger::Write("OBS system=f7.key action=tilt divider=%d", g_roadDivider + 1); }
+						if (g_keys.Pressed(VK_OEM_4, focused) || g_keys.Pressed(VK_OEM_6, focused)) { const double w = kr->road.width > 0 ? kr->road.width : kr->corridor * std::clamp(kr->lanes, 1, 2);
+							ContextField(15, std::clamp(w + (g_keys.Pressed(VK_OEM_6, focused) ? .5 : -.5) * step, 1.0, 400.0)); logger::Write("OBS system=f7.key action=width"); }
+					}
+				}
+				if (g_keys.Pressed(VK_ESCAPE, focused) && !ctrl) {
+					if (g_context.popup != editorcontext::Popup::None || g_ed.sheet) ContextAction(kContextBack, c);
+					else if (g_f7LinkPrompt >= 0) { g_f7LinkPrompt = -1; Status("Join shape unchanged."); }
+					else if (g_ed.point >= 0) { g_ed.point = -1; Status("Unpinned: editing the point nearest the view centre."); logger::Write("OBS system=f7.select mode=nearest reason=esc_unpin"); }
+				}
+			}
 			{
 				trafficdata::Route scratch;
 				const auto* r = Shown(scratch);
@@ -5125,29 +6486,36 @@ namespace routeedit
 			const trafficdata::Route* shown = Shown(scratch);
 			int minute = 0;
 			const bool timeKnown = LocalMinute(minute);
-			const int mine = int(g_ed.file.routes.size());
+			// Static volumes are retained across frames; flow vehicles and handles stay dynamic.
+            std::ostringstream volumeKey;volumeKey<<std::setprecision(17)<<g_ui.ax<<' '<<g_ui.ay<<' '<<g_ui.bx<<' '<<g_ui.by<<' '<<g_ed.view.volumes<<' '<<g_ed.view.others<<' '<<g_ed.route<<' '<<g_ed.other<<' '<<minute;
+            volumeKey.write(reinterpret_cast<const char*>(c.m),sizeof(c.m));volumeKey.write(reinterpret_cast<const char*>(c.port),sizeof(c.port));volumeKey.write(reinterpret_cast<const char*>(c.stage),sizeof(c.stage));volumeKey<<c.eye.x<<' '<<c.eye.y<<' '<<c.eye.z;
+            for(const auto& route:g_ed.file.routes)volumeKey<<routecache::Key(ToTd(route,""))<<' '<<route.color<<' '<<route.removed;for(const auto& other:g_ed.others)volumeKey<<routecache::Key(other.route)<<' '<<other.route.color;
+            if(shown)volumeKey<<routecache::Key(*shown);if(g_ed.routeDrag.kind)volumeKey<<routecache::Key(g_ed.routeDrag.preview);if(g_ed.dragging)volumeKey<<g_ed.point<<' '<<g_ed.dragAt.x<<' '<<g_ed.dragAt.y<<' '<<g_ed.dragAt.z;for(const auto& pick:PicksNow())volumeKey<<pick.kind<<pick.id<<pick.index;for(const auto& pick:g_ed.lanePicks)volumeKey<<pick.route<<' '<<pick.section<<' '<<pick.lane<<' '<<pick.identity;
+            for(const auto& [name,preview]:g_contextPreview)volumeKey<<routecache::Key(preview);
+            const auto volumeSignature=volumeKey.str();g_ui.volumeDirty=volumeSignature!=g_ui.volumeSignature;if(g_ui.volumeDirty){Pen retained(g_ui.volumes);retained.Clear();g_ui.volumeSignature=volumeSignature;}
+            const int mine = int(g_ed.file.routes.size());
 			for (std::size_t k = 0; k < g_ed.others.size(); ++k) {
 				const bool sel = !g_ed.draft && int(k) == g_ed.other;
 				if (!sel && !g_ed.view.others) continue;
 				const auto& o = g_ed.others[k];
 				const unsigned color = RouteColor(o.route, mine + int(k));
 				DrawRoute(lines, c, o.line, color, sel ? 3 : 2, sel ? 0.95 : 0.6);
-				const auto d = routeschedule::Evaluate(o.route.schedule, timeKnown, minute);
-				if (g_ed.view.flow) DrawFlow(lines, c, o.line, std::clamp(o.route.lanes, 1, 2), o.route.speed, color, d.active ? d.vehicles : 0);
+				const auto d = routeschedule::Evaluate(o.route.schedule, timeKnown, minute, trafficdata::DemandLength(o.route));
+				if (g_ed.view.flow) DrawFlow(flow, c, o.line, std::clamp(o.route.lanes, 1, 2), o.route.speed, color, d.active ? d.vehicles : 0);
 				if (g_ed.view.names) RouteName(movie, c, o.line, o.route.label.empty() ? o.name : o.route.label, color);
 			}
 			for (std::size_t k = 0; k < g_ed.file.routes.size(); ++k) {
 				if (g_ed.draft && int(k) == g_ed.draftIndex) continue;
 				if (!Usable(g_ed.file.routes[k])) continue;
 				const auto t = ToTd(g_ed.file.routes[k], "");
-				const auto line = trafficroute::Build(t);
-				const auto d = routeschedule::Evaluate(t.schedule, timeKnown, minute);
+				const auto line = EditorLine(t);
+				const auto d = routeschedule::Evaluate(t.schedule, timeKnown, minute, trafficdata::DemandLength(t));
 				const bool sel = (!g_ed.draft && int(k) == g_ed.route) || IsPicked(kPickRoute, t.name);
 				if (!sel && !g_ed.view.others) continue;
 				const unsigned color = RouteColor(t, int(k));
 				DrawRoute(lines, c, line, color, sel ? 3 : 2, d.active ? 0.9 : 0.45);
 				// A branch fed by junctions has no vehicles of its own: a couple of markers still show which way it runs.
-				if (g_ed.view.flow) DrawFlow(lines, c, line, std::clamp(t.lanes, 1, 2), t.speed, color, d.active ? d.vehicles : FlowShare(t.name) < 1.0 ? 2 : 0);
+				if (g_ed.view.flow) DrawFlow(flow, c, line, std::clamp(t.lanes, 1, 2), t.speed, color, d.active ? d.vehicles : FlowShare(t.name) < 1.0 ? 2 : 0);
 				if (g_ed.view.names) RouteName(movie, c, line, t.label.empty() ? t.name : t.label, color);
 			}
 			if (shown) {
@@ -5155,7 +6523,7 @@ namespace routeedit
 				if (g_ed.routeDrag.kind && g_ed.draft) r = g_ed.routeDrag.preview;  // the Route tool's drag, before it is kept
 				if (g_ed.dragging && g_ed.point >= 0 && g_ed.point < int(r.points.size())) r.points[std::size_t(g_ed.point)] = { g_ed.dragAt.x, g_ed.dragAt.y, g_ed.dragAt.z };
 				if (g_ed.dragging && g_ed.point == -2) { r.shape.cx = g_ed.dragAt.x; r.shape.cy = g_ed.dragAt.y; }
-				const auto line = trafficroute::Build(r);
+				const auto line = EditorLine(r);
 				if (r.ring) {  // the ring's centre handle (Drag moves it, Drop sets it)
 					double hx, hy;
 					if (Local(c, { r.shape.cx, r.shape.cy, r.shape.z }, hx, hy)) {
@@ -5167,14 +6535,26 @@ namespace routeedit
 						Text(movie, b, hx + 12, hy - 10, 0xFFE15A, 320, true);
 					}
 				}
-				const auto d = routeschedule::Evaluate(r.schedule, timeKnown, minute);
+				const auto d = routeschedule::Evaluate(r.schedule, timeKnown, minute, trafficdata::DemandLength(r));
 				const unsigned color = RouteColor(r, ShownIndex());
-				DrawRoute(lines, c, line, color, 10, 0.22);
+				if(r.spacePlan.enabled&&g_ed.sheet>=19&&g_ed.sheet<=20&&!r.points.empty()){const auto i=std::min(std::size_t(std::max(0,g_ed.point)),r.points.size()-1);auto lane=std::find_if(r.spacePlan.lanes.begin(),r.spacePlan.lanes.end(),[&](const auto& p){return p.lane==g_ed.laneFocus;});if(i<r.spacePlan.handles.size()){const auto& h=lane==r.spacePlan.lanes.end()?r.spacePlan.handles[i]:lane->anchors[i].handle;const splinekit::Vec a=lane==r.spacePlan.lanes.end()?splinekit::Vec{r.points[i].x,r.points[i].y,r.points[i].z}:lane->anchors[i].point;double ax,ay;if(Local(c,a,ax,ay)){DrawBall(lines,ax,ay,5,{kTeal,0x246F64},1);for(int side=0;side<2;++side){const auto target=splinekit::Add(a,side?h.outgoing:h.incoming);double x,y;if(Local(c,target,x,y)){lines.Style(1,side?0xFFAB66:0x72C6FF,.85);lines.Move(ax,ay);lines.Line(x,y);DrawBall(lines,x,y,g_ed.kitTarget==side+1?7:5,{side?0xFFAB66u:0x72C6FFu,0x465A70},1);}}}}}
+                // 2026-11-19 (user: changing Width / Divider / edges shows nothing): the shown route's road is its footprint, so it no longer
+                // waits for the "Lane volumes" view switch (a hidden switch left every road edit invisible). The switch still controls the
+                // lane volumes and the other routes.
+                if (!g_ed.view.volumes && !r.ring && r.road.enabled) { static bool told = false; if (!told) { told = true; logger::Write("OBS system=f7.draw event=road_drawn_without_volumes reason=lane_volumes_view_off_road_footprint_still_shown_20261119"); } }
+                if (!r.ring && r.road.enabled) {
+                    DrawRoadTiles(lines, c, r, r.road.height);
+                    // Lane overlap warnings from the road fit (cached; see RoadFit).
+                    for (const auto& o : RoadFit(r).overlaps) { double px = 0, py = 0; if (Local(c, { o.x, o.y, o.z + 1.0 }, px, py)) { lines.Style(2, kClearanceRed, 1); lines.Circle(px, py, 8); lines.NoLine(); } }
+                }
+                DrawRouteFacts(lines, movie, c, r, line);  // footprint of routes without road tiles, lane arrows and numbers, tags, line end, legend (over the road faces)
+                DrawRoute(lines, c, line, color, 10, 0.22);
+				DockCheckTick(&r); DockDrawMap(lines, movie, c, r);  // the dock's tile warnings (one tile a frame) and its selected tiles and points
+				ItemsTick(&r); ItemsDraw(lines, movie, c, r);  // RI-1 / HV-4: the field's items (a slice a frame), the real cars' tracks since Test, the picked item alone
 				if (g_ed.draft) {
 					DrawRoute(lines, c, line, color, 3, 0.95);
-					int planned = d.active ? d.vehicles : r.schedule.allDay ? r.schedule.allDayVehicles : 0;
-					for (const auto& w : r.schedule.windows) planned = std::max(planned, w.vehicles);
-					if (g_ed.view.flow) DrawFlow(lines, c, line, std::clamp(r.lanes, 1, 2), r.speed, color, planned);
+					const int planned = routeschedule::PeakVehicles(r.schedule, trafficdata::DemandLength(r));
+					if (g_ed.view.flow) DrawFlow(flow, c, line, std::clamp(r.lanes, 1, 2), r.speed, color, planned);
 					if (g_ed.view.names) RouteName(movie, c, line, r.label.empty() ? r.name : r.label, color);
 				}
 				for (std::size_t i = 0; i < r.points.size(); ++i) {
@@ -5185,13 +6565,18 @@ namespace routeedit
 					const routemap::Vec3 p{ r.points[i].x, r.points[i].y, r.points[i].z };
 					const double radius = BallRadius(c, p, sel);
 					const Surface* under = g_ed.view.stems ? DrawStem(lines, c, p, x, yy, radius, sel, !r.ring) : nullptr;
-					DrawBall(lines, x, yy, radius, sel ? Ball{ 0xFFE15A, 0xB08A1C } : i == 0 ? Ball{ 0x7CFF8A, 0x2E9E48 } : Ball{ 0xF4F7FA, 0x7D8896 }, 1.0);
+					const auto mapped = navmap::At(p.x, p.y, p.z);
+					if (!under && !r.ring) under = &SurfaceUnder(p.x, p.y, p.z);
+					const bool warning = mapped.blocked || mapped.objBlocked || (under && (under->covered || under->buried));
+					DrawBall(lines, x, yy, radius, warning ? Ball{ kClearanceRed, 0xA82020 } : sel ? Ball{ 0xFFE15A, 0xB08A1C } : i == 0 ? Ball{ 0x7CFF8A, 0x2E9E48 } : Ball{ 0xF4F7FA, 0x7D8896 }, 1.0);
 					const bool over = haveMouse && std::hypot(lx - x, ly - yy) < radius + 6;  // a whole route of numbers would hide the map: the selected one and the one under the cursor
 					if (!sel && !over && !g_ed.view.numbers) continue;
-					char b[64];
+					char b[128];
 					if (sel || over) std::snprintf(b, sizeof b, "%zu  Z %.0f m%s", i + 1, p.z, UpWords(under, p.z).c_str());
 					else std::snprintf(b, sizeof b, "%zu", i + 1);
-					Text(movie, b, x + radius + 4, yy - 10, sel ? 0xFFE15A : 0xFFFFFF, sel || over ? 300 : 40, true);
+					const bool rounded = i < r.rounding.size() && r.rounding[i] > 0 && (r.closed || (i > 0 && i + 1 < r.points.size()));
+					if (rounded) { const std::size_t used = std::strlen(b); std::snprintf(b + used, sizeof b - used, "  R %.0f m", r.rounding[i]); }  // 2026-11-19: the corner radius beside its point
+					Text(movie, b, x + radius + 4, yy - 10, warning ? kClearanceRed : sel ? 0xFFE15A : 0xFFFFFF, sel || over ? 300 : rounded ? 90 : 40, true);
 				}
 			}
 			// Add: a faint copy of the next point under the cursor, joined to where it would go, with its stem (2026-10-30, 3D placement).
@@ -5217,16 +6602,22 @@ namespace routeedit
 					}
 				}
 				routemap::Vec3 at; double gx = 0, gy = 0;
-				if (routemap::MouseAt(c, z, at) && Local(c, at, gx, gy)) {
+				// PL-1: the preview sits where the click will put it: on the surface under the cursor (main task's answer), else the plane.
+				bool placed = false;
+				if (!split) { AskCursor(c); routemap::Vec3 hp; if (CursorAnswer(hp)) { at = { hp.x, hp.y, hp.z + kGroundLift }; placed = true; } }
+				if ((placed || routemap::MouseAt(c, z, at)) && Local(c, at, gx, gy)) {
 					const unsigned color = RouteColor(r, ShownIndex());
 					auto join = [&](const trafficdata::Vec& q) { double qx, qy; if (Local(c, { q.x, q.y, q.z }, qx, qy)) { lines.Style(2, color, 0.5); lines.Move(qx, qy); lines.Line(gx, gy); } };
 					if (after > 0) join(r.points[after - 1]); else if (r.closed && n) join(r.points[n - 1]);
 					if (after < n && (split || g_ed.point >= 0)) join(r.points[after]); else if (r.closed && n >= 2) join(r.points[0]);
 					const double rad = BallRadius(c, at, false);
 					const Surface* under = g_ed.view.stems ? DrawStem(lines, c, at, gx, gy, rad, false, true) : nullptr;
-					DrawBall(lines, gx, gy, rad, Ball{ 0xF4F7FA, 0x7D8896 }, 0.45);
+					if (!under) under = &SurfaceUnder(at.x, at.y, at.z);
+					const auto mapped = navmap::At(at.x, at.y, at.z);
+					const bool warning = mapped.blocked || mapped.objBlocked || under->covered || under->buried;
+					DrawBall(lines, gx, gy, rad, warning ? Ball{ kClearanceRed, 0xA82020 } : Ball{ 0xF4F7FA, 0x7D8896 }, warning ? 0.85 : 0.45);
 					char b[80]; std::snprintf(b, sizeof b, split ? "insert  Z %.0f m%s" : "new  Z %.0f m%s", at.z, UpWords(under, at.z).c_str());
-					Text(movie, b, gx + rad + 4, gy - 10, 0xBFD9E8, 300, true);
+					Text(movie, b, gx + rad + 4, gy - 10, warning ? kClearanceRed : 0xBFD9E8, 300, true);
 				}
 			}
 			// The Route tool: the route's centre and its turn handle (drag the handle to turn, anywhere else to move).
@@ -5360,6 +6751,12 @@ namespace routeedit
 					Text(movie, b, lx + 14, ly - 10, kTeal, 160, true);
 				}
 			}
+            if(g_ed.sheet==18){
+                if(g_ed.itineraryPreview.size()>1){lines.Style(3,kTeal,.9);bool down=false;for(const auto& point:g_ed.itineraryPreview){double x=0,y=0;if(Local(c,{point.x,point.y,point.z},x,y)){if(down)lines.Line(x,y);else lines.Move(x,y);down=true;}else down=false;}lines.NoLine();}
+                if(g_ed.showLivePaths){static std::vector<FvoTrafficPathInspectV1> paths;static ULONGLONG at=0;const auto now=GetTickCount64();if(now-at>=250){at=now;paths.clear();const auto addon=GetModuleHandleW(L"FVO_Traffic.dll");const auto query=addon?reinterpret_cast<FvoTrafficPathQueryV1>(GetProcAddress(addon,"FVO_Traffic_PathInspectV1")):nullptr;if(query)for(int i=0;i<256;++i){FvoTrafficPathInspectV1 path;if(!query(i,&path))break;paths.push_back(path);}}
+                    for(const auto& path:paths){if(now<path.at||now-path.at>3000)continue;lines.Style(2,path.kind==2?kClearanceRed:path.kind==1?0xFFD27C:0xF4F7FA,.75);bool down=false;for(int i=0;i<path.count;++i){double x=0,y=0;if(Local(c,{path.points[i].x,path.points[i].y,path.points[i].z},x,y)){if(down)lines.Line(x,y);else lines.Move(x,y);down=true;}else down=false;}}lines.NoLine();}
+            }
+            if(g_ed.view.volumes&&AreaOn())DrawParkingAccess(lines,c,g_ed.file.landings[std::size_t(g_ed.spot)]);
 			// A faint copy of what the next click places, at the height it would get: Land, Spawn, Zone and a shape's centre.
 			{
 				const bool newLand = g_ed.mode == Mode::Landing && !AreaOn(), newSpawn = g_ed.mode == Mode::Spawn;
@@ -5381,7 +6778,7 @@ namespace routeedit
 				}
 			}
 			// The pad cursor.
-			if (g_ed.padCursor) {
+			if (!navigating && (g_ed.padCursor || haveMouse)) {
 				lines.Style(2, 0x0B1620, 1); lines.Fill(0xFFFFFF, 1);
 				lines.Move(lx, ly); lines.Line(lx + 13, ly + 5); lines.Line(lx + 5, ly + 7); lines.Line(lx + 3, ly + 14); lines.Line(lx, ly);
 				lines.End(); lines.NoLine();
@@ -5397,8 +6794,11 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
                     if(LineOf(junction.from,from,fromRing)&&LineOf(junction.to,to,toRing)){
                         const double u=fromRing?junction.at/360.0*trafficroute::kRingSamples:from.ToLine(junction.at);
                         const double v=junction.toEnd?to.Span():to.ToLine(junction.toAt);
-                        const int lane=trafficlinks::EntryLane(to,2,v);
-                        const auto curve=trafficlinks::TurnPath(from,0,u,to,std::max(0,lane),v,junction.radius);
+                        const int lane=junction.toLane>=0?junction.toLane:trafficlinks::EntryLane(to,LanesOf(junction.to),v);
+                        const int sourceLane=junction.fromLane>=0?junction.fromLane:trafficroute::PickLane(from,LanesOf(junction.from),0);
+                        const auto curve=trafficlinks::TurnPath(from,std::max(0,sourceLane),u,to,std::max(0,lane),v,junction.radius);
+                        if(g_ed.view.volumes&&!curve.empty()){const auto a=trafficroute::SettingsAt(from,u,std::max(0,sourceLane)),b=trafficroute::SettingsAt(to,v,std::max(0,lane));std::vector<lanevolume::Station> stations;for(std::size_t index=0;index<curve.size();++index){const double t=curve.size()>1?double(index)/(curve.size()-1):0;auto profile=a.profile;profile.width=a.profile.width+(b.profile.width-a.profile.width)*t;profile.height=a.profile.height+(b.profile.height-a.profile.height)*t;profile.offset=0;profile.elevation=-profile.height*.5;profile.radius=std::min(profile.radius,std::min(profile.width,profile.height)*.5);const auto p=curve[index];stations.push_back({{p.x,p.y,p.z},profile});}const auto mesh=lanevolume::Build(stations,false,lanevolume::Frame::Transport,2);if(mesh){lines.NoLine();for(const auto& face:mesh.triangles){double x[3],y[3];bool visible=true;for(int j=0;j<3;++j)if(!Local(c,mesh.vertices[face[j]],x[j],y[j]))visible=false;if(!visible)continue;lines.Fill(0xFF8AD8,sel?.22:.10);lines.Move(x[0],y[0]);lines.Line(x[1],y[1]);lines.Line(x[2],y[2]);lines.Line(x[0],y[0]);lines.End();}}}
+
                         lines.Style(sel?3:2,0xFF8AD8,0.9);bool down=false;
                         for(const auto& point:curve){double cx=0,cy=0;if(Local(c,{point.x,point.y,point.z},cx,cy)){if(down)lines.Line(cx,cy);else lines.Move(cx,cy);down=true;}else down=false;}
                     }
@@ -5429,18 +6829,82 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 			cover.NoLine(); cover.Fill(0x000000, 0.01); cover.Rect(0, 0, g_ui.width, g_ui.height); cover.End();
 
 			// ---- toolbar, menus and panel (stage 2) ----
-			SwfTestTick(movie);
-			Layout(shown, timeKnown, minute);
+			g_f7Clock = GetTickCount64() * .001; LoadF7Layout();
+			{
+				int nearest = -1; double best = 1e300;
+				if (shown) for (int i = 0; i < int(shown->points.size()); ++i) { double x = 0, y = 0; const auto& p = shown->points[std::size_t(i)];
+					if (Local(c, { p.x, p.y, p.z }, x, y)) { const double d = std::hypot(x - g_ui.width * .5, y - g_ui.height * .5); if (d < best) { best = d; nearest = i; } } }
+				g_f7Nearest = nearest;
+				static std::string lastSelection;
+				const std::string selection = std::string(g_ed.point >= 0 ? "pinned" : "nearest") + "/" + std::to_string(g_ed.point >= 0 ? g_ed.point : nearest) + "/" + (shown ? shown->name : std::string());
+				if (selection != lastSelection) {
+					if (lastSelection.rfind(g_ed.point >= 0 ? "nearest" : "pinned", 0) == 0) g_f7Divider = false;
+					lastSelection = selection; g_f7Highlight = -1;
+					logger::Write("OBS system=f7.select mode=%s kind=%s point=%d route=%s", g_ed.point >= 0 ? "pinned" : "nearest", g_ed.link >= 0 ? "link" : g_ed.spot >= 0 ? "place" : g_ed.zone >= 0 ? "zone" : "point",
+						(g_ed.point >= 0 ? g_ed.point : nearest) + 1, shown ? shown->name.c_str() : "");
+				}
+			}
+			if (g_dock.on) { Layout(shown, timeKnown, minute); DockLayout(shown, c); }  // the F7 dock (2026-11-06) replaces the side panel and context layers
+			else { Layout(shown, timeKnown, minute);ContextLayout(shown,c);BasicFilter(); }
+			constexpr unsigned kFrost = 0x3A424D;  // (the old frost tint; the panels are sheen glass now)
+			constexpr unsigned kGlassTint = 0x121E26, kGlassAmber = 0xF2C46B;  // look A: a clear dark tint; Save is amber glass
+			// Multi-colour on states (2026-11-20): the same colours the map uses for travel (Drive green, Hover blue, Both violet), Allow amber,
+			// delete red; every other selected control stays teal. The colour follows the choice's own name, so no id table can drift.
+			auto isGlassOn = [&](unsigned f) { return f == kTeal || f == kGlassAmber || f == kCoral || f == roadvisual::kDriveTint || f == roadvisual::kHoverTint || f == roadvisual::kBothTint; };
+			auto lighten = [](unsigned c) { const unsigned r = ((c >> 16) & 255) + (255 - ((c >> 16) & 255)) * 55 / 100, g = ((c >> 8) & 255) + (255 - ((c >> 8) & 255)) * 55 / 100, b = (c & 255) + (255 - (c & 255)) * 55 / 100; return (r << 16) | (g << 8) | b; };
+			auto glassOf = [&](const std::string& word) -> unsigned {
+				if (word == "Drive") return roadvisual::kDriveTint; if (word == "Hover") return roadvisual::kHoverTint; if (word == "Both") return roadvisual::kBothTint;
+				if (word == "Allow") return kGlassAmber; return kTeal; };
 			auto frame = [&](double x, double y, double w, double h, unsigned fill, double alpha, unsigned edge, double edgeAlpha) {
+				// UI_RULES 3: containers 12 px with a bevel, controls 5 px flat, list rows and hairlines square.
+				const bool container = w >= 200 && h >= 46, row = (w >= 200 && h < 46) || h <= 6 || w <= 6;
+				const double radius = container ? std::min({ 12.0, w * .5, h * .5 }) : row ? 0.0 : std::min({ 5.0, w * .5, h * .5 });
+				const bool surface = container && (fill == 0x141C29 || fill == 0x0B1119 || fill == kRowA || fill == kRowB);
+				if (surface) {
+					panel.NoLine(); panel.Fill(kGlassTint, std::min(alpha, .62)); panel.RoundRect(x, y, w, h, 2 * radius); panel.End();
+					if (w > 6 && h > 6) {
+						auto cx = [&](double v) { return std::clamp(v, x + radius, x + w - radius); };
+						const double bw = std::min(w * .16, 130.0), lean = std::min(h * .5, 70.0), x0 = x + w * .05;
+						panel.NoLine(); panel.Fill(0xFFFFFF, .06);  // the diagonal glare band
+						panel.Move(cx(x0), y + h - 1); panel.Line(cx(x0 + bw), y + h - 1); panel.Line(cx(x0 + bw + lean), y + 1); panel.Line(cx(x0 + lean), y + 1); panel.End();
+						panel.NoLine();
+						panel.Style(2, kTeal, .05); panel.RoundRect(x + 2, y + 2, w - 4, h - 4, 2 * std::max(0.0, radius - 2));  // faint teal inner glow
+						panel.Style(1, 0xFFFFFF, .24); panel.RoundRect(x + .5, y + .5, w - 1, h - 1, 2 * radius);  // the rim
+						panel.Style(1, 0xFFFFFF, .50); panel.Move(x + radius, y + 1.5); panel.Line(x + w - radius, y + 1.5);  // the bright top edge
+						panel.Style(1, 0xFFFFFF, .10); panel.Move(x + radius, y + h - 1.5); panel.Line(x + w - radius, y + h - 1.5);
+					}
+					if (edgeAlpha > 0) { panel.Style(1, edge, edgeAlpha * .35); panel.RoundRect(x, y, w, h, 2 * radius); }
+					panel.NoLine();
+					return;
+				}
+				// Controls are glass too: a faint white tint and a lit top edge when idle, tinted teal glass when on (look A, 2026-11-20).
+				const bool control = !container && !row && w >= 24 && h >= 18;
+				const bool glassIdle = control && (fill == kRowA || fill == 0x1A2331 || fill == 0x141C29);
+				const bool glassOn = control && isGlassOn(fill) && alpha >= .99;
+				if (glassIdle || glassOn) {
+					const unsigned tint = glassOn ? fill : 0xFFFFFF;
+					panel.NoLine(); panel.Fill(tint, glassOn ? .58 : .09); panel.RoundRect(x, y, w, h, 2 * radius); panel.End();
+					const bool typing = edge == kTeal && edgeAlpha > 0;  // a value being typed keeps its teal ring
+					if (typing) panel.Style(1, kTeal, edgeAlpha);
+					else if (glassOn) panel.Style(1, lighten(fill), .85);
+					else panel.Style(1, 0xFFFFFF, edgeAlpha > 0 ? .20 : .10);
+					panel.RoundRect(x, y, w, h, 2 * radius);
+					panel.Style(1, 0xFFFFFF, glassOn ? .55 : .28); panel.Move(x + radius + 1, y + 1.5); panel.Line(x + w - radius - 1, y + 1.5);
+					panel.NoLine();
+					return;
+				}
 				if (edgeAlpha > 0) panel.Style(1, edge, edgeAlpha); else panel.NoLine();
-				panel.Fill(fill, alpha); panel.Rect(x, y, w, h); panel.End();
+				panel.Fill(fill, alpha); panel.RoundRect(x, y, w, h, 2 * radius); panel.End();
 				panel.NoLine();
 			};
 			const double px = PanelX();
+			if (g_f7NodeView) DrawNodeView(panel, c, movie);  // Node view: the network over the dimmed map, under the UI
 			frame(g_ui.barX, g_ui.barY, g_ui.barW, g_ui.barH, 0x141C29, 0.95, 0x3A4658, 1);
-			frame(px, 12, kPanelW, g_ui.panelBottom - 12, 0x141C29, 0.94, 0x3A4658, 1);
-			frame(px, 12, kPanelW, 62, 0x0B1119, 0.8, 0, 0);
+			if(g_contextPanel)frame(px, 12, kPanelW, g_ui.panelBottom - 12, 0x141C29, 0.94, 0x3A4658, 1);
+			if(g_contextPanel)frame(px, 12, kPanelW, 62, 0x0B1119, 0.8, 0, 0);
 			for (const auto& bx : g_ui.boxes) frame(bx.x, bx.y, bx.w, bx.h, bx.fill, bx.alpha, bx.line, bx.lineAlpha);
+            for(const auto& polygon:g_ui.polygons)if(polygon.points.size()>2){panel.Style(1,polygon.color,.9);panel.Fill(polygon.color,polygon.alpha);panel.Move(polygon.points.front().first,polygon.points.front().second);for(const auto& p:polygon.points)panel.Line(p.first,p.second);panel.Line(polygon.points.front().first,polygon.points.front().second);panel.End();panel.NoLine();}
+
 			if (g_ed.menu) frame(g_ui.menuX, g_ui.menuY, g_ui.menuW, g_ui.menuH, 0x141C29, 0.97, 0x3A4658, 1);
 			for (const auto& b : g_ui.buttons) {
 				const unsigned textColor = !b.enabled ? 0x5C6876u : b.active && (b.style == 0 || b.style == 1 || b.style == 5) ? 0x07211Fu : kText;
@@ -5480,20 +6944,33 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 					break;
 				}
 				case 5:  // one of a row's choices
-					frame(b.x, b.y, b.w, b.h, b.active ? kTeal : 0x141C29, b.active ? 1 : 0.6, 0x3A4658, b.active ? 0 : 1);
+					frame(b.x, b.y, b.w, b.h, b.active ? glassOf(b.text) : 0x141C29, b.active ? 1 : 0.6, 0x3A4658, b.active ? 0 : 1);
 					Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + 3, !b.enabled ? 0x5C6876u : b.active ? 0x07211Fu : kDim, b.w);
 					break;
 				case 7:  // delete: red outline; red when it is asking for the second click
 					frame(b.x, b.y, b.w, b.h, b.active ? kCoral : 0x141C29, b.active ? 1 : 0.6, kCoral, b.active ? 0 : 1);
 					Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2, b.active ? 0x260A05u : kCoral, b.w);
 					break;
+				case 8: {  // a dock card: its name, its summary under it
+					frame(b.x, b.y, b.w, b.h, !b.enabled ? 0x1A2331 : kRowA, 1, b.active ? kTeal : 0x3A4658, 1);
+					double tx = b.x + 12;
+					if (b.swatch) { frame(tx, b.y + 15, 18, 3, b.swatch, 1, 0, 0); tx += 26; }
+					Text(movie, b.text, tx, b.y + 9, b.enabled ? kText : 0x5C6876u, b.w - (tx - b.x) - 30);
+					if (!b.value.empty()) Text(movie, b.value, b.x + 12, b.y + 31, kDim, b.w - 42);
+					break;
+				}
+				case 9:  // a dock value: click it and type (Enter keeps it, Esc cancels); teal while typing
+					frame(b.x, b.y, b.w, b.h, b.active ? 0x141C29 : 0x1A2331, 1, b.active ? kTeal : 0x3A4658, b.active ? 1 : .6);
+					Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2, !b.enabled ? 0x5C6876u : b.active ? kTeal : kText, b.w);
+					break;
 				case 6:  // the problems badge
 					frame(b.x, b.y, b.w, b.h, kAmber, b.active ? 0.75 : 1, 0, 0);
 					Text(movie, b.text, b.x + 8, b.y + 3, 0x2A1A02, b.w - 16);
 					break;
 				default: {  // a panel button; its key at the right when there is room
-					frame(b.x, b.y, b.w, b.h, !b.enabled ? 0x1A2331 : b.active ? kTeal : kRowA, 1, 0x3A4658, b.active ? 0 : 1);
+					frame(b.x, b.y, b.w, b.h, !b.enabled ? 0x1A2331 : b.id == kSave && b.active ? kGlassAmber : b.active ? glassOf(b.text) : kRowA, 1, 0x3A4658, b.active ? 0 : 1);
 					const double kw = TextWidth(b.key);
+					if (b.nav == 2 && b.enabled) { Text(movie, b.text, b.x + 30 + 14, b.y + (b.h - 16) / 2, textColor, b.w - 30 - 20); break; }  // split button: the arrow square, a divider, then the name
 					if (!b.key.empty() && tw + kw + 16 <= b.w) {
 						Text(movie, b.text, b.x + 8, b.y + (b.h - 16) / 2, textColor, b.w - kw - 12);
 						Text(movie, b.key, b.x + b.w - kw - 6, b.y + (b.h - 16) / 2, b.active ? 0x1D4F4A : kDim, kw + 4);
@@ -5501,6 +6978,15 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 					else Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2, textColor, b.w);
 					break;
 				}
+				}
+				// The dock's doors (user, 2026-11-06): anything that moves you to another menu has a teal frame and a solid teal tab with an
+				// arrow, > going down (right edge), < going up (left edge), so it never reads as an ordinary control.
+				if (b.nav && b.enabled) {
+					frame(b.x, b.y, b.w, b.h, kTeal, .10, kTeal, .75);
+					const double tab = std::min(30.0, b.w * .4), tx = b.nav == 2 ? b.x : b.x + b.w - tab, dividerX = b.nav == 2 ? tx + tab : tx;
+					panel.NoLine(); panel.Fill(kTeal, .20); panel.Move(tx + 1, b.y + 1); panel.Line(tx + tab - 1, b.y + 1); panel.Line(tx + tab - 1, b.y + b.h - 1); panel.Line(tx + 1, b.y + b.h - 1); panel.End();
+					panel.Style(1, 0xFFFFFF, .26); panel.Move(dividerX, b.y + 4); panel.Line(dividerX, b.y + b.h - 4); panel.NoLine();
+					Text(movie, b.nav == 2 ? "<" : ">", tx + (tab - TextWidth(">")) / 2, b.y + (b.h - 16) / 2, kTeal, tab);
 				}
 			}
 			for (const auto& t : g_panelText) Text(movie, t.text, t.x, t.y, t.color, t.w, false, t.unit);
@@ -5510,15 +6996,26 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 				std::vector<std::pair<std::string, unsigned>> msg;
 				if (g_ed.naming) { msg.push_back({ "Name: " + g_ed.nameBuf + "_", 0xFFE15A }); msg.push_back({ "Enter keeps it, Esc cancels", kDim }); }
 				if (!g_ed.status.empty() && now - g_ed.statusAt < 12000)
-					for (const auto& l : strokefont::Wrap(g_ed.status, strokefont::Fit(540, kUnit))) msg.push_back({ l, kText });
+					for (const auto& l : strokefont::Wrap(g_ed.status, strokefont::Fit(380, kUnit))) msg.push_back({ l, kText });
 				if (!g_ui.calibrated) msg.push_back({ "Move the mouse across the map once to line the overlay up", kAmber });
 				if (msg.size() > 4) msg.resize(4);
 				if (!msg.empty()) {
-					const double mx = g_ui.barX, my = g_ui.barY + g_ui.barH + 6, mw = std::min(560.0, std::max(200.0, (g_ed.menu ? g_ui.menuX - 8 : px - 16) - mx));
-					frame(mx, my, mw, 10 + kLine * double(msg.size()), 0x141C29, 0.94, 0x3A4658, 1);
+					const double mh = 14 + kLine * double(msg.size()), mw = std::clamp((g_f7AreaRect[1].w > 0 ? g_f7AreaRect[1].x - 20 : 520.0) - 12 - g_f7Offset[3].dx, 220.0, 520.0);
+					double mx = std::clamp(12 + g_f7Offset[3].dx, 12.0, std::max(12.0, g_ui.width - mw - 12)), my = std::clamp(g_ui.height - 12 - mh + g_f7Offset[3].dy, 12.0, std::max(12.0, g_ui.height - mh - 12));
+					if (g_dock.on && g_dock.rect.w > 0) { mx = g_dock.rect.x; my = std::max(12.0, g_dock.rect.y - 8 - mh); }  // the dock: messages sit on top of it
+					g_f7AreaRect[3] = { mx, my, mw, mh };
+					frame(mx, my, mw, mh, 0x141C29, 0.94, 0x3A4658, 1);
 					double yy = my + 4;
 					for (const auto& [t, col] : msg) { Text(movie, t, mx + 10, yy, col, mw - 20); yy += kLine; }
 				}
+			}
+			if (g_f7Arrange) {
+				const char* names[]{ "Toolbar", "Dock", "Side panel", "Messages" };
+				for (int a = 0; a < 4; ++a) { const auto r = g_f7AreaRect[std::size_t(a)]; if (r.w <= 0) continue;
+					for (double x = r.x; x < r.x + r.w; x += 14) { frame(x, r.y - 3, 7, 2, kAmber, 1, 0, 0); frame(x, r.y + r.h + 1, 7, 2, kAmber, 1, 0, 0); }
+					for (double y = r.y; y < r.y + r.h; y += 14) { frame(r.x - 3, y, 2, 7, kAmber, 1, 0, 0); frame(r.x + r.w + 1, y, 2, 7, kAmber, 1, 0, 0); }
+					Text(movie, std::string(names[a]) + ": drag to move", r.x + 8, r.y + 2, kAmber, std::max(60.0, r.w - 90));
+					frame(r.x + r.w - 66, r.y + 2, 60, 20, 0x141C29, .95, kAmber, 1); Text(movie, "Reset", r.x + r.w - 58, r.y + 3, kAmber, 52); }
 			}
 			// Key hints (as the mockup has them): one row of boxed keys for the tool in use, left of the map's own buttons
 			// (Database, Missions, Return, Fast travel, Back), which start at about x 1050 of 1920.
@@ -5535,11 +7032,16 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 				case Mode::Shape: hints = { { "Click", g_ed.shapeAt ? "Set its size" : "Place its centre" }, { "R-drag", "Turn map" } }; break;
 				default: hints = { { "Click", "Select" }, { "Ctrl+click", "Add to selection" }, { "Del", "Delete" }, { "R-drag", "Turn map" } }; break;
 				}
-				if (altHeld) hints = shift ? std::vector<std::pair<const char*, const char*>>{ { "W S", "Tilt map" }, { "A D", "Turn map" }, { "Mouse", "Both" } }
-					: std::vector<std::pair<const char*, const char*>>{ { "WASD", "Move" }, { "Q E", "Down, up" }, { "Z C", "Turn" }, { "Ctrl", "Fine" }, { "Shift", "Map" } };
+				if (g_dock.on && (g_ed.mode == Mode::Select || g_ed.mode == Mode::Drag))  // the dock's selection rules (user, 2026-11-06)
+					hints = { { "Click", "Point / tile" }, { "Dbl-click", "All of them" }, { "Ctrl+click", "Add / remove" }, { "Esc", "Up a level" } };
+				if (altHeld) hints = !g_photoHost && shift ? std::vector<std::pair<const char*, const char*>>{ { "W S", "Tilt map" }, { "A D", "Turn map" }, { "Mouse", "Both" } }
+					: std::vector<std::pair<const char*, const char*>>{ { "WASD", "Move" }, { "Q E", "Down, up" }, { "Z C", "Turn" }, { "Ctrl", "Fine" }, { "Shift", "Fast" } };
 				else hints.push_back({ "Alt", "Move keys" });
-				double hx = g_ui.barX;
-				const double hy = g_ui.height - 76, limit = g_ui.width * 1040.0 / 1920.0;
+				hints.insert(hints.begin(), {"Hold RMB / L3", "Camera"});
+                for(auto& hint:hints)if(std::strcmp(hint.second,"Turn map")==0)hint={"Ctrl+RMB / LMB","Camera up / down"};
+                hints.insert(hints.begin()+1, {"Shift / LB", "150x speed"});
+                double hx = g_ui.barX;
+				const double hy = g_ui.barY + g_ui.barH + 8, limit = std::min(PanelX() - 12, g_ui.barX + 900.0);
 				for (const auto& [key, what] : hints) {
 					const double kw = TextWidth(key) + 12, ww = TextWidth(what);
 					if (hx + kw + 7 + ww > limit) break;
@@ -5567,10 +7069,58 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 	}
 
+	bool PhotoOpen(){return g_photoOpen.load();}
+
+    void PhotoKeyTick()
+    {
+        const ULONGLONG now=GetTickCount64();
+        static bool was=false;
+        const bool focused=Focused();
+        const bool down=focused&&(GetAsyncKeyState(VK_F8)&0x8000)!=0;
+        const bool pressed=down&&!was;was=down;
+        const uptr ui=*reinterpret_cast<const uptr*>(game::Base()+addr::kUIPtr);
+        if(g_photoExitAsk.exchange(false)){
+            if(g_photoOpen.load()&&ui){
+                // As the game closes photo mode itself (FUN_1419f6be0 / FUN_1417913a0): ShowMenu(ui, "PhotoModeMenu", 2).
+                __try{reinterpret_cast<void(*)(uptr,void*,int)>(game::Base()+addr::kShowMenu)(ui,reinterpret_cast<void*(*)()>(game::Base()+kRvaPhotoName)(),2);
+                    logger::Write("OBS routeedit.photo event=exit_sent");}
+                __except(EXCEPTION_EXECUTE_HANDLER){logger::Write("OBS routeedit.photo event=exit_failed reason=exception");}
+            } else logger::Write("OBS routeedit.photo event=exit_skipped reason=%s",ui?"photo_not_open":"no_ui");
+        }
+        if(g_editorOnPhotoOpen.load()&&!g_photoOpen.load()&&now-g_photoAskAt.load()>3000){
+            g_editorOnPhotoOpen=false;
+            logger::Write("OBS routeedit.photo event=enter_not_opened reason=game_refused_or_slow (the game shows its own reason)");
+        }
+        if(!pressed)return;
+        const char* why=nullptr;
+        if(g_photoOpen.load())why="already_in_photo";       // WorkBody owns F8 there
+        else if(!g_photoOriginal)why="photo_hook_missing";
+        else if(!trafficpool::AddonAttached())why="no_traffic_addon";
+        else if(MapOpen(1000))why="map_open";
+        else if(!inputgate::GameplayAllowed())why="menu_or_not_focused";
+        else if(!ui)why="no_ui";
+        if(why){if(std::strcmp(why,"already_in_photo"))logger::Write("OBS routeedit.photo event=f8_enter_skipped reason=%s",why);return;}
+        g_editorOnPhotoOpen=true;g_photoAskAt=now;
+        __try{reinterpret_cast<void(*)(std::uint8_t)>(game::Base()+kRvaPhotoTryOpen)(0);
+            logger::Write("OBS routeedit.photo event=f8_enter_requested");}
+        __except(EXCEPTION_EXECUTE_HANDLER){g_editorOnPhotoOpen=false;logger::Write("OBS routeedit.photo event=f7_enter_failed reason=exception");}
+    }
+
 	bool MapOpen(unsigned withinMs) { const ULONGLONG at = g_snapAt.load(); return at && GetTickCount64() - at < withinMs; }
 
+	void ItemsMainTick() { ItemsMainTickImpl(); }  // THREAD-1 (routeitems.inl)
 	void GroundTick()
 	{
+		{   // PL-1: the cursor's line, cast on the main frame task.
+			float a[3], b[3]; bool ask = false;
+			{ std::lock_guard lk(g_cursorLock); if (g_cursor.pending) { ask = true; g_cursor.pending = false; for (int k = 0; k < 3; ++k) { a[k] = g_cursor.from[k]; b[k] = g_cursor.to[k]; } } }
+			if (ask) {
+				prefetch::RayHit h; const bool cast = vehicle_probe::CastNow(a, b, 0x22806, h) == 1;
+				const bool hit = cast && h.hit && std::isfinite(h.x) && std::isfinite(h.y) && std::isfinite(h.z);
+				std::lock_guard lk(g_cursorLock);
+				if (cast) { g_cursor.hit = hit; if (hit) { g_cursor.x = h.x; g_cursor.y = h.y; g_cursor.z = h.z; } g_cursor.answeredAt = GetTickCount64(); }
+			}
+		}
 		std::lock_guard lk(g_groundLock);
 		if (g_groundAsks.empty()) return;
 		const ULONGLONG now = GetTickCount64();
@@ -5607,36 +7157,105 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 		}
 	}
 
-	void Advance(std::uintptr_t movie)
+    void RestorePhotoSafe(uptr menu){
+        inputgate::PhotoEditor(false,false);PhotoBoost(false);PhotoRange(false);
+        __try {PhotoChrome(menu,false);Hide();}
+        __except(EXCEPTION_EXECUTE_HANDLER){}
+    }
+    // Where the last overlay fault happened (2026-11-04 21:49: an access violation while moving a pinned point with the
+    // Alt hub, repeated on every F8 because the hub state survived). Filled by the SEH filter, which runs before the
+    // stack unwinds, so the captured frames include the faulting ones.
+    struct OverlayFault {DWORD code=0;uptr address=0,data=0;USHORT frames=0;void* stack[32]{};};
+    OverlayFault g_fault;
+    int CatchOverlayFault(EXCEPTION_POINTERS* e){
+        g_fault=OverlayFault{};
+        if(e&&e->ExceptionRecord){g_fault.code=e->ExceptionRecord->ExceptionCode;g_fault.address=reinterpret_cast<uptr>(e->ExceptionRecord->ExceptionAddress);
+            if(e->ExceptionRecord->NumberParameters>=2)g_fault.data=uptr(e->ExceptionRecord->ExceptionInformation[1]);}
+        g_fault.frames=RtlCaptureStackBackTrace(0,32,g_fault.stack,nullptr);
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    // "module+offset" for an address (offsets resolve against the installed .pdb).
+    void ModuleOffset(uptr address,char* out,std::size_t size){
+        HMODULE module=nullptr;char path[MAX_PATH]{};
+        if(address&&GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,reinterpret_cast<LPCSTR>(address),&module)&&module&&GetModuleFileNameA(module,path,MAX_PATH)){
+            const char* name=std::strrchr(path,'\\');name=name?name+1:path;
+            std::snprintf(out,size,"%s+0x%llX",name,static_cast<unsigned long long>(address-reinterpret_cast<uptr>(module)));
+        } else std::snprintf(out,size,"0x%llX",static_cast<unsigned long long>(address));
+    }
+    void ReportOverlayFault(){
+        char where[96];ModuleOffset(g_fault.address,where,sizeof where);
+        std::string stack;
+        for(USHORT i=0;i<g_fault.frames&&i<32;++i){char frame[96];ModuleOffset(reinterpret_cast<uptr>(g_fault.stack[i]),frame,sizeof frame);
+            if(std::strncmp(frame,"ntdll",5)==0||std::strncmp(frame,"KERNEL",6)==0)continue;stack+=stack.empty()?"":" < ";stack+=frame;}
+        logger::Write("OBS routeedit.fault event=caught code=0x%08lX at=%s data=0x%llX host=%s hub=%d drag=%d route_drag=%d context_drag=%d point=%d stack=%s",
+            g_fault.code,where,static_cast<unsigned long long>(g_fault.data),g_photoHost?"photo":"map",int(g_ed.hubOn),int(g_ed.dragging),g_ed.routeDrag.kind,g_contextDrag,g_ed.point,stack.c_str());
+    }
+    // After a fault, drop every gesture in progress so the next visit starts clean (the draft itself is kept). Before,
+    // the half-finished hub move ran again on the first frame of every F8 and faulted again.
+    void RecoverAfterFault(){
+        g_ed.hubOn=false;g_ed.hubWas=0;g_ed.dragging=false;g_ed.routeDrag.kind=0;g_ed.naming=false;g_ed.orbiting=false;
+        if(g_contextPlace)g_ed.file=g_contextPlaceBase;
+        g_contextPlace=false;g_contextNumber=-1;g_contextDrag=0;g_contextPreview.clear();g_contextDragBase.clear();
+        logger::Write("OBS routeedit.fault event=recovered note=gestures cleared, draft kept; photo mode closes so input is never left with the camera");
+    }
+	void WorkSafe(uptr menu,uptr movie)
 	{
-		if (!movie || movie != g_movie.load()) return;
-		const uptr menu = g_menu.load();
-		if (!menu || (g_ui.failed && g_ui.movie == movie)) return;
 		__try { ApplyGround(); WorkBody(menu, movie); }
-		__except (EXCEPTION_EXECUTE_HANDLER) {
+		__except (CatchOverlayFault(GetExceptionInformation())) {
 			g_ui.failed = true;
-			logger::Write("Route editor: exception 0x%08lX in the map overlay; editor off until the map movie reloads", GetExceptionCode());
+            if(g_photoHost)RestorePhotoSafe(menu);
+			logger::Write("Route editor: exception 0x%08lX in the map overlay; editor off until the map movie reloads", g_fault.code);
+            ReportOverlayFault();
+            RecoverAfterFault();
+            if(g_photoHost){g_ed.on=false;g_photoExitAsk=true;}  // leave photo mode: never strand the player in bare camera mode
 		}
 	}
 
+	void Advance(std::uintptr_t movie)
+    {
+        if(!movie)return;
+        std::lock_guard lock(g_workLock);
+        g_photoHost=movie==g_photoMovie.load();
+        if(!g_photoHost&&movie!=g_movie.load())return;
+        g_currentUi=&g_hostUi[g_photoHost?1:0];
+        const uptr menu=g_photoHost?g_photoMenu.load():g_menu.load();
+		if (!menu || (g_ui.failed && g_ui.movie == movie)) return;
+        crash::Crumb(g_photoHost?"f7 work begin (photo movie advance)":"f7 work begin (map movie advance)",int(g_photoSession.load()));
+        WorkSafe(menu,movie);
+        crash::Crumb(g_photoHost?"f7 work end (photo movie advance)":"f7 work end (map movie advance)",int(g_photoSession.load()));
+	}
+
 	void MovieClosing(std::uintptr_t movie)
-	{
+    {
+        if(movie&&movie==g_photoMovie.load()){
+            crash::Crumb("f7 photo movie closing",int(g_photoSession.load()));
+            g_photoOpen=false;g_photoMovie=0;g_photoMenu=0;inputgate::PhotoEditor(false,false);
+        }
 		if (movie && movie == g_movie.load()) { g_snapAt.store(0);g_movie.store(0); g_menu.store(0); }
 	}
 	void MovieGone(std::uintptr_t movie)
 	{
 		if (!movie) return;
-		if (movie == g_ui.movie) {
+		std::lock_guard lock(g_workLock);
+        for(int host=0;host<2;++host){
+        g_currentUi=&g_hostUi[host];
+        if (movie == g_ui.movie) {
+            if(host==1){for(auto& child:g_photoChildren)child=NativePhotoChild{};g_photoChildCount=0;}
 			// The movie unlinked its values (they live in our memory): forget them, never release.
 			g_ui = Ui{};
-			g_swf = SwfTest{};
 			g_ed.dragging = false;
 		}
+        }
 	}
 
 	bool Install()
 	{
 		void* orig = nullptr;
+        // Photo-mode editing and the map overview install independently: one failing never turns off the other.
+        if(PatchSlot(kRvaPhotoVtbl,kSlotMessage,kRvaPhotoMessage,reinterpret_cast<void*>(&PhotoMessageDetour),&orig))
+            g_photoOriginal=reinterpret_cast<Message_t>(orig);
+        else logger::Write("OBS routeedit.install event=photo_hook_refused reason=slot_differs; F8 editor unavailable, map overview unaffected");
+        orig=nullptr;
 		if (!PatchSlot(kRvaStarMapVtbl, kSlotMessage, kRvaStarMapMessage, reinterpret_cast<void*>(&StarMapMessageDetour), &orig)) {
 			logger::Write("Route editor: StarMapMenu vtable slot %d is not the expected function; map route editor off", kSlotMessage);
 			return false;
@@ -5649,7 +7268,7 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 		g_updateOriginal = reinterpret_cast<Update_t>(orig);
 		double h = 0;
 		const bool known = LocalHours(h);
-		logger::Write("Route editor: local map hooks installed (F7 on the local map); planet local time %s %.2f h", known ? "now" : "unknown,", known ? h : 0.0);
+		logger::Write("Route editor: local map hooks installed (F8 opens it in photo mode; map overview always visible); planet local time %s %.2f h", known ? "now" : "unknown,", known ? h : 0.0);
 		return true;
 	}
 }

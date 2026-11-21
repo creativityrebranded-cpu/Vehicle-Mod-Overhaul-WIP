@@ -19,4 +19,8 @@ namespace modscene
 	// Main thread, once per frame, before anything scans: forget the shared scan.
 	void NewFrame();
 	bool IsActor(std::uintptr_t ref);
+	// Time-sliced scans (2026-11-04 stutter fix): the attached grid's cell count, and the references of cells
+	// [first, first + count) appended to out (same engine iterator as ScanRefs, never more than `limit` in out).
+	std::uint32_t GridCells();
+	void ScanCellRange(std::uint32_t first, std::uint32_t count, std::vector<std::uintptr_t>& out, unsigned limit);
 }

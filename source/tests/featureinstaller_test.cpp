@@ -71,7 +71,9 @@ int main(int argc,char** argv){
     Set(health,L"feature",L"value",L"1");Set(health,L"feature",L"section",L"custom");
     check(Apply(profile,settings,features).status==Status::Invalid&&Bytes(settings)==stable,"fragment cannot redirect writes to another INI section");
     Set(health,L"feature",L"section",L"hud");DeleteFileW(health.c_str());
-    check(Apply(profile,settings,features).status==Status::Invalid&&Bytes(settings)==stable,"incomplete profile does not partially apply");
+    // 2026-11-15: a page the installer did not show (Route beacons without the Traffic Addon) installs no file: that one
+    // setting stays as it is, the others still import (was: the whole set refused, "configuration import failed (3)").
+    check(Apply(profile,settings,features).status==Status::Unchanged&&Bytes(settings)==stable,"missing fragment keeps that setting and imports the rest");
     Set(health,L"feature",L"section",L"hud");Set(health,L"feature",L"key",L"healthBars");Set(health,L"feature",L"value",L"0");
     HANDLE held=CreateFileW(settings.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
     check(held!=INVALID_HANDLE_VALUE,"hold settings without delete sharing");

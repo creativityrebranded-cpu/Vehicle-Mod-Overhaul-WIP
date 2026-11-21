@@ -28,6 +28,7 @@ namespace features
 		Traffic,        // [context] traffic: everyday traffic from parked vehicles (trafficpick.h); after DebugLog so earlier ids keep their numbers
 		RouteMarkers,   // [traffic] markers: probes along the traffic files' routes, exits and places (routeprobes.h)
 		WallPass,       // [physics] fvoWallPass: FVO-flown vehicles and their drivers pass the loaded-area wall (loadedarea.h); settings.ini only
+		Radar,          // [traffic] radar: each vehicle's rotating + forward sweep, every hit looked up (game collision test, body's own box) into World (radar.h); test builds; settings.ini only
 		Count
 	};
 	// Placement (the old randomizer) and PlacementMode (the spot recorder, removed 2026-10-28: the user's own build tool) keep
@@ -44,7 +45,7 @@ namespace features
 	// Free roll, NPCs use vehicles, Everyday traffic, Show traffic routes. The detailed log stays a settings.ini line.
 	inline constexpr bool InMenu(Id id)
 	{
-		return Available(id) && !AlwaysOn(id) && id != Id::PhysicalAi && id != Id::DebugLog && id != Id::WallPass;
+		return Available(id) && !AlwaysOn(id) && id != Id::PhysicalAi && id != Id::DebugLog && id != Id::WallPass && id != Id::Radar;
 	}
 
 	struct Info

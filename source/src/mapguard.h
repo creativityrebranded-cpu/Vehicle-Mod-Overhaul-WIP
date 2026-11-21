@@ -7,10 +7,14 @@
 // Starfield.exe+0x2BD3C05). Install patches the build task's run slot (vtable 0x144C54E38 slot 2, FUN_14142FAE0): past
 // kMaxModels the list is shortened for the build and given back afterwards, and the count is logged with the persistent
 // cell's contents, so the cause of a list that long shows in the log.
+#include <atomic>
 #include <cstdint>
 namespace mapguard
 {
 	bool Install();  // main thread, once
+	// Any thread: tick (GetTickCount64) of the game's last map.procgen call, 0 = none yet (vehicle_probe pauses rays after it: change card F-LOCK).
+	inline std::atomic<unsigned long long> g_procgenAt{ 0 };
+	inline unsigned long long LastProcgen() { return g_procgenAt.load(std::memory_order_relaxed); }
 	// Main thread, every update: logs the player's persistent cell (reference count, run-time ones, the most common bases)
 	// every 60 s and when the build saw a long list.
 	// Also removes the REV-8's leftover wheel dust from the persistent cell (mapguard.cpp). Skipped while `loading`.

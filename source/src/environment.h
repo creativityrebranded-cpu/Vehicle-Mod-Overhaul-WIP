@@ -1,12 +1,15 @@
 #pragma once
 #include <cstdint>
 namespace environment {
+bool CameraRay(std::uint32_t owner,const float from[3],const float to[3],bool& hit,double& distance);
 enum class Verdict { Pending, Safe, Unsafe };
 struct Site {Verdict verdict=Verdict::Pending;double ground=0,x=0,y=0,z=0;bool supported=false;const char* reason="Checking ground";};
 Site CheckSite(std::uint32_t vehicle,double x,double y,double z,double yaw);
 // Before creation: validate dry support and headroom using the base's bounds.
-Site SpawnSite(std::uint32_t base,double x,double y,double z,double yaw);
+Site SpawnSite(std::uint32_t base,double x,double y,double z,double yaw,bool publishFloor=true);
 Site AirSite(std::uint32_t base,double x,double y,double z,double yaw);
+// Set by the caller: rays are answered (gameplay). Behind the loading screen they are not, and AirSite does not wait for them.
+inline bool g_raysAnswered=true;
 // The same envelope against the nav map and baked terrain only (no rays, so a vehicle standing there never hits itself).
 // Pending while nothing is mapped there yet.
 Site MappedSite(std::uint32_t base,double x,double y,double z,double yaw);

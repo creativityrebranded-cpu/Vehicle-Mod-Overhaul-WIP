@@ -29,6 +29,9 @@ inline bool Finite(Point p) { return std::isfinite(p.x) && std::isfinite(p.y) &&
 inline double Distance(Point a, Point b) { return std::hypot(a.x-b.x,a.y-b.y,a.z-b.z); }
 enum class Issue { None, WrongType, MissingName, MissingWorld, InvalidSettings, TooFewPoints, InvalidPoint, DuplicatePoints };
 inline Issue Validate(const Route& route) {
+    if (int(route.travel)<0 || int(route.travel)>2 || !std::isfinite(route.corridor) || route.corridor<1 || route.corridor>200 ||
+        (!route.sections.empty() && (route.sections.size()!=route.points.size() || std::any_of(route.sections.begin(),route.sections.end(),[](const auto& s){return !routepolicy::Valid(s);})))) return Issue::InvalidSettings;
+    if(route.spacePlan.enabled&&splinekit::Problem(route.spacePlan,route.points.size()))return Issue::InvalidSettings;
     if (route.name.empty()) return Issue::MissingName;
     if (route.world.empty()) return Issue::MissingWorld;
     if (!std::isfinite(route.speed) || route.speed <= 0 || !std::isfinite(route.width) || route.width < 0 || route.lanes < 1 || route.lanes > 2) return Issue::InvalidSettings;
@@ -55,6 +58,9 @@ inline Point Centre(const Route& r) {
 }
 // Every point (a ring: its centre) moved by the same amount; heights move by dz.
 inline Route Translated(Route r, double dx, double dy, double dz) {
+    splinekit::Transform(r.spacePlan,{},{dx,dy,dz});
+    lanetransform::Parent(r.lanePlan.transforms,lanetransform::Identity(),{},{dx,dy,dz});
+    for(auto& stop:r.journey.stops){stop.x+=dx;stop.y+=dy;stop.z+=dz;}
     if (r.ring) { r.shape.cx+=dx; r.shape.cy+=dy; r.shape.z+=dz; return r; }
     for (auto& p : r.points) { p.x+=dx; p.y+=dy; p.z+=dz; }
     return r;
@@ -63,6 +69,8 @@ inline Route Translated(Route r, double dx, double dy, double dz) {
 inline Route Turned(Route r, double radians) {
     if (r.ring || r.points.empty() || !std::isfinite(radians)) return r;
     const Point c=Centre(r);
+    splinekit::Transform(r.spacePlan,{c.x,c.y,c.z},{},radians);
+    lanetransform::Parent(r.lanePlan.transforms,lanetransform::Rotation(2,radians),{c.x,c.y,c.z});
     const double cs=std::cos(radians), sn=std::sin(radians);
     for (auto& p : r.points) { const double x=p.x-c.x, y=p.y-c.y; p.x=c.x+x*cs-y*sn; p.y=c.y+x*sn+y*cs; }
     return r;
@@ -73,6 +81,8 @@ inline Route Mirrored(Route r, double ax, double ay) {
     if (r.ring || r.points.empty() || !(l>1e-9)) return r;
     ax/=l; ay/=l;
     const Point c=Centre(r);
+    lanetransform::Parent(r.lanePlan.transforms,{2*ax*ax-1,2*ax*ay,0,2*ax*ay,2*ay*ay-1,0,0,0,1},{c.x,c.y,c.z});
+    auto reflect=[&](splinekit::Vec p){const double along=p.x*ax+p.y*ay;return splinekit::Vec{2*along*ax-p.x,2*along*ay-p.y,p.z};};for(auto& h:r.spacePlan.handles){h.incoming=reflect(h.incoming);h.outgoing=reflect(h.outgoing);}for(auto& lane:r.spacePlan.lanes)for(auto& a:lane.anchors){a.point=splinekit::Add({c.x,c.y,c.z},reflect(splinekit::Sub(a.point,{c.x,c.y,c.z})));a.handle.incoming=reflect(a.handle.incoming);a.handle.outgoing=reflect(a.handle.outgoing);}
     for (auto& p : r.points) {
         const double x=p.x-c.x, y=p.y-c.y, along=x*ax+y*ay;
         p.x=c.x+2*along*ax-x; p.y=c.y+2*along*ay-y;
@@ -126,6 +136,8 @@ inline Route Scaled(Route r, double factor) {
     if (!std::isfinite(factor) || factor <= 0) return r;
     if (r.ring) { r.shape.radius *= factor; return r; }
     const Point c = Centre(r);
+    splinekit::Transform(r.spacePlan,{c.x,c.y,c.z},{},0,factor);
+    lanetransform::Parent(r.lanePlan.transforms,{factor,0,0,0,factor,0,0,0,1},{c.x,c.y,c.z},{},factor);
     for (auto& p : r.points) { p.x = c.x + (p.x - c.x) * factor; p.y = c.y + (p.y - c.y) * factor; }
     for (auto& q : r.rounding) if (q > 0) q = std::clamp(q * factor, 5.0, 200.0);
     return r;
@@ -200,6 +212,7 @@ inline ShapeValues ReadShape(const Route& r) {
 }
 // The closed shapes: the same points stretched along the shape's own two sides. A circle has one value, so give it the same a and b.
 inline Route WithSides(Route r, const ShapeValues& v, double a, double b) {
+    if(!splinekit::Empty(r.spacePlan))return r;
     if (!v.known || v.kind == Shape::Helix || !(v.a > 0) || !(v.b > 0)) return r;
     const double fa = a / v.a, fb = b / v.b;
     for (auto& p : r.points) {
@@ -216,11 +229,15 @@ inline Route WithHelix(Route r, const ShapeValues& v, double radius, double turn
     constexpr double kStep = 0.5235987755982988;
     if (!v.known || v.kind != Shape::Helix) return r;
     const int count = int(std::lround(turns * 12)) + 1;
-    r.points.clear();
+    const auto oldSections=r.sections;if(!splinekit::Empty(r.spacePlan))return r;
+    const auto oldCount=r.points.size();
+    r.points.clear();r.sections.clear();
     for (int i = 0; i < count; ++i) {
         const double t = v.angle + v.dir * i * kStep;
         r.points.push_back({ v.centre.x + radius * std::cos(t), v.centre.y + radius * std::sin(t), v.centre.z + climb * i / 12 });
     }
+    if(!oldSections.empty())for(int i=0;i<count;++i)r.sections.push_back(oldSections[std::min(oldSections.size()-1,std::size_t(double(i)*double(oldCount)/std::max(1,count)))]);
+    {std::vector<int> map;for(int i=0;i<count;++i)map.push_back(std::min(int(oldCount)-1,int(double(i)*double(oldCount)/std::max(1,count))));r.road=roadplan::Remap(r.road,map);r.spacePlan=splinekit::Remap(r.spacePlan,map);r.lanePlan=laneplan::Remap(r.lanePlan,map);}
     r.rounding.clear();
     return r;
 }
@@ -249,11 +266,13 @@ inline CutResult CutRoute(const Route& r, const std::vector<int>& cuts) {
     const auto finish = [&](std::vector<int>& part) {
         if (part.size() >= 2) {
             Route piece = r;
-            piece.closed = false; piece.points.clear(); piece.rounding.clear();
+            piece.closed = false; piece.points.clear(); piece.rounding.clear(); piece.sections.clear();
+            piece.road=roadplan::Remap(r.road,part);piece.spacePlan=splinekit::Remap(r.spacePlan,part,r.closed);piece.lanePlan=laneplan::Remap(r.lanePlan,part);
             const bool rounded = !r.rounding.empty();
             for (std::size_t k = 0; k < part.size(); ++k) {
                 const int old = part[k];
                 piece.points.push_back(r.points[std::size_t(old)]);
+                if(!r.sections.empty())piece.sections.push_back(std::size_t(old)<r.sections.size()?r.sections[std::size_t(old)]:routepolicy::Section{});
                 if (rounded) piece.rounding.push_back(k == 0 || k + 1 == part.size() || std::size_t(old) >= r.rounding.size() ? 0 : r.rounding[std::size_t(old)]);
                 auto& m = out.map[std::size_t(old)];
                 if (m.first < 0) m = { int(out.pieces.size()), int(k) };
@@ -273,13 +292,19 @@ inline CutResult CutRoute(const Route& r, const std::vector<int>& cuts) {
     finish(part);
     return out;
 }
-struct MergeResult { Route route; std::vector<std::vector<int>> map; };  // map: for each route given, old point -> point in the result
+struct MergeResult { Route route; std::vector<std::vector<int>> map;std::vector<bool> reversed;bool valid=true;std::string error; };  // map: for each route given, old point -> point in the result
 // One open route from several, keeping the first one's settings: each time the nearest free end (of a loop: its nearest point, where it opens) goes onto the nearest end of the chain.
 inline MergeResult MergeRoutes(const std::vector<Route>& in) {
     MergeResult out;
     out.map.resize(in.size());
+    out.reversed.resize(in.size());
     if (in.empty()) return out;
+    for(const auto& r:in)if(!lanetransform::Write(r.lanePlan.transforms).empty()){out.valid=false;out.error="Keep transformed lanes connected by junctions to retain their scope";return out;}
+    for(const auto& r:in)if(!lanevehicles::Write(r.lanePlan.vehicles).empty()){out.valid=false;out.error="Routes with lane vehicle rules cannot be merged without losing their scope; keep them connected by a junction";return out;}
+    for(const auto& r:in)if(!roadplan::Write(r.road).empty()){out.valid=false;out.error="Road tiles retain their planes; connect them with a junction or split them into sections";return out;}
     out.route = in[0];
+    if(in[0].points.empty()){out.valid=false;out.error="An empty route cannot be merged";return out;}
+    for(const auto& r:in)if(!r.lanePlan.unsupported.empty()){out.valid=false;out.error="Unsupported lane metadata cannot be safely merged";return out;}
     using Item = std::pair<int, int>;  // route, point
     std::vector<Item> chain;
     const auto flat = [](const Point& a, const Point& b) { return std::hypot(a.x - b.x, a.y - b.y); };
@@ -324,7 +349,11 @@ inline MergeResult MergeRoutes(const std::vector<Route>& in) {
         else chain.insert(chain.end(), seq.begin(), seq.end());
     }
     for (std::size_t i = 0; i < in.size(); ++i) out.map[i].assign(in[i].points.size(), -1);
-    out.route.points.clear(); out.route.rounding.clear(); out.route.closed = false;
+    for(std::size_t c=0;c+1<chain.size();++c)if(chain[c].first==chain[c+1].first) {
+        const auto r=std::size_t(chain[c].first);const int n=int(in[r].points.size());
+        out.reversed[r]=in[r].closed?((chain[c+1].second-chain[c].second+n)%n==n-1):chain[c+1].second<chain[c].second;
+    }
+    out.route.points.clear(); out.route.rounding.clear(); out.route.sections.clear(); out.route.closed = false;
     bool anyRound = false;
     for (std::size_t c = 0; c < chain.size(); ++c) {
         const auto& p = at(chain[c]);
@@ -335,10 +364,40 @@ inline MergeResult MergeRoutes(const std::vector<Route>& in) {
         }
         out.map[std::size_t(chain[c].first)][std::size_t(chain[c].second)] = int(out.route.points.size());
         out.route.points.push_back(p);
+        const int next=c+1<chain.size()&&chain[c+1].first==chain[c].first?chain[c+1].second:chain[c].second+1;
+        const auto section=routepolicy::Segment(from.points.size(),from.closed,chain[c].second,next<chain[c].second?1:0);
+        out.route.sections.push_back(routepolicy::Resolve(from.travel,from.sections,section));
         const bool seam = c == 0 || c + 1 == chain.size() || chain[c - 1].first != chain[c].first || chain[c + 1].first != chain[c].first;
         const double q = !seam && std::size_t(chain[c].second) < from.rounding.size() ? from.rounding[std::size_t(chain[c].second)] : 0;
         if (q > 0) anyRound = true;
         out.route.rounding.push_back(q);
+    }
+    if(std::any_of(in.begin(),in.end(),[](const Route& r){return !splinekit::Empty(r.spacePlan);})){out.valid=false;out.error="Freeform routes retain their own handles; use explicit junctions to connect them";return out;}
+    if(std::any_of(in.begin(),in.end(),[](const Route& r){return r.lanePlan.enabled;})) {
+        auto settings=[](const Route& r,int section,int lane){
+            if(r.lanePlan.enabled)return laneplan::Resolve(r.lanePlan,section,lane);
+            laneplan::Settings s;s.forward=1;s.reverse=r.lanes>1?1:0;s.profile.width=r.corridor;s.gap=std::max(0.0,r.width-r.corridor);
+            s.travel=routepolicy::Resolve(r.travel,r.sections,std::max(0,section)).travel;s.movement=laneplan::Movement::Legacy;s.obstacles=laneplan::Obstacles::InLane;s.recovery=true;
+            if(lane>=0&&r.lanes>1&&r.width<r.corridor)s.profile.offset=(lane&1?-1:1)*(r.width-r.corridor)*.5;
+            return s;
+        };
+        out.route.lanePlan={};out.route.lanePlan.enabled=true;out.route.lanePlan.base=settings(in[0],-1,-1);out.reversed.resize(in.size());
+        auto equal=[](const laneplan::Settings& a,const laneplan::Settings& b){for(int f=0;f<laneplan::Fields;++f)if(laneplan::Value(a,laneplan::Field(f))!=laneplan::Value(b,laneplan::Field(f)))return false;return true;};
+        for(std::size_t c=0;c+1<chain.size();++c) {
+            const auto current=chain[c],next=chain[c+1];const auto& from=in[current.first];
+            const int atNew=out.map[current.first][current.second],nextNew=out.map[next.first][next.second];
+            if(nextNew!=atNew+1)continue;
+            bool reverse=false;
+            if(next.first==current.first)reverse=from.closed?((next.second-current.second+int(from.points.size()))%int(from.points.size())==int(from.points.size())-1):next.second<current.second;
+            else if(c&&chain[c-1].first==current.first)reverse=from.closed?((current.second-chain[c-1].second+int(from.points.size()))%int(from.points.size())==int(from.points.size())-1):current.second<chain[c-1].second;
+            out.reversed[current.first]=reverse;
+            const int section=int(routepolicy::Segment(from.points.size(),from.closed,current.second,reverse?1:0));
+            auto orient=[&](laneplan::Settings s){if(reverse){std::swap(s.forward,s.reverse);s.profile.offset=-s.profile.offset;s.profile.bank=-s.profile.bank;}return s;};
+            const auto base=orient(settings(from,section,-1));
+            std::erase_if(out.route.lanePlan.overrides,[&](const laneplan::Override& r){return r.section==atNew;});
+            out.route.lanePlan.overrides.push_back({atNew,-1,(1ull<<laneplan::Fields)-1,base});
+            for(int lane=0;lane<laneplan::kMaxLanes;++lane){const auto value=orient(settings(from,section,reverse?lane^1:lane));if(!equal(value,base))out.route.lanePlan.overrides.push_back({atNew,lane,(1ull<<laneplan::Fields)-1,value});}
+        }
     }
     if (!anyRound) out.route.rounding.clear();
     return out;
@@ -347,6 +406,8 @@ inline MergeResult MergeRoutes(const std::vector<Route>& in) {
 inline Route WithoutPoints(Route r, const std::vector<int>& picks) {
     for (auto i = picks.rbegin(); i != picks.rend(); ++i) {
         if (*i < 0 || *i >= int(r.points.size())) continue;
+        if (*i < int(r.sections.size())) r.sections.erase(r.sections.begin() + *i);
+        roadplan::Remove(r.road,std::size_t(*i));splinekit::Remove(r.spacePlan,std::size_t(*i));laneplan::Remove(r.lanePlan,std::size_t(*i));
         if (*i < int(r.rounding.size())) r.rounding.erase(r.rounding.begin() + *i);
         r.points.erase(r.points.begin() + *i);
     }
@@ -391,7 +452,7 @@ public:
     Issue Check() const { return Validate(value_); }
     bool Add(Point p) {
         if (!Finite(p)) return false;
-        Checkpoint(); if(!value_.rounding.empty())value_.rounding.push_back(0);value_.points.push_back(p); return true;
+        Checkpoint(); if(!value_.sections.empty())value_.sections.push_back({}); if(!value_.rounding.empty())value_.rounding.push_back(0);splinekit::Append(value_.spacePlan,{p.x,p.y,p.z});value_.points.push_back(p);laneplan::EnsureSections(value_.lanePlan,value_.points.size()); return true;
     }
     bool Move(std::size_t i, Point p) {
         if (i>=value_.points.size() || !Finite(p)) return false;
@@ -405,15 +466,15 @@ public:
     }
     bool Remove(std::size_t i) {
         if (i>=value_.points.size()) return false;
-        Checkpoint();if(i<value_.rounding.size())value_.rounding.erase(value_.rounding.begin()+i);value_.points.erase(value_.points.begin()+i); return true;
+        Checkpoint();roadplan::Remove(value_.road,i);splinekit::Remove(value_.spacePlan,i);laneplan::Remove(value_.lanePlan,i);if(i<value_.sections.size())value_.sections.erase(value_.sections.begin()+i);if(i<value_.rounding.size())value_.rounding.erase(value_.rounding.begin()+i);value_.points.erase(value_.points.begin()+i); return true;
     }
     bool Clear() {
         if (value_.points.empty()) return false;
-        Checkpoint(); value_.rounding.clear();value_.points.clear(); return true;
+        Checkpoint();value_.road={};value_.spacePlan={}; std::erase_if(value_.lanePlan.overrides,[](const laneplan::Override& r){return r.section>=0;});value_.lanePlan.sectionIds.clear();value_.sections.clear();value_.rounding.clear();value_.points.clear(); return true;
     }
     bool Reverse() {
         if (value_.points.size()<2) return false;
-        Checkpoint();std::reverse(value_.rounding.begin(),value_.rounding.end()); std::reverse(value_.points.begin(),value_.points.end()); return true;
+        Checkpoint();roadplan::Reverse(value_.road,value_.points.size(),value_.closed);splinekit::Reverse(value_.spacePlan,value_.points.size(),value_.closed);laneplan::ReverseSections(value_.lanePlan,value_.points.size(),value_.closed);routepolicy::Reverse(value_.sections,value_.points.size(),value_.closed);std::reverse(value_.rounding.begin(),value_.rounding.end()); std::reverse(value_.points.begin(),value_.points.end()); return true;
     }
     bool Round(std::size_t i,double radius){
         if(i>=value_.points.size()||!std::isfinite(radius)||radius<0||radius>200||value_.ring)return false;

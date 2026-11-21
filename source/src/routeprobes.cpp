@@ -1,5 +1,6 @@
 #include "routeprobes.h"
 #include "addresses.h"
+#include "referencebirth.h"
 #include "features.h"
 #include "fvopaths.h"
 #include "game.h"
@@ -72,7 +73,7 @@ namespace routeprobes
 			At<uptr>(dp, 0x30) = base; At<uptr>(dp, 0x38) = cell; At<uptr>(dp, 0x40) = ws;
 			At<std::uint8_t>(dp, 0x8C) = 1; At<std::uint8_t>(dp, 0x8D) = 1; At<std::uint32_t>(dp, 0x98) = 1;
 			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
-			__try { EngineFn<void* (*)(uptr, std::uint64_t*, void*)>(addr::kCreateReference)(data, &handle, d); }
+			__try { referencebirth::Commit("route_marker", data, handle, d); }
 			__except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 			const uptr ref = RefFromHandle(static_cast<std::uint32_t>(handle));
 			if (!ref) return 0;

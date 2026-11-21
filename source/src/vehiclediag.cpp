@@ -4,7 +4,6 @@
 #include "vehiclekeep.h"
 #include "loadedarea.h"
 #include "fvolimits.h"
-#include "placementenable.h"
 #include "hookcost.h"
 
 #include "addresses.h"
@@ -46,7 +45,7 @@ namespace vehiclediag
 		constexpr float kNear = 60.0f;    // m
 		constexpr unsigned kMaxLines = 8;
 
-		struct Comp { uptr component = 0; unsigned updates = 0; };
+		struct Comp { uptr component = 0; unsigned updates = 0; ULONGLONG at = 0; };  // at: last native update (GetTickCount64)
 		std::mutex g_lock;
 		std::unordered_map<std::uint32_t, Comp> g_comps;          // vehicle form id -> its component and update count
 		hookcost::KeyedCounter<> g_steps;               // vehicle instance -> physics steps
@@ -62,35 +61,120 @@ namespace vehiclediag
 		bool g_setupHooked = false;
 		bool g_attachVerified = false;
 		std::atomic<unsigned> g_setupLogs{0};
-		struct ReloadEnable {
-			uptr ref;
-			void CancelRequests() { reinterpret_cast<void (*)(uptr)>(game::Base() + addr::kEnableReference)(ref); }
-			bool Disabled() const { return (*reinterpret_cast<const std::uint32_t*>(ref + 0x20) & 0x800) != 0; }
-			void Enable() { reinterpret_cast<void (*)(uptr, char)>(game::Base() + addr::kRefEnableTask)(ref, 1); }
-		};
-		// Guarded engine calls for the 3D reload (no C++ objects in these frames).
-		void EnableAgain(std::uint32_t id, uptr ref)
-		{
-			__try {
-				if (reinterpret_cast<uptr (*)(std::uint32_t)>(game::Base() + 0x005DE3B0)(id) == ref) { ReloadEnable engine{ ref }; placementenable::Restore(engine); }
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {}
-		}
-		bool DisableRef(uptr ref)
-		{
-			__try { reinterpret_cast<void (*)(uptr, char)>(game::Base() + addr::kDisableReference)(ref, 0); return true; }
-			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-		}
 		struct Retry { uptr component = 0; std::uint32_t body = 0; ULONGLONG since = 0; bool tried = false, reported = false; };
 		std::unordered_map<std::uint32_t, Retry> g_retries;  // main thread only; reset on component/body replacement
-		// 3D reload (2026-10-29, the user: after loading a save in an already running game "a vehicle might not have chassis, not
-		// all but a few or one"; fresh launches never). Log: FE008804, a persistent parked REV-8, kept its old physics record and
-		// scene body across the in-session load, so the game made no new VehicleRuntimeComponent for it, queued no attach, and it
-		// had no chassis ("updates 0, instance NONE") while traffic and the player used it. A parked vehicle within kNear with 3D
-		// whose component the game has not updated for two reports gets its 3D reloaded once per load (disable, then enable
-		// 0.6 s later): the game then makes the component and the attach as on a fresh load.
-		struct Reload { int strikes = 0; ULONGLONG disabledAt = 0; bool done = false; uptr ref = 0; };
-		std::unordered_map<std::uint32_t, Reload> g_reloads;  // main thread only; cleared on a save load
+		// Vehicle with 3D but no VehicleRuntimeComponent (2026-11-17; replaces the 2026-10-29 disable/enable 3D reload, which
+		// never gave a chassis in any logged case: 10-30 FE00882C/D/E, 11-03 FF0166A9 kept 0 updates after it).
+		// From the decomp: the component's pending entry is made only by the factory RuntimeComponentFactoryRegisterImpl<
+		// VehicleRuntimeComponent, ...> (vtable 144C47038; add FUN_141313400) on RuntimeComponentDBFactory::ReferenceAttach, which
+		// the cell sends while adding a reference (FUN_140B02630 -> FUN_14067F230). The listener then queues the native attach
+		// FUN_141314780(form id) only for ids on that list (FUN_1413161E0). On the 2026-11-17 reloads no ReferenceAttach came for any
+		// vehicle (0 pending adds, 0 removes), so the REV-8 you sat in had no component and fell. FUN_141314780 finds or makes the
+		// vehicle's store entry itself (FUN_1424105d0 on store +0x268) and waits for the cell's physics; FVO's retry already calls it
+		// (2026-10-24: FE00A80A built 3 s after). Here it is asked once per load for a vehicle with 3D that gets no component update.
+		struct Attach { ULONGLONG missingSince = 0; bool asked = false, reported = false; };
+		std::unordered_map<std::uint32_t, Attach> g_attaches;  // main thread only; cleared on a save load
+		constexpr ULONGLONG kAttachWaitMs = 750;  // the game's own attach comes within a few frames when it comes at all
+		// Gates the native attach waits for (FUN_141314780), as RetryBlocked, without a component; nullptr = may ask now.
+		const char* AttachBlocked(std::uint32_t id, uptr ref, int& state)
+		{
+			state = -1;
+			__try {
+				if (reinterpret_cast<uptr (*)(std::uint32_t)>(game::Base() + 0x005DE3B0)(id) != ref) return "the form id names another reference";
+				const uptr cell = At<uptr>(ref, off::kRefParentCell);
+				if (!cell) return "no parent cell";
+				state = At<std::uint8_t>(cell, off::kCellState);
+				if (state <= 4 || state > 10) return "cell not attached";
+				const uptr data = At<uptr>(cell, 0x120);
+				if (!data) return "cell has no physics data (+0x120)";
+				if (!At<std::uint8_t>(data, 0x16D)) return "cell physics not ready (+0x120 +0x16D)";
+				return nullptr;
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) { return "unreadable"; }
+		}
+		uptr LookupRef(std::uint32_t id)
+		{
+			__try { return reinterpret_cast<uptr (*)(std::uint32_t)>(game::Base() + 0x005DE3B0)(id); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+		std::uint32_t RefFormId(uptr ref)
+		{
+			__try { return At<std::uint32_t>(ref, off::kFormId); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
+		// The skip rule of the cell attach FUN_140B02C80 (no ReferenceAttach for any reference of the cell): the vehicle's cell, whether
+		// it is an interior (+0x48 bit 0), its form flag 0x40 and TES +0xE8 (the interior the game thinks you are in, 0 outdoors).
+		// Before-load notes (NoteBeforeLoad): the game sends ReferenceAttach only from the cell attach walk (FUN_140B02C80 ->
+		// FUN_140B02630) or when a reference is added to a cell already attaching/attached (FUN_140B1A5A0, cell +0x4F 9..10). A
+		// reference that stays in the same attached cell through a load gets neither. Same objects before and after = that case.
+		struct BeforeLoad { uptr ref = 0, cell = 0; std::uint32_t flags = 0; };
+		std::mutex g_beforeLock;
+		std::unordered_map<std::uint32_t, BeforeLoad> g_before;
+		struct CellFacts { std::uint32_t cell = 0, tesInterior = 0, cellFlags = 0; int interior = -1, state = -1; bool skipRule = false; };
+		std::uint32_t RefFlags(uptr ref) { __try { return At<std::uint32_t>(ref, 0x20); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+		uptr RefCell(uptr ref) { __try { return At<uptr>(ref, off::kRefParentCell); } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+		CellFacts ReadCellFacts(uptr ref)
+		{
+			CellFacts f;
+			__try {
+				const uptr cell = At<uptr>(ref, off::kRefParentCell);
+				const uptr tes = *reinterpret_cast<uptr*>(game::Base() + addr::kTESPtr);
+				const uptr tesCell = tes ? At<uptr>(tes, off::kTESInteriorCell) : 0;
+				f.tesInterior = tesCell ? At<std::uint32_t>(tesCell, off::kFormId) : 0;
+				if (cell) {
+					f.cell = At<std::uint32_t>(cell, off::kFormId);
+					f.interior = (At<std::uint8_t>(cell, 0x48) & 1) ? 1 : 0;
+					f.state = At<std::uint8_t>(cell, off::kCellState);
+					f.cellFlags = At<std::uint32_t>(cell, 0x20);
+					f.skipRule = !(f.cellFlags & 0x40) && (f.interior ? tesCell != cell : tesCell != 0);
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return f;
+		}
+		bool NativeAttach(std::uint32_t id)
+		{
+			__try { reinterpret_cast<void (*)(std::uint32_t)>(game::Base() + 0x01314780)(id); return true; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		// lastUpdate: the component's last native update since this load (0 = none; Reset clears them at every load). Parked
+		// components update only now and then, so only "none since the load" counts as missing. waitMs: how long it must stay
+		// missing first (yours: kAttachWaitMs; others: two reports, as the game may still be attaching a vehicle that just loaded).
+		// True when it asked now.
+		bool AskAttachIfMissing(std::uint32_t id, uptr ref, const char* who, ULONGLONG lastUpdate, ULONGLONG now, ULONGLONG waitMs)
+		{
+			auto& a = g_attaches[id];
+			if (lastUpdate) { if (a.missingSince && !a.asked) logger::Write("Vehicle physics repair: %08X (%s) got its component from the game %.1f s after it was first seen without one", id, who, (now - a.missingSince) / 1000.0); a.missingSince = 0; return false; }
+			if (a.asked) return false;
+			if (!a.missingSince) {
+				a.missingSince = now;
+				const CellFacts f = ReadCellFacts(ref);
+				const uptr me = *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr);
+				const CellFacts p = me ? ReadCellFacts(me) : CellFacts{};
+				BeforeLoad b{}; bool had = false;
+				{ std::lock_guard lk(g_beforeLock); const auto it = g_before.find(id); if (it != g_before.end()) { b = it->second; had = true; } }
+				const std::uint32_t flags = RefFlags(ref);
+				const uptr cellNow = RefCell(ref);
+				if (had) logger::Write("Vehicle physics repair: %08X (%s) before the load: same reference object %s, same cell object %s; form flags before %08X now %08X (persistent 0x400: %d)",
+					id, who, b.ref == ref ? "YES" : "no", b.cell && b.cell == cellNow ? "YES" : "no", b.flags, flags, (flags & 0x400) ? 1 : 0);
+				else logger::Write("Vehicle physics repair: %08X (%s) was not listed before the load; form flags now %08X (persistent 0x400: %d)", id, who, flags, (flags & 0x400) ? 1 : 0);
+				logger::Write("Vehicle physics repair: %08X (%s) seen with 3D but no vehicle component since the load; its cell %08X (%s, state %d, flags %08X), "
+					"your cell %08X (%s), TES interior %08X -> the cell attach's no-ReferenceAttach rule %s now",
+					id, who, f.cell, f.interior < 0 ? "?" : f.interior ? "interior" : "exterior", f.state, f.cellFlags,
+					p.cell, p.interior < 0 ? "?" : p.interior ? "interior" : "exterior", f.tesInterior, f.skipRule ? "APPLIES" : "does not apply");
+				return false;
+			}
+			if (now - a.missingSince < waitMs) return false;
+			int state = -1;
+			if (const char* why = AttachBlocked(id, ref, state)) {
+				if (!a.reported) logger::Write("Vehicle physics repair: %08X (%s) has 3D but no vehicle component; native attach waits: %s (cell state %d)", id, who, why, state);
+				a.reported = true;
+				return false;
+			}
+			a.asked = true;
+			const bool ok = NativeAttach(id);
+			logger::Write("Vehicle physics repair: %08X (%s) has 3D but no vehicle component %.1f s after it was first seen (no ReferenceAttach from its cell); native attach FUN_141314780 %s (cell state %d)",
+				id, who, (now - a.missingSince) / 1000.0, ok ? "requested" : "FAULTED", state);
+			return true;
+		}
 
 		physicssetup::Chassis InspectChassis(uptr chassis)
 		{
@@ -481,6 +565,7 @@ namespace vehiclediag
 					auto& c = g_comps[id];
 					c.component = component;
 					++c.updates;
+					c.at = GetTickCount64();
 				}
 			}
 			g_original(component, dt);
@@ -814,9 +899,13 @@ namespace vehiclediag
         {std::lock_guard lock(g_builtLock);if(g_built.count(id))return true;}
         return HasInstance(ComponentOf(id));
     }
-    bool ReleaseBirth(std::uint32_t id){
-        const bool control=vehicleflight::BirthControlReady(id),built=control&&Built(id);
-        logger::Observe("chassis.birth-handoff",id,unsigned(control)|(unsigned(built)<<1),"controller_ready=%d built=%d build_checked=%d",control,built,control);
+    // KO-2 (2026-11-08, kick-out port): a vehicle the player took is released to the player: the player's control stands in for the traffic pilot's.
+    bool ReleaseBirthFor(std::uint32_t id,bool playerTook);
+    bool ReleaseBirth(std::uint32_t id){return ReleaseBirthFor(id,false);}
+    bool ReleaseBirthToPlayer(std::uint32_t id){return g_birthHolds.Get(id)?ReleaseBirthFor(id,true):true;}
+    bool ReleaseBirthFor(std::uint32_t id,bool playerTook){
+        const bool control=playerTook||vehicleflight::BirthControlReady(id),built=control&&Built(id);
+        logger::Observe("chassis.birth-handoff",id,unsigned(control)|(unsigned(built)<<1)|(unsigned(playerTook)<<2),"controller_ready=%d built=%d build_checked=%d reason=%s",control,built,control,playerTook?"player_took":"traffic_pilot");
         if(!control)return false;
         if(!built){
             static std::unordered_map<std::uint32_t,ULONGLONG> waitLogged;const ULONGLONG now=GetTickCount64();
@@ -831,20 +920,63 @@ namespace vehiclediag
             return [=]()->std::uint64_t {
                 if(!lifecycle::InService())return 0;
                 const auto physics=AcquirePhysics(reinterpret_cast<uptr>(owned.get()));
-                if(!physics||!g_setMotion||!g_birthHolds.BeginRelease(*held))return 0;
+                if(!physics||!g_setMotion||playerTook!=trafficpool::PlayerOwnsHandoff(id)||!g_birthHolds.BeginRelease(*held))return 0;
                 const bool released=SetSceneMotion(physics,kSceneDynamic);
                 g_birthHolds.FinishRelease(*held,released);return released?1:0;
             };
         });
         return result&&*result;
     }
+	void NoteBeforeLoad()
+	{
+		static world::Snapshot snap;  // load hook thread only
+		std::unordered_map<std::uint32_t, BeforeLoad> notes;
+		if (world::Vehicles(snap))
+			for (std::uint32_t i = 0; i < snap.count && i < world::kMaxVehicles; ++i) {
+				const auto& v = snap.v[i];
+				if (v.ref) notes[v.formId] = BeforeLoad{ v.ref, RefCell(v.ref), RefFlags(v.ref) };
+			}
+		std::size_t persistent = 0;
+		for (const auto& [id, b] : notes) if (b.flags & 0x400) ++persistent;
+		logger::Write("Vehicle physics repair: before the load %zu vehicles listed (%zu with the persistent flag 0x400)", notes.size(), persistent);
+		std::lock_guard lk(g_beforeLock);
+		g_before.swap(notes);
+	}
+	// 2026-11-17 (confirmed 23:16/23:18: the reloaded cell and its placed vehicles stay in memory, lose their component and get
+	// no ReferenceAttach): right after the game's load routine returns, before FVO's 3 s settle and the world's first live frame,
+	// each vehicle noted before the load that is still the same reference, has no component update, is not waiting in the
+	// pending list (the game's own attach would come) and whose cell passes the attach gates gets the native attach once.
+	// FUN_141314780 itself waits for the cell's physics. Same once-per-load ledger as the later repair (g_attaches).
+	void AfterLoadTick()
+	{
+		if (!g_setupHooked || !g_attachVerified) return;
+		std::vector<std::pair<std::uint32_t, BeforeLoad>> notes;
+		{ std::lock_guard lk(g_beforeLock); notes.assign(g_before.begin(), g_before.end()); }
+		const ULONGLONG now = GetTickCount64();
+		for (const auto& [id, b] : notes) {
+			auto& a = g_attaches[id];
+			if (a.asked) continue;
+			bool updated = false;
+			{ std::lock_guard lk(g_lock); const auto it = g_comps.find(id); updated = it != g_comps.end() && it->second.component && it->second.at; }
+			if (updated || g_pending.Has(id)) continue;
+			const uptr now_ref = LookupRef(id);
+			if (!now_ref || now_ref != b.ref) continue;  // recreated or gone: the game attaches it as a new reference
+			int state = -1;
+			if (AttachBlocked(id, b.ref, state)) continue;  // asked again next frame
+			if (!a.missingSince) a.missingSince = now;
+			a.asked = true;
+			const bool ok = NativeAttach(id);
+			logger::Write("Vehicle physics repair: %08X kept in memory through the load (same reference and cell), no component: native attach FUN_141314780 %s right after the load returned (cell state %d)",
+				id, ok ? "requested" : "FAULTED", state);
+		}
+	}
 	void Reset()
 	{
 		{
 		std::lock_guard lk(g_lock);
 		g_comps.clear();
 		g_retries.clear();
-		g_reloads.clear();
+		g_attaches.clear();
 		g_lastPos.clear();
         }
         g_birthHolds.Clear();
@@ -905,12 +1037,16 @@ namespace vehiclediag
 		PutBackBuildDrops();
 		CarryBuildMoves();
 		const ULONGLONG now = GetTickCount64();
-		// The second half of a 3D reload: enable what was disabled 0.6 s ago (placementenable::Restore, as placements do).
-		for (auto& [id, rl] : g_reloads) {
-			if (!rl.disabledAt || now - rl.disabledAt < 600) continue;
-			rl.disabledAt = 0;
-			EnableAgain(id, rl.ref);
-			logger::Write("Vehicle physics repair: %08X enabled again after its 3D reload", id);
+		// The vehicle you sit in, every frame (a 5 s report is too late: it falls meanwhile).
+		if (g_setupHooked && g_attachVerified) {
+			const uptr me = *reinterpret_cast<uptr*>(game::Base() + addr::kPlayerCharacterPtr);
+			const uptr mine = me ? npcvehicles::VehicleOf(me) : 0;
+			const std::uint32_t id = mine ? RefFormId(mine) : 0;
+			if (id) {
+				ULONGLONG at = 0;
+				{ std::lock_guard lk(g_lock); const auto it = g_comps.find(id); if (it != g_comps.end() && it->second.component) at = it->second.at; }
+				AskAttachIfMissing(id, mine, "yours", at, now, kAttachWaitMs);
+			}
 		}
 		if (now - g_at < kEveryMs) return;
 		const bool first = !g_at;
@@ -935,7 +1071,7 @@ namespace vehiclediag
 		{
 			std::lock_guard lk(g_lock);
 			comps.swap(g_comps);
-			for (const auto& [id, c] : comps) g_comps[id] = Comp{ c.component, 0 };  // keep the component, restart the count
+			for (const auto& [id, c] : comps) g_comps[id] = Comp{ c.component, 0, c.at };  // keep the component, restart the count
 		}
         const auto skippedSteps=g_steps.Drain([&](uptr instance,unsigned count){steps[instance]=count;});
 		npcvehicles::JobInfo jobs[fvolimits::kVehicles]{};
@@ -1034,21 +1170,27 @@ namespace vehiclediag
 				break;
 			}
 		}
-		// A parked vehicle with 3D whose component the game does not update (kept across an in-session load): reload its 3D.
-		for (const auto* v : nearby) {
-			auto& rl = g_reloads[v->formId];
-			const auto it = comps.find(v->formId);
-			const bool updated = it != comps.end() && it->second.component && it->second.updates > 0;
-			if (updated || v->who != world::VehicleInfo::Who::Parked || !v->ref || !v->bodyCount || rl.done || npcvehicles::UsesVehicle(v->formId)) {
-				if (updated) rl.strikes = 0;
-				continue;
+		// Any other vehicle near you with 3D whose component the game does not update: the native attach once per load.
+		if (g_setupHooked && g_attachVerified) {
+			for (const auto* v : nearby) {
+				if (!v->ref || !v->bodyCount) continue;
+				const auto it = comps.find(v->formId);
+				const ULONGLONG at = it != comps.end() && it->second.component ? it->second.at : 0;
+				const char* who = v->who == world::VehicleInfo::Who::Player ? "yours" : v->who == world::VehicleInfo::Who::Npc ? "npc" : "parked";
+				if (AskAttachIfMissing(v->formId, v->ref, who, at, now, 2 * kEveryMs)) break;  // one per report
 			}
-			if (++rl.strikes < 2) continue;
-			rl.done = true; rl.ref = v->ref; rl.disabledAt = now;
-			logger::Write("Vehicle physics repair: %08X has 3D (scene body %08X) but its physics component got no update for %.0f s: reloading its 3D once",
-				v->formId, v->bodyIds[0], 2 * kEveryMs / 1000.0);
-			if (!DisableRef(v->ref)) rl.disabledAt = 0;
-			break;  // one per report
 		}
+	}
+	std::uint64_t PhysicsChangeCount()
+	{
+		std::uint64_t n = g_buildLogs.load(std::memory_order_relaxed);
+		for (const auto& f : g_freezes) n += f.count.load(std::memory_order_relaxed);
+		return n;
+	}
+	unsigned long long BuiltAt(std::uint32_t vehicle)
+	{
+		std::lock_guard lock(g_builtLock);
+		const auto it = g_built.find(vehicle);
+		return it == g_built.end() ? 0 : it->second;
 	}
 }

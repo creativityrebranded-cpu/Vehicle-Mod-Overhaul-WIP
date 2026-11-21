@@ -130,6 +130,18 @@ namespace modscene
 	}
 
 
+	std::uint32_t GridCells() { return runtimecells::GridSize(); }
+	void ScanCellRange(std::uint32_t first, std::uint32_t count, std::vector<std::uintptr_t>& out, unsigned limit)
+	{
+		const auto total = runtimecells::GridSize();
+		for (std::uint32_t i = first; i < total && i < first + count && out.size() < limit; ++i) {
+			const auto cell = runtimecells::Cell(i, runtimecells::Policy::AttachedCell);
+			if (!cell) continue;
+			RefCollector cb{ RefCollector::kVtbl, &out, limit };
+			EngineFn<int (*)(std::uintptr_t, RefCollector*, char)>(addr::kForEachRefInCell)(cell, &cb, 0);
+		}
+	}
+
 	std::vector<std::uintptr_t> LoadedRefs(unsigned limit)
 	{
 		const ULONGLONG now = GetTickCount64();

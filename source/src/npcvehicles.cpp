@@ -1,8 +1,10 @@
 #include "fvo_addon_api.h"
 #include "npcvehicles.h"
 #include "trafficpool.h"
+#include "loadedarea.h"
+#include "relocation.h"
+#include "relocationapi.h"
 #include "trafficpair.h"
-#include "trafficdiagnostics.h"
 #include "fvolimits.h"
 #include "pilotlayout.h"
 #include "prefetch.h"
@@ -13,6 +15,7 @@
 #include "boardinggate.h"
 #include "trafficcycle.h"
 #include "lifecycle.h"
+#include "routeguidance.h"
 
 #include "addresses.h"
 #include "bindings.h"
@@ -209,6 +212,11 @@ namespace npcvehicles
 			bool haveSeatOff = false; float seatOff[3] = {}; float seatYaw = 0; unsigned seatHolds = 0;  // the driver's seat, vehicle frame                      // cold-start boarding snaps tried before the pilot takes the vehicle
 			int pins = 0; double pinMax = 0;          // an unloaded cold-start driver put back on its vehicle (drifted away while unloaded)
 			FvoTripClaim trip{};               // task 9: an addon's scripted trip (fvo_addon_api.h), e.g. the ring traffic
+#ifndef FVO_RELEASE
+            std::uint64_t factoryLease = 0;     // a live private claim held by this admitted job
+            bool factoryReleased = false;
+            bool factoryStock = false;        // route-free qualification; no seated transfer service
+#endif
 			bool repeatTraffic = false;
 			trafficcycle::Dwell trafficDwell;
 			double taskX = 0, taskY = 0;       // transit: where to; parking: the clear spot
@@ -229,6 +237,7 @@ namespace npcvehicles
 			bool aiOn = false;                 // the full AI flies it this frame
 			bool aiFire = false;               // its weapon zone says fire
 			double aiAimX = 0, aiAimY = 0, aiAimZ = 0;
+			bool aiPlan = false;               // CB-2: a combat line drives it (the plan moves it; only the aim pitch is sent)
 			ULONGLONG aiAt = 0;
 			ULONGLONG stunUntil = 0;           // rammed: out of control until then
 			double stunX = 0, stunY = 0, stunSpin = 0;
@@ -301,6 +310,11 @@ namespace npcvehicles
 		int g_walkKey = 0, g_exitKey = 0, g_aggroKey = 0;
 		std::uint32_t g_ctrlTarget = 0;
 		bool g_walkDown = false, g_exitDown = false;
+#ifndef FVO_RELEASE
+        int g_pairMoveKey=0;
+        bool g_pairMoveDown=false;
+        std::uint32_t g_testPairVehicle=0,g_testPairDriver=0;
+#endif
 		// The led aim point of each job that may fire, for vehicleaim's projectile launch hook (any thread): refreshed by
 		// Update() every frame while attacking; older than kAimSnapMs counts as gone.
 		struct AimSnap
@@ -679,6 +693,20 @@ namespace npcvehicles
 		}
 
 		std::unordered_map<std::uint32_t, bool> g_seatLogged;  // vehicle base -> logged
+		// SL-0 / SL-1 / SL-2 (2026-11-08, the seat ladder; notes/seat-ladder-20261108/CHANGE_CARDS.md). The marker a laddered vehicle uses
+		// (vehicle form id -> marker index; absent: the game's own choice), the marker that seated per model (+1; this session), logged tables.
+		std::mutex g_ladderLock;
+		std::unordered_map<std::uint32_t, std::uint32_t> g_ladderMarker, g_learnedMarker;
+		std::unordered_map<std::uint32_t, bool> g_seatTableLogged;
+		// A marker's keyword when the marker is enabled and its keyword is a keyword form (type 4); 0 otherwise.
+		uptr MarkerKeyword(uptr base, std::uint32_t i, std::uint32_t* countOut = nullptr)
+		{
+			std::uint32_t mask = 0, count = 0; uptr kw = 0;
+			if (!base || !ReadSeat(base, i, mask, count, kw)) return 0;
+			if (countOut) *countOut = count;
+			if (i >= count || i >= 32 || !((mask >> i) & 1u) || !kw) return 0;
+			__try { return At<std::uint8_t>(kw, 0x2E) == 4 ? kw : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+		}
 
 		// Seats are keyword gated (VehicleDriverSeat / VehicleCompanionSeat / VehicleVascoSeat): only the player and
 		// companions carry them (log 2026-10-17 15:13). The NPC that will drive gets the vehicle's own driver-seat keyword
@@ -863,43 +891,6 @@ namespace npcvehicles
 			}
 			return Dist3(actor, vehicle);
 		}
-		// A driver past the loaded area loses its model, its seat and its parent cell (2026-10-31: driver cell 00000000, level 3, sit 0). Nothing returns it in time near the player, so it is
-		// put in the player's cell at its vehicle, where it loads; the seat repair then seats it. It has no model here, so there is nothing to see move.
-		bool DriverCellMoveOn()
-		{
-			static const bool on = GetPrivateProfileIntW(L"traffic", L"driverCellMove", 0, fvopaths::Settings().c_str()) != 0;
-			return on;
-		}
-		bool MoveActorNow(uptr actor, uptr cell, uptr ws, float* pos, float* rot)
-		{
-			std::uint64_t handle = *reinterpret_cast<std::uint32_t*>(game::Base() + addr::kInvalidHandle);
-			__try { EngineFn<void (*)(uptr, std::uint64_t*, uptr, uptr, float*, float*)>(addr::kMoveReference)(actor, &handle, cell, ws, pos, rot); return true; }
-			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-		}
-		void BringDriverIntoCell(uptr npc, uptr vehicle)
-		{
-			const unsigned id = At<unsigned>(npc, off::kFormId), vid = At<unsigned>(vehicle, off::kFormId);
-			lifecycle::Post("driver-cell:" + std::to_string(id), id, [=]() -> lifecycle::Work {
-				const auto a = lifecycle::Keep(npc, id), v = lifecycle::Keep(vehicle, vid);
-				if (!a || !v) return {};
-				return [=]() -> std::uint64_t {
-					const uptr actor = reinterpret_cast<uptr>(a.get()), veh = reinterpret_cast<uptr>(v.get());
-					const uptr player = Ptr(addr::kPlayerCharacterPtr);
-					const uptr cell = player ? At<uptr>(player, off::kRefParentCell) : 0;
-					const uptr ws = cell ? At<uptr>(cell, off::kCellWorldspace) : 0;
-					const uptr before = At<uptr>(actor, off::kRefParentCell);
-					if (!lifecycle::InService() || !cell || !ws || Has3D(actor) || IsDead(actor)) {
-						logger::Write("OBS system=driver.cell vehicle=%08X driver=%08X event=refused player_cell=%p has_model=%d dead=%d", vid, id, reinterpret_cast<void*>(cell), Has3D(actor), IsDead(actor));
-						return 0;
-					}
-					const auto p = At<game::Vec3>(veh, off::kRefPosition);
-					float pos[3] = { p.x, p.y, p.z }, rot[3] = { 0.0f, 0.0f, At<game::Vec3>(veh, off::kRefRotation).z };
-					const bool ok = MoveActorNow(actor, cell, ws, pos, rot);
-					logger::Write("OBS system=driver.cell vehicle=%08X driver=%08X event=moved ok=%d had_cell=%d now_cell=%d level=%d aboard=%d pos=%.1f,%.1f,%.1f", vid, id, ok, before != 0, At<uptr>(actor, off::kRefParentCell) != 0, ProcessLevel(actor), InVehicle(actor) == veh, pos[0], pos[1], pos[2]);
-					return ok ? 1 : 0;
-				};
-			});
-		}
 		// Seated for the traffic seat check (2026-10-29 22:36 run: "aboard 1, sit 0, model distance 0.0 m" on 122 checks; the game
 		// reports sit state 0 until it next processes the actor, e.g. still behind the loading screen). A driver that is aboard and
 		// whose model sits on the vehicle's (under 1 m) is in the seat; a driver standing beside its vehicle is metres away.
@@ -924,6 +915,11 @@ namespace npcvehicles
 			// , . / ' are the user's test keys (2026-10-20): not used here. The escort/pursuit key (was .) is removed; the context engine does it.
 			g_walkKey = controlmap::ClaimFirst("npcveh", "board (debug)", { VK_OEM_1, VK_OEM_4 });  // ; first
 			g_exitKey = controlmap::Claim("npcveh", "exit (debug)", VK_INSERT) ? VK_INSERT : 0;
+#ifndef FVO_RELEASE
+            g_pairMoveKey=controlmap::Claim("npcveh","move seated test pair (debug)",VK_NUMPAD3)?VK_NUMPAD3:0;
+            logger::Write("Pair move test: press %s after the debug-boarded NPC is seated and stopped",
+                g_pairMoveKey?controlmap::KeyName(g_pairMoveKey).c_str():"no available key");
+#endif
 			g_aggroKey = 0;
 			logger::Write("NPC vehicles: debug keys: BOARD %s, EXIT %s, PROFILE %s", g_walkKey ? controlmap::KeyName(g_walkKey).c_str() : "none",
 				g_exitKey ? controlmap::KeyName(g_exitKey).c_str() : "none", g_aggroKey ? controlmap::KeyName(g_aggroKey).c_str() : "none");
@@ -985,7 +981,11 @@ namespace npcvehicles
             j.since = GetTickCount64();
 			if (p != Phase::Following) { j.foe = 0; j.foeTier = -1; j.foeAt = 0; j.rescueParked = j.scoutReported = j.waiting = j.retreating = false; j.pMode = -1;
 				j.manOn = false; j.man = manoeuvre::Mind{}; j.manAt = 0; j.aiOn = false; j.ai = combatai::State{}; j.role = brain::Role::Engager; }
-			if (p == Phase::Idle) { j.resumeFoe=j.lastEnemyActor=j.squadFocus=0; j.boardingFight={}; j.exitWaitSince=0; j.order = 0; j.task = 0; j.haveHome = false; }
+			if (p == Phase::Idle) { j.resumeFoe=j.lastEnemyActor=j.squadFocus=0; j.boardingFight={}; j.exitWaitSince=0; j.order = 0; j.task = 0; j.haveHome = false;
+#ifndef FVO_RELEASE
+                j.factoryLease = 0; j.factoryReleased = false; j.factoryStock = false;
+#endif
+            }
 			if (p == Phase::Idle && j.vehicle && !j.passenger) {  // the job is over: an escort / pursuit assignment ends with it (other profiles are left alone)
 				vcontract::Unassign(j.vehicle, vcontract::Class::Combat);
 				vcontract::Unassign(j.vehicle, vcontract::Class::Weapons);
@@ -2458,7 +2458,20 @@ namespace npcvehicles
             }
 			vehicleflight::Command c;
 			c.set = 0;
-			if (now < j.stunUntil) {
+			// CB-2 (combat on the plan): tactics unchanged; the carrot above is the goal, the aim is Route's facing. While a combat line
+			// drives this pilot only the aim pitch goes as a stick; a stun, or a refused line, keeps today's stick path.
+			const bool aimNow = out.aim && mayAim;
+			const bool onPlan = vehicleflight::PilotCombatAim(j.pilot, out.aimPoint.x, out.aimPoint.y, out.aimPoint.z, aimNow, now >= j.stunUntil);
+			if (onPlan != j.aiPlan) {
+				j.aiPlan = onPlan;
+				logger::Write("OBS system=plan.combat vehicle=%08X pilot=%d event=%s aim=%d reason=%s", j.vehicle, j.pilot, onPlan ? "sticks_dropped" : "sticks_back", int(aimNow),
+					onPlan ? "combat_line_drives_the_plan_moves_it" : now < j.stunUntil ? "stunned" : "no_combat_line_this_frame");
+			}
+			if (onPlan) {
+				if (aimNow && !std::isnan(out.cmd.pitch)) { c.set = vehicleflight::Command::kPitch; c.pitch = out.cmd.pitch; }
+				else if (aimNow) { c.set = vehicleflight::Command::kPitch; c.pitch = std::clamp(std::atan2(out.aimPoint.z-vp.z,std::max(1.0,std::hypot(out.aimPoint.x-vp.x,out.aimPoint.y-vp.y))),-0.6,0.6); }
+			}
+			else if (now < j.stunUntil) {
 				// Rammed: out of control, drifting along the hit and spinning.
 				const double h = vr.z;
 				c.set = vehicleflight::Command::kYaw | vehicleflight::Command::kThrottle | vehicleflight::Command::kStrafe;
@@ -2894,6 +2907,12 @@ namespace npcvehicles
 			else if (j.task == 9) {  // an addon's scripted trip (fvo_addon_api.h): the addon gives the goal each frame
 				FvoTripGoal tg{};
 				const int r = j.trip.step ? j.trip.step(j.trip.user, vp.x, vp.y, vp.z, &tg) : 1;
+#ifndef FVO_RELEASE
+                if (j.factoryLease && r != 0) {
+                    EndJobOf(j.vehicle, "factory private route ended");
+                    return;
+                }
+#endif
 				if (trafficcycle::Destination(r)) {
 					BeginPark(j, player, tg.x, tg.y, j.trip.name ? j.trip.name : "scripted trip: at its destination");
 					j.repeatTraffic = trafficcycle::Repeat(r) && g_trafficCycle; return;
@@ -2905,10 +2924,30 @@ namespace npcvehicles
 				}
 				g.x = tg.x; g.y = tg.y; g.z = tg.z; g.stop = tg.stop > 0 ? tg.stop : 6.0;
 				g.nav.passThrough = tg.passThrough != 0;
-				if (tg.fly) { g.nav.travel = travelmode::Default::Hover; g.nav.trafficLane = true; }
+#ifndef FVO_RELEASE
+                if (j.factoryStock) {
+                    routeguidance::Clear(j.pilot);
+                    g.nav.travel = travelmode::Default::Drive;
+                    g.hold = true;
+                } else
+#endif
+                vehicleflight::RouteNav(j.pilot,j.trip.user,tg,g.nav);
+#ifndef FVO_RELEASE
+                if (j.factoryLease && !j.factoryStock) {
+                    const auto* lane = routeguidance::Get(j.pilot, GetTickCount64());
+                    if (!lane || lane->travel != 1 || !lane->held) {
+                        EndJobOf(j.vehicle, "factory route no longer supplies a held drive lane");
+                        return;
+                    }
+                }
+#endif
 				if (tg.speed > 0) g.nav.speedLimit = tg.speed;
 			}
-			if (j.task != 4 && now - j.since > (j.task == 9 ? kTaskMaxMs * 3 : kTaskMaxMs)) {
+			if (j.task != 4 &&
+#ifndef FVO_RELEASE
+                !j.factoryLease &&
+#endif
+                now - j.since > (j.task == 9 ? kTaskMaxMs * 3 : kTaskMaxMs)) {
 				BeginPark(j, player, vp.x, vp.y, "task took too long");
 				return;
 			}
@@ -3561,8 +3600,6 @@ namespace npcvehicles
 				if(!Has3D(npc)){const double drift=Dist3(npc,vehicle);
 					if(drift>2.0&&std::isfinite(drift)&&PinToVehicle(npc,vehicle)){++j.pins;j.pinMax=std::max(j.pinMax,drift);
 						if(j.pins==1)logger::Write("NPC vehicles: [%d] unloaded traffic driver %08X had drifted %.1f m from vehicle %08X: kept on its vehicle until both load",j.pilot,j.npc,drift,j.vehicle);}}
-				// [traffic] driverCellMove, default off: the 20:47 run showed every move loses the seat link (aboard=0), the driver ends up about 95 m off and the vehicle lands.
-				if(DriverCellMoveOn()&&Has3D(vehicle)&&!Has3D(npc)&&modelsToPlayer<trafficpair::kDriverModelReach&&now-j.cellBringAt>=3000){j.cellBringAt=now;BringDriverIntoCell(npc,vehicle);}
 				if(trafficpair::LandForMissingModel(Has3D(vehicle),Has3D(npc),now-j.no3DSince,modelsToPlayer))vehicleflight::PilotStop(j.pilot,"traffic driver model missing: land before repair");
 				return;
 			}
@@ -3607,7 +3644,11 @@ namespace npcvehicles
 						"pilot %s (last end: %s); pitch %.0f roll %.0f deg", j.pilot, (now - j.watchAt) / 1000.0, j.npc, j.vehicle, base ? At<std::uint32_t>(base, off::kFormId) : 0,
 						vp.x, vp.y, vp.z, Name(j.phase), kProfiles[int(j.profile)].name, j.foe, foe && Dead(foe) ? " (dead)" : "", foe ? Dist(vehicle, foe) : -1.0, toPlayer,
 						vehicleflight::PilotActive(j.pilot) ? "flying" : "OFF", vehicleflight::PilotEndReason(j.pilot) ? vehicleflight::PilotEndReason(j.pilot) : "-", rot.x * 57.29578, rot.y * 57.29578);
-					if (j.task == 9 && j.trip.step && now - j.watchAt >= kTripStuckMs) {
+					if (j.task == 9 && j.trip.step &&
+#ifndef FVO_RELEASE
+                        !j.factoryLease &&
+#endif
+                        now - j.watchAt >= kTripStuckMs) {
 						logger::Write("NPC vehicles: [%d] traffic trip of vehicle %08X stuck %.0f s at (%.0f, %.0f, %.0f): trip ended, driver stays aboard",
 							j.pilot, j.vehicle, (now - j.watchAt) / 1000.0, vp.x, vp.y, vp.z);
 						vehicleflight::PilotStop(j.pilot, "traffic trip stuck");
@@ -3783,11 +3824,27 @@ namespace npcvehicles
 						if (j.trip.step(j.trip.user, vpos.x, vpos.y, vpos.z, &tg) == 0) {
 							first.x = tg.x; first.y = tg.y; first.z = tg.z; first.stop = tg.stop > 0 ? tg.stop : 6.0;
 							first.nav.passThrough = tg.passThrough != 0;
-							if (tg.fly) { first.nav.travel = travelmode::Default::Hover; first.nav.trafficLane = true; }
+#ifndef FVO_RELEASE
+                            if (j.factoryStock) {
+                                routeguidance::Clear(j.pilot);
+                                first.nav.travel = travelmode::Default::Drive;
+                                first.hold = true;
+                            } else
+#endif
+                            vehicleflight::RouteNav(j.pilot,j.trip.user,tg,first.nav);
 							if (tg.speed > 0) first.nav.speedLimit = tg.speed;
 							haveFirst = true;
 						}
 					}
+#ifndef FVO_RELEASE
+                    if (j.factoryLease && !j.factoryStock) {
+                        const auto* lane = routeguidance::Get(j.pilot, GetTickCount64());
+                        if (!haveFirst || !lane || lane->travel != 1 || !lane->held) {
+                            EndJobOf(j.vehicle, "factory route did not supply a held drive lane");
+                            return;
+                        }
+                    }
+#endif
 					if ((haveFirst || vcontract::GoalFor(vcontract::User::Npc, j.pilot, vehicle, player, first)) && vehicleflight::PilotFly(j.pilot, vehicle, first)) {
 						if (!g_told) FollowerNotice(j.npc,j.vehicle==vehicleflight::OwnRoverId()?"Your driver is ready":"Vehicle driver ready");
 						g_told = true;
@@ -3883,6 +3940,12 @@ namespace npcvehicles
 					break;
 				}
 				if(j.task && Aggressor(j.vehicle,now)) {
+#ifndef FVO_RELEASE
+                    if (j.factoryLease) {
+                        EndJobOf(j.vehicle, "factory private lease interrupted by combat");
+                        return;
+                    }
+#endif
 					j.task=0;const auto vp=At<game::Vec3>(vehicle,off::kRefPosition);
 					vcontract::Assign(j.vehicle,vcontract::Find("escort"),vp.x,vp.y);
 				}
@@ -4034,7 +4097,7 @@ namespace npcvehicles
                 // job keeps flying it. Exit and take-the-wheel stay on the passenger keys.
                 const auto owner=integrationlogic::ControllerFor(false,false,mode!=overrides::Mode::None||toMarker,rescuer,foe!=0,searching,false,j.task!=0);
                 j.controller=owner;
-                if (!manActive && j.aiOn) { j.aiOn=false; j.aiFire=false; vehicleflight::ClearPilotCommand(j.pilot); }
+                if (!manActive && j.aiOn) { j.aiOn=false; j.aiFire=false; j.aiPlan=false; vehicleflight::ClearPilotCommand(j.pilot); }
 				if (!manActive && !manRam && j.manOn) { j.manOn = false; j.man = manoeuvre::Mind{}; }
 				if (manRam) break;  // the ram order flies this vehicle (the Ramming branch above from the next frame)
                 if(foe && !rescuer && !toMarker && !scouting && rules.chase && !manActive) {
@@ -4171,7 +4234,9 @@ namespace npcvehicles
 				else if (have && vehicleflight::PilotActive(j.pilot)) {
 					const double above = vehicleflight::PilotAboveGround(j.pilot, vehicle);
 					// Parked only once down (2026-10-28: a follower parked in the air dropped); ground unknown: as before.
-					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar && !busyGoal && (!std::isfinite(above) || above < 3.5)) {
+					// Never while you drive it from the passenger seat (2026-11-18 00:30:37: parked ~20 times a second under your control).
+					if (kProfiles[int(j.profile)].parkWhenStill && playerStill && toPlayer < kFollowFar && !busyGoal && (!std::isfinite(above) || above < 3.5) &&
+						!(passenger::Controlling() && passenger::RidingVehicle() == j.vehicle)) {
 						vehicleflight::PilotStop(j.pilot, "follow: player stopped; parked");
 						j.parked = true;
 						logger::Write("NPC vehicles: [%d] parked %.0f m from you (NPC stays aboard)", j.pilot, toPlayer);
@@ -4265,6 +4330,12 @@ namespace npcvehicles
 		std::atomic<ULONGLONG> g_driverUntil{ 0 };
 		uptr SeatKeywordDetour(uptr actor, uptr vehicle)
 		{
+			// SL-1: a laddered vehicle seats an NPC at its current ladder marker (never the player: the player's seat logic below is unchanged).
+			if (actor && vehicle && actor != Ptr(addr::kPlayerCharacterPtr)) {
+				std::uint32_t marker = 0; bool laddered = false;
+				{ std::lock_guard lk(g_ladderLock); const auto it = g_ladderMarker.find(At<std::uint32_t>(vehicle, off::kFormId)); if (it != g_ladderMarker.end()) { marker = it->second; laddered = true; } }
+				if (laddered) { if (const uptr kw = MarkerKeyword(At<uptr>(vehicle, 0x98), marker)) return kw; }
+			}
 			const bool asDriver = vehicle == g_driverFor.load() && GetTickCount64() < g_driverUntil.load();
 			const uptr pinned = GetTickCount64() < g_boardUntil.load() ? g_boardVehicle.load() : 0;
 			const uptr kw = boardinggate::PassengerKeyword(vehicle, asDriver, pinned, g_boardKeyword.load(), g_swapVehicle.load(), g_swapKeyword.load());
@@ -4568,6 +4639,9 @@ namespace npcvehicles
 		void TakeSeat(uptr player, uptr vehicle, uptr occupant, const char* why)
 		{
 			const std::uint32_t oid = At<std::uint32_t>(occupant, off::kFormId);
+			// KO-1 (2026-11-08, kick-out port): the player takes this vehicle now: recorded at once, so traffic lets go of the pair (no re-seat, bring or move
+			// of its driver) and a birth-held chassis is released to the player (2026-11-07 21:12: FF100075 re-seated 2 s after the pull-out, FF10006C frozen).
+			trafficpool::NotePlayerTook(At<std::uint32_t>(vehicle, off::kFormId), !std::strcmp(why, "hijack") ? "hijack" : !std::strcmp(why, "hand-over") ? "hand_over" : "pulled_out");
 			for (auto& j : g_jobs) {
 				if (j.phase != Phase::Idle && j.npc == oid) {
 					vehicleflight::PilotStop(j.pilot, why);
@@ -4995,8 +5069,145 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: [%d] force: NPC %08X (%s, %.0f m in front of you, %.0f deg off)", slot->pilot, At<std::uint32_t>(npc, off::kFormId),
 				modscene::RttiName(npc), npcDist, npcOff * 57.2958);
 			if (!StartWalkBoard(slot, npc, vehicle)) return;
+#ifndef FVO_RELEASE
+            g_testPairVehicle=slot->vehicle;g_testPairDriver=slot->npc;
+            logger::Write("OBS system=pair.move_test event=pair_selected source=debug_board vehicle=%08X driver=%08X",
+                g_testPairVehicle,g_testPairDriver);
+#endif
 			logger::Write("NPC sent to a vehicle (%.0f m)", bestV);
 		}
+
+#ifndef FVO_RELEASE
+        // ---- Seated-pair relocation experiment (diagnostic builds only; notes/RELOCATION_DOER_AND_COMMUNICATOR_20261120.md) ----
+        // Numpad 3 relocates the seated NPC you face (else the pair made with the board key) 6 m ahead along its vehicle's heading.
+        // Roles: this file is the Coordinator (relocation.h: grant, receipt, one delivery to every consumer); vehicleflight::relocate is the
+        // doer (one substitution of the chassis pose at one physics step, then facts). Nothing else decides here, and nothing moves the actor.
+        relocation::Coordinator g_reloc;
+        std::uint64_t g_relocEpoch = 1, g_relocSerial = 0, g_relocArmedAt = 0, g_relocPendingLogAt = 0;
+        std::uint32_t g_relocVehicle = 0, g_relocDriver = 0;
+        bool g_relocIssued = false, g_relocSubscribed = false;
+        bool RelocLog(const relocation::Receipt& r, void*)
+        {
+            logger::Write("OBS system=relocation event=published serial=%llu epoch=%llu vehicle=%08X driver=%08X result=%s reason=%s from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f measured=%.2f,%.2f,%.2f displacement=%.2f step_before=%llu step_after=%llu seat_before=%d seat_after=%d live=%d",
+                (unsigned long long)r.serial, (unsigned long long)r.epoch, r.vehicle, r.driver, relocation::ResultName(r.result), r.reason,
+                r.from.x, r.from.y, r.from.z, r.to.x, r.to.y, r.to.z, r.measured.x, r.measured.y, r.measured.z, r.displacement,
+                (unsigned long long)r.stepBefore, (unsigned long long)r.stepAfter, r.seatedBefore ? 1 : 0, r.seatedAfter ? 1 : 0, r.physicsLive ? 1 : 0);
+            return true;
+        }
+        // The seated NPC in front of the player (the same facing rule as the board key): the actor and the vehicle it sits in.
+        bool FacedSeatedPair(uptr player, uptr& npc, uptr& vehicle)
+        {
+            const auto refs = modscene::LoadedRefs(8000);
+            const auto pp = At<game::Vec3>(player, off::kRefPosition);
+            const double facing = At<game::Vec3>(player, off::kRefRotation).z;
+            double best = 1e9;
+            for (const uptr r : refs) {
+                if (r == player || Disabled(r) || !Has3D(r) || !IsActorRef(r) || Dead(r)) continue;
+                const uptr v = InVehicle(r);
+                if (!v) continue;
+                const auto q = At<game::Vec3>(r, off::kRefPosition);
+                const double dx = double(q.x) - pp.x, dy = double(q.y) - pp.y, d = std::hypot(dx, dy);
+                if (d < 0.5 || d > kFaceRange) continue;
+                double off = std::atan2(dx, dy) - facing;
+                while (off > 3.14159265) off -= 6.28318531;
+                while (off < -3.14159265) off += 6.28318531;
+                off = std::fabs(off);
+                if (off > kFaceCone) continue;
+                const double score = off * 30.0 + d;
+                if (score < best) { best = score; npc = r; vehicle = v; }
+            }
+            return npc != 0;
+        }
+        void RelocationRefuse(std::uint32_t v, std::uint32_t d, const char* reason)
+        {
+            logger::Write("OBS system=relocation event=refused vehicle=%08X driver=%08X reason=%s", v, d, reason);
+        }
+        void RelocationStart(uptr player)
+        {
+            if (g_relocSerial) { RelocationRefuse(g_relocVehicle, g_relocDriver, "previous_relocation_still_running"); return; }
+            uptr d = 0, v = 0;
+            if (!FacedSeatedPair(player, d, v)) {
+                v = RefById(g_testPairVehicle); d = RefById(g_testPairDriver);
+                if (!v || !d || InVehicle(d) != v) { RelocationRefuse(g_testPairVehicle, g_testPairDriver, "no_seated_npc_in_front_and_no_board_pair"); return; }
+            }
+            const std::uint32_t vid = At<std::uint32_t>(v, off::kFormId), did = At<std::uint32_t>(d, off::kFormId);
+            if (Disabled(v) || trafficpool::MadeVehicle(vid) || trafficpool::PlayerOwnsHandoff(vid) || VehicleInCombat(vid)) { RelocationRefuse(vid, did, "vehicle_unavailable"); return; }
+            if (!SeatedNow(d, v, true)) { RelocationRefuse(vid, did, "driver_not_seated"); return; }
+            const auto vp = At<game::Vec3>(v, off::kRefPosition), vr = At<game::Vec3>(v, off::kRefRotation);
+            const double dx = std::sin(vr.z) * 6.0, dy = std::cos(vr.z) * 6.0, dz = 0.3;
+            relocation::Request q;
+            q.vehicle = vid; q.driver = did; q.epoch = g_relocEpoch; q.stepBefore = 0; q.seatedBefore = true;
+            q.from = { vp.x, vp.y, vp.z, vr.z }; q.to = { vp.x + dx, vp.y + dy, vp.z + dz, vr.z };
+            if (!g_relocSubscribed) { g_reloc.Subscribe("log", RelocLog, nullptr); g_relocSubscribed = true; }
+            const char* why = "";
+            const std::uint64_t serial = g_reloc.Arm(q, g_relocEpoch, why);
+            if (!serial) { RelocationRefuse(vid, did, why); return; }
+            const ULONGLONG now = GetTickCount64();
+            logger::Write("OBS system=relocation event=grant serial=%llu epoch=%llu vehicle=%08X driver=%08X from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f delta=%.1f,%.1f,%.1f source=%s",
+                (unsigned long long)serial, (unsigned long long)g_relocEpoch, vid, did, q.from.x, q.from.y, q.from.z, q.to.x, q.to.y, q.to.z, dx, dy, dz,
+                (vid == g_testPairVehicle) ? "board_pair" : "faced_seated_npc");
+            if (const char* refusal = vehicleflight::relocate::Arm(vid, dx, dy, dz, serial)) {
+                g_reloc.Refuse(serial, refusal, now);
+                return;
+            }
+            g_relocSerial = serial; g_relocVehicle = vid; g_relocDriver = did; g_relocArmedAt = now; g_relocIssued = false; g_relocPendingLogAt = 0;
+        }
+        void RelocationTick()
+        {
+            if (!g_relocSerial) return;
+            const ULONGLONG now = GetTickCount64();
+            if (!g_relocIssued) {
+                vehicleflight::relocate::Facts f;
+                if (vehicleflight::relocate::Take(g_relocSerial, f)) {
+                    if (f.issued) {
+                        g_reloc.MarkIssued(g_relocSerial, now); g_relocIssued = true;
+                        logger::Write("OBS system=relocation event=issued serial=%llu vehicle=%08X driver=%08X ring_first_ok=%d com_near_body=%d speed=%.2f com_before=%.3f,%.3f,%.3f com_after=%.3f,%.3f,%.3f body_before=%.3f,%.3f,%.3f body_after=%.3f,%.3f,%.3f",
+                            (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, f.ringFirstOk ? 1 : 0, f.comNearBody ? 1 : 0, f.speed,
+                            f.comBefore[0], f.comBefore[1], f.comBefore[2], f.comAfter[0], f.comAfter[1], f.comAfter[2],
+                            f.bodyBefore[0], f.bodyBefore[1], f.bodyBefore[2], f.bodyAfter[0], f.bodyAfter[1], f.bodyAfter[2]);
+                    } else {
+                        g_reloc.Refuse(g_relocSerial, f.refusal, now);
+                        vehicleflight::relocate::Disarm(g_relocSerial); g_relocSerial = 0; return;
+                    }
+                } else if (now - g_relocArmedAt > 3000) {
+                    g_reloc.Refuse(g_relocSerial, "not_issued_in_time", now);   // the chassis took no physics step in 3 s (asleep, or not owned by a pilot)
+                    vehicleflight::relocate::Disarm(g_relocSerial); g_relocSerial = 0; return;
+                } else return;
+            }
+            const uptr v = RefById(g_relocVehicle), d = RefById(g_relocDriver);
+            relocation::Readback rb;
+            vehicleflight::relocate::Chassis ch;
+            const bool have = vehicleflight::relocate::Read(g_relocSerial, ch);
+            rb.bodyValid = have && ch.bodyValid && v && d;
+            rb.chassis = { ch.pos[0], ch.pos[1], ch.pos[2], 0 };
+            if (d) { const auto dp = At<game::Vec3>(d, off::kRefPosition); rb.driver = { dp.x, dp.y, dp.z, 0 }; }
+            rb.aboardAfter = d && v && InVehicle(d) == v;
+            rb.seatedAfter = rb.aboardAfter && SeatedNow(d, v, true);
+            rb.physicsLive = have && ch.live;
+            rb.driverPoseKnown = false;   // the stored actor position may lag its seat: until the actor's own body is read, the seat link is the evidence
+            rb.stepAfter = have ? ch.completedSteps : 0;
+            if (now - g_relocPendingLogAt >= 500) {
+                g_relocPendingLogAt = now;
+                const auto vp = v ? At<game::Vec3>(v, off::kRefPosition) : game::Vec3{};
+                logger::Write("OBS system=relocation event=pending serial=%llu vehicle=%08X driver=%08X steps=%llu live=%d body_valid=%d chassis=%.2f,%.2f,%.2f vehicle_ref=%.2f,%.2f,%.2f driver_ref=%.2f,%.2f,%.2f aboard=%d seated=%d seat_dist=%.2f",
+                    (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, (unsigned long long)rb.stepAfter, rb.physicsLive ? 1 : 0, rb.bodyValid ? 1 : 0,
+                    rb.chassis.x, rb.chassis.y, rb.chassis.z, vp.x, vp.y, vp.z, rb.driver.x, rb.driver.y, rb.driver.z, rb.aboardAfter ? 1 : 0, rb.seatedAfter ? 1 : 0,
+                    (d && v) ? SeatDist(d, v) : -1.0);
+            }
+            relocation::Receipt out;
+            if (g_reloc.Verify(g_relocSerial, rb, now, out)) {
+                vehicleflight::relocate::Disarm(g_relocSerial); g_relocSerial = 0; g_relocIssued = false;
+            }
+        }
+        void PairMoveKey(uptr player){
+            RelocationTick();
+            const bool down=g_pairMoveKey&&Focused()&&(GetAsyncKeyState(g_pairMoveKey)&0x8000)!=0;
+            const bool pressed=down&&!g_pairMoveDown;
+            g_pairMoveDown=down;
+            if(!pressed||!bindings::Allowed()||hoverui::IsScannerOpen()||InVehicle(player))return;
+            RelocationStart(player);
+        }
+#endif
 
 		// ---- The player's followers: the game's own follower list (used by the seat rules: a follower hands the wheel over) ----
 		// Game.GetPlayerFollowers (FUN_14200B760): the player's extra data of type 0x1B holds {.. +0x18 count, +0x20
@@ -5145,15 +5356,6 @@ namespace npcvehicles
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
 				return false;
-			}
-		}
-
-		void SeatPlayerNow(uptr vehicle)
-		{
-			__try {
-				g_seatPlayerOriginal(vehicle);
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {
 			}
 		}
 
@@ -5550,13 +5752,6 @@ namespace npcvehicles
 		// driver's sit state or releases its seat. FUN_1418EC2B0 is the sit state setter (ActorState, actor +0xF0, vtable +0x198),
 		// FUN_1419942C0 the seat release, FUN_140BA9770 attaches the carrier (REFRSyncController) that moves a seated passenger.
 		// Any thread. Only listed drivers, and a bounded number of lines per load.
-		constexpr std::uint32_t kSitStateFn = 0x018EC2B0, kSeatReleaseFn = 0x019942C0, kSyncAttachFn = 0x00BA9770;
-		using SitStateSet_t = std::uint64_t (*)(uptr, int);
-		using SeatRelease_t = void (*)(uptr, std::uint64_t, std::uint64_t, std::uint64_t);
-		using SyncAttach_t = bool (*)(uptr, uptr, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
-		SitStateSet_t g_sitStateOriginal = nullptr;
-		SeatRelease_t g_seatReleaseOriginal = nullptr;
-		SyncAttach_t g_syncAttachOriginal = nullptr;
 		std::atomic<int> g_seatTraceBudget{ 4000 };
 		int g_dropTraces = 0;
 
@@ -5585,34 +5780,6 @@ namespace npcvehicles
 			}
 		}
 
-		// Which game rule takes a driver's model away (2026-10-30, for the driver's rule exemption, the same kind vehicles have to show far away). Both are
-		// trace only: FUN_140B3E1E0, called from the actor's model setter, and FUN_1418E17D0, the demotion the cell-unload loop FUN_140B0FF10 skips only for
-		// the player and followers (actor +0x37C bit 21). Whether that loop is the path that runs when the player walks away is what the callers will show.
-		using RefModelSet_t = void (*)(uptr, uptr, char, std::uint64_t);
-		using ActorDemote_t = std::uint64_t (*)(uptr, char, std::uint64_t, std::uint64_t);
-		RefModelSet_t g_refModelOriginal = nullptr;
-		ActorDemote_t g_actorDemoteOriginal = nullptr;
-		std::atomic<int> g_modelTraceBudget{ 600 };
-		void TraceDriverModel(const char* what, uptr actor, std::uint64_t value)
-		{
-			const std::uint32_t id = TraceId(actor);
-			if (!id || !FullSimListed(id) || g_modelTraceBudget.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
-			char callers[128], probe[256];
-			CallerText(callers, sizeof(callers));
-			SeatProbe(actor, probe, sizeof(probe), InVehicle(actor));
-			logger::Write("NPC vehicles: model trace: driver %08X %s %llX, model %d, from %s; %s", id, what, static_cast<unsigned long long>(value), Has3D(actor) ? 1 : 0, callers, probe);
-		}
-		void RefModelDetour(uptr ref, uptr node, char a, std::uint64_t b)
-		{
-			TraceDriverModel("model set to", ref, node);
-			g_refModelOriginal(ref, node, a, b);
-		}
-		std::uint64_t ActorDemoteDetour(uptr actor, char a, std::uint64_t b, std::uint64_t c)
-		{
-			TraceDriverModel("demoted, argument", actor, static_cast<std::uint8_t>(a));
-			return g_actorDemoteOriginal(actor, a, b, c);
-		}
-
 		// The driver's rule exemption (trafficpair.h has the why).
 		constexpr std::uint32_t kFullLodFlag = 0x10000;
 		using ActorCellCheck_t = void (*)(uptr);
@@ -5628,32 +5795,6 @@ namespace npcvehicles
 			g_actorCellCheckOriginal(actor);
 		}
 		// Main thread. One per pass of the list: each makes a reference (2026-10-29: a batch of reference changes in one frame was a visible hitch).
-		// The model guard at the moment a model arrives (FUN_141948250, the actor's vt +0x538): a guarded driver's new model is shrunk before it is attached, so it is never drawn full size for a frame.
-		// Load3D (FUN_140B38A10) has already written the ref's scale; nothing writes the root's scale per frame. The guard shows it the next update if the driver sits. Any thread: exact ids in a plain table.
-		constexpr float kModelHidden = 0.001f;
-		constexpr std::uint32_t kGuardTable = 1024;
-		std::atomic<std::uint32_t> g_guardIds[kGuardTable] = {};
-		std::atomic<float> g_attachScale[kGuardTable] = {};
-		using ActorModelSet_t = void (*)(uptr, uptr, std::uint64_t, std::uint64_t);
-		ActorModelSet_t g_actorModelOriginal = nullptr;
-		void ShrinkArriving(uptr actor, uptr model)
-		{
-			__try {
-				const std::uint32_t id = At<std::uint32_t>(actor, off::kFormId);
-				const std::uint32_t slot = id & (kGuardTable - 1);
-				if (!id || g_guardIds[slot].load(std::memory_order_relaxed) != id) return;
-				float& scale = At<float>(model, 0x7C);
-				if (scale == kModelHidden) return;
-				g_attachScale[slot].store(scale > 0.0f ? scale : 1.0f, std::memory_order_relaxed);
-				scale = kModelHidden;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) {}
-		}
-		void ActorModelDetour(uptr actor, uptr model, std::uint64_t a, std::uint64_t b)
-		{
-			if (actor && model) ShrinkArriving(actor, model);
-			g_actorModelOriginal(actor, model, a, b);
-		}
 
 		// The driver pass (notes/driver-pass-20261031/TRACE.md): the game's own far-cell route for actors, the one flying actors use.
 		constexpr std::uint32_t kFarCellEnter = 0x00BB5180, kFarCellLeave = 0x00BB53C0;  // (world, ref)
@@ -5779,45 +5920,8 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: [%d] driver pass queued for %08X / %08X; awaiting native cell membership",j.pilot,j.npc,j.vehicle);
 		}
 
-		std::uint64_t SitStateDetour(uptr state, int value)
-		{
-			const uptr actor = state - 0xF0;
-			const std::uint32_t id = TraceId(actor);
-			if (!TraceWanted(id)) return g_sitStateOriginal(state, value);
-			const int before = SitState(actor);
-			const std::uint64_t r = g_sitStateOriginal(state, value);
-			char callers[128], probe[256];
-			CallerText(callers, sizeof(callers));
-			SeatProbe(actor, probe, sizeof(probe), InVehicle(actor));
-			logger::Write("NPC vehicles: seat trace: driver %08X sit %d -> %d (set %d) from %s; %s", id, before, SitState(actor), value, callers, probe);
-			return r;
-		}
 
-		void SeatReleaseDetour(uptr actor, std::uint64_t a, std::uint64_t b, std::uint64_t c)
-		{
-			const std::uint32_t id = TraceId(actor);
-			if (TraceWanted(id)) {
-				char callers[128], probe[256];
-				CallerText(callers, sizeof(callers));
-				SeatProbe(actor, probe, sizeof(probe), InVehicle(actor));
-				logger::Write("NPC vehicles: seat trace: driver %08X seat release (%d, %d) at sit %d from %s; %s", id, int(a & 0xFF), int(b & 0xFF), SitState(actor), callers, probe);
-			}
-			g_seatReleaseOriginal(actor, a, b, c);
-		}
 
-		bool SyncAttachDetour(uptr first, uptr second, std::uint64_t a, std::uint64_t b, std::uint64_t c, std::uint64_t d)
-		{
-			const bool r = g_syncAttachOriginal(first, second, a, b, c, d);  // first: its arguments may be in vector registers
-			// Which argument is the driver is not read yet from the decompile: either one being listed counts.
-			const std::uint32_t id1 = TraceId(first), id2 = TraceId(second);
-			const std::uint32_t id = FullSimListed(id1) ? id1 : FullSimListed(id2) ? id2 : 0;
-			if (TraceWanted(id)) {
-				char callers[128];
-				CallerText(callers, sizeof(callers));
-				logger::Write("NPC vehicles: seat trace: driver %08X carrier attach -> %d (argument %d) from %s", id, r ? 1 : 0, id == id1 ? 1 : 2, callers);
-			}
-			return r;
-		}
 
 		// Lists this frame's drivers and follows a driver's position every frame for 1.5 s after it leaves its vehicle (one step: an
 		// old controller position came back; a smooth curve: a real fall).
@@ -5896,6 +6000,9 @@ namespace npcvehicles
 		const bool wdown = g_walkKey && Focused() && (GetAsyncKeyState(g_walkKey) & 0x8000) != 0;
 		if (wdown && !g_walkDown) Force(player);
 		g_walkDown = wdown;
+#ifndef FVO_RELEASE
+        PairMoveKey(player);
+#endif
 		const bool xdown = g_exitKey && Focused() && (GetAsyncKeyState(g_exitKey) & 0x8000) != 0;
 		if (xdown && !g_exitDown) ExitAllJobs();
 		g_exitDown = xdown;
@@ -6302,42 +6409,13 @@ namespace npcvehicles
 			logger::Write("NPC vehicles: dismount hook FAILED (bytes differ)");
 		}
 		logger::Write("NPC vehicles: native process-level selection preserved (no forced high process)");
-		static const std::uint8_t kSitStatePrologue[16] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x40, 0xB7, 0x01 };
-		static const std::uint8_t kSeatReleasePrologue[17] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0x44, 0x88, 0x48, 0x20, 0x88, 0x50, 0x10, 0x55, 0x56, 0x57 };
-		static const std::uint8_t kSyncAttachPrologue[15] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x4C, 0x89, 0x44, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54 };
-		void* traced = nullptr;
-		// Trace only, and they run on the game's worker threads in the middle of its unloads, reading actors being taken apart. Off unless settings.ini [traffic] traceHooks=1 (2026-10-30 14:00 crash).
-		const bool traceHooks = GetPrivateProfileIntW(L"traffic", L"traceHooks", 0, fvopaths::Settings().c_str()) != 0;
-		if (traceHooks) {
-		const bool sitTrace = hook::Install(game::Base() + kSitStateFn, kSitStatePrologue, sizeof(kSitStatePrologue), reinterpret_cast<void*>(&SitStateDetour), &traced);
-		if (sitTrace) g_sitStateOriginal = reinterpret_cast<SitStateSet_t>(traced);
-		const bool releaseTrace = hook::Install(game::Base() + kSeatReleaseFn, kSeatReleasePrologue, sizeof(kSeatReleasePrologue), reinterpret_cast<void*>(&SeatReleaseDetour), &traced);
-		if (releaseTrace) g_seatReleaseOriginal = reinterpret_cast<SeatRelease_t>(traced);
-		const bool syncTrace = hook::Install(game::Base() + kSyncAttachFn, kSyncAttachPrologue, sizeof(kSyncAttachPrologue), reinterpret_cast<void*>(&SyncAttachDetour), &traced);
-		if (syncTrace) g_syncAttachOriginal = reinterpret_cast<SyncAttach_t>(traced);
-		logger::Write("NPC vehicles: seat trace hooks: sit state %d, seat release %d, carrier attach %d", sitTrace ? 1 : 0, releaseTrace ? 1 : 0, syncTrace ? 1 : 0);
-		static const std::uint8_t kRefModelPrologue[15] = { 0x48, 0x8B, 0xC4, 0x44, 0x88, 0x48, 0x20, 0x44, 0x88, 0x40, 0x18, 0x48, 0x89, 0x50, 0x10 };
-		static const std::uint8_t kActorDemotePrologue[16] = { 0x88, 0x54, 0x24, 0x10, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57 };
-		const bool modelTrace = hook::Install(game::Base() + 0x00B3E1E0, kRefModelPrologue, sizeof(kRefModelPrologue), reinterpret_cast<void*>(&RefModelDetour), &traced);
-		if (modelTrace) g_refModelOriginal = reinterpret_cast<RefModelSet_t>(traced);
-		const bool demoteTrace = hook::Install(game::Base() + 0x018E17D0, kActorDemotePrologue, sizeof(kActorDemotePrologue), reinterpret_cast<void*>(&ActorDemoteDetour), &traced);
-		if (demoteTrace) g_actorDemoteOriginal = reinterpret_cast<ActorDemote_t>(traced);
-		logger::Write("NPC vehicles: model trace hooks: model setter %d, demotion %d", modelTrace ? 1 : 0, demoteTrace ? 1 : 0);
-		}
-		static const std::uint8_t kActorModelPrologue[16] = { 0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x40 };
-		void* actorModel = nullptr;
-		if (trafficdiagnostics::ModelGuardEnabled()) {
-			if (hook::Install(game::Base() + 0x01948250, kActorModelPrologue, sizeof(kActorModelPrologue), reinterpret_cast<void*>(&ActorModelDetour), &actorModel)) g_actorModelOriginal = reinterpret_cast<ActorModelSet_t>(actorModel);
-			logger::Write("NPC vehicles: model guard at attach %s; per-frame guard on", g_actorModelOriginal ? "installed" : "FAILED (bytes differ)");
-		}
-		else logger::Write("NPC vehicles: model guard OFF at attach and per frame (settings.ini [traffic] modelGuard=0; restart to change)");
         // Preserve native 1418EBF00/1418EBF90 collision housekeeping.
-        if(GetPrivateProfileIntW(L"traffic",L"driverPass",0,fvopaths::Settings().c_str())){
+        {  // driver pass: always on (2026-11-05 settings strip; was settings.ini [traffic] driverPass, which the user ran on)
             static const std::uint8_t prologue[]={0x40,0x55,0x53,0x56,0x57,0x41,0x56,0x41,0x57,0x48,0x8B,0xEC,0x48,0x83,0xEC,0x48};
             void* farOriginal=nullptr;
             if(hook::Install(game::Base()+0x018DB800,prologue,sizeof(prologue),reinterpret_cast<void*>(&FarTestDetour),&farOriginal))g_farTestOriginal=reinterpret_cast<FarTest_t>(farOriginal);
             logger::Write("NPC vehicles: driver pass %s; native cell/physics housekeeping preserved",g_farTestOriginal?"queued":"unavailable");
-        }else logger::Write("NPC vehicles: driver pass off (controlled allocator comparison retained)");
+        }
 
 		{
 			auto** slot = reinterpret_cast<void**>(game::Base() + kFireSinkSlot);
@@ -6389,32 +6467,6 @@ namespace npcvehicles
 		const uptr player = Ptr(addr::kPlayerCharacterPtr);
 		const uptr v = RefById(vehicleId);
 		return player && v && DriverOf(v, player) != 0;
-	}
-
-	std::uint32_t TakeDriver(std::uint32_t vehicleId)
-	{
-		for (auto& j : g_jobs) {
-			if (!vehicleId || j.phase != Phase::Following || j.vehicle != vehicleId) continue;
-			const std::uint32_t npcId = j.npc;
-			const uptr npc = RefById(npcId);
-			vehicleflight::PilotStop(j.pilot, "the player took the wheel");
-			Set(j, Phase::Idle);
-			if (npc) {
-				g_allowDismount = true;
-				EndInteraction(npc);
-				g_allowDismount = false;
-			}
-			return npc ? npcId : 0;
-		}
-		return 0;
-	}
-
-	bool SeatPlayerDriver(std::uintptr_t vehicle)
-	{
-		const uptr player = Ptr(addr::kPlayerCharacterPtr);
-		if (!player || !vehicle || !g_seatPlayerOriginal) return false;
-		SeatPlayerNow(vehicle);
-		return InVehicle(player) == vehicle;
 	}
 
 	bool RequestExit(std::uintptr_t actor, const vcontract::ExitRequest& req) { return StartExit(actor, req); }
@@ -6827,10 +6879,159 @@ namespace npcvehicles
 			Set(j,Phase::Boarding);
             const bool pkg=pilotquest::AssignTraffic(j.pilot-1,actor,vehicle);
             j.questPending=!pkg&&lifecycle::Pending(npcId,"pilot-assign");
-			if (!pkg&&!j.questPending) logger::Write("NPC vehicles: [%d] cold start: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)", j.pilot, npcId);
+			if (!pkg&&!j.questPending) {
+                logger::Write("NPC vehicles: [%d] cold start: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)",j.pilot,npcId);
+                j=Job{};return false;
+            }
 			logger::Write("NPC vehicles: [%d] %s: seated NPC %08X drives vehicle %08X (cold start)", j.pilot, claim.name ? claim.name : "scripted trip", npcId, vehId);
 			return true;
 		}
+		return false;
+	}
+
+#ifndef FVO_RELEASE
+    static std::uint64_t StartFactoryLeaseImpl(std::uintptr_t actor, std::uintptr_t vehicle,
+                                               const FvoTripClaim& claim, bool stock)
+    {
+        if (!actor || !vehicle || !claim.step || (!stock && !claim.user)) return 0;
+        const auto vehicleId = At<std::uint32_t>(vehicle, off::kFormId);
+        const auto driverId = At<std::uint32_t>(actor, off::kFormId);
+        for (const auto& job : g_jobs) {
+            if (job.factoryLease && (!stock || !job.factoryStock ||
+                !vehicleflight::FactoryMotionProved(job.pilot, job.vehicle, job.factoryLease))) return 0;
+        }
+        if (!StartScriptedSeated(actor, vehicle, claim)) return 0;
+        static std::uint64_t nextLease = 0;
+        for (auto& job : g_jobs) {
+            if (job.phase != Phase::Boarding || job.vehicle != vehicleId || job.npc != driverId) continue;
+            job.factoryLease = ++nextLease;
+            job.factoryStock = stock;
+            logger::Write("OBS system=factory.lease vehicle=%08X driver=%08X event=granted token=%llu pilot=%d mode=%s reason=seated_job_admitted",
+                vehicleId, driverId, job.factoryLease, job.pilot, stock ? "stationary_goal" : "held_lane");
+            return job.factoryLease;
+        }
+        return 0;
+    }
+
+    std::uint64_t StartFactoryLease(std::uintptr_t actor, std::uintptr_t vehicle, const FvoTripClaim& claim)
+    {
+        return StartFactoryLeaseImpl(actor, vehicle, claim, false);
+    }
+
+    std::uint64_t StartFactoryStockLease(std::uintptr_t actor, std::uintptr_t vehicle)
+    {
+        const FvoTripClaim hold{
+            [](void*, double x, double y, double z, FvoTripGoal* out) {
+                *out = {x, y, z, 1.5, 0, 0, 0};
+                return 0;
+            },
+            nullptr, "factory stock qualification"
+        };
+        return StartFactoryLeaseImpl(actor, vehicle, hold, true);
+    }
+
+    static Job* FactoryJob(unsigned vehicle, unsigned driver, std::uint64_t token)
+    {
+        if (!token) return nullptr;
+        for (auto& job : g_jobs) {
+            if (job.factoryLease == token && job.vehicle == vehicle && job.npc == driver &&
+                job.phase != Phase::Idle) return &job;
+        }
+        return nullptr;
+    }
+
+    bool CheckFactoryLease(unsigned vehicle, unsigned driver, std::uint64_t token)
+    {
+        const auto* job = FactoryJob(vehicle, driver, token);
+        return job && job->task == 9 && (job->phase == Phase::Boarding || job->phase == Phase::Following);
+    }
+
+    bool DepartFactoryLease(std::uintptr_t actor, std::uintptr_t vehicle, std::uint64_t token)
+    {
+        if (!actor || !vehicle) return false;
+        const auto vehicleId = At<std::uint32_t>(vehicle, off::kFormId);
+        const auto driverId = At<std::uint32_t>(actor, off::kFormId);
+        auto* job = FactoryJob(vehicleId, driverId, token);
+        if (!job || job->factoryStock || job->task != 9 || job->phase != Phase::Following || job->questPending || !job->factoryReleased ||
+            IsDead(actor) || !SeatedNow(actor, vehicle, InVehicle(actor) == vehicle) ||
+            !vehicleflight::HandoffPhysics(vehicleId).bound ||
+            !vehicleflight::FactoryMotionProved(job->pilot, vehicleId, token))
+            return false;
+        logger::Write("OBS system=factory.lease vehicle=%08X driver=%08X event=departed token=%llu pilot=%d reason=proof_current",
+            vehicleId, driverId, token, job->pilot);
+        job->factoryLease = 0;
+        job->factoryReleased = false;
+        job->since = job->taskAt = job->watchAt = job->watchTickAt = GetTickCount64();
+        return true;
+    }
+
+    bool CancelFactoryLease(unsigned vehicle, unsigned driver, std::uint64_t token)
+    {
+        if (!FactoryJob(vehicle, driver, token)) return false;
+        logger::Write("OBS system=factory.lease vehicle=%08X driver=%08X event=cancelled token=%llu reason=request",
+            vehicle, driver, token);
+        return EndJobOf(vehicle, "factory private lease cancelled");
+    }
+
+    void FactoryLeaseReleased(unsigned vehicle)
+    {
+        for (auto& job : g_jobs) {
+            if (job.vehicle != vehicle || !job.factoryLease || job.factoryReleased || job.phase != Phase::Following) continue;
+            job.factoryReleased = true;
+            logger::Write("OBS system=factory.lease vehicle=%08X driver=%08X event=released token=%llu pilot=%d reason=handoff",
+                vehicle, job.npc, job.factoryLease, job.pilot);
+            return;
+        }
+    }
+
+    std::uint64_t FactoryLeaseOf(int pilot, unsigned vehicle, bool releasedOnly)
+    {
+        if (pilot < 1 || pilot > kJobs || !vehicle) return 0;
+        const auto& job = g_jobs[pilot - 1];
+        return job.vehicle == vehicle && job.phase == Phase::Following &&
+            (!releasedOnly || job.factoryReleased) ? job.factoryLease : 0;
+    }
+
+    std::uint64_t FactoryStockLeaseOf(int pilot, unsigned vehicle, bool releasedOnly)
+    {
+        if (pilot < 1 || pilot > kJobs || !g_jobs[pilot - 1].factoryStock) return 0;
+        return FactoryLeaseOf(pilot, vehicle, releasedOnly);
+    }
+#endif
+
+	// Passenger control (2026-11-18 00:31 run: back in the passenger seat after the driver's trip had ended, G found "nobody drives it"):
+	// the seated driver gets an autopilot job again, as a cold-start driver does (no walk, no trip), so G has a pilot to hand you.
+	bool StartSeatedForPassenger(std::uintptr_t vehicle)
+	{
+		const uptr player = Ptr(addr::kPlayerCharacterPtr);
+		if (!vehicle || !player) return false;
+		const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId);
+		if (PilotFor(vehId)) return true;
+		const uptr actor = DriverOf(vehicle, player);
+		const char* refusal = actor ? ScriptedRefusal(actor, vehicle) : "no seated driver";
+		if (*refusal || IsFollower(player, actor)) {
+			logger::Write("NPC vehicles: passenger control: %08X gets no autopilot job: %s", vehId, *refusal ? refusal : "the driver is your follower");
+			return false;
+		}
+		const std::uint32_t npcId = At<std::uint32_t>(actor, off::kFormId);
+		for (auto& j : g_jobs) {
+			if (j.phase != Phase::Idle) continue;
+			j = Job{};
+			j.pilot = int(&j - g_jobs) + 1;
+			j.npc = npcId; j.vehicle = vehId;
+			j.profile = Profile::Escort;
+			j.cmd = true;  // already seated: no instant-seat fallback
+			const auto vp = At<game::Vec3>(vehicle, off::kRefPosition);
+			j.homeX = vp.x; j.homeY = vp.y; j.haveHome = true;
+			j.originX = vp.x; j.originY = vp.y; j.haveOrigin = true;
+			j.coldStart = true;
+			Set(j, Phase::Boarding);
+			const bool pkg = pilotquest::AssignTraffic(j.pilot - 1, actor, vehicle);
+			j.questPending = !pkg && lifecycle::Pending(npcId, "pilot-assign");
+			logger::Write("NPC vehicles: [%d] passenger control: seated NPC %08X takes vehicle %08X on its autopilot again (no trip)", j.pilot, npcId, vehId);
+			return true;
+		}
+		logger::Write("NPC vehicles: passenger control: %08X gets no autopilot job: every NPC job slot is in use", vehId);
 		return false;
 	}
 
@@ -6850,7 +7051,22 @@ namespace npcvehicles
 		for (const auto& j : g_jobs) if (j.phase == Phase::Idle) return true;
 		return false;
 	}
-	bool StartTrafficArmed(std::uintptr_t actor, std::uintptr_t vehicle, const FvoTripClaim& claim)
+    handoff::WheelAdmission AdmitWheelOutput(int pilot, unsigned vehicle)
+    {
+        if (pilot < 1 || pilot > kJobs) return {};
+        const auto& job = g_jobs[pilot - 1];
+        if (job.phase == Phase::Idle || job.task != 9 || !job.coldStart || job.vehicle != vehicle) return {};
+        const auto generation = trafficpool::CaptureWheelHandoff(vehicle);
+        return {generation != 0, generation};
+    }
+    bool TrafficPackageReady(unsigned vehicle,unsigned driver)
+    {
+        for(const auto& j:g_jobs)
+            if(j.phase!=Phase::Idle&&j.task==9&&j.coldStart&&j.vehicle==vehicle&&j.npc==driver)
+                return !j.questPending;
+        return false;
+    }
+    bool StartTrafficArmed(std::uintptr_t actor, std::uintptr_t vehicle, const FvoTripClaim& claim)
 	{
 		if (!actor || !vehicle || !claim.step || !IsActorRef(actor) || IsActorRef(vehicle) || IsDead(actor)) return false;  // 2026-10-30 18:43 crash: a reused id
 		const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId), npcId = At<std::uint32_t>(actor, off::kFormId);
@@ -6872,7 +7088,10 @@ namespace npcvehicles
 			Set(j,Phase::Boarding);
             const bool pkg=pilotquest::AssignTraffic(j.pilot-1,actor,vehicle);
             j.questPending=!pkg&&lifecycle::Pending(npcId,"pilot-assign");
-			if (!pkg&&!j.questPending) logger::Write("NPC vehicles: [%d] pre-armed pilot: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)", j.pilot, npcId);
+			if (!pkg&&!j.questPending) {
+                logger::Write("NPC vehicles: [%d] pre-armed pilot: no pilot quest package for NPC %08X (FVO_NPCPilots.esm loaded?)",j.pilot,npcId);
+                j=Job{};return false;
+            }
 			logger::Write("NPC vehicles: [%d] %s: pre-armed pilot for vehicle %08X / driver %08X at its birth", j.pilot, claim.name ? claim.name : "traffic trip", vehId, npcId);
 			return true;
 		}
@@ -6921,35 +7140,7 @@ namespace npcvehicles
         if(!Has3D(actor)){PinToVehicle(actor,vehicle);return;}
         PlaceSeated(actor,vehicle,{});
     }
-    void ShrinkModel(std::uintptr_t actor,bool hide,float& saved) {
-        // Local and world scale written directly, the way PlaceSeated writes a position; never an update call. A forced update on an actor from here races its animation on the worker threads,
-        // and both allocator crashes on 2026-10-31 (11:03, 11:23) had one running. The game did not carry the local scale to the world scale by itself (11:23 log).
-        __try {
-            const uptr loaded=actor?At<uptr>(actor,off::kRefLoadedData):0;
-            const uptr root=loaded?At<uptr>(loaded,off::kLoadedData3D):0;
-            if(!root)return;
-            float& scale=At<float>(root,0x7C);
-            if(hide&&scale!=kModelHidden)saved=scale>0.0f?scale:1.0f;
-            const float want=hide?kModelHidden:saved;
-            scale=want;
-            At<float>(root,0xBC)=want;
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER){}
-    }
     double SeatDistance(std::uintptr_t actor,std::uintptr_t vehicle) { return SeatDist(actor,vehicle); }
-    void SetGuardIds(const std::uint32_t* ids,int count) {
-        for(auto& s:g_guardIds)s.store(0,std::memory_order_relaxed);
-        for(int i=0;i<count;++i)g_guardIds[ids[i]&(kGuardTable-1)].store(ids[i],std::memory_order_relaxed);
-    }
-    float AttachScale(std::uint32_t id) { return g_attachScale[id&(kGuardTable-1)].load(std::memory_order_relaxed); }
-    bool ModelShrunk(std::uintptr_t actor) {
-        __try {
-            const uptr loaded=actor?At<uptr>(actor,off::kRefLoadedData):0;
-            const uptr root=loaded?At<uptr>(loaded,off::kLoadedData3D):0;
-            return root&&At<float>(root,0x7C)==kModelHidden;
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER){return false;}
-    }
     bool DriverLeaving(std::uintptr_t actor) {
         if(!actor)return false;
         std::uint32_t id=0;
@@ -6992,11 +7183,50 @@ namespace npcvehicles
         __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
         return InVehicle(actor)==vehicle&&SitState(actor)>0;
     }
+    // SL-0: a keyword's form id and form type, guarded (kept apart: __try cannot share a function with objects that unwind).
+    void KeywordInfo(uptr kw,std::uint32_t& id,unsigned& type){id=0;type=0;if(!kw)return;
+        __try{id=At<std::uint32_t>(kw,off::kFormId);type=At<std::uint8_t>(kw,0x2E);}__except(EXCEPTION_EXECUTE_HANDLER){id=0;type=0;}}
+    // SL-0: a model's seat markers, once (read only).
+    void LogSeatTable(std::uintptr_t vehicle,std::uintptr_t base,std::uint32_t vid,std::uint32_t bid){
+        std::uint32_t mask=0,count=0;uptr k0=0;if(!ReadSeat(base,0,mask,count,k0))return;
+        std::string list;
+        for(std::uint32_t i=0;i<count&&i<16;++i){std::uint32_t m=0,c=0;uptr kw=0;ReadSeat(base,i,m,c,kw);std::uint32_t kwid=0;unsigned type=0;
+            KeywordInfo(kw,kwid,type);
+            char b[48];std::snprintf(b,sizeof b,"%s%u:%08X/%u/%u",list.empty()?"":" ",i,kwid,type,unsigned((mask>>i)&1u));list+=b;}
+        (void)vehicle;
+        logger::Write("OBS system=seat.table base=%08X vehicle=%08X count=%u mask=%X markers=[%s] reason=seat_markers_of_this_model_once",bid,vid,count,mask,list.c_str());
+    }
     int SeatNewborn(std::uintptr_t actor,std::uintptr_t vehicle) {
         if(!actor||!vehicle)return 0;
         EnsureSeatKeyword(actor,vehicle);
+        // SL-0..SL-2 (seat ladder): the model's seat table once; a driver stuck getting on (sit 1) moves to the next marker; a marker that seats is learned per model.
+        const uptr base=At<uptr>(vehicle,0x98);const std::uint32_t vid=At<std::uint32_t>(vehicle,off::kFormId),bid=base?At<std::uint32_t>(base,off::kFormId):0;
+        if(base){
+            const int sitNow=SitState(actor);
+            bool logTable=false;{std::lock_guard lk(g_ladderLock);logTable=!g_seatTableLogged[bid];g_seatTableLogged[bid]=true;}
+            if(logTable)LogSeatTable(vehicle,base,vid,bid);
+            std::uint32_t useMarker=0,from=0;bool give=false;const char* ev="";
+            {   std::lock_guard lk(g_ladderLock);
+                const auto it=g_ladderMarker.find(vid);
+                if(sitNow==3){if(it!=g_ladderMarker.end()&&g_learnedMarker[bid]!=it->second+1){g_learnedMarker[bid]=it->second+1;useMarker=it->second;from=it->second;ev="learned";}}
+                else if(it==g_ladderMarker.end()){
+                    const auto l=g_learnedMarker.find(bid);
+                    if(l!=g_learnedMarker.end()&&l->second>0){useMarker=l->second-1;g_ladderMarker[vid]=useMarker;give=true;ev="use_learned";}
+                    else if(sitNow==1){std::uint32_t count=0;MarkerKeyword(base,0,&count);
+                        for(std::uint32_t k=1;k<count&&k<32;++k)if(MarkerKeyword(base,k)){useMarker=k;g_ladderMarker[vid]=k;give=true;ev="next_marker";break;}}
+                }
+                else if(sitNow==1){from=it->second;std::uint32_t count=0;MarkerKeyword(base,0,&count);
+                    for(std::uint32_t step=1;step<=count&&count;++step){const std::uint32_t k=(from+step)%count;if(k!=from&&MarkerKeyword(base,k)){useMarker=k;it->second=k;give=true;ev="next_marker";break;}}}
+            }
+            if(give){if(const uptr kw=MarkerKeyword(base,useMarker))GiveKeyword(actor,kw);}
+            if(*ev)logger::Write("OBS system=seat.ladder vehicle=%08X driver=%08X base=%08X event=%s from=%u to=%u sit=%d reason=%s",vid,At<std::uint32_t>(actor,off::kFormId),bid,ev,from,useMarker,sitNow,
+                !std::strcmp(ev,"learned")?"this_marker_seated_remembered_for_the_model":!std::strcmp(ev,"use_learned")?"a_marker_that_seated_this_model_before":"stuck_getting_on_try_the_next_seat_marker");
+        }
         int seated=-1;const int link=SnapSeat(actor,vehicle,seated);
         if(link<0)return -1;
+        if(seated>0&&base){std::lock_guard lk(g_ladderLock);const auto it=g_ladderMarker.find(vid);
+            if(it!=g_ladderMarker.end()&&g_learnedMarker[bid]!=it->second+1){g_learnedMarker[bid]=it->second+1;
+                logger::Write("OBS system=seat.ladder vehicle=%08X base=%08X event=learned to=%u reason=snap_seated_at_this_marker",vid,bid,it->second);}}
         return link==0?0:(seated>0?2:1);
     }
 	std::uintptr_t VehicleOf(std::uintptr_t actor) { return actor ? InVehicle(actor) : 0; }
@@ -7249,6 +7479,9 @@ namespace npcvehicles
 
 	void Reset()
 	{
+#ifndef FVO_RELEASE
+        g_testPairVehicle=0;g_testPairDriver=0;g_pairMoveDown=false;++g_relocEpoch;if(g_relocSerial)vehicleflight::relocate::Disarm(g_relocSerial);g_relocSerial=0;g_relocIssued=false;
+#endif
 		g_passengerRequest = 0; g_passengerAttempt = {};
 		g_boardVehicle = 0; g_boardKeyword = 0; g_boardUntil = 0;
 		g_swapVehicle = 0; g_swapKeyword = 0; g_swapped = 0;
@@ -7260,7 +7493,6 @@ namespace npcvehicles
 		for (auto& j : g_jobs) j = Job{};
 		FullSimClear();  // the game reuses FF ids across saves
 		g_seatTraceBudget.store(4000, std::memory_order_relaxed);
-		g_modelTraceBudget.store(600, std::memory_order_relaxed);
 		g_dropTraces = 0;
 		g_riders.clear();
 		g_seatLogged.clear();
@@ -7643,6 +7875,23 @@ void BeginFrame()
 	}
 
 }
+
+#ifndef FVO_RELEASE
+// The relocation receipt status for the Traffic add-on's Health (optional, diagnostic cores only; relocationapi.h).
+extern "C" __declspec(dllexport) int FVO_TrafficRelocationV1(unsigned vehicle, FvoRelocationStatusV1* out)
+{
+    if (!vehicle || !out || out->size != sizeof(*out) || out->version != 1) return 0;
+    relocation::Receipt r{};
+    const bool has = npcvehicles::g_reloc.LastFor(vehicle, r), relocating = npcvehicles::g_reloc.Relocating(vehicle);
+    if (!has && !relocating) return 0;
+    out->relocating = relocating ? 1 : 0;
+    if (has) {
+        out->serial = r.serial; out->epoch = r.epoch; out->stepAfter = r.stepAfter; out->result = int(r.result);
+        out->to[0] = r.to.x; out->to[1] = r.to.y; out->to[2] = r.to.z;
+    }
+    return 1;
+}
+#endif
 
 extern "C" __declspec(dllexport) int FVO_RegisterTrafficCycle(FvoTrafficCycle cycle)
 {

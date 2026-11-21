@@ -5,9 +5,12 @@
 #include "notify.h"
 #include "npcvehicles.h"
 #include "routeedit.h"
+#include "trafficarrival.h"
 
 #include <Windows.h>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <vector>
 
 // Read in Starfield 1.16.244 (2026-10-29, notes/start-swap-unpause-20261029/RESULT.md):
@@ -108,10 +111,15 @@ namespace secretunpause
         std::vector<uptr> menus;
         if (!ui || !PausingMenus(ui, menus)) { logger::Write("Secret unpause: UI not readable; the map stays paused"); return Result::Unavailable; }
         const int before = PauseCount(ui);
-        if (menus.empty() || before <= 0) { logger::Write("Secret unpause: nothing holds a pause (count %d)", before); return Result::NotPaused; }
+        if (menus.empty() || before <= 0) {
+            trafficarrival::panel.store(before == 0);
+            logger::Write("Secret unpause: nothing holds a pause (count %d)", before);
+            return Result::NotPaused;
+        }
         g_names.clear();
         for (const uptr name : menus) if (SetPauses(ui, name, false)) g_names.push_back(name);
         g_active = !g_names.empty();
+        trafficarrival::panel.store(g_active);
         g_since = GetTickCount64();
         const int after = PauseCount(ui);
         logger::Write("Secret unpause: lifted the pause of %zu open menu(s) under the Start/Swap panel; pause count %d -> %d%s",
@@ -121,6 +129,7 @@ namespace secretunpause
 
     void End(const char* why)
     {
+        trafficarrival::panel.store(false);
         if (!g_active) return;
         g_active = false;
         const uptr ui = Ui();
@@ -132,6 +141,55 @@ namespace secretunpause
     }
 
     bool Active() { return g_active; }
+
+    namespace {
+        const char* MenuClass(uptr menu)
+        {
+            __try {
+                const uptr vtbl = *reinterpret_cast<uptr*>(menu);
+                const uptr col = *reinterpret_cast<uptr*>(vtbl - 8);
+                const uptr td = game::Base() + *reinterpret_cast<std::uint32_t*>(col + 0x0C);
+                return reinterpret_cast<const char*>(td + 0x10);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return "?"; }
+        }
+        int ReadMenus(uptr ui, uptr* menus, std::uint32_t* flags, int max)
+        {
+            __try {
+                const std::uint32_t n = *reinterpret_cast<std::uint32_t*>(ui + kMenuCount);
+                const uptr data = *reinterpret_cast<uptr*>(ui + kMenuData);
+                if (n > 64 || (n && !data)) return -1;
+                int k = 0;
+                for (std::uint32_t i = 0; i < n && k < max; ++i) {
+                    const uptr m = *reinterpret_cast<uptr*>(data + 8ull * i);
+                    if (!m) continue;
+                    menus[k] = m; flags[k] = *reinterpret_cast<std::uint32_t*>(m + kMenuFlags); ++k;
+                }
+                return k;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+        }
+    }
+    int Describe(char* out, int size)
+    {
+        if (!out || size <= 0) return -1;
+        out[0] = 0;
+        const uptr ui = Ui();
+        if (!ui) { std::snprintf(out, size, "ui=none"); return -1; }
+        const int count = PauseCount(ui);
+        uptr menus[12]; std::uint32_t flags[12];
+        const int n = ReadMenus(ui, menus, flags, 12);
+        int w = std::snprintf(out, size, "menus=");
+        if (n < 0) { std::snprintf(out + w, size - w, "unreadable"); return count; }
+        if (n == 0 && w < size) w += std::snprintf(out + w, size - w, "none");
+        for (int i = 0; i < n && w > 0 && w < size; ++i) {
+            const char* c = MenuClass(menus[i]);
+            if (!std::strncmp(c, ".?AV", 4)) c += 4;
+            char cls[48]; int j = 0; for (; c[j] && c[j] != '@' && j < 47; ++j) cls[j] = c[j]; cls[j] = 0;
+            w += std::snprintf(out + w, size - w, "%s%s:%X%s", i ? "," : "", cls, flags[i], (flags[i] & kPausesGame) && (flags[i] & kOpen) ? "[P]" : "");
+        }
+        return count;
+    }
     void Reset() { End("world reset"); g_promptAfterCombat = false; g_calmSince = 0; }
 
     void Tick()
@@ -148,7 +206,7 @@ namespace secretunpause
         }
         if (!g_active) return;
         if (GetTickCount64() - g_since > kMaxMs) { End("time cap"); return; }
-        if (!routeedit::MapOpen(1000)) { End("the map closed"); return; }
+        if (!routeedit::MapOpen(1000) && !routeedit::PhotoOpen()) { End("the traffic view closed"); return; }
         if (PlayerInCombat()) {
             End("combat started");
             notify::Show("Combat started: traffic update paused. Exit combat first.");

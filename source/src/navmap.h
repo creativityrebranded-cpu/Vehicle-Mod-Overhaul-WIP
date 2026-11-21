@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 // The shared local map for predictive navigation (Driving Behavior session, 2026-10-18; the user: "predictive models
 // based on the shape of the environment", then "is there anything that can be shared by all vehicles"). Step 1 of the
@@ -24,7 +25,8 @@ namespace navmap
 	// A forward ray from `from` to `to` (as asked). hit: it hit something at (hx, hy, hz) on `layer` (collision layer
 	// number 0..63, from the hit record); the ray is free from `from` up to the hit (or all of it without one).
 	// normalOk: the hit record held a unit vector at +0x10 (counted, to learn whether that is the surface normal).
-	void NoteRay(const float from[3], const float to[3], bool hit, float hx, float hy, float hz, std::uint32_t layer, bool normalOk);
+	// normalZ: the hit surface's normal z (2026-11-05): kept with the hit, so floors (decks, ramps: facing up) and walls can be told apart.
+	void NoteRay(const float from[3], const float to[3], bool hit, float hx, float hy, float hz, std::uint32_t layer, bool normalOk, float normalZ = std::numeric_limits<float>::quiet_NaN(), bool keepAnyLayer = false, std::uint32_t owner = 0);  // keepAnyLayer: path rays and hull sweeps keep a hit on any layer they were cast on (2026-11-05)
 	// A contact at the vehicle's place: up = the solver pushed it up (a floor under it), else a side bump toward (dx, dy).
 	void NoteContact(double x, double y, double z, bool up, double dx, double dy);
 	// The game's own collision objects (navseed, 2026-10-20): a solid object's box (centre, heading, half-extents, bottom and top) marks
@@ -33,7 +35,6 @@ namespace navmap
 	void NoteObject(double cx, double cy, double yaw, double hx, double hy, double zlo, double zhi);
 	void NoteSeeded(double cx, double cy, double radius);
 	// How far the scanned (known) area reaches from (x, y) along `heading` (0 outside it or before the first scan).
-	double KnownAhead(double x, double y, double heading);
 
 	// ---- Questions ----
 	struct Sample
@@ -49,6 +50,24 @@ namespace navmap
 		float blockedZ = 0;     // the height of the remembered solid hit (valid when blocked): a hillside hit sits at the ground, a wall above it
 	};
 	Sample At(double x, double y, double z);
+	// A real ray hit point (not its whole 4 m cell) within `radius` metres of (x, y), between heights zLo and zHi, still trusted.
+	// hitZ: the nearest one's height. Used by waypoint driving so a thin post blocks about its own size (2026-11-04).
+	bool HitNear(double x, double y, double zLo, double zHi, double radius, double* hitZ);
+	// As HitNear, but a hit on a surface facing up (normal z > 0.7: a deck, a ramp, a floor) is not a wall. Hits with no normal count.
+	// hitZ: the highest wall hit near (2026-11-05: was the nearest; the height of what is there). face: one of them had a sideways normal
+	// (a vertical face: a barrier, a post), so even a low hit is a wall, not a step.
+	bool WallNear(double x, double y, double zLo, double zHi, double radius, double* hitZ, bool* face = nullptr);
+	// The real hit points near (x, y), for World (planworld.h): up is |normal z| as WallNear uses it; signedZ keeps the game's sign, unproven until a run
+	// shows it (TakeNormalSigns: falling rays normal up, down; rising rays normal up, down).
+	struct KeptHit { float x, y, z, up, signedZ; bool haveNormal; std::uint32_t owner; double age; std::uint8_t layer = 255; };  // layer: world truth A (255 unknown)
+	int HitsNear(double x, double y, double zLo, double zHi, double radius, KeptHit* out, int max);
+	void TakeNormalSigns(unsigned out[4]);
+	// Collision boxes kept whole, and every ground level remembered at a spot, for World (planworld.h). Additive: At() still answers from the bands and
+	// the highest surface.
+	struct KeptBox { double x, y, yaw, hx, hy, zLo, zHi; };
+	int BoxesNear(double x, double y, double radius, KeptBox* out, int max);
+	int GroundLevels(double x, double y, float* out, int max);
+	unsigned TakeFloorSkips();  // hits WallNear ignored as floors since the last call (probe)
 	// The same answers for n heights of one column: one cell lookup instead of n (2026-10-29 audit: the flight field asked each of its
 	// 33 heights separately, ~515 000 lookups a field).
 	void Column(double x, double y, const double* zs, int n, Sample* out);
@@ -62,36 +81,11 @@ namespace navmap
 		double* at, const char** why);
 
 	// ---- The heading sampler (step 2) ----
-	// A blocked straight way: tries the sweep ring's compass directions (every 22.5 degrees) within 120 degrees of the
-	// bearing to the target, sweeps the vehicle along each against this map for about 2.5 s of travel, and scores them: progress toward the
-	// target, how far the run is open, and not changing the current detour more than needed. Headings with no data
-	// (map unknown) are not chosen; none usable = the caller keeps its own rule.
-	struct HeadingQuery
-	{
-		float pos[3] = {};
-		double bearing = 0;          // world bearing to the target, atan2(dx, dy)
-		bool haveAvoid = false;
-		double avoidOffset = 0;      // the offset found blocked (rad): candidates within 8 degrees of it are skipped
-		double currentOffset = 0;    // the detour in use (rad): staying near it is cheap
-		double speed = 0;
-		double halfWidth = 2.5;      // vehicle half-width plus margin
-		double clearance = 4.0;
-		double climbRate = 6.0;
-	};
-	struct HeadingChoice
-	{
-		bool found = false;
-		double offset = 0, freeDist = 0, score = 0;
-		int usable = 0, blocked = 0, unknown = 0;
-	};
-	HeadingChoice ChooseHeading(const HeadingQuery& q);
 	bool RaysEnabled();            // nav.ini [nav] rays=0 stops every engine ray and hull-sweep query (default on); the walls-only nav map then gets nothing from them
-	bool NewAutopilot();           // nav.ini [nav] autopilot=0 goes back to 0.8's autopilot rules (default 1: autodrive.h)
 	bool HullEnabled();            // nav.ini [nav] shape=0 turns the hull-sized sweeps off (default on); a fault turns them off by itself
 	// For the log line: the straight way's thin ray and hull sweep verdicts side by side this frame.
 	void NoteHull(bool rayBlocked, bool hullBlocked);
 	bool SamplerEnabled();        // Logs\FlyingVehicleOverhaul\nav.ini [nav] sampler=0 turns it off (default on); re-read every 5 s
-	void NoteSampler(bool used);  // for the log line: used the sampler's choice / fell back to the old rule
 
 	// ---- Housekeeping ----
 	void Tick();    // main thread, once per frame: eviction and the stats line every 10 s

@@ -5,10 +5,13 @@
 #include "hook.h"
 #include "log.h"
 #include "inputownership.h"
+#include "photoeditorinput.h"
+#include "camera_visibility.h"
 
 #include <Windows.h>
 
 #include <atomic>
+#include <cstdio>
 
 namespace inputgate
 {
@@ -30,6 +33,11 @@ namespace inputgate
         std::atomic<std::uint64_t> g_devicePress{0};
         std::atomic<ULONGLONG> g_mapEditUntil{0}, g_mapAllUntil{0}, g_wheelUntil{0};
         std::atomic<int> g_wheel{0};
+        std::atomic<ULONGLONG> g_photoUntil{0};
+        std::atomic<bool> g_photoNavigating{false};
+        std::atomic<int> g_photoMouseX{0},g_photoMouseY{0};
+        std::atomic<std::uint64_t> g_lookMouseAt{0};
+        std::atomic<std::int64_t> g_lookMouseX{0},g_lookMouseY{0};
         // The map's camera keys and the ways out stay with the map while the route editor holds it.
         bool MapKeyAllowed(std::uint32_t vk)
         {
@@ -55,6 +63,50 @@ namespace inputgate
                 const auto device=*reinterpret_cast<std::uint8_t*>(event+8);
                 const auto code=*reinterpret_cast<std::uint32_t*>(event+0x30);
                 const auto kind=*reinterpret_cast<std::uint8_t*>(event+0x10);
+                if(GetTickCount64()<g_photoUntil.load(std::memory_order_relaxed)){
+                    // Only IDEvent subclasses carry the block-reason field.
+                    if(device>2||(kind!=0&&kind!=1&&kind!=4))return;
+                    const bool nav=g_photoNavigating.load(std::memory_order_relaxed);
+                    const bool lift=(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0;  // Ctrl+RMB: camera up
+                    if(!nav&&device==1&&kind==1){
+                        g_photoMouseX.fetch_add(*reinterpret_cast<const int*>(event+0x38),std::memory_order_relaxed);
+                        g_photoMouseY.fetch_add(*reinterpret_cast<const int*>(event+0x3C),std::memory_order_relaxed);
+                    }
+                    if(!nav&&device==1&&kind==kButton&&(code==8||code==9)&&
+                       GetTickCount64()<g_wheelUntil.load(std::memory_order_relaxed)&&
+                       *reinterpret_cast<float*>(event+0x4C)==0)
+                        g_wheel.fetch_add(code==8?1:-1,std::memory_order_relaxed);
+                    bool block=photoeditorinput::Block(true,nav,lift,device,kind,code);
+                    if(kind==0){
+                        auto index=code;
+                        if(device==kGamepad){const auto bit=bindlogic::GamePadBit(code);
+                            if(!bit)return;index=0;auto scan=bit;while(scan>>=1)++index;}
+                        if(index>=256)return;
+                        const bool down=*reinterpret_cast<float*>(event+0x48)>0;
+                        const bool fresh=*reinterpret_cast<float*>(event+0x4C)==0;
+                        // Ctrl can be pressed after RMB. Explicitly handing this
+                        // gesture to MoveUp also hands its eventual release back.
+                        if(device==1&&code==1&&nav&&lift&&down)g_owner[device][index]=1;
+                        const bool owned=inputownership::Own(g_owner[device][index],down,fresh,block);
+                        // A native press must still receive its release after a mode change.
+                        block=owned||(down&&block);
+                    }
+                    if(block&&!*reason){
+                        *reason=kBlockedReason;g_count.fetch_add(1,std::memory_order_relaxed);
+                    }
+                    return; // never fall through to the surface-map or gameplay gates
+                }
+                if(device==1&&kind==1&&!*reason){
+                    const int x=*reinterpret_cast<const int*>(event+0x38),y=*reinterpret_cast<const int*>(event+0x3C);
+                    if(x||y){
+                        const auto now=GetTickCount64();
+                        if(now>=g_mapEditUntil.load(std::memory_order_relaxed)){
+                            g_lookMouseX.fetch_add(x,std::memory_order_relaxed);
+                            g_lookMouseY.fetch_add(y,std::memory_order_relaxed);
+                            g_lookMouseAt.store(now,std::memory_order_release);
+                        }
+                    }
+                }
                 if(device==1&&code!=0&&GetTickCount64()<g_mapEditUntil.load(std::memory_order_relaxed)){
                     // What the wheel really sends is only known from a live run (2026-10-30, scroll height): the first few events are logged.
                     static std::atomic<int> told{0};
@@ -94,7 +146,7 @@ namespace inputgate
                         g_devicePress.store(((previous&~1ull)+2)|(device==kGamepad?1ull:0ull),std::memory_order_release);
                     }
                 }
-                requested=requested&&GameplayAllowed();
+                requested=requested&&ModKeysAllowed();
                 const bool owned=inputownership::Own(g_owner[device][index],value>0,seconds==0,requested);
                 if(!owned||*reason)return; // never replace a native block reason
 				*reason = kBlockedReason;
@@ -126,23 +178,62 @@ namespace inputgate
         if(keys[VK_MENU]){g_keys[VK_LMENU]=true;g_keys[VK_RMENU]=true;}
     }
     std::uint64_t LastDevicePress(){return g_devicePress.load(std::memory_order_acquire);}
+    namespace
+    {
+        // The control map's input context stack (+0x2A8 count, +0x2B0 entries of 16 bytes, id in the first byte).
+        // Returns the count, or -1 when it cannot be read; the game window must have the focus.
+        int ContextStack(std::uint8_t (&ids)[128])
+        {
+            DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
+            if(pid!=GetCurrentProcessId())return -1;
+            __try{
+                const auto cm=*reinterpret_cast<std::uintptr_t*>(game::Base()+0x061DE668);
+                if(!cm)return -1;
+                const auto count=*reinterpret_cast<std::uint32_t*>(cm+0x2A8);
+                const auto stack=*reinterpret_cast<std::uintptr_t*>(cm+0x2B0);
+                if(count>128||(count&&!stack))return -1;
+                for(std::uint32_t i=0;i<count;++i)ids[i]=*reinterpret_cast<std::uint8_t*>(stack+i*16);
+                return int(count);
+            }__except(EXCEPTION_EXECUTE_HANDLER){return -1;}
+        }
+    }
     bool GameplayAllowed()
     {
-        DWORD pid=0;GetWindowThreadProcessId(GetForegroundWindow(),&pid);
-        if(pid!=GetCurrentProcessId())return false;
-        __try{
-            const auto cm=*reinterpret_cast<std::uintptr_t*>(game::Base()+0x061DE668);
-            if(!cm)return false;
-            const auto count=*reinterpret_cast<std::uint32_t*>(cm+0x2A8);
-            const auto stack=*reinterpret_cast<std::uintptr_t*>(cm+0x2B0);
-            if(count>128||(count&&!stack))return false;
-            for(std::uint32_t i=0;i<count;++i){const auto id=*reinterpret_cast<std::uint8_t*>(stack+i*16);if(id==0x4E||id==0x11)return false;}
-            return true;
-        }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+        std::uint8_t ids[128];const int n=ContextStack(ids);
+        return n>=0&&inputownership::Gameplay(ids,std::size_t(n));
+    }
+    bool ModKeysAllowed()
+    {
+        std::uint8_t ids[128];const int n=ContextStack(ids);
+        const bool on=n>=0&&inputownership::ModKeys(ids,std::size_t(n));
+        // Trace (diagnostic builds): the stack each time the answer changes, so a live run shows which contexts a menu uses.
+        // Also each new readable stack (first 400), so a stack that keeps the keys from the mod is named in the log.
+        static std::atomic<int> last{-1};static std::atomic<std::uint64_t> lastStack{0};static std::atomic<int> stackLines{0};
+        std::uint64_t h=1469598103934665603ull;for(int i=0;i<n;++i)h=(h^ids[i])*1099511628211ull;h^=std::uint64_t(n<0?0xFFFF:n)<<48;
+        const bool changed=last.exchange(on?1:0,std::memory_order_relaxed)!=(on?1:0);
+        const bool newStack=n>=0&&lastStack.exchange(h,std::memory_order_relaxed)!=h&&stackLines.fetch_add(1,std::memory_order_relaxed)<400;
+        if(changed||newStack){
+            char text[128*3+1]{};int at=0;
+            for(int i=0;i<n&&at<int(sizeof(text))-4;++i)at+=std::snprintf(text+at,sizeof(text)-at,"%s%02X",i?" ":"",ids[i]);
+            logger::WriteUnlocked("Input gate: mod keys %s (contexts: %s)",on?"on":"given back to the game",n<0?"unreadable or unfocused":text);
+        }
+        return on;
     }
 	unsigned TakeBlockedCount() { return g_count.exchange(0, std::memory_order_relaxed); }
 	void HoldMapForEditor() { g_mapEditUntil.store(GetTickCount64() + 300, std::memory_order_relaxed); }
 	void HoldMapAll() { const auto t = GetTickCount64() + 300; g_mapEditUntil.store(t, std::memory_order_relaxed); g_mapAllUntil.store(t, std::memory_order_relaxed); }
 	void WheelForEditor(bool on) { g_wheelUntil.store(on ? GetTickCount64() + 300 : 0, std::memory_order_relaxed); if (!on) g_wheel.store(0, std::memory_order_relaxed); }
 	int TakeWheel() { return g_wheel.exchange(0, std::memory_order_relaxed); }
+    void PhotoEditor(bool editing,bool navigating){
+        g_photoNavigating.store(navigating,std::memory_order_relaxed);
+        g_photoUntil.store(editing?GetTickCount64()+300:0,std::memory_order_relaxed);
+        g_mapEditUntil=0;g_mapAllUntil=0;
+        if(!editing||navigating){g_wheelUntil=0;g_wheel=0;}
+        if(!editing||navigating){g_photoMouseX=0;g_photoMouseY=0;}
+    }
+    void TakePhotoMouse(int& dx,int& dy){dx=g_photoMouseX.exchange(0);dy=g_photoMouseY.exchange(0);}
+    cameravisibility::Mouse LookMouse(){
+        const auto at=g_lookMouseAt.load(std::memory_order_acquire);
+        return {g_lookMouseX.load(std::memory_order_relaxed),g_lookMouseY.load(std::memory_order_relaxed),at};
+    }
 }

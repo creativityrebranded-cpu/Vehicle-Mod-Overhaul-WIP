@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <array>
+namespace cameravisibility { struct Mouse; }
 
 // Switches the GAME's own action off on the controller buttons the mod uses in the situation now (2026-10-24, the user:
 // a mod button must never also do the game's thing). Every input event is resolved to the game's user event as it is
@@ -15,6 +16,9 @@ namespace inputgate
 	void SetBlocked(std::uint32_t padBits);  // bindlogic controller bits; any thread
     void SetBlockedKeys(const std::array<bool,256>& keys);
     bool GameplayAllowed();
+    // GameplayAllowed and no menu input context (ship builder, maps, settings, terminals...) on the stack: only then do the
+    // mod's bindings act and take keys or buttons from the game (inputownership::ModKeys).
+    bool ModKeysAllowed();
     // Ordered fresh native button presses; low bit pad, upper bits sequence.
     std::uint64_t LastDevicePress();
 	unsigned TakeBlockedCount();             // events blocked since the last call (for the log)
@@ -29,4 +33,9 @@ namespace inputgate
 	// The editor's scroll height: for the next 300 ms the wheel is counted for the editor instead of zooming the map.
 	void WheelForEditor(bool on);
 	int TakeWheel();                         // notches since the last call: up +, down -
+    // Photo editor owns input only while visible. Navigation is a hold gesture;
+    // its own button must not also raise the camera or toggle the helmet.
+    void PhotoEditor(bool editing, bool navigating);
+    void TakePhotoMouse(int& dx,int& dy);
+    cameravisibility::Mouse LookMouse();
 }

@@ -14,7 +14,7 @@ constexpr double kBankGain=3.0;     // roll rate per radian of bank error
 constexpr double kPitchGain=2.0;    // pitch rate per radian of pitch error
 constexpr double kPitchDeadzone=0.05;
 constexpr double kLevelRate=1.2;    // 1/s, unaimed pitch levels at this rate
-constexpr double kSideAcceleration=6;  // m/s^2: the AI chassis' slip-damping side thrusters (player: 3)
+// (FC-1: the side thrusters' bound is the flight gear row's, carcap::Flight: gear 3 = 6 m/s^2 AI, 3 player)
 struct Input {
     vtol::Vec right{1,0,0}, forward{0,1,0}, up{0,0,1};
     double pitch=0, roll=0;  // nose up +, right side down +

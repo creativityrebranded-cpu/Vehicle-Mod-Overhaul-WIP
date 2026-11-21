@@ -1,8 +1,8 @@
-﻿// Standalone check of the nav map + heading sampler against a simulated world (no game).
+﻿// Standalone check of the nav map against a simulated world (no game).
 #include "navmap.h"
 #include <cstdarg>
 #include <cstdio>
-namespace logger { void Write(const char* fmt, ...) { va_list a; va_start(a, fmt); std::vprintf(fmt, a); std::printf("\n"); va_end(a); } }
+namespace logger { void Write(const char* fmt, ...) { va_list a; va_start(a, fmt); std::vprintf(fmt, a); std::printf("\n"); va_end(a); } bool Verbose() { return false; } }
 
 #include <cmath>
 #include <cstdio>
@@ -47,55 +47,7 @@ void Sweep(double px, double py, double pz, double range, const std::vector<Wall
 int main()
 {
 	const double kPi = 3.14159265358979;
-	navmap::HeadingQuery q;
-	q.pos[0] = 0; q.pos[1] = 0; q.pos[2] = 10;
-	q.bearing = 0;  // the target is north
-	q.speed = 10;
-	q.halfWidth = 2.5; q.clearance = 4.0; q.climbRate = 6.0;
-
-	// 1. Nothing known: nothing usable (the caller keeps its own rule).
-	navmap::Reset();
-	{
-		const auto c = navmap::ChooseHeading(q);
-		Check(!c.found, "empty map: no heading chosen");
-	}
-
-	// 2. A wall across the way north, open to the east: it should turn east, not west.
-	navmap::Reset();
-	std::vector<Wall> walls = { { -80, 30, 6, 30 } };  // y = 30, from x -80 to 6
-	for (int k = 0; k < 3; ++k) Sweep(0, 0, 10, 40, walls);
-	{
-		float p[3] = { 0, 0, 10 };
-		double at = 0;
-		const auto v = navmap::PathClear(p, 0, 40, 2.5, 4.0, 6.0, 10, &at, nullptr);
-		Check(v == navmap::Verdict::Blocked, "straight north is blocked by the wall");
-		Check(at > 20 && at < 34, "...about 30 m ahead");
-		q.haveAvoid = true; q.avoidOffset = 0; q.currentOffset = 0;
-		const auto c = navmap::ChooseHeading(q);
-		std::printf("  chosen offset %+.1f deg, open %.0f m, usable %d, blocked %d, unknown %d\n", c.offset * 180 / kPi, c.freeDist, c.usable, c.blocked, c.unknown);
-		Check(c.found, "a heading is found");
-		Check(c.offset > 0.3, "it turns east (the open side)");
-	}
-
-	// 3. The wall now blocks the east too, only the west is open: it must go west.
-	navmap::Reset();
-	walls = { { -6, 30, 80, 30 } };
-	for (int k = 0; k < 3; ++k) Sweep(0, 0, 10, 40, walls);
-	{
-		const auto c = navmap::ChooseHeading(q);
-		std::printf("  mirror: found %d offset %+.1f deg, open %.0f m, usable %d, blocked %d, unknown %d\n", c.found, c.offset * 180 / kPi, c.freeDist, c.usable, c.blocked, c.unknown);
-		Check(c.found && c.offset < -0.3, "mirror world: it turns west");
-	}
-
-	// 4. Boxed in: walls on every side close by: nothing usable.
-	navmap::Reset();
-	walls = { { -5, 5, 5, 5 }, { -5, -5, 5, -5 }, { 5, -5, 5, 5 }, { -5, -5, -5, 5 } };
-	for (int k = 0; k < 3; ++k) Sweep(0, 0, 10, 40, walls);
-	{
-		const auto c = navmap::ChooseHeading(q);
-		std::printf("  boxed in: found %d, usable %d, blocked %d, unknown %d\n", c.found, c.usable, c.blocked, c.unknown);
-		Check(!c.found, "boxed in: no heading (the caller climbs / backs out)");
-	}
+	// (Sections 1-4, the old heading sampler navmap::ChooseHeading, were removed with it on 2026-11-14.)
 
 	// 5. A learned floor (a push-up) blocks a path that would otherwise look clear over low ground.
 	navmap::Reset();
@@ -117,6 +69,48 @@ int main()
 		navmap::NoteRay(from, to, true, 0, 23.5f, 11, 8 /* biped */, true);
 		float p[3] = { 0, 0, 10 };
 		Check(navmap::PathClear(p, 0, 40, 0.5, 4.0, 6.0, 10, nullptr, nullptr) != navmap::Verdict::Blocked, "a character in the way is not remembered as a wall");
+	}
+	// Hit normals (2026-11-05): an up-facing hit (a deck, a ramp) is not a wall; a sideways one (a railing) is; no normal still counts.
+	navmap::Reset();
+	{
+		const float from[3] = { 0, 0, 12 }, to[3] = { 0, 20, 8 };
+		navmap::NoteRay(from, to, true, 0, 10, 10, 1 /* static */, true, 0.98f);
+		double z = 0;
+		Check(navmap::HitNear(0, 10, 9, 11, 1.0, &z), "an up-facing hit is still a hit");
+		Check(!navmap::WallNear(0, 10, 9, 11, 1.0, &z), "but not a wall: a deck or a ramp");
+		Check(navmap::TakeFloorSkips() >= 1, "and the probe counts it as a floor ignored");
+		navmap::NoteRay(from, to, true, 2, 12, 10, 1, true, 0.05f);
+		Check(navmap::WallNear(2, 12, 9, 11, 1.0, &z), "a sideways hit (a railing) is a wall");
+		navmap::NoteRay(from, to, true, 4, 14, 10, 1, false);
+		Check(navmap::WallNear(4, 14, 9, 11, 1.0, &z), "a hit with no normal still counts as a wall (no change from before)");
+		bool face = true;
+		navmap::WallNear(4, 14, 9, 11, 1.0, &z, &face);
+		Check(!face, "a hit with no normal is not known to be a face");
+		navmap::NoteRay(from, to, true, 6, 16, 9.5f, 1, true, 0.02f);
+		navmap::NoteRay(from, to, true, 6.3f, 16, 10.6f, 1, true, 0.02f);
+		Check(navmap::WallNear(6, 16, 9, 11, 1.0, &z, &face) && face && z > 10.5, "a barrier face: reported as a face, at its highest hit");
+	}
+
+	{	// Boxes kept whole, beside the bands.
+		navmap::Reset();
+		navmap::NoteObject(100, 100, 0.5, 3, 8, 10, 14);
+		navmap::NoteObject(100, 100, 0.5, 3, 8, 10, 14);
+		navmap::KeptBox kb[8];
+		int n = navmap::BoxesNear(101, 99, 20, kb, 8);
+		Check(n == 1, "a box noted twice is kept once");
+		Check(n == 1 && kb[0].hy == 8 && kb[0].yaw == 0.5 && kb[0].zHi == 14, "its real size and heading survive");
+		Check(navmap::BoxesNear(400, 400, 20, kb, 8) == 0, "nothing far away");
+		navmap::NoteObject(127, 64, 0, 10, 10, 0, 2);  // straddles two buckets
+		Check(navmap::BoxesNear(120, 62, 5, kb, 8) >= 1 && navmap::BoxesNear(130, 66, 5, kb, 8) >= 1, "a box across a bucket edge is found from both sides");
+		// Stacked decks: every level is remembered, `ground` still reads the highest as before.
+		navmap::NoteGround(300, 300, 50);
+		navmap::NoteGround(300, 300, 62);
+		navmap::NoteGround(300, 300, 50.4);
+		float lv[3]; const int m = navmap::GroundLevels(300, 300, lv, 3);
+		Check(m == 2, "two decks over one spot are two levels");
+		Check(navmap::GroundLevels(900, 900, lv, 3) == 0, "no levels where nothing was seen");
+		navmap::Reset();
+		Check(navmap::BoxesNear(101, 99, 20, kb, 8) == 0, "a reset clears kept boxes");
 	}
 
 	std::printf("%d failure(s)\n", failures);

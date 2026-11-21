@@ -1,4 +1,5 @@
 #include "trafficdata.h"
+#include "routefiles.h"
 #include <cstdio>
 #include <fstream>
 #include <sstream>
@@ -9,6 +10,35 @@ static void Check(bool ok, const char* what) { if (!ok) { ++g_fail; std::printf(
 int main(int argc, char** argv)
 {
     using namespace trafficdata;
+    {
+        routefiles::File file;
+        file.worldId="city";
+        routefiles::Route route;
+        route.id="levels"; route.closed=false; route.points={{0,0,0},{5000,0,0}};
+        route.schedule.allDayVehicles=37;
+        route.schedule.trafficLevel=routeschedule::Steady;
+        route.schedule.trafficBands[routeschedule::Steady]={6,10};
+        file.routes.push_back(route);
+        const auto text=routefiles::Format(file);
+        Data d;
+        Read(text,"Editor_city.ini",d);
+        Check(d.routes.size()==1 && d.problems.empty(),"route file with traffic levels round trips");
+        if (d.routes.size()==1) {
+            const auto& read=d.routes.front();
+            Check(read.schedule.allDayVehicles==37 && read.trafficMetres==5000 &&
+                  routeschedule::Evaluate(read.schedule,false,-1,read.trafficMetres).vehicles==40 &&
+                  routefiles::TotalVehicles(file)==40,"serialized saved count and length-based demand both preserved");
+        }
+        file.routes[0].closed=true;
+        Check(TrafficLength(file.routes[0])==10000,"loop includes its return segment");
+        route.ring=true; route.shape.radius=500;
+        Check(TrafficLength(route)>3100 && TrafficLength(route)<3150,"ring uses its circumference");
+        Data malformed;
+        Read("[route.bad_range]\nworld=city\ntype=path\npoints=0 0 0,5000 0 0\ndensity=37\ntraffic_level=busy\ntraffic_ranges=8 2\n","bad_level.ini",malformed);
+        Check(malformed.routes.size()==1 && malformed.problems.size()==1 &&
+              routeschedule::Evaluate(malformed.routes.front().schedule,false,-1).vehicles==37,
+              "malformed preset metadata keeps the route and its original count");
+    }
     {
         Data d;
         Read("[route.night]\nworld=city\ntype=path\npoints=0 0 100,100 0 110\nwindows=1080 360 2,360 1080 4\n"

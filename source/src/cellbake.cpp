@@ -5,10 +5,8 @@
 #include "fvopaths.h"
 #include "game.h"
 #include "log.h"
-#include "navseed.h"
 #include "prefetch.h"
 #include "runtimecells.h"
-#include "vehicle_probe.h"
 
 #include <Windows.h>
 
@@ -28,7 +26,7 @@ namespace cellbake
 
 		constexpr std::uint32_t kTerrainLayers = (1u << 13) | (1u << 17);  // vehicleflight's terrain probes
 		constexpr double kCellMin = 100.0, kCellMax = 220.0;              // m: a cell's box from its references, clamped
-		constexpr ULONGLONG kPollMs = 1000, kReportMs = 30000, kSolidWaitMs = 3000;
+		constexpr ULONGLONG kPollMs = 1000, kReportMs = 30000;
 		constexpr int kBank = prefetch::kSlotBakeCount / 2;
 
 		struct Job { std::uint32_t cell = 0; float mn[3] = {}, mx[3] = {}; };
@@ -39,13 +37,11 @@ namespace cellbake
 		uptr g_world = 0;
 		bool g_use = false;
 		ULONGLONG g_pollAt = 0, g_reportAt = 0, g_iniAt = 0;
-		unsigned g_cellsBaked = 0, g_solids = 0, g_points = 0, g_solidFails = 0;
+		unsigned g_cellsBaked = 0;
 
-		// The job in hand: its solids, then its terrain points, a bank of probes a frame.
+		// The job in hand: its terrain points, a bank of probes a frame.
 		bool g_have = false;
 		Job g_job;
-		int g_phase = 0;                  // 0 solids asked?, 1 waiting solids, 2 terrain
-		ULONGLONG g_askedAt = 0;
 		std::vector<std::pair<std::int32_t, std::int32_t>> g_todo;
 		std::size_t g_next = 0;
 		struct Pending { std::int32_t ix = 0, iy = 0; bool on = false; };
@@ -96,6 +92,7 @@ namespace cellbake
 			if (world != g_world) {  // another world: nothing of the old one applies
 				if (g_world) logger::Write("Cell bake: world changed; %u cell(s), %zu terrain point(s) dropped", g_cellsBaked, g_grid.h.size());
 				g_world = world; g_grid.Clear(); g_known.clear(); g_jobs.clear(); g_have = false; g_cellsBaked = 0;
+				if (world) logger::Observe("world.cellbake", 0, world, "event=terrain_only reason=whole_cell_query_hang");
 			}
 			if (!world) return;
 			const unsigned grid = runtimecells::GridSize(64);
@@ -121,7 +118,6 @@ namespace cellbake
 					if (!g_grid.Has(ix, iy)) g_todo.push_back({ ix, iy });
 			for (auto& p : g_pending) p.on = false;
 			g_waitTicks = 0;
-			g_phase = 2;
 		}
 		// One bank: read what it was asked last round (two rounds ago for its slots), then ask the next points.
 		void TerrainStep()
@@ -133,7 +129,6 @@ namespace cellbake
 				float h = 0; unsigned age = 0;
 				if (prefetch::LatestGround(prefetch::kSlotBake0 + first + k, h, age) && age <= 3 && h > -1e30f && h != -500.0f) {
 					g_grid.Put(p.ix, p.iy, h);
-					++g_points;
 				}
 				p.on = false;
 			}
@@ -146,29 +141,15 @@ namespace cellbake
 			}
 			g_bank ^= 1;
 		}
-		void Work(ULONGLONG now)
+		void Work()
 		{
 			if (!g_have) {
 				if (g_jobs.empty()) return;
 				g_job = g_jobs.front(); g_jobs.pop_front();
-				g_have = true; g_phase = 0;
-			}
-			if (g_phase == 0) {
-				if (vehicle_probe::RequestSolids(g_job.mn, g_job.mx)) { g_phase = 1; g_askedAt = now; }
-				return;
-			}
-			if (g_phase == 1) {
-				std::vector<std::uint32_t> ids;
-				bool ok = false;
-				if (vehicle_probe::TakeSolids(ids, ok)) {
-					std::sort(ids.begin(), ids.end());
-					ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-					if (ok) { navseed::MarkSolid(ids.data(), ids.size()); g_solids += unsigned(ids.size()); }
-					else ++g_solidFails;
-					StartTerrain();
-				}
-				else if (now - g_askedAt > kSolidWaitMs) { ++g_solidFails; StartTerrain(); }  // no answer: the terrain anyway
-				return;
+				g_have = true;
+				// A native whole-cell collision query can stall while holding the world read lock.
+				// Keep terrain here and leave solid prediction to the other World sources.
+				StartTerrain();
 			}
 			TerrainStep();
 			// Done when every point was asked and both banks have been read once more.
@@ -184,7 +165,7 @@ namespace cellbake
 		static fvopaths::Watch watch;  // re-read only when settings.ini changed (2026-10-29 audit)
 		if (watch.Changed(fvopaths::Settings())) {
 			g_iniAt = now;
-			const bool use = GetPrivateProfileIntW(L"nav", L"bakedGround", 0, fvopaths::Settings().c_str()) != 0;
+			const bool use = false;  // [nav] bakedGround: fixed off (2026-11-05 settings strip)
 			if (use != g_use) logger::Write("Cell bake: NPC pilots %s the baked terrain (settings.ini [nav] bakedGround)", use ? "now use" : "do not use");
 			g_use = use;
 		}
@@ -192,12 +173,12 @@ namespace cellbake
 		const uptr player = Player();
 		if (!player) return;
 		if (now - g_pollAt >= kPollMs) { g_pollAt = now; Poll(player); }
-		Work(now);
+		Work();
 		if (now - g_reportAt >= kReportMs) {
 			g_reportAt = now;
-			logger::Write("Cell bake: %u cell(s) baked, %zu queued; %u solid object(s) named by the physics world (%u queries without an answer); %zu terrain point(s); "
+			logger::Write("Cell bake: %u cell(s) baked, %zu queued; %zu terrain point(s); "
 				"agreement with live terrain probes: %u sample(s), mean %.2f m apart, %u within 0.5 m, %u more than 2 m off",
-				g_cellsBaked, g_jobs.size() + (g_have ? 1 : 0), g_solids, g_solidFails, g_grid.h.size(), g_agree.samples, g_agree.Mean(), g_agree.close, g_agree.off2);
+				g_cellsBaked, g_jobs.size() + (g_have ? 1 : 0), g_grid.h.size(), g_agree.samples, g_agree.Mean(), g_agree.close, g_agree.off2);
 		}
 	}
 
@@ -211,7 +192,7 @@ namespace cellbake
 	void Reset()
 	{
 		g_world = 0; g_grid.Clear(); g_known.clear(); g_jobs.clear(); g_have = false;
-		g_cellsBaked = g_solids = g_points = g_solidFails = 0;
+		g_cellsBaked = 0;
 		g_agree = {};
 	}
 }

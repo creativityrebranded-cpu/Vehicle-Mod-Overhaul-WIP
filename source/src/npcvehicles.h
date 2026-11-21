@@ -1,5 +1,6 @@
 #pragma once
 #include "fvo_addon_api.h"
+#include "handoff.h"
 
 #include <cstdint>
 
@@ -33,10 +34,6 @@ namespace npcvehicles
 	int PilotFor(std::uint32_t vehicleId);
 	// Anyone (a job NPC, a gang driver, a stranger) sits in the driver seat of this vehicle.
 	bool HasDriver(std::uint32_t vehicleId);
-	// Take the wheel: stops that job and takes its NPC out at once (the NPC's form id, 0 when nobody drives it).
-	std::uint32_t TakeDriver(std::uint32_t vehicleId);
-	// Seats the player as the driver of the vehicle (the game's own put-the-player-in), true when the game agrees.
-	bool SeatPlayerDriver(std::uintptr_t vehicle);
 	// ---- Exit service (spec: vcontract.h ExitRequest / SeatState; polled). An actor aboard any vehicle gets out; a job's driver also ends its job and the
 	// vehicle is Unassigned from its profile. Modes: Auto = wait landed, the game's animated dismount, then the instant exit; Normal = the first two (Refused
 	// if they fail); Quick = the dismount with a short watch; Instant = the game's instant exit at once. After it the actor stands at the request's point or
@@ -61,10 +58,6 @@ namespace npcvehicles
 	// A driver not sitting, too far for a snap, written straight to the vehicle: from there the snap can seat them. True: moved.
 	bool BringToVehicle(std::uintptr_t actor,std::uintptr_t vehicle);
 	void HoldAtVehicle(std::uintptr_t actor,std::uintptr_t vehicle);  // a linked driver, not by the game's mover (FUN_142062F50 releases the seat): position written, model along with it
-	void ShrinkModel(std::uintptr_t actor,bool hide,float& saved);  // the 3D root scaled out of sight (saved: its scale), or back to saved. Done again for a model that was reloaded
-	void SetGuardIds(const std::uint32_t* ids,int count);  // main thread: the drivers whose new models are shrunk as they arrive
-	float AttachScale(std::uint32_t id);  // the scale such a model came with
-	bool ModelShrunk(std::uintptr_t actor);
 	double SeatDistance(std::uintptr_t actor,std::uintptr_t vehicle);  // models' distance when both are loaded: a flying driver's reference lags behind
 	bool DriverLeaving(std::uintptr_t actor);  // on the way out: an exit in progress, a pull-out standing up, or a job in a leaving phase
     bool ResumeSavedSeat(std::uintptr_t actor,std::uintptr_t vehicle); // reuse saved interaction; never build another
@@ -115,6 +108,8 @@ namespace npcvehicles
 	// The player rides `vehicle` as a passenger: its driver (seated, or posed in the driver seat) gets an autopilot job if it
 	// has none, so the vehicle drives itself. true when a job flies it.
 	bool AdoptDriver(std::uintptr_t vehicle);
+	// Passenger control: the seated driver of `vehicle` gets an autopilot job again (no walk, no trip); true when it has one.
+	bool StartSeatedForPassenger(std::uintptr_t vehicle);
 	// Return home: a following job's vehicle flies back to where it was taken from and parks there (false: no home known, or already there).
 	bool SendHome(std::uint32_t vehicleId);
 	int CivilJobs();                                         // jobs running a civil task now
@@ -138,6 +133,18 @@ namespace npcvehicles
 	bool StartScriptedSeated(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);
 	// Pre-armed traffic pilot: bound in the same call as the vehicle's creation (no readiness waits); flies once the model exists.
 	bool TrafficPilotFree();
+    bool TrafficPackageReady(unsigned vehicle, unsigned driver);
+    handoff::WheelAdmission AdmitWheelOutput(int pilot, unsigned vehicle);
+#ifndef FVO_RELEASE
+    std::uint64_t StartFactoryLease(std::uintptr_t actor, std::uintptr_t vehicle, const FvoTripClaim& claim);
+    std::uint64_t StartFactoryStockLease(std::uintptr_t actor, std::uintptr_t vehicle);
+    bool CheckFactoryLease(unsigned vehicle, unsigned driver, std::uint64_t token);
+    bool DepartFactoryLease(std::uintptr_t actor, std::uintptr_t vehicle, std::uint64_t token);
+    bool CancelFactoryLease(unsigned vehicle, unsigned driver, std::uint64_t token);
+    void FactoryLeaseReleased(unsigned vehicle);
+    std::uint64_t FactoryLeaseOf(int pilot, unsigned vehicle, bool releasedOnly);
+    std::uint64_t FactoryStockLeaseOf(int pilot, unsigned vehicle, bool releasedOnly);
+#endif
 	// The base form lists a driver's seat (seat 0 in its seat list, with a keyword): a driver can be seated in it (2026-10-30).
 	bool BaseHasDriverSeat(std::uintptr_t baseForm);
 	bool StartTrafficArmed(std::uintptr_t actor, std::uintptr_t vehicle, const struct FvoTripClaim& claim);

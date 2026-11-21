@@ -11,6 +11,8 @@ void BeforeSave();
 void AfterSave();
 void Report(); // deliver queued error notifications on the main frame thread
 std::wstring Routes();
+std::wstring PermanentDir();
+bool RefreshPermanent(std::string& why);
 std::wstring File(const wchar_t* name);
 #ifdef FVO_TRAFFICPROFILE_TEST
 namespace testing {

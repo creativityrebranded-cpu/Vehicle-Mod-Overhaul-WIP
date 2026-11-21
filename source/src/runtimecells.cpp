@@ -49,4 +49,15 @@ bool References(std::uintptr_t cell,std::uintptr_t*& data,std::uint32_t& count) 
     return false;
 }
 void Reset(){g_refsOffset=-1;}
+bool InventoryReferences(std::uintptr_t cell,std::uintptr_t*& data,std::uint32_t& count) {
+    data=nullptr;count=0;
+    const int offset=g_refsOffset;
+    if(!cell||offset<0)return false;
+    __try {
+        const auto size=At<std::uint32_t>(cell,unsigned(offset)),cap=At<std::uint32_t>(cell,unsigned(offset+4));
+        const auto refs=At<std::uintptr_t*>(cell,unsigned(offset+8));
+        if(size>cap||cap>200000||(cap&&!refs))return false;
+        data=refs;count=size;return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER){return false;}
+}
 }

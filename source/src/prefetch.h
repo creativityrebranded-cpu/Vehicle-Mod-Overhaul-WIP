@@ -57,9 +57,11 @@ namespace prefetch
 	// ranges above (slots 21..23 and 45..47 between them belong to scantarget and environment).
 	enum { kRayAirTraffic0=62,kRayAirTrafficCount=16,kRayExtra0=kRayAirTraffic0+kRayAirTrafficCount,kRayExtraEach=8,kRayPilots=1+kSlotPilotCount,
 		kRayEnvironment0=kRayExtra0+kRayExtraEach*(kRayPilots-7),kRayEnvironmentCount=11,  // environment's own, after every pilot's (2026-10-31: 5 rays against about 900 asked a second)
-		kRaySlots=kRayEnvironment0+kRayEnvironmentCount };
+		kRayGap0=kRayEnvironment0+kRayEnvironmentCount,  // one per pilot: the gap keeper's ray, cycling through six directions (gapkeep.h)
+		kRaySlots=kRayGap0+kRayPilots };
 	constexpr int CorridorRay(int pilot, int c) { return pilot < 7 ? pilot * 3 + c : kRayExtra0 + (pilot - 7) * kRayExtraEach + c; }
 	constexpr int CeilingRay(int pilot, int k) { return pilot < 7 ? 48 + pilot * 2 + k : kRayExtra0 + (pilot - 7) * kRayExtraEach + 3 + k; }
+	constexpr int GapRay(int pilot) { return kRayGap0 + pilot; }
 	constexpr int SweepRay(int pilot, int k) { return pilot < 7 ? 24 + pilot * 3 + k : kRayExtra0 + (pilot - 7) * kRayExtraEach + 5 + k; }
 	static_assert(CorridorRay(6, 2) == 20 && SweepRay(6, 2) == 44 && CeilingRay(6, 1) == 61 && SweepRay(kRayPilots - 1, 2) == kRayEnvironment0 - 1);
 	struct RayHit
@@ -93,6 +95,15 @@ namespace prefetch
 		float from[3] = {}, to[3] = {};  // the sweep as cast (body position to its end)
 		unsigned micros = 0;             // time the cast took
 		int kept = 0, skipped = 0;       // hits that counted / were left out (own body, ground below)
+	};
+	// One contact of a path sweep (World radar, vehicle_probe::SweepPathNow): every body the swept hull touches, not only the nearest.
+	struct SweepContact
+	{
+		float x = 0, y = 0, z = 0;       // contact point
+		float nx = 0, ny = 0, nz = 0; bool normalOk = false;  // hit record +0x10 (unit vector checked)
+		std::uint32_t bodyId = 0, layer = 0;
+		float distance = 0;              // metres along the sweep
+		bool atStart = false;            // already overlapping where the sweep began
 	};
 	void RequestSweep(int slot, std::uintptr_t instance, float dirX, float dirY, float range, std::uint64_t mask);
 	bool LatestSweep(int slot, SweepHit& out, unsigned& age);

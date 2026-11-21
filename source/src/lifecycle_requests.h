@@ -60,19 +60,21 @@ public:
     static constexpr std::uint64_t kAbandonMs=10000;
     explicit Requests(std::size_t limit=64,std::uint64_t (*clock)()=SteadyMs):limit_(limit),clock_(clock){}
     template<class Factory,class Submit>
-    std::optional<std::uint64_t> Poll(const std::string& key,unsigned id,Factory factory,Submit submit,bool forget=false) {
+    std::optional<std::uint64_t> Poll(const std::string& key,unsigned id,Factory factory,Submit submit,bool forget=false,bool allowNew=true,bool* tracked=nullptr) {
         Ticket ticket;
         bool fresh=false,done=false;
+        if(tracked)*tracked=false;
         {
             std::lock_guard lock(mutex_);
             if(closed_)return std::nullopt; // not a failure: the caller asks again once the table opens
-            Purge();
+            if(allowNew)Purge();
             auto it=jobs_.find(key);
             if(it!=jobs_.end()) {
                 ticket=it->second;
                 done=ticket->state.load(std::memory_order_acquire)==Request::Done;
                 if(done)jobs_.erase(it); // ticket keeps captures alive past unlock
             } else {
+                if(!allowNew)return std::nullopt;
                 // Full: a post is dropped and says so (its owner keeps the wanted state and asks again); a request
                 // waits, and Pending answers true, so no caller reads a full table as a failed birth (15:32 run).
                 if(jobs_.size()>=limit_){refused_.fetch_add(1);if(forget)return std::uint64_t(0);return std::nullopt;}
@@ -80,6 +82,7 @@ public:
                 ticket->epoch=epoch_;ticket->generation=epoch_->value.load();ticket->id=id;ticket->forget=forget;
                 jobs_.emplace(key,ticket);fresh=true;
             }
+            if(tracked)*tracked=true;
         }
         if(done)return ticket->generation==epoch_->value.load()?ticket->result:0;
         if(!fresh)return std::nullopt;

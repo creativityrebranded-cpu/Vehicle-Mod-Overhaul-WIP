@@ -146,13 +146,25 @@ void ReportRefused(const std::string& key) {
     if(refused<=8||refused%256==0)logger::Write("Traffic lifecycle: request table full; refused %s (%u refused since start)",key.c_str(),refused);
 }
 }
-std::optional<std::uint64_t> Poll(const std::string& key,unsigned id,const std::function<Work()>& factory) {
+namespace {
+std::optional<std::uint64_t> PollRequest(const std::string& key,unsigned id,const std::function<Work()>& factory,bool* tracked) {
     HandOff();
     tCurrentKey=key.c_str();
-    const auto result=requests.Poll(key,id,factory,Submit);
+    const auto result=requests.Poll(key,id,factory,Submit,false,true,tracked);
     tCurrentKey=nullptr;
     logger::ObserveReference("lifecycle.poll",id,result?(1ull+(*result!=0)):0,"key=%s complete=%d result=%llu outstanding=%zu in_service=%d",key.c_str(),bool(result),static_cast<unsigned long long>(result?*result:0),requests.Outstanding(""),InService());
     ReportRefused(key);return result;
+}
+}
+std::optional<std::uint64_t> Poll(const std::string& key,unsigned id,const std::function<Work()>& factory) {
+    return PollRequest(key,id,factory,nullptr);
+}
+std::optional<std::uint64_t> PollTracked(const std::string& key,unsigned id,const std::function<Work()>& factory,bool& tracked) {
+    return PollRequest(key,id,factory,&tracked);
+}
+std::optional<std::uint64_t> Collect(const std::string& key,bool& tracked) {
+    HandOff();
+    return requests.Poll(key,0,[]{return Work{};},Submit,false,false,&tracked);
 }
 std::size_t Outstanding(const char* operation) {return requests.Outstanding(operation);}
 bool Pending(unsigned id,const char* operation) {HandOff();return requests.Pending(id,operation?operation:"");}

@@ -15,7 +15,7 @@ namespace {int mode=0;std::array<prefetch::RayHit,prefetch::kRaySlots> hits;std:
 bool refusing=false;float refuseAtX=1e9f;std::array<std::array<float,3>,prefetch::kRaySlots> asked{};std::array<bool,prefetch::kRaySlots> refusedSlots{};}
 namespace game {std::uintptr_t Base(){return 0;}}
 namespace cellbake {bool Ground(double,double,double&){return false;}}
-namespace navmap {Sample At(double,double,double){Sample s;s.known=true;return s;}void NoteGround(double,double,double){}void Column(double x,double y,const double* zs,int n,Sample* out){for(int k=0;k<n;++k)out[k]=At(x,y,zs[k]);}}
+namespace navmap {Sample At(double,double,double){Sample s;s.known=true;return s;}void NoteGround(double,double,double){}bool HitNear(double,double,double,double,double,double*){return false;}void Column(double x,double y,const double* zs,int n,Sample* out){for(int k=0;k<n;++k)out[k]=At(x,y,zs[k]);}}
 namespace world {
 bool Vehicles(Snapshot& s){s={};s.count=1;s.v[0].formId=1;s.v[0].pos[2]=2.5;s.v[0].half[0]=2;s.v[0].half[1]=3;s.v[0].half[2]=1.2f;return true;}
 }

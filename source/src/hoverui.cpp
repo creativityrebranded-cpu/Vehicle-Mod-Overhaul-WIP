@@ -417,6 +417,7 @@ namespace hoverui
 			bool own = false, nearOwn = false, autoOn = false, occupied = false;
 			std::string occKey;
 			std::string summonKey, followKey, useKey, status, autoLine, summonLabel, coverLabel, autoKey, lifebar;
+			std::string planLine; unsigned long long planLineAt = 0;  // the plan ledger line (test builds), shown while fresh
 			std::string rows[kMaxRows];
 			int rowCount = 0;
 			std::string vbarName;  // the vehicle bar under the game's enemy bar (empty: hidden)
@@ -700,7 +701,8 @@ namespace hoverui
                     SetMember(pc,"visible",Bool(true));SetMember(inst,"visible",Bool(true));
                     bool editing,pad;{std::lock_guard layout(g_lay.lock);editing=g_lay.edit;pad=bindings::UsingPad();}
                     auto key=editing?bindings::PromptInput(actions[i],pad,bindlogic::kCtxAll):bindings::Label(actions[i]);
-                    if(!editing&&(i==kGearDown||i==kHover)){const auto view=CurrentHints();key=inlinehints::Keys(view[i==kGearDown?inlinehints::Element::Gear:inlinehints::Element::Hover]);}
+                    if(!editing&&(i==kGearDown||i==kHover)){const auto view=CurrentHints();const auto hinted=inlinehints::Keys(view[i==kGearDown?inlinehints::Element::Gear:inlinehints::Element::Hover]);
+                        if(!hinted.empty())key=hinted;}  // no hint (the game not in front, a menu, input paused): the key's own binding, never "UNBOUND" while it is bound
                     if(key.empty())key="UNBOUND";const Value args[]={Str(key.c_str())};Invoke(inst,"SetText",args,1);
                 }Release(inst);Release(pc);
             } // no label: "GEAR n" is all inside the key box
@@ -2029,7 +2031,7 @@ namespace hoverui
 			bool own, nearOwn, autoOn, occupied;
 			int rowCount = 0;
 			std::string rows[kMaxRows];
-			std::string summonKey, followKey, useKey, status, autoLine, occKey, target, summonLabel, coverLabel, autoKey, lifebar;
+			std::string summonKey, followKey, useKey, status, autoLine, occKey, target, summonLabel, coverLabel, autoKey, lifebar, planLine;
 			{
 				std::lock_guard lk(g_ctx.lock);
 				own = g_ctx.own; nearOwn = g_ctx.nearOwn; autoOn = g_ctx.autoOn;
@@ -2037,6 +2039,7 @@ namespace hoverui
 				summonKey = g_ctx.summonKey; followKey = g_ctx.followKey; useKey = g_ctx.useKey; status = g_ctx.status;
 				summonLabel = g_ctx.summonLabel; coverLabel = g_ctx.coverLabel;
 				autoLine = g_ctx.autoLine; autoKey = g_ctx.autoKey; lifebar = g_ctx.lifebar;
+				planLine = GetTickCount64() - g_ctx.planLineAt < 1000 ? g_ctx.planLine : std::string();
 				rowCount = g_ctx.rowCount;
 				for (int i = 0; i < kMaxRows; ++i) rows[i] = g_ctx.rows[i];
 			}
@@ -2082,14 +2085,14 @@ namespace hoverui
 			// One vehicle prompt of FVO's own (2026-10-28, the user: "merge the UI for this all ... just change based on context";
 			// the separate passenger prompt overlapped). It lives in the "Board vehicle" slot (moved in the UI editor) and its
 			// meaning follows the situation: facing a vehicle someone drives, E = passenger seat / hold E = pull the driver out;
-			// riding as a passenger, G = get out / hold G = take the wheel. Otherwise hidden: the game's own Enter prompt is
+			// riding as a passenger, G = take / give back control (leaving is the game's own hold E). Otherwise hidden: the game's own Enter prompt is
 			// left as it is.
 			{
 				const bool riding = passenger::RidingVehicle() != 0;
 				std::string text, keys;
 				if (riding) {
 					keys = bindings::PromptInput(bindings::Action::PassengerExit, pad, bindlogic::kCtxPassenger);
-					text = "Get out  |  hold: Take the wheel";
+					text = passenger::Controlling() ? "Give back control" : "Take control";
 				}
 				else if (!inVehicle && occupied) {
 					keys = passengerKey;
@@ -2158,6 +2161,8 @@ namespace hoverui
 				if (!nextStop.empty()) card[3]=nextStop;
 			}
             if(g_showAll)for(int i=0;i<kMaxRows&&i<rowCount&&i<4;++i)card[4+i]=rows[i];
+            // The plan ledger (test builds): why your car on the plan does what it does, without reading the log. Last line, never over another.
+            if(inVehicle&&!planLine.empty()&&card[hudchildren::CardCount-1].empty())card[hudchildren::CardCount-1]=planLine;
             if(!ed&&!features::On(features::Id::StatusCard))card.fill({});
             const bool cardChild=hudchildren::In(selection,hudchildren::CardBase,hudchildren::CardCount);
             if(ed&&cardChild){
@@ -2798,6 +2803,17 @@ namespace hoverui
 		if (g_ctx.lifebar != line) g_ctx.lifebar = line;
 	}
 
+	void SetPlanLine(const char* line)
+	{
+#ifndef FVO_RELEASE
+		std::lock_guard lk(g_ctx.lock);
+		if (g_ctx.planLine != line) g_ctx.planLine = line ? line : "";
+		g_ctx.planLineAt = GetTickCount64();
+#else
+		(void)line;
+#endif
+	}
+
 	void SetVehicleBar(const char* name, float share)
 	{
 		std::lock_guard lk(g_ctx.lock);
@@ -2883,7 +2899,7 @@ namespace hoverui
 	void EditTick(bool focused)
 	{
 		// F7 on the local map belongs to the traffic route editor (routeedit.cpp); drain the HUD editor's key meanwhile.
-		if (routeedit::MapOpen(1000)) { bindings::Triggered(bindings::Action::HudEdit); return; }
+		if (routeedit::MapOpen(1000) || routeedit::PhotoOpen()) { bindings::Triggered(bindings::Action::HudEdit); return; }
 		static bool down[14] = {};
 		static ULONGLONG repeatAt[14] = {};
 		// 10..13: + / - on the main row and the number pad (the size, while editing).

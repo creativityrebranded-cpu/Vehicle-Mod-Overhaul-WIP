@@ -60,17 +60,30 @@ struct Command {
     bool assist=true, brake=false;
     // AI pilots: a commanded push along the body's right (strafe), and the side thrusters' bound for slip damping.
     double strafeAcceleration=0, sideAcceleration=3;
+    // FC-1 (2026-11-19): the flight gear's row (carcap::FlightRow). Defaults are gear 3 = the numbers Solve always had. The side push stays
+    // along the body's right (real thrusters; the user, 2026-11-19), the same way in every gear.
+    double rateGain=5, angularLimit=6, sideGain=1.2, sideDead0=0, sideDeadPerSpeed=0;
 };
 struct State {
     double referenceMass=0;  // fixed thruster specification for this flight/body; payload changes do not create free thrust
     double trim=9.8;         // bounded collective trim; assist integrates vertical-speed error, never per-step "gravity"
 };
-struct Output { Vec linear{}, angular{}; double collective=0; bool saturated=false, valid=false; };
+struct Output {
+    Vec linear{}, angular{}; double collective=0; bool saturated=false, valid=false;
+    // FC-1 traces: rate error (rad/s, |wanted - spin|, assist on), drift along the right (m/s) and the side push (m/s^2), the rate gain used,
+    // and which bound held this step (angular limit, torque budget, side budget).
+    double rateError=0, drift=0, sidePush=0, rateGain=0; bool angularCapped=false, torqueCapped=false, sideCapped=false;
+};
+// FC-1: at a low frame rate a high rate gain overshoots (gain x dt past ~0.8). Gears above today's 5 /s are held under 0.8 / dt; today's
+// gain and below are never touched (gear 3 stays exactly as it was at every dt Solve accepts).
+inline double StableRateGain(double gain,double dt) { return std::min(gain,std::max(5.0,0.8/dt)); }
 inline Output Solve(const Body& b,const Command& c,State& state,double dt) {
     Output out;
     if (!Valid(b)||!Finite(c.rates)||!std::isfinite(c.forwardAcceleration)||!std::isfinite(c.manualLift)||
         !std::isfinite(c.verticalSpeed)||!std::isfinite(c.brakeAcceleration)||!std::isfinite(c.speedCap)||!std::isfinite(c.radius)||
         !std::isfinite(c.strafeAcceleration)||!std::isfinite(c.sideAcceleration)||c.sideAcceleration<0||
+        !std::isfinite(c.rateGain)||c.rateGain<=0||!std::isfinite(c.angularLimit)||c.angularLimit<=0||!std::isfinite(c.sideGain)||c.sideGain<0||
+        !std::isfinite(c.sideDead0)||c.sideDead0<0||!std::isfinite(c.sideDeadPerSpeed)||c.sideDeadPerSpeed<0||
         !(dt>0&&dt<=0.25)||c.brakeAcceleration<0||c.speedCap<0||c.radius<=0) return out;
     if (!state.referenceMass) state.referenceMass=1/b.motion.inverseMass;
     if (!std::isfinite(state.referenceMass)||state.referenceMass<=0||!std::isfinite(state.trim)) return out;
@@ -96,13 +109,26 @@ inline Output Solve(const Body& b,const Command& c,State& state,double dt) {
     Vec acceleration=b.forward*forward+b.up*collective;
     const double side=std::min(c.sideAcceleration,12.0);
     if (c.strafeAcceleration!=0) acceleration=acceleration+b.right*std::clamp(c.strafeAcceleration,-12.0,12.0);
-    else if (c.assist) acceleration=acceleration+b.right*(-std::clamp(Dot(b.velocity,b.right)*1.2,-side,side)); // bounded side thrusters
+    else if (c.assist) {
+        // Bounded side thrusters along the body's right: the drift past the gear's deadband (none below gear 4) is opposed at its gain.
+        const double drift=Dot(b.velocity,b.right),dead=c.sideDead0+c.sideDeadPerSpeed*std::hypot(b.velocity.x,b.velocity.y);
+        const double past=std::fabs(drift)>dead?drift-std::copysign(dead,drift):0.0;
+        const double push=past*c.sideGain;
+        out.drift=drift; out.sideCapped=std::fabs(push)>side; out.sidePush=-std::clamp(push,-side,side);
+        acceleration=acceleration+b.right*out.sidePush;
+    }
     const Vec force=Limited(acceleration,65)*state.referenceMass;
     // Assist is an actuator controller, not an angular-velocity overwrite. Off: zero command applies zero torque.
-    const Vec angularAcceleration=Limited((c.assist?c.rates-b.spin:c.rates)*5,6);
+    const Vec rateWant=c.assist?c.rates-b.spin:c.rates;
+    out.rateGain=StableRateGain(c.rateGain,dt);
+    const Vec rawAngular=rateWant*out.rateGain;
+    out.angularCapped=Length(rawAngular)>c.angularLimit;
+    if (c.assist) out.rateError=Length(rateWant);
+    const Vec angularAcceleration=Limited(rawAngular,c.angularLimit);
     const Vec angular=AngularImpulse(b.motion,angularAcceleration,dt);
-    const double torqueBudget=state.referenceMass*std::max(0.25,c.radius*c.radius)*6;
+    const double torqueBudget=state.referenceMass*std::max(0.25,c.radius*c.radius)*c.angularLimit;
     out.linear=force*dt;
+    out.torqueCapped=Length(angular)>torqueBudget*dt;
     out.angular=Limited(angular,torqueBudget*dt);
     out.collective=collective;
     out.valid=Finite(out.linear)&&Finite(out.angular);

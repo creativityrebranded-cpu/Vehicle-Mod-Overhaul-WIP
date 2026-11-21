@@ -32,6 +32,7 @@ typedef int (*FvoTrafficOffer)(double x, double y, double z, unsigned vehicleId,
 typedef int (*FvoRegisterTrafficProvider_t)(FvoTrafficOffer offer);  // export "FVO_RegisterTrafficProvider"; 1: registered
 typedef void (*FvoLog_t)(const char* line);                          // export "FVO_Log": one line in FlyingVehicleOverhaul.log
 typedef int (*FvoWorldName_t)(char* out, int size);                  // export "FVO_WorldName": the player's worldspace editor name; 0 none
+typedef int (*FvoRefHeading_t)(unsigned refId, double* heading);   // export "FVO_RefHeading" (2026-11-05, optional): 1 + heading (atan2(x, y)), 0 unknown
 typedef unsigned (*FvoBaseOf_t)(unsigned refId);                     // export "FVO_BaseOf": a reference's base form id; 0 unknown
 // export "FVO_SetRouteMarkers": probes for `world` at `count` points (x, y, z, scale each); shown while "Show traffic routes" is on.
 typedef void (*FvoSetRouteMarkers_t)(const char* world, const float* xyzs, int count);

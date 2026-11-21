@@ -30,13 +30,23 @@ namespace world
 		bool heldFar = false;    // kept loaded outside the attached cells (Keep in sight): only VehiclesAndHeld lists it
 		std::uint32_t driverId = 0;
 		enum class Who : std::uint8_t { None, Player, Npc, Parked } who = Who::None;
+		bool outOfTraffic = false;  // C4: the coordinator says this vehicle is no longer traffic that will move (Health: broken / retiring)
 		std::uint32_t bodyId = 0;
 		std::uint32_t bodyCount=0,bodyIds[16]={}; // owned scene bodies; native vehicle callback identifies its chassis
+		bool velFromBody = false;  // VL-1: vel is the body's own velocity from the pilot that flies it (else the smoothed estimate)
 	};
 	// Capacity, not a policy (2026-10-29, the user: "raise the limit"; "base it on the resource req of each"): every loaded vehicle up
 	// to this many is listed; how often each one's 3D and bodies are re-read is decided per vehicle by its measured cost against a
 	// frame budget (vehicleworld.cpp Publish, settings.ini [world] sampleBudgetMs).
 	constexpr std::uint32_t kMaxVehicles = fvolimits::kVehicles;
+	// C4 (graph edge Coordinator -> Vehicle List, 2026-11-07): the coordinator's list of vehicles out of traffic; each mark lasts
+	// coordinator::kOutOfTrafficMs unless sent again. Any thread.
+	void MarkOutOfTraffic(const std::uint32_t* ids, int count);
+	bool OutOfTraffic(std::uint32_t id);
+	// VL-1 (design: Vehicle List "use real body velocity for cars we fly"): a pilot publishes the body velocity it already reads;
+	// Publish uses it for that vehicle while fresh (kFlownFreshMs). Any thread.
+	void NoteFlownVelocity(std::uint32_t id, const double v[3]);
+	bool FlownVelocity(std::uint32_t id, float out[3]);
 	struct Snapshot
 	{
 		std::uint64_t frame = 0;

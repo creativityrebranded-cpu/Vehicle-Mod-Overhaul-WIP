@@ -8,6 +8,7 @@ namespace trafficpool
 	bool PutBack(unsigned id,double x,double y,double z);    // back to where it was, no sight check: undoes the game's own move (vehiclediag)
 	int PairHealth(unsigned vehicleId);  // trafficpair::PairHealth as an int; a vehicle that is no traffic pair is 0 (unproven)
 	void Reset();  // a save load
+	bool MayHideParked(unsigned id,const char* reason,bool protectedPlacement);
 	bool MadeVehicle(std::uint32_t id);  // the traffic addon made or reused it since the load
     void WorldActionsAllowed(bool allowed); // main scheduler: false during save loads and world teardown
     void ArrivalChecks(int& rayChecked,int& mapOnly,bool reset); // arrival placements since the last reset, by clearance check
@@ -23,5 +24,9 @@ namespace trafficpool
 	int Everyday();
 	// FVO_Traffic.dll is attached; ask it to re-read its traffic files (any thread).
 	bool AddonAttached();
+	// KO-1 (2026-11-08): the player took this vehicle (pull-out, hand-over, hijack); traffic lets go of it and its birth hold releases to the player.
+	void NotePlayerTook(unsigned vehicle, const char* why);
+    bool PlayerOwnsHandoff(unsigned vehicle);
+    std::uint64_t CaptureWheelHandoff(unsigned vehicle);
 	void ReloadFiles();
 }

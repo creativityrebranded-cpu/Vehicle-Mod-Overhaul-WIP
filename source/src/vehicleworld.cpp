@@ -1,4 +1,6 @@
 #include "vehicleworld.h"
+#include "vehiclevel.h"  // VS-1
+#include "traffic/coordinator.h"
 
 #include "addresses.h"
 #include "bodymass.h"
@@ -69,7 +71,9 @@ namespace world
 			float scale = 1;              // the 3D's scale at the last full sample
 			float costMs = 0.02f;         // this vehicle's measured full-sample cost (smoothed)
 			ULONGLONG sampledAt = 0;      // its last full sample (3D + bodies)
+			bool velFromBody = false;     // VL-1: the last velocity source traced
 		};
+		constexpr unsigned long long kFlownFreshMs = 300;  // VL-1: a pilot's body velocity older than this is not used
 		std::unordered_map<std::uint32_t, Cached> g_cache;
 		constexpr int kDriverCallsPerFrame = 3;
 		constexpr ULONGLONG kDriverActiveMs = 250, kDriverParkedMs = 1000;
@@ -391,19 +395,28 @@ namespace world
 						if (logger::Verbose()) logger::Write("Vehicle hop: %08X (base %08X) moved %.1f m while parked, to (%.1f, %.1f, %.1f)", id, v.baseId, d3, p.x, p.y, p.z);
 					}
 				}
-				if (dt > 1e-4 && dt < 0.5 && jump < 50.0f) {
-					const float a = float(std::min(1.0, dt * 8.0));
+				{   // VS-1: believed only when physically possible and fresh (vehiclevel.h); the 50 m reset and the smoothing are unchanged.
 					const float cur[3] = { p.x - t.last[0], p.y - t.last[1], p.z - t.last[2] };
-					for (int k = 0; k < 3; ++k) t.vel[k] += (float(cur[k] / dt) - t.vel[k]) * a;
-				}
-				else if (jump >= 50.0f) {
-					t.vel[0] = t.vel[1] = t.vel[2] = 0;
+					double implied = 0; const auto ev = vehiclevel::Step(t.vel, cur, dt, &implied);
+					if (ev == vehiclevel::Event::JumpIgnored || ev == vehiclevel::Event::Stale)
+						logger::Observe("world.velocity", id, ev == vehiclevel::Event::JumpIgnored ? 0x10u : 0x11u, "event=%s implied_mps=%.0f jump_m=%.1f dt_s=%.2f reason=%s", vehiclevel::Name(ev), implied, jump, dt,
+							ev == vehiclevel::Event::JumpIgnored ? "faster_than_any_vehicle_a_teleport_or_placement_move" : "no_fresh_sample_old_speed_not_carried");
 				}
 			}
 			t.last[0] = p.x; t.last[1] = p.y; t.last[2] = p.z;
 			t.at = qpc;
 			t.have = true;
 			std::memcpy(v.vel, t.vel, sizeof(v.vel));
+			{   // VL-1: a car we fly: its body's own velocity (traced when the source changes for a vehicle)
+				float bodyVel[3];
+				v.velFromBody = FlownVelocity(id, bodyVel);
+				if (v.velFromBody) std::memcpy(v.vel, bodyVel, sizeof(v.vel));
+				if (cache.velFromBody != v.velFromBody) {
+					cache.velFromBody = v.velFromBody;
+					logger::Observe("world.velocity", id, v.velFromBody ? 1u : 0u, "event=source source=%s estimate=%.2f,%.2f body=%.2f,%.2f reason=%s", v.velFromBody ? "body" : "position_difference",
+						t.vel[0], t.vel[1], v.vel[0], v.vel[1], v.velFromBody ? "a_pilot_of_ours_flies_it" : "not_flown_by_us_or_stale");
+				}
+			}
 			QueryPerformanceCounter(&partStart);
 			// Occupants: your driven vehicle needs no engine call; the engine lookup is cached and rationed.
 			static ULONGLONG callFrame = 0;
@@ -427,6 +440,7 @@ namespace world
 			else {
 				v.who = VehicleInfo::Who::Parked;
 			}
+			v.outOfTraffic = OutOfTraffic(id);  // C4: the coordinator's fact; World reads it like parked (D1)
             QueryPerformanceCounter(&partEnd);driverMs+=milliseconds(partStart,partEnd);
             const auto vehicleMs=milliseconds(vehicleStart,partEnd);
             if(vehicleMs>slowMs){slowMs=vehicleMs;slowId=id;}
@@ -532,4 +546,49 @@ namespace world
 		__try { return Bounds(base, half, centre); }
 		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 	}
+	namespace { std::mutex g_outLock; std::unordered_map<std::uint32_t, unsigned long long> g_out; }
+	void MarkOutOfTraffic(const std::uint32_t* ids, int count)
+	{
+		const unsigned long long now = GetTickCount64();
+		std::lock_guard lk(g_outLock);
+		for (auto it = g_out.begin(); it != g_out.end();) if (now - it->second > coordinator::kOutOfTrafficMs) it = g_out.erase(it); else ++it;
+		for (int i = 0; ids && i < count; ++i) if (ids[i]) {
+			const bool fresh = g_out.find(ids[i]) == g_out.end();
+			g_out[ids[i]] = now;
+			if (fresh) logger::Write("OBS system=world.who vehicle=%08X event=out_of_traffic source=coordinator reason=health_broken_or_retiring", ids[i]);
+		}
+	}
+	// VL-1: the body velocity a pilot of ours reads for the car it flies (g_sh.v, the physics step's own read). The Vehicle List uses it
+	// in place of the smoothed position difference while it is fresh; every other vehicle keeps the estimate.
+	namespace { std::mutex g_flownLock; struct Flown { float v[3]; unsigned long long at; }; std::unordered_map<std::uint32_t, Flown> g_flown; }
+	void NoteFlownVelocity(std::uint32_t id, const double v[3])
+	{
+		if (!id || !v || !std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2])) return;
+		if (std::fabs(v[0]) > 400 || std::fabs(v[1]) > 400 || std::fabs(v[2]) > 400) return;  // not a car's speed: keep the estimate
+		std::lock_guard lk(g_flownLock);
+		g_flown[id] = Flown{ { float(v[0]), float(v[1]), float(v[2]) }, GetTickCount64() };
+	}
+	bool FlownVelocity(std::uint32_t id, float out[3])
+	{
+		const unsigned long long now = GetTickCount64();
+		std::lock_guard lk(g_flownLock);
+		const auto it = g_flown.find(id);
+		if (it == g_flown.end()) return false;
+		if (now - it->second.at > kFlownFreshMs) { g_flown.erase(it); return false; }
+		std::memcpy(out, it->second.v, sizeof(it->second.v));
+		return true;
+	}
+	bool OutOfTraffic(std::uint32_t id)
+	{
+		std::lock_guard lk(g_outLock);
+		const auto it = g_out.find(id);
+		return it != g_out.end() && GetTickCount64() - it->second <= coordinator::kOutOfTrafficMs;
+	}
+}
+// C4: the coordinator (addon) sends the vehicles that are out of traffic. Optional export: an older addon never calls it.
+extern "C" __declspec(dllexport) int FVO_VehiclesOutOfTrafficV1(const std::uint32_t* ids, int count)
+{
+	if (count < 0 || count > 1024) return 0;
+	world::MarkOutOfTraffic(ids, count);
+	return 1;
 }

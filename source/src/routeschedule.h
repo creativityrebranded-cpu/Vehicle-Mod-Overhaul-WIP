@@ -4,6 +4,7 @@
 // game day, not host time or UT. The engine clock adapter must supply valid=false
 // when local time is unknown; no live clock binding is implied by this module.
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <sstream>
@@ -20,13 +21,54 @@ struct Window { int start=0, end=0, vehicles=1; }; // [start,end), may cross mid
 constexpr int kWords=5;
 inline const char* WordName(int word) { static const char* const names[kWords]={"Closed","Quiet","Steady","Busy","Rush"}; return names[word>=0&&word<kWords?word:0]; }
 struct Zone { int start=0, word=2; };
+enum TrafficLevel { Saved = -1, Quiet, Steady, Busy, LevelCount };
+struct VehicleBand {
+    int low = 0, high = 0;
+    bool operator==(const VehicleBand&) const = default;
+};
+using TrafficBands = std::array<VehicleBand, LevelCount>;
+inline constexpr TrafficBands kTrafficBands{{{1, 3}, {4, 8}, {9, 16}}};
+inline const char* LevelName(int level) {
+    constexpr const char* names[]{"Quiet", "Steady", "Busy"};
+    return level >= Quiet && level < LevelCount ? names[level] : "Saved";
+}
 struct Schedule {
     bool allDay=true; int allDayVehicles=1; std::vector<Window> windows;
     std::vector<Zone> zones;              // empty: plain windows or all day
     int peak=0;                           // vehicles at 100%
     int levels[kWords]={0,25,50,75,100};  // each word's share of peak
     int blend=30;                         // minutes to ease from one zone to the next
+    int trafficLevel = Saved;
+    TrafficBands trafficBands = kTrafficBands;
 };
+inline bool HasLevel(const Schedule& s) { return s.trafficLevel >= Quiet && s.trafficLevel < LevelCount; }
+inline int ScaleRate(double vehiclesPerKm, double metres) {
+    if (vehiclesPerKm <= 0 || !std::isfinite(metres) || metres <= 0) return 0;
+    const double count = std::min(double(fvolimits::kVehicles), vehiclesPerKm * (metres / 1000.0));
+    return std::max(1, int(std::lround(count)));
+}
+inline int VehiclesFor(const Schedule& s, int saved, double metres) {
+    if (!HasLevel(s)) return saved;
+    const auto band = s.trafficBands[s.trafficLevel];
+    if (s.allDay) return ScaleRate((band.low + band.high) * 0.5, metres);
+    return saved > 0 ? std::clamp(saved, ScaleRate(band.low, metres), ScaleRate(band.high, metres)) : 0;
+}
+inline int PeakVehicles(const Schedule& s, double metres) {
+    if (s.allDay && HasLevel(s)) return VehiclesFor(s, s.allDayVehicles, metres);
+    int peak = s.allDay ? s.allDayVehicles : 0;
+    for (const auto& w : s.windows) peak = std::max(peak, VehiclesFor(s, w.vehicles, metres));
+    return peak;
+}
+inline bool ReadTrafficBands(const std::string& text, TrafficBands& out) {
+    TrafficBands bands{};
+    std::istringstream fields(text);
+    for (auto& band : bands)
+        if (!(fields >> band.low >> band.high) || band.low < 0 || band.high < band.low || band.high > fvolimits::kVehicles) return false;
+    std::string extra;
+    if (fields >> extra) return false;
+    out = bands;
+    return true;
+}
 enum class Issue { None, NoWindows, InvalidTime, EmptyWindow, InvalidDensity, Overlap };
 inline bool Contains(const Window& w,int minute) {
     return w.start<w.end ? minute>=w.start && minute<w.end : minute>=w.start || minute<w.end;
@@ -133,11 +175,14 @@ inline const char* IssueText(Issue i) {
     default: return "";
     }
 }
-inline Decision Evaluate(const Schedule& s,bool localTimeKnown,int localMinute) {
+inline Decision Evaluate(const Schedule& s,bool localTimeKnown,int localMinute,double metres=0) {
     if(Validate(s)!=Issue::None) return {};
-    if(s.allDay) return {true,s.allDayVehicles>0,s.allDayVehicles};
+    if(s.allDay) { const int n=VehiclesFor(s,s.allDayVehicles,metres); return {true,n>0,n}; }
     if(!localTimeKnown || localMinute<0 || localMinute>=kMinutesPerDay) return {};
-    for(const auto& w:s.windows) if(Contains(w,localMinute)) return {true,w.vehicles>0,w.vehicles};
+    for(const auto& w:s.windows) if(Contains(w,localMinute)) {
+        const int n=VehiclesFor(s,w.vehicles,metres);
+        return {true,n>0,n};
+    }
     return {true,false,0};
 }
 }

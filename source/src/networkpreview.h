@@ -1,0 +1,9 @@
+#pragma once
+#include "roadnetwork.h"
+namespace networkpreview {
+inline std::vector<trafficdata::Vec> Trace(const roadnetwork::Network& network,const roadnetwork::Itinerary& trip,const std::vector<trafficdata::Link>& links){
+    std::vector<trafficdata::Vec> points;if(trip.routes.empty())return points;std::vector<int> routes;std::vector<const trafficdata::Route*> refs;for(const auto& r:network.routes)refs.push_back(&r);for(const auto& name:trip.routes){int index=-1;for(int i=0;i<int(network.routes.size());++i)if(network.routes[i].name==name){index=i;break;}if(index<0)return {};routes.push_back(index);}
+    std::vector<std::vector<trafficdata::Vec>> turns(routes.size());for(std::size_t i=0;i+1<routes.size();++i){const auto& from=network.lines[routes[i]];const auto& to=network.lines[routes[i+1]];for(const auto& link:trafficlinks::Of(links,refs,trip.routes[i]))if(link.other==trip.routes[i+1]&&std::fabs(link.u-trip.exits[i])<.01&&(link.fromLane<0||link.fromLane==trip.lanes[i])&&(link.toLane<0||link.toLane==trip.lanes[i+1])){turns[i]=trafficlinks::TurnPath(from,trip.lanes[i],link.u,to,trip.lanes[i+1],link.otherU,link.radius);break;}}
+    for(std::size_t i=0;i<routes.size();++i){const auto& line=network.lines[routes[i]];const int lane=trip.lanes[i];double entry=trip.entries[i],exit=trip.exits[i];if(i&& !turns[i-1].empty()){const auto p=turns[i-1].back();entry=trafficroute::Nearest(line,lane,p.x,p.y);}if(!turns[i].empty()){const auto p=turns[i].front();exit=trafficroute::Nearest(line,lane,p.x,p.y);}const double length=trafficroute::DistanceAlong(line,lane,entry,exit);if(!std::isfinite(length))return {};for(double d=0;d<length&&points.size()<4095;d+=std::max(2.0,length/200))points.push_back(trafficroute::At(line,lane,trafficroute::LeadU(line,lane,entry,d,false,false)));points.push_back(trafficroute::At(line,lane,exit));for(const auto& p:turns[i])if(points.size()<4096)points.push_back(p);}return points;
+}
+}

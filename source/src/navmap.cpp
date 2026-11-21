@@ -7,6 +7,7 @@
 #include <ShlObj.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -46,7 +47,22 @@ namespace navmap
 			ULONGLONG seen = 0, groundAt = 0, floorAt = 0, blockedAt = 0, freeAt = 0, contactAt = 0;
 			std::uint8_t contacts = 0;
 			float objLo[2] = { kNaN, kNaN }, objHi[2] = { kNaN, kNaN };  // solid height bands from the game's collision objects (navseed)
+			// Every level seen here, for World (2026-11-06): `ground` keeps only the highest, so stacked decks collapse. Beside it, not instead of it.
+			static constexpr int kLevels = 3;
+			float levelZ[kLevels] = { kNaN, kNaN, kNaN };
+			ULONGLONG levelAt[kLevels] = {};
 			ULONGLONG objAt[2] = {};
+			// The actual ray hit points in this cell (2026-11-04: a 0.3 m post blocked its whole 4 m cell; waypoint driving asks
+			// HitNear for the real points instead). Ring of the last kHits, each with its time.
+			static constexpr int kHits = 4;
+			float hitX[kHits] = { kNaN, kNaN, kNaN, kNaN }, hitY[kHits] = { kNaN, kNaN, kNaN, kNaN }, hitZ[kHits] = { kNaN, kNaN, kNaN, kNaN };
+			ULONGLONG hitAt[kHits] = {};
+			float hitUp[kHits] = { kNaN, kNaN, kNaN, kNaN };  // the hit surface's normal z (NaN unknown): up-facing = floor
+			// Kept for World (2026-11-06, planworld.h), beside hitUp, which stays as it was until the sign below is proven in a run:
+			float hitNz[kHits] = { kNaN, kNaN, kNaN, kNaN };  // the normal z as the game gave it, with its sign
+			std::uint32_t hitOwner[kHits] = {};               // the reference that owns the hit body, 0 unknown
+			std::uint8_t hitLayer[kHits] = { 255, 255, 255, 255 };  // the game's collision layer of the hit (255 unknown; world truth A)
+			std::uint8_t hitNext = 0;
 		};
 
 		std::unordered_map<std::uint64_t, Cell> g_cells;
@@ -86,10 +102,55 @@ namespace navmap
 		}
 	}
 
+	// Boxes kept whole for World (2026-11-06). Buckets of 64 m; a box is listed in every bucket it touches. Same box again refreshes it. The
+	// bands above stay in charge: road boxes are whole deck pieces with railings, so nothing blocks on these until a run proves the wanted-surface
+	// test reads them as floor (OBS system=plan.world).
+	namespace {
+		constexpr double kBoxBucket = 64.0;
+		struct StoredBox { KeptBox box; ULONGLONG at = 0; };
+		std::unordered_map<std::uint64_t, std::vector<StoredBox>> g_boxes;
+		std::uint64_t BoxBucket(int ix, int iy) { return (std::uint64_t(std::uint32_t(ix)) << 32) | std::uint32_t(iy); }
+		int BucketIndex(double v) { return int(std::floor(v / kBoxBucket)); }
+		void KeepBox(const KeptBox& b, ULONGLONG now) {
+			const double c = std::fabs(std::cos(b.yaw)), s = std::fabs(std::sin(b.yaw)), ex = c * b.hx + s * b.hy, ey = s * b.hx + c * b.hy;
+			for (int ix = BucketIndex(b.x - ex); ix <= BucketIndex(b.x + ex); ++ix)
+				for (int iy = BucketIndex(b.y - ey); iy <= BucketIndex(b.y + ey); ++iy) {
+					auto& list = g_boxes[BoxBucket(ix, iy)]; bool have = false;
+					for (auto& o : list) if (std::fabs(o.box.x - b.x) < .05 && std::fabs(o.box.y - b.y) < .05 && std::fabs(o.box.zLo - b.zLo) < .05) { o.box = b; o.at = now; have = true; break; }
+					if (!have) { list.erase(std::remove_if(list.begin(), list.end(), [&](const StoredBox& o) { return now - o.at >= kObjLifeMs; }), list.end()); list.push_back({ b, now }); }
+				}
+		}
+	}
+	int BoxesNear(double x, double y, double radius, KeptBox* out, int max)
+	{
+		if (!Finite(x) || !Finite(y) || !(radius > 0) || !out || max <= 0) return 0;
+		const ULONGLONG now = GetTickCount64(); int n = 0;
+		for (int ix = BucketIndex(x - radius); ix <= BucketIndex(x + radius); ++ix)
+			for (int iy = BucketIndex(y - radius); iy <= BucketIndex(y + radius); ++iy) {
+				const auto it = g_boxes.find(BoxBucket(ix, iy));
+				if (it == g_boxes.end()) continue;
+				for (const auto& o : it->second) {
+					if (n >= max) return n;
+					if (now - o.at >= kObjLifeMs || std::hypot(o.box.x - x, o.box.y - y) > radius + std::hypot(o.box.hx, o.box.hy)) continue;
+					bool dup = false; for (int k = 0; k < n; ++k) if (std::fabs(out[k].x - o.box.x) < .05 && std::fabs(out[k].y - o.box.y) < .05 && std::fabs(out[k].zLo - o.box.zLo) < .05) { dup = true; break; }
+					if (!dup) out[n++] = o.box;
+				}
+			}
+		return n;
+	}
+	int GroundLevels(double x, double y, float* out, int max)
+	{
+		if (!Finite(x) || !Finite(y) || !out || max <= 0) return 0;
+		const auto it = g_cells.find(Key(CellIndex(x), CellIndex(y)));
+		if (it == g_cells.end()) return 0;
+		int n = 0; for (int k = 0; k < Cell::kLevels && n < max; ++k) if (Valid(it->second.levelZ[k])) out[n++] = it->second.levelZ[k];
+		return n;
+	}
 	void NoteObject(double cx, double cy, double yaw, double hx, double hy, double zlo, double zhi)
 	{
 		if (!Finite(cx) || !Finite(cy) || !Finite(zlo) || !Finite(zhi) || !(hx > 0) || !(hy > 0)) return;
 		const ULONGLONG now = GetTickCount64();
+		KeepBox({ cx, cy, yaw, hx, hy, zlo, zhi }, now);
 		const double c = std::cos(yaw), s = std::sin(yaw);
 		// The box's world footprint (heading `yaw`: forward = (sin, cos), right = (cos, -sin)), inflated by half a cell.
 		const double ex = std::fabs(c) * hx + std::fabs(s) * hy + kCell * 0.5, ey = std::fabs(s) * hx + std::fabs(c) * hy + kCell * 0.5;
@@ -129,18 +190,6 @@ namespace navmap
 		}
 	}
 
-	double KnownAhead(double x, double y, double heading)
-	{
-		const ULONGLONG now = GetTickCount64();
-		if (!g_seedAt || now - g_seedAt >= kObjLifeMs) return 0.0;
-		// From (x, y) along the heading to the edge of the scanned circle.
-		const double ux = std::sin(heading), uy = std::cos(heading);
-		const double ox = x - g_seedX, oy = y - g_seedY;
-		const double b = ox * ux + oy * uy, c = ox * ox + oy * oy - g_seedR * g_seedR;
-		const double disc = b * b - c;
-		if (disc <= 0.0) return 0.0;
-		return std::max(0.0, -b + std::sqrt(disc));
-	}
 
 	void NoteSeeded(double cx, double cy, double radius)
 	{
@@ -157,10 +206,19 @@ namespace navmap
 		Cell& c = Make(x, y);
 		c.ground = float(h);
 		c.groundAt = c.seen = now;
+		{	int k = -1, oldest = 0;  // the same level again refreshes it; a new one takes the oldest slot
+			for (int i = 0; i < Cell::kLevels; ++i) {
+				if (Valid(c.levelZ[i]) && std::fabs(c.levelZ[i] - float(h)) < 1.0f) { k = i; break; }
+				if (c.levelAt[i] < c.levelAt[oldest]) oldest = i;
+			}
+			if (k < 0) k = oldest;
+			c.levelZ[k] = float(h); c.levelAt[k] = now;
+		}
 		++g_n.ground;
 	}
 
-	void NoteRay(const float from[3], const float to[3], bool hit, float hx, float hy, float hz, std::uint32_t layer, bool normalOk)
+	std::atomic<unsigned> g_signs[4]{};  // rays falling onto a flat surface: normal up, normal down; rays rising into one: normal up, normal down
+	void NoteRay(const float from[3], const float to[3], bool hit, float hx, float hy, float hz, std::uint32_t layer, bool normalOk, float normalZ, bool keepAnyLayer, std::uint32_t owner)
 	{
 		for (int i = 0; i < 3; ++i) {
 			if (!Finite(from[i]) || !Finite(to[i])) return;
@@ -182,15 +240,28 @@ namespace navmap
 				c.blockedZ = kNaN;
 				++g_n.cleared;
 			}
+			// The same rule for the kept hit points: an old one at this height that a ray now flies through is forgotten. Only one the ray
+			// really passes (within 0.5 m of its line, 2026-11-05): a ray 1.5 m beside a post crossed the post's 4 m cell and erased it,
+			// so obstacles flickered in and out of the plan.
+			if (s <= freeLen - kCell)
+				for (int k = 0; k < Cell::kHits; ++k)
+					if (Valid(c.hitZ[k]) && now - c.hitAt[k] > kBlockedStaleMs && std::fabs(z - c.hitZ[k]) <= kBlockedBand * 0.6 &&
+						(len < 1e-6 || std::fabs((c.hitX[k] - from[0]) * dy - (c.hitY[k] - from[1]) * dx) / len < 0.5)) c.hitZ[k] = kNaN;
 		}
 		if (usable) {
 			++g_n.hits;
 			if (normalOk) ++g_n.normals;
 		}
-		if (usable && layer < 64 && ((kPersistentLayers >> layer) & 1ull)) {
+		if (usable && (keepAnyLayer || (layer < 64 && ((kPersistentLayers >> layer) & 1ull)))) {
 			Cell& c = Make(hx, hy);
 			c.blockedZ = hz;
 			c.blockedAt = c.seen = now;
+			const int k = c.hitNext++ % Cell::kHits;
+			c.hitX[k] = hx; c.hitY[k] = hy; c.hitZ[k] = hz; c.hitAt[k] = now;
+			c.hitUp[k] = normalOk && Finite(normalZ) ? std::fabs(normalZ) : kNaN;
+			c.hitNz[k] = normalOk && Finite(normalZ) ? normalZ : kNaN; c.hitOwner[k] = owner; c.hitLayer[k] = layer < 255 ? std::uint8_t(layer) : std::uint8_t(255);
+			// Proof of the sign: a ray falling onto a flat surface should read normal up. Until a run shows that, nothing relies on the sign.
+			if (normalOk && Finite(normalZ) && std::fabs(normalZ) > 0.7f) g_signs[(hz < from[2] ? 0 : 2) + (normalZ > 0 ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
 		}
 		++g_n.rays;
 	}
@@ -266,6 +337,75 @@ namespace navmap
 		return AtCell(Find(x, y), seeded, z, now);
 	}
 
+	std::atomic<unsigned> g_floorSkips{ 0 };
+	unsigned TakeFloorSkips() { return g_floorSkips.exchange(0); }
+	bool WallNear(double x, double y, double zLo, double zHi, double radius, double* hitZ, bool* face)
+	{
+		if (face) *face = false;
+		if (!Finite(x) || !Finite(y) || !(radius > 0)) return false;
+		const ULONGLONG now = GetTickCount64();
+		const int x0 = CellIndex(x - radius), x1 = CellIndex(x + radius), y0 = CellIndex(y - radius), y1 = CellIndex(y + radius);
+		bool found = false; double top = -1e30;
+		for (int ix = x0; ix <= x1; ++ix)
+			for (int iy = y0; iy <= y1; ++iy) {
+				const auto it = g_cells.find(Key(ix, iy));
+				if (it == g_cells.end()) continue;
+				const Cell& c = it->second;
+				for (int k = 0; k < Cell::kHits; ++k) {
+					if (!Valid(c.hitZ[k]) || now - c.hitAt[k] >= kBlockedLifeMs) continue;
+					if (c.hitZ[k] < zLo || c.hitZ[k] > zHi) continue;
+					const double d = std::hypot(c.hitX[k] - x, c.hitY[k] - y);
+					if (d > radius) continue;
+					if (Valid(c.hitUp[k]) && c.hitUp[k] > 0.7f) { g_floorSkips.fetch_add(1, std::memory_order_relaxed); continue; }  // a floor, not a wall
+					found = true;
+					if (face && Valid(c.hitUp[k]) && std::fabs(c.hitUp[k]) < 0.5f) *face = true;
+					if (c.hitZ[k] > top) { top = c.hitZ[k]; if (hitZ) *hitZ = c.hitZ[k]; }
+				}
+			}
+		return found;
+	}
+	void TakeNormalSigns(unsigned out[4]) { for (int i = 0; i < 4; ++i) out[i] = g_signs[i].exchange(0); }
+	int HitsNear(double x, double y, double zLo, double zHi, double radius, KeptHit* out, int max)
+	{
+		if (!Finite(x) || !Finite(y) || !(radius > 0) || !out || max <= 0) return 0;
+		const ULONGLONG now = GetTickCount64();
+		const int x0 = CellIndex(x - radius), x1 = CellIndex(x + radius), y0 = CellIndex(y - radius), y1 = CellIndex(y + radius);
+		int n = 0;
+		for (int ix = x0; ix <= x1; ++ix)
+			for (int iy = y0; iy <= y1; ++iy) {
+				if (n == max) return n;
+				const auto it = g_cells.find(Key(ix, iy));
+				if (it == g_cells.end()) continue;
+				const Cell& c = it->second;
+				for (int k = 0; k < Cell::kHits && n < max; ++k) {
+					if (!Valid(c.hitZ[k]) || now - c.hitAt[k] >= kBlockedLifeMs || c.hitZ[k] < zLo || c.hitZ[k] > zHi) continue;
+					if (std::hypot(c.hitX[k] - x, c.hitY[k] - y) > radius) continue;
+					out[n++] = { c.hitX[k], c.hitY[k], c.hitZ[k], Valid(c.hitUp[k]) ? c.hitUp[k] : 0.0f, Valid(c.hitNz[k]) ? c.hitNz[k] : 0.0f, Valid(c.hitUp[k]), c.hitOwner[k], double(now - c.hitAt[k]) / 1000.0, c.hitLayer[k] };
+				}
+			}
+		return n;
+	}
+	bool HitNear(double x, double y, double zLo, double zHi, double radius, double* hitZ)
+	{
+		if (!Finite(x) || !Finite(y) || !(radius > 0)) return false;
+		const ULONGLONG now = GetTickCount64();
+		const int x0 = CellIndex(x - radius), x1 = CellIndex(x + radius), y0 = CellIndex(y - radius), y1 = CellIndex(y + radius);
+		bool found = false; double best = 1e30;
+		for (int ix = x0; ix <= x1; ++ix)
+			for (int iy = y0; iy <= y1; ++iy) {
+				const auto it = g_cells.find(Key(ix, iy));
+				if (it == g_cells.end()) continue;
+				const Cell& c = it->second;
+				for (int k = 0; k < Cell::kHits; ++k) {
+					if (!Valid(c.hitZ[k]) || now - c.hitAt[k] >= kBlockedLifeMs) continue;
+					if (c.hitZ[k] < zLo || c.hitZ[k] > zHi) continue;
+					const double d = std::hypot(c.hitX[k] - x, c.hitY[k] - y);
+					if (d <= radius && d < best) { best = d; found = true; if (hitZ) *hitZ = c.hitZ[k]; }
+				}
+			}
+		return found;
+	}
+
 	void Column(double x, double y, const double* zs, int n, Sample* out)
 	{
 		const ULONGLONG now = GetTickCount64();
@@ -298,46 +438,10 @@ namespace navmap
 		return total > 0 && known * 10 < total * 3 ? Verdict::Unknown : Verdict::Clear;
 	}
 
-	HeadingChoice ChooseHeading(const HeadingQuery& q)
-	{
-		HeadingChoice best;
-		best.score = -1e9;
-		const double kPi = 3.14159265358979;
-		const double len = std::clamp(q.speed * 3.0, 40.0, 80.0);  // at least the corridors' own reach (40 m)
-		const double minFree = std::max(8.0, q.speed);
-		// The candidates are the sweep ring's own 16 compass directions (22.5 degrees apart) within 120 degrees of the
-		// bearing: the sweep rays run exactly along them, so the map has data on those lines (a thin ray knows nothing
-		// between its lines; the hull-sized shape sweep will, later).
-		for (int i = 0; i < 16; ++i) {
-			const double hd = i * (2.0 * kPi / 16.0);
-			double off = hd - q.bearing;
-			while (off > kPi) off -= 2.0 * kPi;
-			while (off < -kPi) off += 2.0 * kPi;
-			if (std::fabs(off) > 2.0944) continue;
-			if (q.haveAvoid && std::fabs(off - q.avoidOffset) < 0.2) continue;
-			double at = len;
-			const Verdict v = PathClear(q.pos, std::sin(hd) * len, std::cos(hd) * len, q.halfWidth, q.clearance, q.climbRate, q.speed, &at, nullptr);
-			if (v == Verdict::Unknown) { ++best.unknown; continue; }
-			double freeDist = len;
-			if (v == Verdict::Blocked) {
-				if (at < minFree) { ++best.blocked; continue; }
-				freeDist = at;
-			}
-			++best.usable;
-			const double score = std::cos(off) + 0.8 * (freeDist / len) - (v == Verdict::Blocked ? 0.5 : 0.0) - 0.5 * std::fabs(off - q.currentOffset) / kPi;
-			if (score > best.score) {
-				best.score = score;
-				best.offset = off;
-				best.freeDist = freeDist;
-				best.found = true;
-			}
-		}
-		return best;
-	}
 
 	namespace
 	{
-		bool g_samplerOn = true, g_hullOn = true, g_raysOn = true, g_newPilot = true;
+		bool g_samplerOn = true, g_hullOn = true, g_raysOn = true;
 		ULONGLONG g_samplerRead = 0;
 		std::wstring g_iniPath;
 
@@ -354,18 +458,15 @@ namespace navmap
 				}
 			}
 			if (g_iniPath == L"-") return;
-			const bool on = GetPrivateProfileIntW(L"nav", L"sampler", 1, g_iniPath.c_str()) != 0;
+			const bool on = true;  // [nav] sampler: fixed on (2026-11-05 settings strip)
 			if (on != g_samplerOn) logger::Write("Nav map: heading sampler %s (nav.ini)", on ? "ON" : "OFF");
 			g_samplerOn = on;
-			const bool hull = GetPrivateProfileIntW(L"nav", L"shape", 1, g_iniPath.c_str()) != 0;
+			const bool hull = true;  // [nav] shape: fixed on (2026-11-05 settings strip)
 			if (hull != g_hullOn) logger::Write("Nav map: hull sweeps %s (nav.ini)", hull ? "ON" : "OFF");
 			g_hullOn = hull;
-			const bool rays = GetPrivateProfileIntW(L"nav", L"rays", 1, g_iniPath.c_str()) != 0;
+			const bool rays = true;  // [nav] rays: fixed on (2026-11-05 settings strip)
 			if (rays != g_raysOn) logger::Write("Nav map: engine ray and sweep queries %s (nav.ini)", rays ? "ON" : "OFF");
 			g_raysOn = rays;
-			const bool pilot = GetPrivateProfileIntW(L"nav", L"autopilot", 1, g_iniPath.c_str()) != 0;
-			if (pilot != g_newPilot) logger::Write("Nav map: autopilot %s (nav.ini)", pilot ? "NEW (autodrive)" : "OLD (0.8 rules)");
-			g_newPilot = pilot;
 		}
 	}
 
@@ -387,11 +488,6 @@ namespace navmap
 		return g_raysOn;
 	}
 
-	bool NewAutopilot()
-	{
-		SamplerEnabled();  // (re-reads nav.ini every 5 s)
-		return g_newPilot;
-	}
 
 	bool HullEnabled()
 	{
@@ -407,11 +503,6 @@ namespace navmap
 		else if (rayBlocked) ++g_n.rayOnly;
 	}
 
-	void NoteSampler(bool used)
-	{
-		if (used) ++g_n.sampUsed;
-		else ++g_n.sampFallback;
-	}
 
 	void Tick()
 	{
@@ -470,6 +561,7 @@ namespace navmap
 	void Reset()
 	{
 		g_cells.clear();
+		g_boxes.clear();
 		g_seedAt = 0;
 		g_n = Counters{};
 		g_lastTick = g_lastLog = 0;

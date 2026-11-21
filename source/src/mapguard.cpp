@@ -73,7 +73,7 @@ namespace mapguard
         std::uint64_t TraceTerrain(uptr a,uptr b){const auto at=GetTickCount64(),id=TraceBegin("map.terrain_setup",a,b);const auto r=g_mapTerrain(a,b);TraceEnd("map.terrain_setup",id,at,r);return r;}
         std::uint64_t TraceModels(uptr a,uptr b){const auto at=GetTickCount64(),id=TraceBegin("map.models_collect",a,b);const auto r=g_mapModels(a,b);TraceEnd("map.models_collect",id,at,r);return r;}
         void TraceCells(uptr a){const auto at=GetTickCount64(),id=TraceBegin("map.terrain_cells",a);g_mapCells(a);TraceEnd("map.terrain_cells",id,at,0);}
-        std::uint64_t TraceProc(uptr a){const auto at=GetTickCount64(),id=TraceBegin("map.procgen",a);const auto r=g_mapProc(a);TraceEnd("map.procgen",id,at,r);return r;}
+        std::uint64_t TraceProc(uptr a){const auto at=GetTickCount64();mapguard::g_procgenAt.store(at);const auto id=TraceBegin("map.procgen",a);const auto r=g_mapProc(a);mapguard::g_procgenAt.store(GetTickCount64());TraceEnd("map.procgen",id,at,r);return r;}
         using Region=void(*)(uptr,int,int,uptr,uptr);Region g_mapRegion=nullptr;
         void ReadPair(uptr p,int& x,int& y){__try{if(p){x=At<int>(p,0);y=At<int>(p,4);}}__except(EXCEPTION_EXECUTE_HANDLER){x=y=0x7fffffff;}}
         void TraceRegion(uptr a,int level,int margin,uptr begin,uptr end){

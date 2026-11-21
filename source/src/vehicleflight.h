@@ -25,6 +25,7 @@ namespace vehicleflight
     bool PilotHolds(std::uint32_t vehicleId);
     int PilotLive(std::uint32_t vehicleId);  // -1 no pilot, 0 a pilot but no physics steps, 1 stepping (or a scripted or physical flight, which does not use them)
     bool PlayerDriving(std::uint32_t vehicle);
+	std::uint64_t NativeStepCount(); // load trace: vehicle physics steps seen by the step hook so far
 	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera, instrument and key set: physical flight with you at the wheel, you or the autopilot flying
 
 	// NPC pilots 1..3 (the "pursuit" side; pilot 0 is the player's escort autopilot): the same flight model, terrain
@@ -44,6 +45,10 @@ namespace vehicleflight
 	struct PhysicsStatus { bool bound = false, live = false; std::uint64_t serial = 0; };
 	// Fresh successful steps for the current bound instance; never saved.
 	PhysicsStatus PilotPhysics(int pilot);
+    PhysicsStatus HandoffPhysics(std::uint32_t vehicle);
+#ifndef FVO_RELEASE
+    bool FactoryMotionProved(int pilot, unsigned vehicle, std::uint64_t lease);
+#endif
 	const char* PilotEndReason(int pilot);  // why the pilot last stopped ("arrived", "stuck", ...)
 	void PilotStop(int pilot, const char* why);
 	std::uint32_t OwnRoverId();  // the player's own vehicle (form id), never flown by an NPC
@@ -69,6 +74,7 @@ namespace vehicleflight
 	bool Cruising();
 	// The traffic addon's route planner for Auto (fvo_addon_api.h FVO_RegisterRoutePlanner).
 	void SetRoutePlanner(FvoRoutePlanner planner);
+    void RouteNav(int pilot, void* trip, const FvoTripGoal& goal, vcontract::NavParams& nav);
 	void SetCruisePlanner(FvoCruisePlanner planner);
 	void RetryScannerTrip();
     void CancelScannerTrip(); // hold current position, preserving hover and the crew driver
@@ -100,7 +106,14 @@ namespace vehicleflight
 			kScripted = 256,
 			// With kScripted: the script picks how it travels (travel: 1 float = the hover at the commanded height, 2 drive = the hover
 			// held just over the surface under it, following the road; the automatic hover-or-drive choice is skipped).
-			kTravel = 512 };
+			kTravel = 512,
+			// 2026-11-17 passenger control (the user: "take control directly ... we dont need to swap seats"): the player drives an
+			// NPC-driven vehicle from the passenger seat. kManual: the player's own hands, as at their own wheel: no planner veto, no
+			// arrival turn or avoidance braking, kTravel picks hover / wheels (wheels = the game's own driving). kSteer: wheel
+			// steering -1 left .. 1 right for drive mode (hover keeps kYaw).
+			kSteer = 1024, kManual = 2048,
+			// With kManual: the game's forward boost on its own wheels (drive mode).
+			kBoost = 4096 };
 		unsigned set = 0;
 		double throttle = 0;   // -1 full reverse .. 1 full forward (the gear's thrust)
 		double strafe = 0;     // -1 slide left .. 1 slide right
@@ -112,12 +125,24 @@ namespace vehicleflight
 		int gear = 0;          // 1-4
 		unsigned holdMs = 300;
 		int travel = 0;        // with kTravel: 1 float, 2 drive
+		double steer = 0;      // with kSteer: -1 full left .. 1 full right (drive mode)
+		bool boost = false;    // with kBoost
 	};
 	void ClearPilotCommand(int pilot);
     bool ImpactSince(std::uint32_t vehicleId, unsigned long long since);
     double CruiseLimit(std::uint32_t vehicleId);
     double TurnLimit(std::uint32_t vehicleId);
 	bool PilotCommand(int pilot, const Command& c);  // false: that pilot is not on autopilot
+	// Passenger control while hovering (2026-11-17, the user: "just the flying matters", as at your own wheel): this pilot flies through
+	// the player's own hover model (your keys, camera turn, roll, lift, gear, boost) every frame, its autopilot off for that pass.
+	// Renew every frame (lasts 250 ms); gear 1-4.
+	void PlayerHands(int pilot, int gear);
+	// CB-2 (combat on the plan): combat's aim point this frame and whether it may go on the plan (not stunned). True: a combat line
+	// drives this pilot now (settings.ini [traffic] planCombat), so combat sends only the aim pitch, no movement sticks.
+	bool PilotCombatAim(int pilot, double x, double y, double z, bool aim, bool onPlan);
+	// H1 (strip build 4): the Census copy says this traffic pair is broken or retiring (Health's verdict, the addon's Census). Readers
+	// (Keep in sight) use this, never a health judgement of their own.
+	bool CensusBroken(std::uint32_t vehicle);
 
 	// The navigation settings of a profile (vcontract::Goal::nav) travel with the goal: PilotFly(pilot, vehicle, Goal) stores them; nothing else sets them.
 
@@ -125,4 +150,24 @@ namespace vehicleflight
 	// vehicles). Tipped past ~65 degrees and slow for 2 s: its hover (if any) ends and it is set upright 1.5 m higher
 	// in place, heading kept.
 	void WatchFlip(std::uintptr_t vehicle, const char* who);
+	// CM (read-only measurement): physics steps of every piloted vehicle since start (sum of the per-pilot counters), and how many pilots are bound to a body.
+	std::uint64_t TotalPhysicsSteps(int* boundPilots = nullptr);
+#ifndef FVO_RELEASE
+	// Relocation doer (diagnostic builds; notes/RELOCATION_DOER_AND_COMMUNICATOR_20261120.md): one pose substitution for one chassis in one
+	// physics step. The main thread arms and reads; the physics thread issues it inside the vehicle step hook.
+	namespace relocate {
+		struct Facts {
+			bool issued = false, bodyOk = false, ringFirstOk = false, comNearBody = false;
+			const char* refusal = "";
+			double comBefore[3]{}, comAfter[3]{}, bodyBefore[3]{}, bodyAfter[3]{};
+			float speed = 0;
+			std::uint64_t actionCalls = 0;
+		};
+		struct Chassis { bool bodyValid = false, live = false; double pos[3]{}; std::uint64_t completedSteps = 0; };
+		const char* Arm(std::uint32_t vehicleId, double dx, double dy, double dz, std::uint64_t serial);  // nullptr = armed, else why not
+		bool Take(std::uint64_t serial, Facts& out);   // true once the physics thread has issued (or refused)
+		bool Read(std::uint64_t serial, Chassis& out); // the chassis where the body record says it is now, and completed steps since issue
+		void Disarm(std::uint64_t serial);
+	}
+#endif
 }

@@ -1,5 +1,6 @@
 #include "addresses.h"
 #include "lifecycle.h"
+#include "spottest.h"
 #include "features.h"
 #include "framepacing.h"
 #include "updateschedule.h"
@@ -12,9 +13,11 @@
 #include "hoverui.h"
 #include "routeedit.h"
 #include "trafficprofile.h"
+#include "flightsave.h"
 #include "notify.h"
 #include "mapguard.h"
 #include "cellbake.h"
+#include "routesurvey_run.h"
 #include "disableguard.h"
 #include "realvehicles.h"
 #include "runtimecells.h"
@@ -26,14 +29,12 @@
 #include "modscene.h"
 #include "navmap.h"
 #include "navfield.h"
-#include "groundnav.h"
 #include "environment.h"
 #include "npcvehicles.h"
 #include "pilotquest.h"
 #include "passenger.h"
 #include "traffic.h"
 #include "profiles.h"
-#include "routeplan.h"
 #include "scantarget.h"
 #include "bindings.h"
 #include "inputgate.h"
@@ -45,6 +46,8 @@
 #include "vehicleworld.h"
 #include "vehiclehits.h"
 #include "navseed.h"
+#include "navprobe.h"
+#include "navmesh.h"
 #include "vehicleaim.h"
 #include "plugininfo.h"
 #include "shipmodel.h"
@@ -59,6 +62,7 @@
 
 #include "hook.h"
 #include <atomic>
+#include <cstring>
 #include <algorithm>
 #include <Windows.h>
 
@@ -83,6 +87,10 @@ namespace
     // while cells already attach, and FVO had started traffic and filled its pilot-quest aliases (quest + package changes)
     // 3-4 s before each fault, mid-load. Nothing that changes the world runs from PreLoadGame until PostLoadGame + a settle.
     std::atomic<ULONGLONG> g_loadBegan{0}, g_loadDone{0};
+    // 2026-11-15 hotfix (Nexus: crash loading a save from a running game; first load fine). As in the rewrite's load rule:
+    // the moment a load starts, the next frame drops everything FVO holds from the old world (Reset), instead of waiting
+    // until the planet manager is seen at state 0/1 (about a second later, with hooks still holding old pointers).
+    std::atomic<bool> g_dropAll{false};
     constexpr ULONGLONG kLoadSettleMs = 3000, kLoadTimeoutMs = 180000;
     // SFSE never sent PreLoadGame / PostLoadGame here (01:53 run: no "Save load" lines), so the game's own load routine
     // FUN_141815620 ("***Loading game: %s (%s)") is wrapped: it runs the whole load on a background thread.
@@ -96,11 +104,16 @@ namespace
         lifecycle::Close();
         trafficprofile::BeginLoad();
         trafficarrival::Reset();
-        logger::Write("Save load: the game's load routine started; FVO world actions paused until it finishes");
+        flightsave::OnLoad(reinterpret_cast<const char*>(b));  // FUN_141815620 param_2: the save's name
+        vehiclediag::NoteBeforeLoad();  // no-chassis trace: which vehicles stay in memory through the load
+        g_dropAll = true;
+        crash::Crumb("save load: routine started");
+        logger::Important("Save load: the game's load routine started; FVO world actions paused and held objects dropped");
         const auto r = g_loadGameOriginal(a, b, c, d);
         lifecycle::Open();
         g_loadDone = GetTickCount64();
-        logger::Write("Save load: the game's load routine returned after %.1f s", (g_loadDone.load() - g_loadBegan.load()) / 1000.0);
+        crash::Crumb("save load: routine returned");
+        logger::Important("Save load: the game's load routine returned after %.1f s", (g_loadDone.load() - g_loadBegan.load()) / 1000.0);
         return r;
     }
     void InstallLoadHook()
@@ -119,10 +132,15 @@ namespace
     void AfterTrafficSave() { trafficprofile::AfterSave(); }
     void SaveGameDetour(std::int64_t* a, std::uint64_t b, std::int64_t c, std::uint64_t d)
     {
+        flightsave::OnSave(reinterpret_cast<const char*>(d));  // FUN_141814220 param_4: the save's name ("Finished saving game: %s")
         BeforeTrafficSave();
         struct Finish { ~Finish() { AfterTrafficSave(); } } finish;
         g_saveGameOriginal(a, b, c, d);
     }
+    // 2026-11-17 (user: the hook system belongs to the core; the Traffic Addon only manages what the core has): the core owns
+    // the SaveGame hook in every standalone install, installed with the load hook. It records the core's own per-save state
+    // (saved hover) and, only while a Traffic Addon is attached, takes the traffic snapshot as in 1.2.1. Replaces 1.2.1's
+    // addon-only install ("Do not add a save hook to core-only installs"). Save files and settings are unchanged.
     void InstallSaveHook()
     {
         static const std::uint8_t prologue[15] = {0x4C,0x89,0x4C,0x24,0x20,0x4C,0x89,0x44,0x24,0x18,0x48,0x89,0x54,0x24,0x10};
@@ -130,10 +148,10 @@ namespace
         if (hook::Install(game::Base() + addr::kSaveGame, prologue, sizeof prologue, reinterpret_cast<void*>(&SaveGameDetour), &original)) {
             g_saveGameOriginal = reinterpret_cast<SaveGame_t>(original);
             trafficprofile::SaveReady(true);
-            logger::Write("Traffic snapshots: native SaveGame hook installed");
+            logger::Write("Save hook: native SaveGame hook installed (core per-save state; traffic snapshots while the Traffic Addon is attached)");
         } else {
             trafficprofile::SaveReady(false);
-            logger::Important("Traffic snapshots: SaveGame hook unavailable; traffic remains paused");
+            logger::Important("Save hook: SaveGame hook unavailable (bytes differ); saved hover is off and traffic remains paused");
         }
     }
     bool Loading(ULONGLONG now)
@@ -160,6 +178,18 @@ namespace
         __try { return *reinterpret_cast<volatile std::uint8_t*>(game::Base() + kLoadingScreenFlag) != 0; }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
+    // 2026-11-17 no-chassis research: the cell attach FUN_140B02C80 skips RuntimeComponentDBFactory::ReferenceAttach for every
+    // reference of an exterior cell while TES +0xE8 (the interior cell, null outdoors) is set, and for an interior cell that is not
+    // that one (cVar11 -> FUN_140B02630 param_3). Without the event no vehicle gets a component. Logged during loads to see the value.
+    std::uint32_t TesInteriorCellId()
+    {
+        __try {
+            const auto tes = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kTESPtr);
+            const auto cell = tes ? *reinterpret_cast<std::uintptr_t*>(tes + off::kTESInteriorCell) : 0;
+            return cell ? *reinterpret_cast<std::uint32_t*>(cell + off::kFormId) : 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0xFFFFFFFF; }
+    }
     // The arrival window: the loading screen is up, the save (if any) has been read and the planet manager has the world.
     bool ArrivalWindow(bool worldReady)
     {
@@ -180,13 +210,43 @@ namespace
         }
         if (!window && wasWindow) windowMs += now - windowAt;
         if (!screen && wasScreen) {
+            trafficarrival::closedAt.store(now);  // T-1: the one cover owner records the close (the spot test reads it)
             int rays = 0, mapOnly = 0; trafficpool::ArrivalChecks(rays, mapOnly, false);
             logger::Write("Loading screen: closed after %.1f s (arrival window %.1f s); arrival traffic %d of %d route positions placed or held (%d ray-checked, %d nav-map only)",
                 (now - screenAt) / 1000.0, windowMs / 1000.0, trafficarrival::ready.load(), trafficarrival::expected.load(), rays, mapOnly);
+            // CC-1 (2026-11-07, user: "do within mandate"): the one cover owner reports the close frame to the traffic addon while the
+            // cover still holds (Window is switched off below, LoadingMenu is still listed). Health judges with that fact and Retirement
+            // removes under its own rule. Optional export: an older addon without it is left as it was.
+            {   using CoverClosing = int (*)(int);
+                const auto addon = trafficpool::AddonAttached() ? GetModuleHandleW(L"FVO_Traffic.dll") : nullptr;
+                const auto told = addon ? reinterpret_cast<CoverClosing>(GetProcAddress(addon, "FVO_Traffic_CoverClosingV1")) : nullptr;
+                const int result = told ? told(3) : -2;
+                logger::Write("OBS system=cover.closing event=told kind=3 addon_export=%d result=%d covered=%d", told ? 1 : 0, result, int(trafficarrival::Covered()));
+            }
         }
         if (window && !trafficarrival::seeded && navseed::CompletedPasses() > seedAtOpen) {
             trafficarrival::seeded = true;
             logger::Write("Loading screen: nav map seeded behind it %.1f s after it opened; arrival traffic placement begins", (now - screenAt) / 1000.0);
+        }
+        {   // CM (2026-11-07, user: "measure first"): read-only. Does anything step behind the loading screen, and what holds the pause?
+            // Logged 4 times a second while the screen is up and for 3 s after it closes, and at once on any change of pause or menus.
+            static ULONGLONG measureAt = 0, closedAt = 0; static std::uint64_t stepsWas = 0; static int pauseWas = -2; static char menusWas[512] = {};
+            if (!screen && wasScreen) closedAt = now;
+            const bool watch = screen || (closedAt && now - closedAt <= 3000);
+            if (watch) {
+                char menus[512]; const int pause = secretunpause::Describe(menus, int(sizeof menus));
+                int bound = 0; const std::uint64_t steps = vehicleflight::TotalPhysicsSteps(&bound);
+                const bool changed = pause != pauseWas || std::strcmp(menus, menusWas) != 0 || screen != wasScreen;
+                if (changed || now - measureAt >= 250) {
+                    measureAt = now;
+                    logger::Write("OBS system=cover.measure screen=%d window=%d reading_save=%d world_ready=%d pause=%d %s vehicle_steps=%llu new_steps=%llu bound_pilots=%d since_open_ms=%lld since_close_ms=%lld change=%d",
+                        int(screen), int(window), int(readingSave), int(worldReady), pause, menus, (unsigned long long)steps, (unsigned long long)(steps - stepsWas), bound,
+                        screenAt ? (long long)(now - screenAt) : -1LL, !screen && closedAt ? (long long)(now - closedAt) : -1LL, int(changed));
+                    stepsWas = steps;
+                }
+                pauseWas = pause; std::strncpy(menusWas, menus, sizeof menusWas - 1);
+                trafficarrival::fade.store(std::strstr(menus, "FaderMenu") != nullptr);  // T-1: the fade-in, kept by the one cover owner
+            } else trafficarrival::fade.store(false);
         }
         wasScreen = screen; wasWindow = window;
         trafficarrival::Window(window);
@@ -202,6 +262,8 @@ namespace
 
 	void Reset()
 	{
+        crash::Crumb("reset: begin");
+        logger::Write("Load trace: reset begins (thread %lu, world_ready %d)", GetCurrentThreadId(), int(g_worldReady));
         trafficprofile::Allow(false);
         trafficpool::WorldActionsAllowed(false);
         lifecycle::Reset();  // first: a queued callback must not refill what the resets below clear
@@ -227,15 +289,15 @@ namespace
 		viewdist::Reset();
 		vehiclekeep::Reset();
 		profiles::Reset();
-		routeplan::Reset();
 		world::Reset();
 		vehiclehits::Reset();
 		navseed::Reset();
 		cellbake::Reset();
 		navmap::Reset();
 		navfield::Reset();
-		groundnav::Reset();
         environment::Reset();
+        crash::Crumb("reset: done");
+        logger::Write("Load trace: reset done");
 	}
 
     struct FrameCost {
@@ -264,8 +326,8 @@ namespace
         const char* slowName[2]={"",""};double slowMs[2]={0,0};
         auto part=[&](int bucket,const char* name,auto&& fn){LARGE_INTEGER a{},b{};QueryPerformanceCounter(&a);fn();QueryPerformanceCounter(&b);
             const double ms=1000.0*double(b.QuadPart-a.QuadPart)/frequency.QuadPart;if(ms>slowMs[bucket]){slowMs[bucket]=ms;slowName[bucket]=name;}};
-        part(0,"cell bake",[]{cellbake::Tick(Loading(GetTickCount64()));});part(0,"collision-box scan",[]{navseed::Tick();});part(0,"lane planner",[]{routeplan::Frame();});part(0,"flight field",[]{navfield::Service();});
-        part(0,"ground planner",[]{groundnav::Service();});part(0,"surface checks",[]{environment::Tick();});part(0,"nav map",[]{navmap::Tick();});mark(2);
+        part(0,"cell bake",[]{cellbake::Tick(Loading(GetTickCount64()));});part(0,"route survey",[]{routesurvey::Tick(Loading(GetTickCount64()));});part(0,"navmesh input probe",[]{navprobe::Tick(Loading(GetTickCount64()));});part(0,"car navmesh",[]{navmesh::Tick(Loading(GetTickCount64()));});part(0,"collision-box scan",[]{navseed::Tick();});part(0,"flight field",[]{navfield::Service();});
+        part(0,"surface checks",[]{environment::Tick();});part(0,"nav map",[]{navmap::Tick();});mark(2);
         profiles::Tick();context::Tick();mark(3);
         npcvehicles::Tick();passenger::Tick();mark(4);
         // (The native movement-controller probe did its job, 2026-10-27: every vehicle has a controller. Off: it took an engine lock every 5 s.)
@@ -284,11 +346,6 @@ namespace
     }
     void Frame()
     {
-        // Do not add a save hook to core-only installs with no Traffic Addon.
-        static bool saveHookAttempted = false;
-        if (g_standalone && !saveHookAttempted && trafficpool::AddonAttached()) {
-            saveHookAttempted = true; InstallSaveHook();
-        }
         trafficprofile::Report();
         // Engine calls may pump SFSE tasks recursively. Never re-enter our
         // mutable world/AI pipeline; this guard skips rather than waits.
@@ -297,6 +354,12 @@ namespace
         // Paused/map frames still prove the callback is alive. Measuring only
         // full simulation updates mislabels a paused menu as a hung thread.
         crash::Beat();
+        if (g_dropAll.exchange(false) && g_standalone) {
+            crash::Crumb("save load: drop held objects");
+            Reset();
+            g_worldReady = false;
+            logger::Important("Save load: FVO dropped every vehicle, pilot and pointer it held from the previous world");
+        }
         static const double ticksPerMs=[] {LARGE_INTEGER f{};QueryPerformanceFrequency(&f);return double(f.QuadPart)/1000.0;}();
         LARGE_INTEGER start{},end{};QueryPerformanceCounter(&start);const double now=double(start.QuadPart)/ticksPerMs;
         g_pacing.Begin(now); // all raw callbacks, including rejected duplicate polls
@@ -325,18 +388,49 @@ namespace
             // behind the loading screen) run here; flight, AI and everything else wait for gameplay as before.
             world::Publish();navseed::Tick();trafficpool::Tick();  // the nav map is seeded before anything is placed
         }
-        if(work==updateschedule::Work::Full&&loading)work=updateschedule::Work::Housekeeping;  // a save is still loading
+        // 2026-11-15 hotfix: the full simulation runs only with a world: none at the main menu (manager state 0), while a save
+        // loads, or behind the loading screen (the rewrite's rule). 1.2 ran it at the main menu after play and faulted in game
+        // functions on the player and escorts (2026-11-01 run: ConditionFloat, HealthOf).
+        // 2026-11-17 audit: the loading screen alone does not hold it. Door / fast-travel / landing screens (no save load)
+        // keep 1.2's full update, which places arrival traffic behind them; the crash evidence was a save loading or no world.
+        const bool worldSafe=!loading&&g_worldReady;
+        {
+            static int lastSafe=-1;
+            if(lastSafe!=int(worldSafe)){
+                lastSafe=int(worldSafe);crash::Crumb(worldSafe?"world: simulation on":"world: simulation held",state.haveManager?int(state.managerState):-1);
+                logger::Write("World: simulation %s (loading %d, world ready %d, loading screen %d, manager state %d, TES interior cell %08X)",worldSafe?"on":"held",int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1,TesInteriorCellId());
+            }
+        }
+        if(!worldSafe){  // load trace: once a second while the simulation is held
+            static ULONGLONG heldAt=0;const ULONGLONG t=GetTickCount64();
+            if(t-heldAt>=1000){heldAt=t;
+                static std::uint64_t steps0=0,updates0=0;
+                const auto steps=vehicleflight::NativeStepCount(),updates=g_standalone?vehicle_probe::UpdateSerial():0;
+                logger::Write("Load trace: frame held (thread %lu) loading %d world_ready %d loading_screen %d manager_state %d TES_interior %08X schedule %u load_began %llu load_done %llu; hooks since last line: vehicle steps %llu, component updates %llu",
+                GetCurrentThreadId(),int(loading),int(g_worldReady),int(LoadingScreenUp()),state.haveManager?int(state.managerState):-1,TesInteriorCellId(),unsigned(work),
+                static_cast<unsigned long long>(g_loadBegan.load()),static_cast<unsigned long long>(g_loadDone.load()),
+                static_cast<unsigned long long>(steps-steps0),static_cast<unsigned long long>(updates-updates0));
+                steps0=steps;updates0=updates;}
+        }
+        // 2026-11-17: from the load routine's return until the world's first live frame, re-attach the vehicles the load kept
+        // in memory without a component (vehiclediag::AfterLoadTick), so they have a chassis before the world runs.
+        if(!worldSafe&&g_standalone&&g_worldReady){const auto began=g_loadBegan.load(),done=g_loadDone.load();if(began&&done>=began)vehiclediag::AfterLoadTick();}
+        if(work==updateschedule::Work::Full&&!worldSafe)work=updateschedule::Work::Housekeeping;
         if(work==updateschedule::Work::Full)Update();
         else if(work==updateschedule::Work::Housekeeping) {
             // UI bindings/settings and logs keep working while simulation is
             // paused. Never enumerate the scene or queue placement/AI work here.
-            features::Tick();bindings::Tick(false);logger::Service();
+            features::Tick();bindings::Tick(false,worldSafe);logger::Service();
             if(!loading&&g_worldReady)trafficpool::RushTick(); // never mutate a world during a save load
         }
         if(work!=updateschedule::Work::Skip) {
             mapguard::Tick(Loading(GetTickCount64()));  // the persistent cell report and the wheel dust cleanup
-            secretunpause::Tick();  // Start/Swap's running world: back to paused on combat, a closed map or the time cap
-            routeedit::GroundTick();  // the editor's ground asks (new points sit 2 m over what is under the cursor), paused or not
+            if(worldSafe){  // 2026-11-15 hotfix (ported 2026-11-18): these reach the player, the camera or cast rays; never without a world
+                secretunpause::Tick();  // Start/Swap's running world: back to paused on combat, a closed map or the time cap
+                routeedit::PhotoKeyTick();  // F7: photo mode + Traffic Manager in one key, and back out
+                routeedit::GroundTick();  // the editor's ground asks (new points sit 2 m over what is under the cursor), paused or not
+                routeedit::ItemsMainTick();  // THREAD-1: F7 route items' reference scan on the main frame task (2 cells a frame), only while F7 asks
+            }
             if(!g_scheduleBegan)g_scheduleBegan=now;
             if(now-g_scheduleBegan>=10000) {
                 const auto counts=g_schedule.TakeCounts();const auto elapsed=now-g_scheduleBegan;
@@ -414,6 +508,7 @@ namespace
 			return;
 		}
 		g_standalone = true;
+		InstallSaveHook();  // the core owns the save hook in every standalone install (2026-11-17); with the Seamless core its own hook saves
         InstallFeatureSystems();
 		g_tasks->AddTaskPermanent(&g_frameTask);
 		logger::Write("Vehicle: standalone ground and physics service started; native pulse scheduling with 60 Hz fallback, 240 Hz admission ceiling, no catch-up queue");
@@ -444,12 +539,14 @@ namespace
 			g_loadBegan = GetTickCount64();
 			trafficprofile::BeginLoad();
 			lifecycle::Reset();
-			logger::Write("Save load: started; FVO world actions paused until it finishes");
+			crash::Crumb("save load: SFSE PreLoadGame");
+			logger::Write("Save load: SFSE PreLoadGame (thread %lu); FVO world actions paused until it finishes", GetCurrentThreadId());
 			if (g_standalone) Reset();
 			break;
 		case SFSEMessagingInterface::kMessage_PostLoadGame:
 			g_loadDone = GetTickCount64();
-			logger::Write("Save load: PostLoadGame (%s)", msg->data ? "ok" : "failed");
+			crash::Crumb("save load: SFSE PostLoadGame");
+			logger::Write("Save load: PostLoadGame (%s, thread %lu)", msg->data ? "ok" : "failed", GetCurrentThreadId());
 			break;
 		default:
 			break;
@@ -459,7 +556,7 @@ namespace
 
 extern "C" {
 __declspec(dllexport) SFSEPluginVersionData SFSEPlugin_Version = {
-	SFSEPluginVersionData::kVersion, 121, "FlyingVehicleOverhaul", "seemless",
+	SFSEPluginVersionData::kVersion, 122, "FlyingVehicleOverhaul", "seemless",
 	SFSEPluginVersionData::kAddressIndependence_Signatures,
 	SFSEPluginVersionData::kStructureIndependence_1_14_70_Layout,
 	{ addr::kRuntimeVersion, 0 }, 0, 0, 0,

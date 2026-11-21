@@ -322,7 +322,13 @@ namespace bindings
 		{
             if(hoverui::Editing())return bindlogic::kCtxEditor;
 			if (hoverui::IsScannerOpen()) return bindlogic::kCtxScanner;
-			if (passenger::RidingVehicle()) return bindlogic::kCtxPassenger;
+			if (passenger::RidingVehicle()) {
+				if (!passenger::Controlling()) return bindlogic::kCtxPassenger;
+				// 2026-11-17 (the user: "the full set ... as if I was just driving the vehicle"): with control from the passenger seat
+				// your keys are a driver's, in the layer of the vehicle's mode (its wheels or its hover).
+				vehicleflight::DriveInput wheels{};
+				return vehicleflight::DriveFor(passenger::RidingVehicle(), wheels) ? bindlogic::kCtxGround : bindlogic::kCtxHover;
+			}
 			const auto player = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kPlayerCharacterPtr);
 			const auto driven = player ? reinterpret_cast<std::uintptr_t (*)(std::uintptr_t)>(game::Base() + addr::kPlayerVehicle)(player) : 0;
 			if (!driven) return bindlogic::kCtxFoot;
@@ -357,6 +363,16 @@ namespace bindings
 			}
 			return 0;
 		}
+		// A key bound to some FVO action that is down now (0: none). After a reload FVO waits only for these to come up, so the release of a key
+		// pressed before cannot fire an action; an unrelated key that reads as held (14:57 run: Numpad 8 down for the whole session) blocks nothing.
+		int BoundKeyHeld()
+		{
+			for(std::size_t i=0;i<std::size(kDefs);++i)for(const auto& alt:g_bind[i]){
+				const int vk=alt.useDefault?(alt.defaultKeyboard?g_defaultVk[i]:0):alt.vk;
+				if(vk>0&&vk<256&&KeyDown(vk))return vk;
+			}
+			return 0;
+		}
 		bool SaveLocked(std::size_t i,const bindlogic::Binding& binding)
 		{
 			const auto spec=bindlogic::Spec(binding);const std::wstring wide(spec.begin(),spec.end());
@@ -368,7 +384,7 @@ namespace bindings
 		}
 	}
 
-	void Tick(bool gameplay)
+	void Tick(bool gameplay, bool world)
 	{
 		const ULONGLONG now = GetTickCount64();
 		PollPad(now);
@@ -387,17 +403,19 @@ namespace bindings
             logger::Write("Bindings: prompts now name the %s",g_device.device==bindlogic::Device::Pad?"controller":"keyboard and mouse");
 		g_padShown.store(g_device.device == bindlogic::Device::Pad, std::memory_order_relaxed);
         {
-            const auto ctx=Situation();
+            // 2026-11-15 hotfix (crash loading a save from a running game): with no world (a save loading, the loading screen,
+            // the main menu) the player and its vehicle are not read; the mod's input is off and no key is taken from the game.
+            const std::uint8_t ctx=world?Situation():std::uint8_t(bindlogic::kCtxFoot);
             const bool contextChanged=g_ctx.exchange(ctx)!=ctx;
             if(contextChanged)g_generation.fetch_add(1);
-            const bool allowed=inputgate::GameplayAllowed();
+            const bool allowed=world&&inputgate::ModKeysAllowed();
             g_allowed=allowed;
             g_sample={};g_sample.context=ctx;g_sample.pad=g_pad.load();
             {std::lock_guard axes(g_axesLock);g_sample.axes=g_axes;}
             g_sample.allowed=allowed&&!g_suppressInput&&g_captureAction<0;
             const auto player=*reinterpret_cast<std::uintptr_t*>(game::Base()+addr::kPlayerCharacterPtr);
-            const auto driven=player?reinterpret_cast<std::uintptr_t(*)(std::uintptr_t)>(game::Base()+addr::kPlayerVehicle)(player):0;
-            g_sample.driving=driven&&!passenger::RidingVehicle();
+            const auto driven=world&&player?reinterpret_cast<std::uintptr_t(*)(std::uintptr_t)>(game::Base()+addr::kPlayerVehicle)(player):0;
+            g_sample.driving=driven&&(!passenger::RidingVehicle()||passenger::Controlling());
             g_sample.placement=!g_sample.driving&&realvehicles::RecordingPlacements();
             for(int key=1;key<256;++key)g_sample.keys[std::size_t(key)]=KeyDown(key);
             g_commands.Update(g_bind,g_defaultVk,g_gamePad,g_sample,now);
@@ -421,7 +439,7 @@ namespace bindings
             }
             // 2026-10-28 (the user: "restrict input from wasd" in the passenger seat): the driver's own job flies it; the game
             // never gets the passenger's movement, boost or jump keys.
-            if(ctx==bindlogic::kCtxPassenger)for(const int vk:{int('W'),int('A'),int('S'),int('D'),VK_SPACE,VK_LSHIFT,VK_SHIFT})keys[std::size_t(vk)]=true;
+            if(passenger::RidingVehicle())for(const int vk:{int('W'),int('A'),int('S'),int('D'),VK_SPACE,VK_LSHIFT,VK_SHIFT})keys[std::size_t(vk)]=true;
             inputgate::SetBlocked(g_connected?blocked:0);
             inputgate::SetBlockedKeys(keys);
             if(blocked!=g_blockedShown){g_blockedShown=blocked;logger::Write("Bindings: situation %u, owned controller buttons: %s",unsigned(ctx),PadList(blocked).c_str());}
@@ -430,7 +448,15 @@ namespace bindings
 		const bool shownPad = PadInUse();
 		const auto style = Style();
 		if (shownPad != g_lastShownPad || style != g_lastStyle) { g_lastShownPad = shownPad; g_lastStyle = style; g_generation.fetch_add(1); }
-		if(g_captureAction<0&&g_suppressInput&&!CaptureKey()&&!g_pad.load())g_suppressInput=false;
+		if(g_captureAction<0&&g_suppressInput&&!BoundKeyHeld()&&!g_pad.load())g_suppressInput=false;  // replaces: every key on the keyboard up (CaptureKey)
+		{   // 2026-11-14 (Cruise and Auto did nothing, Hover / Gear read UNBOUND): whether FVO's keys are live, and why not, traced on every change.
+			static int was=-1;DWORD fp=0;GetWindowThreadProcessId(GetForegroundWindow(),&fp);const bool front=fp==GetCurrentProcessId();
+			const int state=(g_allowed?1:0)|(g_suppressInput?2:0)|(front?4:0)|(g_captureAction>=0?8:0);
+			if(state!=was){was=state;const int heldKey=BoundKeyHeld();
+				logger::Write("OBS system=input.gate event=state allowed=%d suppressed=%d game_in_front=%d capturing=%d pad_bits=%08X bound_key_held=%d reason=%s",
+					int(g_allowed),int(g_suppressInput),int(front),int(g_captureAction>=0),unsigned(g_pad.load()),heldKey,
+					!front?"game_not_in_front":!g_allowed?"a_game_menu_or_input_context_holds_gameplay":g_suppressInput?"waiting_for_fvo_keys_and_buttons_up_after_a_reload":g_captureAction>=0?"capturing_a_new_binding":"fvo_keys_live");}
+		}
 	}
 
 	bool Held(Action a, int defaultVk)

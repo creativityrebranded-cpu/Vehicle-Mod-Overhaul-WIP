@@ -13,4 +13,7 @@ namespace secretunpause
     void RefusedForCombat(); // after combat, prompt the player to go back and press Start/Swap
     void Reset();            // a load or world reset: pause given back, no stale prompt
     void Tick();             // ends it on combat, a closed map or the time cap
+    // CM (2026-11-07, read-only measurement, user: "measure first"): the pause count and every open menu as
+    // "Class:flags[P]" (P: it pauses the game). Writes nothing to the game, calls no game function. Returns the pause count (-1 unreadable).
+    int Describe(char* out, int size);
 }

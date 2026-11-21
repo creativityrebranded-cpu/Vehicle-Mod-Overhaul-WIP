@@ -32,6 +32,29 @@ int main() {
     check(!ParseWindows("1080 360 2, 300 600 3",parsed),"overlap parsing rejected");
     check(!ParseWindows("100 200 2,",parsed),"trailing empty window rejected");
     check(!ParseWindows("100 200 2 extra",parsed),"unexpected fields rejected");
+    {
+        Schedule sized; sized.allDayVehicles=47;
+        check(Evaluate(sized,false,-1,9000).vehicles==47,"saved counts are independent of route length");
+        sized.trafficLevel=Quiet;
+        check(Evaluate(sized,false,-1,100).vehicles==1 && Evaluate(sized,false,-1,5000).vehicles==10,
+              "a short quiet road keeps one vehicle and a long road uses its length");
+        sized.trafficLevel=Busy;
+        check(Evaluate(sized,false,-1,2000).vehicles==25 && PeakVehicles(sized,2000)==25,
+              "busy rate uses the same midpoint target for admission and capacity");
+        check(Evaluate(sized,false,-1,100000).vehicles==kV,"long routes remain under the vehicle limit");
+        sized.trafficBands[Busy]={0,0};
+        check(!Evaluate(sized,false,-1,4000).active,"a zero range stays off");
+        night.windows={{1080,360,2},{360,720,14},{720,1080,0}};
+        night.trafficLevel=Steady;
+        check(Evaluate(night,true,0,2000).vehicles==8 && Evaluate(night,true,600,2000).vehicles==14 &&
+              !Evaluate(night,true,800,2000).active && !Evaluate(night,false,0,2000).known &&
+              PeakVehicles(night,2000)==14,"scheduled counts fit their scaled range and closed hours remain closed");
+        TrafficBands bands=kTrafficBands;
+        check(ReadTrafficBands("0 1 6 8 10 12",bands) && bands[Busy]==VehicleBand{10,12},
+              "three editable ranges parse");
+        check(!ReadTrafficBands("0 1 8 6 10 12",bands) && !ReadTrafficBands("0 1 6 8 10 12 extra",bands) &&
+              bands[Busy]==VehicleBand{10,12},"invalid ranges leave the previous values intact");
+    }
     {   // busy words become windows; the count eases between zones
         Schedule day; day.peak=20; day.zones={{0,1},{480,4},{1200,0}};
         Expand(day);

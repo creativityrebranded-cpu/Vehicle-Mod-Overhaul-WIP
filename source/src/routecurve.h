@@ -8,6 +8,15 @@
 // points keep their identities; the expanded path is shared by preview/flight.
 namespace routecurve {
 struct Result {std::vector<trafficdata::Vec> points;std::vector<double> authored;};
+// Same geometric limit used by Build. Exposed to authoring so a requested bend
+// never masquerades as an achievable radius on short adjoining sections.
+inline double CornerLimit(const std::vector<trafficdata::Vec>& pts,std::size_t i,bool closed){
+    if(pts.size()<3||i>=pts.size()||(!closed&&(i==0||i+1==pts.size())))return 0;
+    const auto a=pts[(i+pts.size()-1)%pts.size()],b=pts[i],c=pts[(i+1)%pts.size()];
+    const double first=std::hypot(a.x-b.x,a.y-b.y),second=std::hypot(c.x-b.x,c.y-b.y);if(first<.1||second<.1)return 0;
+    const double angle=std::acos(std::clamp(((a.x-b.x)*(c.x-b.x)+(a.y-b.y)*(c.y-b.y))/(first*second),-1.0,1.0));
+    constexpr double pi=3.141592653589793;if(angle<pi/36||angle>pi*35/36)return 0;return .45*std::min(first,second)*std::tan(angle/2);
+}
 inline Result Build(const std::vector<trafficdata::Vec>& pts,const std::vector<double>& radii,bool closed){
     Result out;const auto count=pts.size();if(count<2){out.points=pts;return out;}
     constexpr double pi=3.141592653589793;

@@ -16,6 +16,8 @@
 #include "placementedit.h"
 #include "notify.h"
 #include "fvopaths.h"
+#include "traffic/roadclearance.h"
+#include "traffic/traffic_api.h"
 
 #include <Windows.h>
 #include <ShlObj.h>
@@ -33,6 +35,7 @@
 #include <cstdio>
 #include <atomic>
 #include <thread>
+#include <mutex>
 
 // Engine pieces (1.16.244, from the decompile):
 //  - Reference: OBJ_REFR at +0x80 (rotation +0x80, position +0x8C, base object +0x98), parent cell +0xB0, extra data
@@ -364,7 +367,7 @@ namespace realvehicles
 			return base == g.rev8 || base == g.deimog || base == g.moonJumper;
 		}
 
-		void Disable(uptr ref);
+		bool Disable(uptr ref,const char* reason);
 
 		// A vehicle that must stay: the player's own, the one the player is in, one an NPC job uses.
 		bool Protected(uptr r)
@@ -409,8 +412,8 @@ namespace realvehicles
 			int removed = 0;
 			for (const uptr r : here) {
 				const std::uint32_t id = At<std::uint32_t>(r, 0x28);
-				if (r == keep || (id >> 24) != 0xFF || Protected(r)) continue;
-				Disable(r);
+				if (r == keep || (id >> 24) != 0xFF) continue;
+				if(!Disable(r,"parked_spot_duplicate"))continue;
 				++removed;
 				logger::Write("Real vehicles: duplicate vehicle %08X at spot (%.0f, %.0f, %.0f) removed (kept %08X)", id, p.x, p.y, p.z, At<std::uint32_t>(keep, 0x28));
 			}
@@ -420,12 +423,15 @@ namespace realvehicles
 
 		// A real vehicle at a place and rotation in the cell (no owner: parked vehicles are free to take, as Parked Vehicles'
 		// are); returns its form id, 0 when nothing was placed.
-		void Disable(uptr ref)
+		bool Disable(uptr ref,const char* reason)
 		{
+            if(!trafficpool::MayHideParked(At<std::uint32_t>(ref,0x28),reason,Protected(ref)))return false;
 			__try {
 				EngineFn<void (*)(uptr, char)>(addr::kDisableReference)(ref, 0);
+                return true;
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
 			}
 		}
 
@@ -546,8 +552,8 @@ namespace realvehicles
 				for (const std::size_t k : here) {
 					const uptr r = parked[k];
 					const std::uint32_t id = At<std::uint32_t>(r, 0x28);
-					if (k == keep || (id >> 24) != 0xFF || Protected(r) || liveTraffic(r)) continue;
-					Disable(r);
+					if (k == keep || (id >> 24) != 0xFF) continue;
+					if(!Disable(r,"parked_stacked_duplicate"))continue;
 					gone[k] = true;
 					g.registry.erase(id);
 					g.dirty = true;
@@ -615,8 +621,8 @@ namespace realvehicles
 					changed = true;
 					continue;
 				}
-				if (Protected(r) || std::strcmp(StateOf(r), "parked") != 0) { ++it; continue; }  // in use: later
-				if (!(At<std::uint32_t>(r, 0x20) & 0x800)) Disable(r);
+				if (std::strcmp(StateOf(r), "parked") != 0) { ++it; continue; }  // in use: later
+				if (!(At<std::uint32_t>(r, 0x20) & 0x800) && !Disable(r,"legacy_parked_placement")) { ++it; continue; }
 				logger::Write("Own placements: retired runtime-spawned vehicle %08X (spot %016llX); the plugin places that spot now", it->second,
 					static_cast<unsigned long long>(it->first));
 				g.ownVehicles.erase(it->second);
@@ -938,6 +944,278 @@ namespace realvehicles
             LARGE_INTEGER at{};QueryPerformanceCounter(&at);
             return double(at.QuadPart-began.QuadPart)>double(frequency.QuadPart)*0.0005;
         });
+    }
+
+    bool ReadModelBounds(uptr base, double (&half)[3], double& bottom, double& top)
+    {
+        if (!base) return false;
+        __try {
+            for (int i = 0; i < 3; ++i) {
+                const double lo = At<float>(base, 0x50 + i * 4), hi = At<float>(base, 0x5C + i * 4);
+                if (!std::isfinite(lo) || !std::isfinite(hi) || hi <= lo ||
+                    hi - lo > roadclearance::maxBound || std::max(std::abs(lo), std::abs(hi)) > roadclearance::maxBound) return false;
+                half[i] = std::max(std::abs(lo), std::abs(hi));
+                if (i == 2) { bottom = lo; top = hi; }
+            }
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    namespace {
+        struct RoadSource {
+            struct Vehicle { unsigned index; uptr ref; };
+            struct Census { std::vector<uptr> entries; std::vector<Vehicle> vehicles; ULONGLONG at = 0; };
+            uptr* array = nullptr; // identity only between calls; always reacquired before use
+            unsigned count = 0, grid = 0;
+            int x = 0, y = 0;
+            bool persistent = false;
+            Census seen, next;
+        };
+        std::mutex g_roadInventoryLock;
+        std::map<uptr, RoadSource> g_roadSources;
+        uptr g_roadWorld = 0, g_roadPlayerCell = 0;
+        std::uint64_t g_roadEpoch = 0;
+        std::size_t g_roadCursor = 0;
+        double g_roadPeerRadius = 0;
+
+        uptr RoadPersistentCell(uptr world) {
+            __try {
+                for (int depth = 0; world && depth < 4; ++depth) {
+                    if (const auto cell = At<uptr>(world, 0x1D8)) return cell;
+                    if (!(At<std::uint8_t>(world, 0xF2) & 0x40)) break;
+                    world = At<uptr>(world, 0x1F0);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            return 0;
+        }
+        bool RoadCellCoordinates(uptr cell, uptr world, int& x, int& y) {
+            __try {
+                if (!cell || At<uptr>(cell, off::kCellWorldspace) != world) return false;
+                const auto ext = At<uptr>(cell, off::kCellExterior);
+                if (!ext) return false;
+                x = At<int>(ext, 0); y = At<int>(ext, 4);
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        bool RoadEntry(const uptr* refs, unsigned index, uptr& ref, bool& vehicle) {
+            __try {
+                ref = refs[index];
+                vehicle = false;
+                if (!ref) return true;
+                uptr base = 0; std::uint32_t flags = 0;
+                if (!RefHead(ref, flags, base)) return false;
+                vehicle = std::find(g.pool.begin(),g.pool.end(),base)!=g.pool.end();
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        bool RoadSameEntries(const uptr* refs, const uptr* copied, unsigned count) {
+            if (!count) return true;
+            __try { return std::memcmp(refs, copied, std::size_t(count) * sizeof(uptr)) == 0; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        bool RoadSameEntry(const uptr* refs, unsigned index, uptr ref) {
+            __try { return refs[index] == ref; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        bool RoadPose(uptr ref, FvoTrafficVehicle& row) {
+            __try {
+                uptr base = 0; std::uint32_t flags = 0;
+                if (!RefHead(ref, flags, base) || !IsVehicleBase(base)) return false;
+                const auto loaded = At<uptr>(ref, off::kRefLoadedData);
+                if ((flags & 0x20) || ((flags & 0x800) && (!loaded || !At<uptr>(loaded, off::kLoadedData3D)))) return true;
+                const auto pos = At<game::Vec3>(ref, off::kRefPosition);
+                row.id = At<unsigned>(ref, off::kFormId);
+                if (!row.id || !std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z)) return false;
+                row.baseId = At<unsigned>(base, off::kFormId);
+                row.x = pos.x; row.y = pos.y; row.z = pos.z;
+                double half[3]{}, bottom = 0, top = 0;
+                if (ReadModelBounds(base, half, bottom, top)) {
+                    row.radius = std::hypot(half[0], half[1]) + 1; row.halfHeight = half[2] + 1;
+                } else {
+                    row.radius = roadclearance::maxPeerRadius;
+                    row.halfHeight = roadclearance::maxBound + 1;
+                }
+                return true;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+        void SetRoadWorld(uptr playerCell, uptr world) {
+            g_roadSources.clear(); g_roadCursor = 0;
+            g_roadPeerRadius = 0;
+            g_roadWorld = world; g_roadPlayerCell = playerCell; ++g_roadEpoch;
+        }
+        bool RoadView(uptr cell, const RoadSource& source, uptr*& refs) {
+            unsigned count = 0;
+            return runtimecells::InventoryReferences(cell, refs, count) && refs == source.array && count == source.count;
+        }
+        bool RoadSourceCurrent(uptr cell, const RoadSource& source, ULONGLONG now) {
+            uptr* refs = nullptr;
+            return roadclearance::Fresh(source.seen.at, now, roadclearance::evidenceMs) && RoadView(cell, source, refs) &&
+                source.seen.entries.size() == source.count;
+        }
+    }
+
+    void RefreshRoadInventory(uptr playerCell, uptr world)
+    {
+        std::unique_lock lock(g_roadInventoryLock, std::try_to_lock);
+        if (!lock) return;
+        if (world != g_roadWorld) SetRoadWorld(playerCell, world);
+        else if (playerCell != g_roadPlayerCell) { g_roadPlayerCell = playerCell; ++g_roadEpoch; }
+        const unsigned grid = runtimecells::GridSize(roadclearance::maxSources + 1);
+        if (!world || !playerCell || !g.haveVehicles || g.pool.empty() || !grid || grid > roadclearance::maxSources) {
+            g_roadSources.clear();
+            logger::Observe("traffic.road_inventory",0,1,"event=unavailable world=%p cell=%p grid=%u vehicle_types=%zu",
+                reinterpret_cast<void*>(world),reinterpret_cast<void*>(playerCell),grid,g.pool.size());
+            return;
+        }
+        if (!g_roadPeerRadius) {
+            for (auto base : g.pool) {
+                double half[3]{}, bottom = 0, top = 0;
+                if (!ReadModelBounds(base,half,bottom,top)) {g_roadPeerRadius=roadclearance::maxPeerRadius;break;}
+                g_roadPeerRadius=std::max(g_roadPeerRadius,std::hypot(half[0],half[1])+1);
+            }
+        }
+        std::vector<uptr> cells;
+        const auto remember = [&](uptr cell, unsigned index, int x, int y, bool persistent) {
+            uptr* refs = nullptr; unsigned count = 0;
+            if (!runtimecells::InventoryReferences(cell, refs, count) &&
+                !runtimecells::References(cell, refs, count)) return;
+            auto& source = g_roadSources[cell];
+            if (source.array != refs || source.count != count) {
+                const auto matchesPrefix = [&](const RoadSource::Census& scan) {
+                    const unsigned size = unsigned(scan.entries.size());
+                    return size && size <= count && RoadSameEntries(refs, scan.entries.data(), size);
+                };
+                // Cell streaming can append repeatedly before the first pass finishes.
+                if (source.seen.entries.size() > source.next.entries.size() && matchesPrefix(source.seen))
+                    source.next = std::move(source.seen);
+                else if (!matchesPrefix(source.next)) source.next = matchesPrefix(source.seen) ? std::move(source.seen) : RoadSource::Census{};
+                source.next.at = 0;
+                source.seen = {};
+            }
+            source.array = refs; source.count = count; source.grid = index;
+            source.x = x; source.y = y; source.persistent = persistent;
+            cells.push_back(cell);
+        };
+        const auto persistent = RoadPersistentCell(world);
+        for (unsigned i = 0; i < grid; ++i) {
+            const auto cell = runtimecells::Attached(i); int x = 0, y = 0;
+            if (cell != persistent && RoadCellCoordinates(cell, world, x, y)) remember(cell, i, x, y, false);
+        }
+        if (persistent) remember(persistent, 0, 0, 0, true);
+        for (auto it = g_roadSources.begin(); it != g_roadSources.end();) {
+            if (std::find(cells.begin(), cells.end(), it->first) == cells.end()) it = g_roadSources.erase(it);
+            else ++it;
+        }
+        const auto now = GetTickCount64();
+        unsigned budget = roadclearance::scanRefs;
+        LARGE_INTEGER began{}, frequency{}; QueryPerformanceCounter(&began); QueryPerformanceFrequency(&frequency);
+        for (std::size_t visited = 0; visited < cells.size() && budget; ++visited) {
+            const auto cell = cells[g_roadCursor++ % cells.size()];
+            auto& source = g_roadSources.at(cell);
+            if (!source.next.entries.size() && roadclearance::Fresh(source.seen.at, now, roadclearance::refreshMs)) continue;
+            uptr* refs = nullptr;
+            if (!RoadView(cell, source, refs)) { source.seen = {}; source.next = {}; continue; }
+            const unsigned slice = std::min(budget, source.persistent ? 512u : 256u);
+            for (unsigned n = 0; n < slice && source.next.entries.size() < source.count; ++n, --budget) {
+                uptr ref = 0; bool vehicle = false;
+                if (!RoadEntry(refs, unsigned(source.next.entries.size()), ref, vehicle)) {
+                    logger::Observe("traffic.road_inventory",0,9,"event=read_failed persistent=%d cell=%d,%d index=%zu count=%u",
+                        source.persistent,source.x,source.y,source.next.entries.size(),source.count);
+                    source.seen = {}; source.next = {}; break;
+                }
+                if (vehicle) source.next.vehicles.push_back({unsigned(source.next.entries.size()), ref});
+                source.next.entries.push_back(ref);
+            }
+            if (source.next.entries.size() == source.count) {
+                if (RoadView(cell, source, refs) && RoadSameEntries(refs, source.next.entries.data(), source.count)) {
+                    source.next.at = now; std::swap(source.seen, source.next);
+                } else source.seen = {};
+                source.next.at = 0; source.next.entries.clear(); source.next.vehicles.clear();
+            }
+            LARGE_INTEGER at{}; QueryPerformanceCounter(&at);
+            if (double(at.QuadPart - began.QuadPart) > double(frequency.QuadPart) * .0005) break;
+        }
+    }
+
+    void ResetRoadInventory() {
+        std::lock_guard lock(g_roadInventoryLock);
+        SetRoadWorld(0, 0);
+    }
+
+    int AppendRoadVehicles(FvoTrafficVehicle* out, int count, int max) {
+        std::unique_lock lock(g_roadInventoryLock, std::try_to_lock);
+        if (!lock) return -1;
+        const auto now = GetTickCount64();
+        for (const auto& [cell, source] : g_roadSources) {
+            if (!RoadSourceCurrent(cell, source, now)) continue;
+            uptr* refs = nullptr;
+            if (!RoadView(cell, source, refs)) return -1;
+            for (const auto& vehicle : source.seen.vehicles) {
+                FvoTrafficVehicle row{};
+                if (!RoadSameEntry(refs, vehicle.index, vehicle.ref) || !RoadPose(vehicle.ref, row)) return -1;
+                if (!row.id || std::any_of(out, out + count, [&](const auto& v) { return v.id == row.id; })) continue;
+                if (count >= max) return max;
+                out[count++] = row;
+            }
+        }
+        return count;
+    }
+
+    FvoRoadClearance CheckRoadSite(uptr playerCell, uptr world, const FvoRoadSiteV1& site, std::uint64_t& epoch) {
+        using Result = FvoRoadClearance;
+        const auto unknown = [&](unsigned code,const char* reason,int x=0,int y=0) {
+            logger::Observe("traffic.road_inventory",0,code,"event=site_unknown reason=%s site=%.2f,%.2f required_cell=%d,%d",reason,site.x,site.y,x,y);
+            return Result::Unknown;
+        };
+        std::unique_lock lock(g_roadInventoryLock, std::try_to_lock);
+        if (!lock || !world || world != g_roadWorld || playerCell != g_roadPlayerCell ||
+            (epoch && epoch != g_roadEpoch)) return unknown(3,"world_or_epoch_changed");
+        roadclearance::Range range{};
+        if (!roadclearance::Cells(site, range, g_roadPeerRadius>0?g_roadPeerRadius:roadclearance::maxPeerRadius))
+            return unknown(2,"invalid_footprint");
+        const auto persistent = RoadPersistentCell(world);
+        const auto saved=g_roadSources.find(persistent);
+        if (!persistent || saved==g_roadSources.end()) return unknown(4,"persistent_source_missing");
+        const auto now = GetTickCount64();
+        if (!RoadSourceCurrent(saved->first,saved->second,now)){
+            logger::Observe("traffic.road_inventory",0,5,"event=site_unknown reason=persistent_inventory_unfinished copied=%zu total=%u site=%.2f,%.2f",
+                saved->second.next.entries.size(),saved->second.count,site.x,site.y);
+            return Result::Unknown;
+        }
+        const auto attached = [&](int x, int y) {
+            return std::find_if(g_roadSources.begin(), g_roadSources.end(), [&](const auto& item) {
+                const auto& s = item.second;
+                return !s.persistent && s.x == x && s.y == y && runtimecells::Attached(s.grid) == item.first;
+            });
+        };
+        // Defer uncovered slots before comparing the potentially large persistent array.
+        for (int y = range.bottom; y <= range.top; ++y) for (int x = range.left; x <= range.right; ++x) {
+            const auto it = attached(x, y);
+            if (it == g_roadSources.end()) return unknown(6,"footprint_cell_unattached",x,y);
+            if (!RoadSourceCurrent(it->first, it->second, now)) return unknown(7,"footprint_inventory_unfinished",x,y);
+        }
+        unsigned compared = 0;
+        const auto inspect = [&](uptr cell, const RoadSource& source) {
+            if (!RoadSourceCurrent(cell, source, now) || source.count > roadclearance::maxCompareRefs - compared) return Result::Unknown;
+            uptr* refs = nullptr;
+            if (!RoadView(cell, source, refs) || !RoadSameEntries(refs, source.seen.entries.data(), source.count)) return Result::Unknown;
+            compared += source.count;
+            for (const auto& vehicle : source.seen.vehicles) {
+                FvoTrafficVehicle row{};
+                if (!RoadPose(vehicle.ref, row)) return Result::Unknown;
+                if (row.id && spawnflow::VehicleSpacing({site.x, site.y, site.z, site.heading}, site.radius, site.halfHeight,
+                    {row.x, row.y, row.z}, row.radius, row.halfHeight)) return Result::Occupied;
+            }
+            return Result::Clear;
+        };
+        const auto result = roadclearance::Verify(range, [&] { return inspect(saved->first,saved->second); }, [&](int x, int y) {
+            const auto it = attached(x, y);
+            if (it == g_roadSources.end()) return Result::Unknown;
+            return inspect(it->first, it->second);
+        });
+        if (result == Result::Clear) epoch = g_roadEpoch;
+        if (result == Result::Unknown) return unknown(8,"reference_membership_or_pose_changed");
+        return result;
     }
 
 	void Reset()

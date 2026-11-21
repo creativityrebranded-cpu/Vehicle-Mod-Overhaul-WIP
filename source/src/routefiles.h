@@ -16,6 +16,7 @@
 namespace routefiles {
 using Vec = trafficdata::Vec;
 struct Route {
+
     std::string id, label;             // id: the section name (ed_..., or an original route's own name), label: what the player typed
     // An edited original (2026-10-29) keeps its own name and world key (empty: the editor's world); it replaces the original.
     // removed: hides the original of that name. ring: a ring route (shape; points unused).
@@ -34,18 +35,28 @@ struct Route {
     std::vector<unsigned> exclude;     // vehicle rules: models (base form ids) left out of this route
     std::string role;                  // empty: civilian
     std::string group;                 // a route group's name (VehicleGroups.ini); empty: none
+    routepolicy::Travel travel = routepolicy::Travel::Hover;
+    std::vector<routepolicy::Section> sections;
+    double corridor = 7;
+    laneplan::Plan lanePlan;
+    splinekit::Plan spacePlan;
+    roadplan::Plan road;
+    journeyplan::Plan journey;trafficconstraints::Rules restrictions;
+    routeend::Plan end;                // line_end / line_arrive (2026-11-06)
+
 };
 // A landing place (parked: a vehicle stands there) or a spawn spot. world: empty for the editor's world, else an anchored city's
 // key (2026-10-29): the spot is written in the city's own coordinates, so it follows the city wherever the game lays it down.
 struct Spot {
     std::string id; Vec at; double heading = 0; double radius = 30; bool parked = false; std::string world;
     // A landing area and its occupancy rules (trafficdata::Place).
-    std::string layout = "single", purpose = "stop", full = "circle"; int spaces = 1; double turn = 0, stay = 0; std::vector<std::string> routes;
+    std::string layout = "single", purpose = "stop", full = "circle"; int spaces = 1; double turn = 0, stay = 0; std::vector<std::string> routes;placeaccess::Plan access;
+    std::vector<placeaccess::Wire> wires;  // landing wires; the first In / Out mirror `access` (written as before)
 };
 using Zone = trafficdata::Zone;
 // A junction (trafficdata::Link): `from` (any route of the world, a ring in degrees, a path by point index) at `at` meets the
 // editor route `to` at its start or end; `share` of the laps passing it turn in.
-struct Link { std::string id, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; };  // toAt: a point index of `to` (0: its start); type: trafficdata::Link
+struct Link { std::string id, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; int fromLane=-1,toLane=-1; };  // toAt: a point index of `to` (0: its start); type: trafficdata::Link
 struct File {
     std::string worldId;               // the worldspace's editor name, as FVO_WorldName gives it
     std::vector<Route> routes;
@@ -112,13 +123,38 @@ inline std::string Windows(const routeschedule::Schedule& s);
 // The time rules lines of a route: busy words, plain windows or all day.
 inline std::string ScheduleLines(const routeschedule::Schedule& s)
 {
+    std::string levels;
+    if (routeschedule::HasLevel(s)) levels = std::string("traffic_level = ") + routeschedule::LevelName(s.trafficLevel) + "\n";
+    if (s.trafficBands != routeschedule::kTrafficBands) {
+        levels += "traffic_ranges =";
+        for (const auto& band : s.trafficBands) levels += " " + std::to_string(band.low) + " " + std::to_string(band.high);
+        levels += "\n";
+    }
     if (!s.zones.empty()) {
         std::string t = "day = " + routeschedule::FormatDay(s) + "\npeak = " + std::to_string(s.peak) + "\nblend = " + std::to_string(s.blend) + "\nlevels =";
         for (const int l : s.levels) t += " " + std::to_string(l);
-        return t + "\n";
+        return t + "\n" + levels;
     }
-    if (s.allDay) return "density = " + std::to_string(std::clamp(s.allDayVehicles, 0, fvolimits::kVehicles)) + "\n";
-    return "windows = " + Windows(s) + "\n";
+    if (s.allDay) return "density = " + std::to_string(std::clamp(s.allDayVehicles, 0, fvolimits::kVehicles)) + "\n" + levels;
+    return "windows = " + Windows(s) + "\n" + levels;
+}
+inline std::string DefaultsLine(const laneplan::Plan& plan){const auto text=laneplan::Write(plan);return text.empty()?std::string():"lane_defaults = "+text+"\n";}
+inline std::string RestrictionLine(const trafficconstraints::Rules& rules){const auto text=trafficconstraints::Write(rules);return text.empty()?std::string():"restrictions = "+text+"\n";}
+inline std::string TravelLines(const Route& r) {
+    std::string out=RestrictionLine(r.restrictions);
+    const auto journey=journeyplan::Write(r.journey);if(!journey.empty())out+="journey_plan = "+journey+"\n";
+    const auto road=roadplan::Write(r.road);if(!road.empty())out+="road_tiles = "+road+"\n";
+    // Field boxes, one per tile (2026-11-06): only once someone set one; a route without them reads exactly as before.
+    if(!r.ring){const std::size_t tiles=r.closed?r.points.size():r.points.size()>0?r.points.size()-1:0;const auto boxes=roadplan::WriteBoxes(r.road,tiles);if(!boxes.empty())out+="road_boxes = "+boxes+"\n";}
+    out+=routeend::Lines(r.end);
+    const auto space=splinekit::Write(r.spacePlan);if(!space.empty())out+="space_plan = "+space+"\n";
+    const auto transforms=lanetransform::Write(r.lanePlan.transforms);if(!transforms.empty())out+="lane_transforms = "+transforms+"\n";
+    const auto models=lanevehicles::Write(r.lanePlan.vehicles);if(!models.empty())out+="lane_vehicles = "+models+"\n";
+    const auto plan=laneplan::Write(r.lanePlan);if(!plan.empty())out+="lane_plan = "+plan+"\n";
+    if (r.travel != routepolicy::Travel::Hover) out += std::string("travel = ") + routepolicy::Token(r.travel) + "\n";
+    if (r.corridor != 7) out += "corridor = " + Num(r.corridor) + "\n";
+    if (!r.sections.empty()) out += "sections = " + routepolicy::Write(r.sections) + "\n";
+    return out;
 }
 inline std::string RoleLine(const std::string& role) { return role.empty() || role == "civilian" ? std::string() : "role = " + role + "\n"; }
 inline std::string GroupLine(const std::string& group) { return group.empty() ? std::string() : "group = " + group + "\n"; }
@@ -126,7 +162,7 @@ inline std::string GroupLine(const std::string& group) { return group.empty() ? 
 inline std::string FormatGroups(const std::vector<trafficdata::RouteGroup>& groups)
 {
     std::string t = "; FVO Traffic Manager: route groups and the vehicles each leaves out. The group named global applies to every route, on every planet.\n\n";
-    for (const auto& g : groups) t += "[group." + g.name + "]\nlabel = " + CleanLabel(g.label) + "\n" + ExcludeLine(g.exclude) + "\n";
+    for (const auto& g : groups) t += "[group." + g.name + "]\nlabel = " + CleanLabel(g.label) + "\n" + ExcludeLine(g.exclude) + RestrictionLine(g.restrictions) + DefaultsLine(g.laneDefaults) + "\n";
     return t;
 }
 inline std::string Windows(const routeschedule::Schedule& s)
@@ -143,9 +179,7 @@ inline int TotalVehicles(const File& f)
     int n = 0;
     for (const auto& r : f.routes) {
         if (r.removed) continue;
-        int most = r.schedule.allDay ? r.schedule.allDayVehicles : 0;
-        for (const auto& w : r.schedule.windows) most = std::max(most, w.vehicles);
-        n += most;
+        n += routeschedule::PeakVehicles(r.schedule, trafficdata::DemandLength(r));
     }
     return std::clamp(n, 1, fvolimits::kVehicles);
 }
@@ -166,7 +200,7 @@ inline std::string Format(const File& f)
                  "\nheight = " + Num(r.shape.z) + "\nradius = " + Num(r.shape.radius) + "\naspect = " + Num(r.shape.aspect) + "\nrotation = " +
                  Num(r.shape.rotation * 180.0 / ringlogic::kPi) + "\nlane_gap = " + Num(r.shape.gap) + "\ntilt = " + Num(r.tilt) + "\ntilt_toward = " + Num(r.tiltToward) +
                  "\nlanes = " + std::to_string(std::clamp(r.lanes, 1, 2)) + "\nspeed = " + Num(r.speed) + "\n";
-            t += ScheduleLines(r.schedule) + ColorLine(r.color) + ExcludeLine(r.exclude) + RoleLine(r.role) + GroupLine(r.group);
+            t += ScheduleLines(r.schedule) + ColorLine(r.color) + ExcludeLine(r.exclude) + RoleLine(r.role) + GroupLine(r.group) + TravelLines(r);
             if (r.test) t += "test = 1\n";
             t += "\n";
             continue;
@@ -177,29 +211,29 @@ inline std::string Format(const File& f)
         if(!r.rounding.empty()){t+="\nrounding = ";for(std::size_t i=0;i<r.points.size();++i)t+=(i?" ":"")+Num(i<r.rounding.size()?r.rounding[i]:0);}
         t += "\nclosed = " + std::string(r.closed ? "1" : "0") + "\nlanes = " + std::to_string(std::clamp(r.lanes, 1, 2)) +
              "\nspeed = " + Num(r.speed) + "\nwidth = " + Num(r.width) + "\n";
-        t += ScheduleLines(r.schedule) + ColorLine(r.color) + ExcludeLine(r.exclude) + RoleLine(r.role) + GroupLine(r.group);
+        t += ScheduleLines(r.schedule) + ColorLine(r.color) + ExcludeLine(r.exclude) + RoleLine(r.role) + GroupLine(r.group) + TravelLines(r);
             if (r.test) t += "test = 1\n";
         t += "\n";
     }
     for (const auto& k : f.links)
         t += "[link." + k.id + "]\nfrom = " + k.from + "\nat = " + Num(k.at) + "\nto = " + k.to + "\nto_at = " + (k.toEnd ? std::string("end") : k.toAt > 0 ? Num(k.toAt) : std::string("start")) +
-             "\nshare = " + Num(k.share) + (k.radius>0?"\nradius = "+Num(k.radius):"") + (k.type.empty()?"":"\ntype = "+k.type) + "\n\n";
+             "\nshare = " + Num(k.share) + (k.radius>0?"\nradius = "+Num(k.radius):"") + (k.type.empty()?"":"\ntype = "+k.type) + (k.fromLane>=0?"\nfrom_lane = "+std::to_string(k.fromLane):"") + (k.toLane>=0?"\nto_lane = "+std::to_string(k.toLane):"") + "\n\n";
     for (const auto& p : f.landings)
     {
         std::string who;
         for (const auto& name : p.routes) who += (who.empty() ? "" : ", ") + name;
         t += "[place." + p.id + "]\nworld = " + (p.world.empty() ? w : p.world) + "\npoint = " + Num(p.at.x) + " " + Num(p.at.y) + " " + Num(p.at.z) + "\nradius = " + Num(p.radius) +
              (p.parked ? "\nparked = 1" : "") + "\nlayout = " + p.layout + "\nspaces = " + std::to_string(p.spaces) + "\nturn = " + Num(p.turn) +
-             "\npurpose = " + p.purpose + "\nstay = " + Num(p.stay) + "\nfull = " + p.full + (who.empty() ? "" : "\nroutes = " + who) + "\n\n";
+             "\npurpose = " + p.purpose + "\nstay = " + Num(p.stay) + "\nfull = " + p.full + (who.empty() ? "" : "\nroutes = " + who) + (placeaccess::Empty(p.access)?"":"\naccess_plan = "+placeaccess::Write(p.access)) + (placeaccess::Extra(placeaccess::Merge(p.access,p.wires))?"\naccess_wires = "+placeaccess::WriteWires(placeaccess::Merge(p.access,p.wires)):"") + "\n\n";
     }
     for (const auto& p : f.spawns)
         t += "[spawn." + p.id + "]\nworld = " + (p.world.empty() ? w : p.world) + "\npoint = " + Num(p.at.x) + " " + Num(p.at.y) + " " + Num(p.at.z) + "\nheading = " + Num(p.heading) + "\n\n";
     for (const auto& z : f.zones)
         t += "[zone." + z.name + "]\nworld = " + (z.world.empty() ? w : z.world) + "\npoint = " + Num(z.at.x) + " " + Num(z.at.y) + " " + Num(z.at.z) + "\nradius = " + Num(z.radius) +
-             "\nkind = " + (z.slow ? "slow" : "keepout") + "\ntop = " + Num(z.top) + "\nspeed = " + Num(z.speed) + "\n\n";
+             "\nkind = " + (z.slow ? "slow" : "keepout") + "\ntop = " + Num(z.top) + "\nspeed = " + Num(z.speed) + "\n"+RestrictionLine(z.restrictions)+(z.restrictionFloor>-1000000000?"restriction_floor = "+Num(z.restrictionFloor)+"\n":"")+(z.restrictionTop<1000000000?"restriction_top = "+Num(z.restrictionTop)+"\n":"")+"\n";
     if (f.cityWritten)
         t += "[city." + w + "]\nworld = " + w + "\ntraffic = " + (f.city.on ? "1" : "0") + "\ndensity = " + std::to_string(f.city.density) + "\nlimit = " + std::to_string(f.city.limit) +
-             "\noriginals = " + (f.city.originals ? "1" : "0") + "\n\n";
+             "\noriginals = " + (f.city.originals ? "1" : "0") + "\n" + RestrictionLine(f.city.restrictions) + DefaultsLine(f.city.laneDefaults) + "\n";
     if (f.traffic && !f.routes.empty())
         t += "[traffic." + w + "]\nworld = " + w + "\nmax = " + std::to_string(TotalVehicles(f)) + "\ngap = 20\nvehicles = any\ntrips = " +
              std::string(f.landings.empty() ? "laps" : "mixed") + "\nreach = 600\nstart_on_route = " + std::to_string(std::min<std::size_t>(f.spawns.size(), 6)) + "\n";
@@ -219,17 +253,17 @@ inline bool Parse(const std::string& text, const std::string& name, File& out, s
     const std::string w = WorldKey(f.worldId);
     for (const auto& r : d.routes) {
         Route e;
-        e.id = r.name; e.label = r.label.empty() ? r.name : r.label; e.color = r.color; e.points = r.points; e.rounding=r.rounding; e.closed = r.closed;
+        e.restrictions=r.restrictions;e.journey=r.journey;e.lanePlan=r.lanePlan;e.spacePlan=r.spacePlan;e.road=r.road;e.end=r.end;e.travel=r.travel; e.sections=r.sections; e.corridor=r.corridor; e.id = r.name; e.label = r.label.empty() ? r.name : r.label; e.color = r.color; e.points = r.points; e.rounding=r.rounding; e.closed = r.closed;
         e.lanes = r.lanes; e.speed = r.speed; e.width = r.width; e.schedule = r.schedule; e.test = r.test; e.exclude = r.exclude; e.role = r.role; e.group = r.group;
         e.world = r.world == w ? std::string() : r.world;
         e.removed = r.removed; e.ring = r.ring; e.shape = r.shape; e.tilt = r.tilt; e.tiltToward = r.tiltToward;
         f.routes.push_back(e);
     }
-    for (const auto& k : d.links) f.links.push_back({ k.name, k.from, k.to, k.at, k.toEnd, k.share, k.toAt, k.radius, k.type });
+    for (const auto& k : d.links) f.links.push_back({ k.name, k.from, k.to, k.at, k.toEnd, k.share, k.toAt, k.radius, k.type,k.fromLane,k.toLane });
     for (const auto& p : d.places) {
         Spot s;
         s.id = p.name; s.at = p.at; s.radius = p.radius; s.parked = p.parked; s.world = p.world == w ? std::string() : p.world;
-        s.layout = p.layout; s.purpose = p.purpose; s.full = p.full; s.spaces = p.spaces; s.turn = p.turn; s.stay = p.stay; s.routes = p.routes;
+        s.layout = p.layout; s.purpose = p.purpose; s.full = p.full; s.spaces = p.spaces; s.turn = p.turn; s.stay = p.stay; s.routes = p.routes;s.access=p.access;s.wires=p.wires;
         f.landings.push_back(s);
     }
     for (const auto& q : d.spawns) {

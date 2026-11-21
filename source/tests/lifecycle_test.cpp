@@ -39,6 +39,24 @@ int main() {
     check(requests.Pending(77),"completed unconsumed birth remains discoverable");
     check(requests.Poll("birth",77,factory,submit)==42,"completion crosses worker boundary");
     check(!requests.Pending(),"consuming completion removes pending state");commands.clear();
+    {
+        Requests births(1,FakeClock);std::vector<Ticket> queued;int prepared=0;bool tracked=false;
+        auto queue=[&](const Ticket& t){queued.push_back(t);return true;};
+        auto work=[&]()->Work{++prepared;return []()->std::uint64_t{return 55;};};
+        check(!births.Poll("create:first",1,work,queue,false,false,&tracked)&&!tracked&&prepared==0,
+              "collect never starts an absent birth");
+        check(!births.Poll("create:first",1,work,queue,false,true,&tracked)&&tracked&&prepared==1,
+              "a submitted birth reports its exact ticket");
+        check(!births.Poll("create:other",1,work,queue,false,true,&tracked)&&!tracked&&prepared==1,
+              "a full table cannot report that it tracked a new birth");
+        check(!births.Poll("create:first",1,work,queue,false,false,&tracked)&&tracked&&queued.size()==1,
+              "collect can find a pending exact ticket");
+        queued[0]->Run();
+        check(births.Poll("create:first",1,work,queue,false,false,&tracked)==55&&tracked&&prepared==1,
+              "collect returns the birth without calling the factory");
+        check(!births.Poll("create:first",1,work,queue,false,false,&tracked)&&!tracked&&queued.size()==1,
+              "an already collected birth cannot be recreated by polling");
+    }
     requests.Poll("cancel",77,factory,submit);requests.Reset();
     commands[0]->Run();commands.clear();
     check(executed==1&&released==2,"save reset cancels old command but releases its capture");

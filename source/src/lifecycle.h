@@ -10,6 +10,8 @@ void InstallCover();
 std::size_t Outstanding(const char* operation); // requests of that kind not yet finished
 Reference Keep(std::uintptr_t ref,unsigned expectedId=0); // owning handle lookup, checks pointer and optional form ID
 std::optional<std::uint64_t> Poll(const std::string& key,unsigned id,const std::function<Work()>& factory);
+std::optional<std::uint64_t> PollTracked(const std::string& key,unsigned id,const std::function<Work()>& factory,bool& tracked);
+std::optional<std::uint64_t> Collect(const std::string& key,bool& tracked); // consume an existing result, never start work
 bool Pending(unsigned id=0,const char* operation=nullptr);
 bool Post(const std::string& key,unsigned id,const std::function<Work()>& factory); // false: the table is full and it was dropped
 void Reset();

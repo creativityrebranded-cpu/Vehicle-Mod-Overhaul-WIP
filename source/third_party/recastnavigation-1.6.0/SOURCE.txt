@@ -1,0 +1,3 @@
+Recast & Detour 1.6.0, unmodified, from https://github.com/recastnavigation/recastnavigation/archive/refs/tags/v1.6.0.zip
+zip SHA-256 8b50c62177249554b226514b307e6c529934a62b3926822777bf6abb8906a155 (downloaded 2026-11-05 on the user's request)
+zlib licence: License.txt. Only Recast/ and Detour/ are kept.

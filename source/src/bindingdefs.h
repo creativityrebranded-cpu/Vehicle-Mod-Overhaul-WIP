@@ -54,8 +54,8 @@ inline constexpr Def kDefs[] = {
     {L"focus_target", "default-key@scanner, Pad:LS:double@scanner", "Focus fire on the aimed hostile person or vehicle",nullptr,nullptr,'H',Layer::Target},
     {L"clear_focus", "default-key@foot|vehicle|scanner, Pad:DLeft:double@scanner", "Clear combat focus",nullptr,nullptr,'O'},
     {L"throttle_lock", "default-key:double@flying, Pad:RB:double@flying", "Toggle throttle lock",nullptr,nullptr,0xA0},
-    {L"passenger_exit", "default-key:tap@passenger, Pad:A:tap@passenger", "Exit passenger seat",nullptr,nullptr,'G'},
-    {L"take_wheel", "default-key:hold@passenger, Pad:A:hold@passenger", "Take the wheel from passenger seat",nullptr,nullptr,'G'},
+    {L"passenger_exit", "default-key:tap@passenger, Pad:A:tap@passenger", "Take / give back control (passenger seat)",nullptr,nullptr,'G'},
+    {L"take_wheel", "default-key:hold@passenger, Pad:A:hold@passenger", "Not used (kept for saved settings)",nullptr,nullptr,'G'},
     {L"driver_exit", "default@vehicle", "Exit driver seat (land first while hovering)","Vehicle","VehicleExit",'E'},
     {L"board_passenger", "default:tap@foot", "Ride in the aimed occupied vehicle", "MainGameplay","Activate",'E'},
     {L"pull_driver", "default:hold@foot", "Pull out the aimed driver / take their seat", "MainGameplay","Activate",'E'},
@@ -76,7 +76,7 @@ inline constexpr Def kDefs[] = {
     {L"hud_shrink", "default-key@editor, NumpadMinus@editor, Pad:LT@editor", "HUD: decrease size",nullptr,nullptr,0xBD,Layer::Editor},
     {L"hud_reset", "default-key@editor, Pad:X@editor", "HUD: reset selected element",nullptr,nullptr,0x2E,Layer::Editor},
     {L"hud_fast", "default-key@editor, Pad:LS@editor", "HUD: larger movement step",nullptr,nullptr,0x11,Layer::Editor},
-    {L"ship_preview", "default-key@vehicle, Pad:RS:hold@vehicle", "Toggle ship hull preview",nullptr,nullptr,0x77},
+    {L"ship_preview", "default-key@vehicle, Pad:RS:hold@vehicle", "Toggle ship hull preview",nullptr,nullptr,0x79},  // F10; F8 is the Traffic Manager (user, 2026-11-04: F8 showed the ship hull on the car)
     {L"npc_profile", "default-key@foot|scanner, Pad:DRight:double@scanner", "Cycle escort NPC navigation profile",nullptr,nullptr,0x78},
     {L"cruise", "default-key:double@vehicle, Pad:DLeft:double@vehicle", "Cruise: join traffic with no destination",nullptr,nullptr,'T'},
 };

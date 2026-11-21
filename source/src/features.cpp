@@ -11,6 +11,11 @@
 #include <mutex>
 #include <string>
 
+// The decision pipeline stays off in player releases until proven in game; test builds run it (design section 15).
+// PD-1a (user, 2026-11-12: "can you do these 4"): one driver, the plan, in every build. The old lane driver, detour and mode selector were
+// still driving flying cars (planHover off) and every car in player builds (planArbiter off). A settings.ini key still wins.
+static constexpr bool kPlanDefault = true;
+
 namespace features
 {
 	namespace
@@ -37,6 +42,7 @@ namespace features
 			{ Id::Traffic, "Everyday traffic", "Calm NPCs take parked vehicles near you on trips. With city traffic installed they fly the routes in Data/SFSE/Plugins/FVO_Traffic: onto a route, off at the exit nearest a landing place, or a lap and home. No vehicles are created.", L"context", L"traffic", true },
 			{ Id::RouteMarkers, "Show traffic routes", "Probes in the sky along every route in the FVO_Traffic files of the world you are in, larger ones at exits and landing places. The routes themselves are only defined in the files.", L"traffic", L"markers", true },
 			{ Id::WallPass, "FVO vehicles pass the loaded-area wall", "The game keeps an invisible box round the loaded cells: moving bodies that touch its sides bounce back, and characters are moved back inside (this pulled traffic drivers out of their seats). On: vehicles FVO is flying and their drivers pass the side walls and are not moved back; everything else, and the floor, stay as the game made them.", L"physics", L"fvoWallPass", true },
+			{ Id::Radar, "Vehicle radar", "Test builds: each vehicle sweeps around and ahead of itself; every object a sweep hits is looked up in the game's own collision rules and given its real size, and the energy planner sees those boxes. Off: no radar.", L"traffic", L"radar", true },  // radar.h
 		};
 
 		std::atomic<bool> g_on[kCount];

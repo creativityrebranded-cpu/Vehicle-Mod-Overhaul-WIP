@@ -1,5 +1,7 @@
+#include "routeguidance.h"
 #include "trafficprofile.h"
 #include "trafficprofilestore.h"
+#include "trafficpermanent.h"
 #include "pilotlayout.h"
 #include "fvopaths.h"
 #include "log.h"
@@ -112,6 +114,7 @@ void BeforeSave() {
     if (g_saveDepth++) return;
     if (g_cachedRoutes.empty()) return; // traffic was not initialized: existing saved identity stays valid
     try {
+        if(routeguidance::beforeSave && !routeguidance::beforeSave()) throw std::runtime_error("Active traffic journeys could not be recorded");
         float& value = SavedValue();
         if (static_cast<std::uint32_t>(value) != g_cachedId)
             throw std::runtime_error("Traffic snapshot identity changed before saving");
@@ -130,6 +133,12 @@ void BeforeSave() {
     }
 }
 void AfterSave() { Guard lock(g_lock); if (g_saveDepth) --g_saveDepth; }
+namespace {
+void WritePermanentCache(const std::filesystem::path& path,const std::string& text){const auto temporary=path.wstring()+L".permanent.tmp";const auto backup=path.wstring()+L".bak";const HANDLE file=CreateFileW(temporary.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);if(file==INVALID_HANDLE_VALUE)throw std::runtime_error("Could not stage permanent traffic cache");DWORD written=0;const bool ok=WriteFile(file,text.data(),DWORD(text.size()),&written,nullptr)&&written==text.size()&&FlushFileBuffers(file);CloseHandle(file);if(!ok){DeleteFileW(temporary.c_str());throw std::runtime_error("Could not flush permanent traffic cache");}if(std::filesystem::exists(path)&&!CopyFileW(path.c_str(),backup.c_str(),FALSE)){DeleteFileW(temporary.c_str());throw std::runtime_error("Could not back up permanent traffic cache");}if(!MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){DeleteFileW(temporary.c_str());throw std::runtime_error("Could not replace permanent traffic cache");}}
+std::filesystem::path PermanentRoot(){return std::filesystem::path(Storage())/L"TrafficProfiles"/L"Permanent"/L"routes";}
+}
+std::wstring PermanentDir(){Guard lock(g_lock);if(Routes().empty())return {};const auto path=PermanentRoot();try{std::filesystem::create_directories(path);return path.wstring();}catch(...){return {};}}
+bool RefreshPermanent(std::string& why){Guard lock(g_lock);if(g_cachedRoutes.empty()){why="No editable traffic profile is active";return false;}try{trafficpermanent::Sync(PermanentRoot(),g_cachedRoutes,WritePermanentCache);return true;}catch(const std::exception& error){why=error.what();return false;}}
 std::wstring Routes() {
     if (!g_allowed.load(std::memory_order_acquire)) return {};
     std::lock_guard lock(g_lock);
@@ -151,6 +160,7 @@ std::wstring Routes() {
             logger::Write("Traffic profile: created %u (%s)", id, created.imported ? "legacy setup imported" : "fresh defaults");
         } else routes = trafficprofilestore::Open(root, id);
         const auto working = trafficprofilestore::Clone(root / L"Working", routes, Seed());
+        trafficpermanent::Sync(PermanentRoot(),working.routes,WritePermanentCache);
         g_cachedId = id; g_cachedRoutes = working.routes.wstring(); g_reported = false;
         return g_cachedRoutes;
     } catch (const std::exception& error) {

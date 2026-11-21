@@ -9,11 +9,16 @@
 #include "hook.h"
 #include "log.h"
 #include "navmap.h"
+#include "mapguard.h"
+#include "probeguard.h"
+#include "vehiclediag.h"
 #include "prefetch.h"
+#include "hitarray.h"
 #include "shipmodel.h"
 
 #include <Windows.h>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -120,11 +125,13 @@ namespace vehicle_probe
 		{
 			int faults = 0;
 			ULONGLONG retryAt = 0;
-			bool Blocked() const { return faults >= kMaxFaults || GetTickCount64() < retryAt; }
+			bool capped = true;  // false: pauses only, never off until restart
+			ULONGLONG fixedMs = 0;  // R1: a fixed pause (the grid-settle window) instead of a growing one
+			bool Blocked() const { return (capped && faults >= kMaxFaults) || GetTickCount64() < retryAt; }
 			void Fault(const char* what)
 			{
 				++faults;
-				const ULONGLONG wait = 5000ull << std::min(faults - 1, 3);
+				const ULONGLONG wait = fixedMs ? fixedMs : 5000ull << std::min(faults - 1, 3);
 				retryAt = GetTickCount64() + wait;
 				HMODULE m = nullptr;
 				char name[MAX_PATH] = "?";
@@ -134,13 +141,39 @@ namespace vehicle_probe
 				logger::Write("Prefetch: %s faulted (#%d): 0x%08lX at %s+0x%llX (%s 0x%llX); %s", what, faults, g_fault.code, leaf ? leaf + 1 : name,
 					static_cast<unsigned long long>(g_fault.address - reinterpret_cast<std::uintptr_t>(m)),
 					g_fault.access == 0 ? "read" : g_fault.access == 1 ? "write" : g_fault.access == 8 ? "execute" : "no access info",
-					static_cast<unsigned long long>(g_fault.target), faults >= kMaxFaults ? "off until restart" : "trying again after a pause");
+					static_cast<unsigned long long>(g_fault.target), capped && faults >= kMaxFaults ? "off until restart" : "trying again after a pause");
 			}
 		};
-		Backoff g_rayBackoff, g_sweepBackoff;
+		// R1 (2026-11-07): a ray fault is the broadphase being rebuilt while the cell grid moves (22 of 25 faults within 1.4 s of
+		// map.procgen); the faulting walk holds no game lock. Rays and sweeps pause for the grid-settle window and come back; never off
+		// until restart (that left every car blind for the rest of the session).
+		Backoff g_rayBackoff{ 0, 0, false, probeguard::kProcgenHoldMs }, g_sweepBackoff{ 0, 0, false, probeguard::kProcgenHoldMs };
+		// Direct rays (the doubt probe, the sweep, F7) run outside the queued rays' safe point and fault at Starfield.exe+0x3730CC0 while the
+		// world streams (2026-11-07). They pause on their own: five of them once turned every ray off and left all cars blind for 18 minutes.
+		Backoff g_directBackoff{ 0, 0, false, probeguard::kProcgenHoldMs };
 
 		template <class T>
 		T& F(std::uint8_t* p, std::size_t o) { return *reinterpret_cast<T*>(p + o); }
+
+		// PF-1: Havok's heap free, as the game frees a grown hit array: FUN_142E90220(*0x14586C920, array, 0x70, capacity).
+		constexpr std::uint32_t kRvaHavokFreeArray = 0x02E90220, kRvaHavokHeapPtr = 0x0586C920;
+		hitarray::Stats g_hitStats;
+		void FreeGrown(const hitarray::View& v)
+		{
+			if (!v.owned) return;
+			const auto base = game::Base();
+			reinterpret_cast<void (*)(std::uintptr_t, void*, int, std::uint32_t)>(base + kRvaHavokFreeArray)(*reinterpret_cast<std::uintptr_t*>(base + kRvaHavokHeapPtr), v.data, int(hitarray::kHitBytes), v.capacity & hitarray::kCapacityMask);
+		}
+		// PF-1 trace, at most every 10 s: how many casts grew Havok's array, the largest hit count, the bytes given back, drops on a fault.
+		void TraceHits()
+		{
+			static std::atomic<unsigned long long> last{ 0 };
+			const unsigned long long now = GetTickCount64(); unsigned long long was = last.load();
+			if (now - was < 10000 || !last.compare_exchange_strong(was, now)) return;
+			logger::Write("OBS system=probe.hits casts=%llu grown=%llu largest=%u freed_bytes=%llu dropped_on_fault=%llu reason=grown_havok_hit_arrays_freed",
+				static_cast<unsigned long long>(g_hitStats.casts.load()), static_cast<unsigned long long>(g_hitStats.grown.load()), g_hitStats.largest.load(),
+				static_cast<unsigned long long>(g_hitStats.freedBytes.load()), static_cast<unsigned long long>(g_hitStats.droppedOnFault.load()));
+		}
 
 		std::uintptr_t RayWorld(std::uintptr_t tes, const float* at)
 		{
@@ -172,21 +205,57 @@ namespace vehicle_probe
 		// task jumped through a destroyed object right after the first live forward ray). The lock is taken inside the Now functions once the world is known and
 		// released by the guarded wrappers on every path (a fault included), so it can never stay held.
 		constexpr std::uint32_t kRvaWorldLock = 0x022CC350;
-		std::uintptr_t g_heldWorld = 0;
+		// F-LOCK (2026-11-07): the record of the held lock is per thread (probeguard::held). It was one global while two job threads cast
+		// at once, so one thread's release could clear the other's record and that read count was never given back (freezes 13:17, 13:21).
 		void LockWorld(std::uintptr_t bs)
 		{
 			crash::Crumb("world read lock", 1);
 			reinterpret_cast<void (*)(std::uintptr_t)>(game::Base() + kRvaWorldLock)(bs + 0xB20);
-			g_heldWorld = bs;
+			probeguard::Lock(bs);
 		}
 		void UnlockWorld()
 		{
-			if (!g_heldWorld) return;
-			crash::Crumb("world read lock released", 0);
-			volatile LONG* count = reinterpret_cast<volatile LONG*>(g_heldWorld + 0xB24);
-			g_heldWorld = 0;
-			const std::uint32_t old = static_cast<std::uint32_t>(InterlockedExchangeAdd(count, -1));
-			if ((old & 0xFFC00FFFu) == 1 && (old & 0x3FF000u) != 0) WakeByAddressSingle(const_cast<LONG*>(count));
+			probeguard::Unlock([](std::uintptr_t world) {
+				crash::Crumb("world read lock released", 0);
+				volatile LONG* count = reinterpret_cast<volatile LONG*>(world + 0xB24);
+				const std::uint32_t old = static_cast<std::uint32_t>(InterlockedExchangeAdd(count, -1));
+				if ((old & 0xFFC00FFFu) == 1 && (old & 0x3FF000u) != 0) WakeByAddressSingle(const_cast<LONG*>(count));
+			});
+		}
+
+		// F-LOCK: one caster at a time (queued rays, sweeps, box query, direct rays). A thread that finds it busy skips this turn.
+		SRWLOCK g_caster = SRWLOCK_INIT;
+		std::atomic<unsigned> g_casterBusy{ 0 };
+		// B2: the world is not being changed now (probeguard::MayCast); counted and logged like a busy caster.
+		std::atomic<unsigned> g_settleSkips{ 0 };
+		std::atomic<std::uint64_t> g_changeSeen{ 0 }; std::atomic<unsigned long long> g_changedAt{ 0 };
+		bool WorldSteady(const char* who, unsigned long long& deferSince)
+		{
+			const unsigned long long now = GetTickCount64();
+			const std::uint64_t count = vehiclediag::PhysicsChangeCount();
+			if (g_changeSeen.exchange(count) != count) g_changedAt.store(now);  // the hooks counted a body build or a motion-type set
+			if (probeguard::MayCast(now, 0, g_changedAt.load(), deferSince)) return true;
+			const unsigned n = ++g_settleSkips;
+			if (n <= 3 || n % 500 == 0) logger::Write("OBS system=probe.settle event=skip who=%s count=%u reason=physics_world_just_changed", who, n);
+			return false;
+		}
+		bool TakeCaster(const char* who)
+		{
+			if (TryAcquireSRWLockExclusive(&g_caster)) return true;
+			const unsigned n = ++g_casterBusy;
+			if (n <= 3 || n % 200 == 0) logger::Write("OBS system=probe.caster event=busy who=%s count=%u thread=%lu reason=another_thread_casting", who, n, GetCurrentThreadId());
+			return false;
+		}
+		void GiveCaster() { ReleaseSRWLockExclusive(&g_caster); }
+		// F-LOCK: rays pause for probeguard::kProcgenHoldMs after the game's map.procgen (both freeze runs: a fault or the freeze within 2 s).
+		std::atomic<bool> g_procgenHeld{ false };
+		bool ProbeHeld()
+		{
+			const unsigned long long last = mapguard::LastProcgen();
+			const bool held = probeguard::ProcgenHold(GetTickCount64(), last);
+			if (g_procgenHeld.exchange(held) != held)
+				logger::Write("OBS system=probe.hold event=%s reason=map_procgen hold_ms=%llu since_procgen_ms=%llu", held ? "start" : "end", probeguard::kProcgenHoldMs, GetTickCount64() - last);
+			return held;
 		}
 
 		bool CastRayNow(std::uintptr_t tes, const RayProbe& r, prefetch::RayHit& out)
@@ -232,11 +301,12 @@ namespace vehicle_probe
 			F<std::uintptr_t>(fr.collector, 0x30) = reinterpret_cast<std::uintptr_t>(fr.hits);
 			F<std::uint32_t>(fr.collector, 0x3C) = 0x8000000A;
 			reinterpret_cast<void (*)(std::uintptr_t, void*, void*)>(base + kRvaCastRay)(bs + 0x20, fr.query, fr.collector);
-			const std::uint32_t n = std::min<std::uint32_t>(std::max(F<std::uint32_t>(fr.collector, 0xC), F<std::uint32_t>(fr.collector, 0x38)), 10);
+			const hitarray::View view = hitarray::Read(fr.collector, fr.hits);  // PF-1: the hits where Havok put them (was: the 10 inline slots)
+			const std::uint32_t n = view.count;
 			const float len = std::sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
 			float best = 1e30f;
 			for (std::uint32_t i = 0; i < n; ++i) {
-				std::uint8_t* h = fr.hits + i * 0x70;
+				std::uint8_t* h = view.data + i * 0x70;
 				if (F<std::int32_t>(h, 0x68) != 1) continue;
 				if (loadedarea::IsWall(F<std::uint32_t>(h, 0x48))) continue;  // the game's loaded-area wall: FVO vehicles pass it
 				const float hx = F<float>(h, 0), hy = F<float>(h, 4), hz = F<float>(h, 8);
@@ -256,6 +326,8 @@ namespace vehicle_probe
 					out.nx = ax; out.ny = ay; out.nz = az;
 				}
 			}
+			g_hitStats.Note(view);
+			FreeGrown(view);  // PF-1: Havok's grown array goes back to the game's heap (was: leaked on every ray with more than 10 hits)
 			return true;
 		}
 
@@ -393,10 +465,11 @@ namespace vehicle_probe
 			reinterpret_cast<void (*)(std::uintptr_t, void*, void*, void*, void*)>(base + kRvaCastShape)(bs, fr.query, fr.orient, fr.collector[0], fr.collector[1]);
 			QueryPerformanceCounter(&t1);
 			out.micros = unsigned(double(t1.QuadPart - t0.QuadPart) * 1e6 / double(fq.QuadPart));
-			const std::uint32_t n = std::min<std::uint32_t>(std::max(F<std::uint32_t>(fr.collector[0], 0xC), F<std::uint32_t>(fr.collector[0], 0x38)), 10);
+			const hitarray::View view = hitarray::Read(fr.collector[0], fr.hits[0]), startView = hitarray::Read(fr.collector[1], fr.hits[1]);  // PF-1
+			const std::uint32_t n = view.count;
 			float best = 1e30f;
 			for (std::uint32_t i = 0; i < n; ++i) {
-				std::uint8_t* h = fr.hits[0] + i * 0x70;
+				std::uint8_t* h = view.data + i * 0x70;
 				if (F<std::int32_t>(h, 0x68) != 2) continue;  // 2 = shape cast
 				const float hx = F<float>(h, 0), hy = F<float>(h, 4), hz = F<float>(h, 8);
 				const std::uint32_t bodyId = F<std::uint32_t>(h, 0x48), layer = F<std::uint32_t>(h, 0x5C) & 0x7F;
@@ -421,6 +494,8 @@ namespace vehicle_probe
 				out.from[i] = start[i];
 				out.to[i] = start[i] + (i == 0 ? disp[0] : i == 1 ? disp[1] : 0.0f);
 			}
+			g_hitStats.Note(view); g_hitStats.Note(startView);
+			FreeGrown(view); FreeGrown(startView);  // PF-1: both collectors' grown arrays (was: leaked)
 			return true;
 		}
 
@@ -433,8 +508,111 @@ namespace vehicle_probe
 			}
 			__except (CaptureFault(GetExceptionInformation())) {
 				result = -1;
+				++g_hitStats.droppedOnFault;  // PF-1: a collector caught mid-cast is not trusted; any grown array is dropped (counted)
 			}
 			UnlockWorld();
+			TraceHits();
+			return result;
+		}
+
+		// Path sweep (World radar, 2026-11-13): the same CastShape as above, but from an offset of the body's position, turned by `yaw` (FVO heading
+		// sense, clockwise from +y) from the body's present orientation, along a 3-D displacement, and EVERY contact kept (not only the nearest):
+		// a swept volume cannot pass something it overlaps. The body rotation is stored as columns (radar box layout check, 231 of 238 bodies),
+		// so turning it is each column turned about world z.
+		struct PathSweepReq { std::uintptr_t instance = 0; float offset[3] = {}, disp[3] = {}; float yaw = 0; std::uint64_t mask = 0; };
+		bool PathSweepNow(std::uintptr_t tes, const PathSweepReq& r, prefetch::SweepContact* out, int max, int& count, unsigned& micros)
+		{
+			count = 0; micros = 0;
+			const auto base = game::Base();
+			SweepReq q; q.instance = r.instance;
+			std::uintptr_t read = 0; std::uint32_t ownId = 0; float start[3] = {};
+			if (ReadSweepStart(q, read, ownId, start) != 1) return false;
+			const auto bodyOf = reinterpret_cast<std::uintptr_t (*)(std::uintptr_t, std::uint32_t)>((*reinterpret_cast<void***>(read))[0x70 / 8]);
+			for (int i = 0; i < 3; ++i) start[i] += r.offset[i];
+			const float dl = std::sqrt(r.disp[0] * r.disp[0] + r.disp[1] * r.disp[1] + r.disp[2] * r.disp[2]);
+			if (!std::isfinite(start[0]) || !std::isfinite(start[1]) || !std::isfinite(start[2]) || !(dl > 0.05f) || !(dl < 200.0f)) return false;
+			const std::uintptr_t bs = RayWorld(tes, start);
+			if (!bs) return false;
+			LockWorld(bs);
+			const std::uintptr_t body = bodyOf(read, ownId);
+			if (!body) return false;
+			const std::uintptr_t shape = *reinterpret_cast<std::uintptr_t*>(body + 0x78);
+			if (!shape) return false;
+			const std::uintptr_t inner = bs + 0x20;
+			{
+				void** vt = *reinterpret_cast<void***>(inner);
+				if (!vt || !InImage(reinterpret_cast<std::uintptr_t>(vt)) || !InImage(reinterpret_cast<std::uintptr_t>(vt[3]))) return false;
+			}
+			ShapeFrame fr{};
+			F<std::uintptr_t>(fr.filter, 0) = base + kRvaFilterVtbl;
+			F<std::uint64_t>(fr.filter, 8) = 0xFFFFFFFFull;
+			F<std::uint64_t>(fr.filter, 0x10) = 1;
+			F<std::uint8_t>(fr.filter, 0x18) = 4;
+			F<std::uint64_t>(fr.filter, 0x20) = r.mask;
+			F<std::uint32_t>(fr.filter, 0x28) = 0x6001E;
+			F<std::uint64_t>(fr.query, 0) = reinterpret_cast<std::uint64_t (*)(std::uintptr_t)>((*reinterpret_cast<void***>(inner))[3])(inner);
+			F<std::uintptr_t>(fr.query, 8) = reinterpret_cast<std::uintptr_t>(fr.filter);
+			F<std::uint16_t>(fr.query, 0x10) = 0xFFFF;
+			F<std::uint32_t>(fr.query, 0x14) = 0xFFFFFFFF;
+			F<std::uint16_t>(fr.query, 0x20) = 1;
+			F<std::uint8_t>(fr.query, 0x22) = 0xFB;
+			F<std::uintptr_t>(fr.query, 0x28) = shape;
+			const float dirW = *reinterpret_cast<const float*>(base + kRvaDirW);
+			const float* invZero = reinterpret_cast<const float*>(base + kRvaInvZero);
+			const float disp[4] = { r.disp[0], r.disp[1], r.disp[2], dirW };
+			for (int i = 0; i < 3; ++i) F<float>(fr.query, 0x30 + 4 * i) = start[i];
+			for (int i = 0; i < 4; ++i) {
+				F<float>(fr.query, 0x40 + 4 * i) = disp[i];
+				F<float>(fr.query, 0x50 + 4 * i) = disp[i] == 0.0f ? invZero[i] : 1.0f / disp[i];
+			}
+			F<float>(fr.query, 0x60) = *reinterpret_cast<const float*>(base + kRvaAccuracy);
+			F<std::uint32_t>(fr.query, 0x6C) = 0x100;
+			F<float>(fr.query, 0x78) = 3.4028235e38f;
+			std::memcpy(fr.orient, reinterpret_cast<const void*>(body), sizeof(fr.orient));
+			if (r.yaw != 0.0f) {  // each column (local axis image) turned about world z, clockwise by yaw (FVO heading sense)
+				const float c = std::cos(r.yaw), s = std::sin(r.yaw);
+				for (int k = 0; k < 3; ++k) { const float x = fr.orient[4 * k], y = fr.orient[4 * k + 1]; fr.orient[4 * k] = x * c + y * s; fr.orient[4 * k + 1] = -x * s + y * c; }
+			}
+			InitCollector(fr.collector[0], fr.hits[0]);
+			InitCollector(fr.collector[1], fr.hits[1]);
+			LARGE_INTEGER t0, t1, fq;
+			QueryPerformanceFrequency(&fq);
+			QueryPerformanceCounter(&t0);
+			reinterpret_cast<void (*)(std::uintptr_t, void*, void*, void*, void*)>(base + kRvaCastShape)(bs, fr.query, fr.orient, fr.collector[0], fr.collector[1]);
+			QueryPerformanceCounter(&t1);
+			micros = unsigned(double(t1.QuadPart - t0.QuadPart) * 1e6 / double(fq.QuadPart));
+			const hitarray::View views[2] = { hitarray::Read(fr.collector[0], fr.hits[0]), hitarray::Read(fr.collector[1], fr.hits[1]) };
+			for (int v = 0; v < 2; ++v) {
+				for (std::uint32_t i = 0; i < views[v].count && count < max; ++i) {
+					std::uint8_t* h = views[v].data + i * 0x70;
+					const float hx = F<float>(h, 0), hy = F<float>(h, 4), hz = F<float>(h, 8);
+					if (!std::isfinite(hx) || !std::isfinite(hy) || !std::isfinite(hz)) continue;
+					const std::uint32_t bodyId = F<std::uint32_t>(h, 0x48);
+					if (bodyId == ownId || loadedarea::IsWall(bodyId)) continue;
+					auto& o = out[count++];
+					o.x = hx; o.y = hy; o.z = hz; o.bodyId = bodyId; o.layer = F<std::uint32_t>(h, 0x5C) & 0x7F; o.atStart = v == 1;
+					const float ax = F<float>(h, 0x10), ay = F<float>(h, 0x14), az = F<float>(h, 0x18), al = std::sqrt(ax * ax + ay * ay + az * az);
+					o.normalOk = std::isfinite(al) && al > 0.9f && al < 1.1f; o.nx = ax; o.ny = ay; o.nz = az;
+					o.distance = std::max(0.0f, ((hx - start[0]) * disp[0] + (hy - start[1]) * disp[1] + (hz - start[2]) * disp[2]) / dl);
+				}
+			}
+			g_hitStats.Note(views[0]); g_hitStats.Note(views[1]);
+			FreeGrown(views[0]); FreeGrown(views[1]);  // PF-1
+			return true;
+		}
+		int PathSweepGuarded(std::uintptr_t tes, const PathSweepReq* r, prefetch::SweepContact* out, int max, int* count, unsigned* micros)
+		{
+			int result = -1;
+			crash::Crumb("path sweep begin", 0);
+			__try {
+				result = PathSweepNow(tes, *r, out, max, *count, *micros) ? 1 : 0;
+			}
+			__except (CaptureFault(GetExceptionInformation())) {
+				result = -1; *count = 0;
+				++g_hitStats.droppedOnFault;
+			}
+			UnlockWorld();
+			TraceHits();
 			return result;
 		}
 
@@ -454,7 +632,7 @@ namespace vehicle_probe
 				}
 				g_sweepPending.clear();
 			}
-			if (g_sweepBackoff.Blocked() || g_rayBackoff.faults > 0 || !navmap::RaysEnabled()) return;  // (the sweep follows the rays: it starts only once a ray has gone through unharmed)
+			if (g_sweepBackoff.Blocked() || g_rayBackoff.Blocked() || !navmap::RaysEnabled()) return;  // R1: the sweep follows the rays' pause (was: off for the session after any ray fault)
 			for (const auto& [i, w] : work) {
 				prefetch::SweepHit hit;
 				const int r = CastShapeGuarded(tes, &w, &hit);
@@ -486,8 +664,10 @@ namespace vehicle_probe
 			}
 			__except (CaptureFault(GetExceptionInformation())) {
 				result = -1;
+				++g_hitStats.droppedOnFault;  // PF-1 (as the sweep's)
 			}
 			UnlockWorld();
+			TraceHits();
 			return result;
 		}
 
@@ -676,9 +856,14 @@ namespace vehicle_probe
 			const auto base = game::Base();
 			const auto tes = *reinterpret_cast<std::uintptr_t*>(base + addr::kTESPtr);
 			if (!tes) return;
-			ServiceRays(tes);
-			ServiceSweeps(tes);
-			ServiceSolid(tes);
+			static std::atomic<unsigned long long> queuedDefer{ 0 }; unsigned long long qd = queuedDefer.load();
+			const bool steady = WorldSteady("queued", qd); queuedDefer.store(qd);
+			if (!ProbeHeld() && steady && TakeCaster("queued")) {  // F-LOCK: queued work stays pending while held or busy
+				ServiceRays(tes);
+				ServiceSweeps(tes);
+				ServiceSolid(tes);
+				GiveCaster();
+			}
 			const auto ray = reinterpret_cast<float (*)(std::uintptr_t, const float*, std::uint32_t, float, float)>(base + addr::kGroundRayCast);
 			for (int i = 0; i < prefetch::kSlotCount; ++i) {
 				Probe work;
@@ -803,18 +988,69 @@ namespace vehicle_probe
 	// One ray now, on the calling (main) thread (2026-10-29 late: the route editor on the local map, which pauses the game, so the
 	// queued rays above are never serviced and new points kept a guessed height). Same query, same physics world read lock and
 	// fault guard as the queued path; refused while that path is backed off after a fault. 1 = answered, 0 = no world, -1 = fault.
+	bool RaysLive() { return !g_rayBackoff.Blocked() && navmap::RaysEnabled() && !ProbeHeld(); }  // F-LOCK: paused rays are not live (fail-safe applies)
+	static thread_local int g_lastRefusal = 0;
+	int LastRefusal() { return g_lastRefusal; }
+	const char* RefusalName(int why)
+	{
+		constexpr const char* n[]{ "answered", "backoff_after_fault", "rays_off", "no_world", "physics_world_settling", "map_procgen_hold", "caster_busy", "fault" };
+		return why >= 0 && why < RefusedKinds ? n[why] : "unknown";
+	}
+	bool GateOpen(int& why)
+	{
+		why = RefusedNone;
+		if (g_rayBackoff.Blocked() || g_directBackoff.Blocked()) { why = RefusedBackoff; return false; }
+		if (!navmap::RaysEnabled()) { why = RefusedRaysOff; return false; }
+		if (!*reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kTESPtr)) { why = RefusedNoWorld; return false; }
+		if (ProbeHeld()) { why = RefusedHeld; return false; }
+		static std::atomic<unsigned long long> gateDefer{ 0 }; unsigned long long dd = gateDefer.load();
+		const bool steady = WorldSteady("volume_gate", dd); gateDefer.store(dd);
+		if (!steady) { why = RefusedSettling; return false; }
+		return true;
+	}
 	int CastNow(const float from[3], const float to[3], std::uint64_t mask, prefetch::RayHit& out)
 	{
 		out = prefetch::RayHit{};
-		if (g_rayBackoff.Blocked() || !navmap::RaysEnabled()) return 0;
+		g_lastRefusal = RefusedNone;
+		if (g_rayBackoff.Blocked() || g_directBackoff.Blocked()) { g_lastRefusal = RefusedBackoff; return 0; }
+		if (!navmap::RaysEnabled()) { g_lastRefusal = RefusedRaysOff; return 0; }
 		const auto tes = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kTESPtr);
-		if (!tes) return 0;
+		if (!tes) { g_lastRefusal = RefusedNoWorld; return 0; }
 		RayProbe r;
 		for (int i = 0; i < 3; ++i) { r.from[i] = from[i]; r.to[i] = to[i]; }
 		r.mask = mask;
+		static std::atomic<unsigned long long> directDefer{ 0 }; unsigned long long dd = directDefer.load();
+		const bool steady = WorldSteady("direct", dd); directDefer.store(dd);
+		if (ProbeHeld()) { g_lastRefusal = RefusedHeld; return 0; }  // F-LOCK: no answer (measured nothing), never clear
+		if (!steady) { g_lastRefusal = RefusedSettling; return 0; }
+		if (!TakeCaster("direct")) { g_lastRefusal = RefusedCasterBusy; return 0; }
 		const int result = CastRayGuarded(tes, &r, &out);
-		if (result < 0) { g_rayBackoff.Fault("editor ray"); return -1; }
+		GiveCaster();
+		if (result < 0) { g_lastRefusal = RefusedFault; g_directBackoff.Fault("direct ray"); return -1; }
 		if (result == 1) for (int j = 0; j < 3; ++j) { out.from[j] = from[j]; out.to[j] = to[j]; }
+		return result;
+	}
+
+	// The vehicle's own hull swept now (main thread), every contact returned (World radar path sweep). Same gates, caster, world read lock and
+	// fault guard as CastNow; a fault backs the direct casts off like a ray fault. 1 = cast (count = contacts), 0 = not cast, -1 = fault.
+	int SweepPathNow(std::uintptr_t instance, const float offset[3], float yaw, const float disp[3], std::uint64_t mask, prefetch::SweepContact* out, int max, int& count, unsigned& micros)
+	{
+		count = 0; micros = 0;
+		g_lastRefusal = RefusedNone;
+		if (g_rayBackoff.Blocked() || g_directBackoff.Blocked() || g_sweepBackoff.Blocked()) { g_lastRefusal = RefusedBackoff; return 0; }
+		if (!navmap::RaysEnabled()) { g_lastRefusal = RefusedRaysOff; return 0; }
+		const auto tes = *reinterpret_cast<std::uintptr_t*>(game::Base() + addr::kTESPtr);
+		if (!tes || !instance) { g_lastRefusal = RefusedNoWorld; return 0; }
+		static std::atomic<unsigned long long> sweepDefer{ 0 }; unsigned long long dd = sweepDefer.load();
+		const bool steady = WorldSteady("path_sweep", dd); sweepDefer.store(dd);
+		if (ProbeHeld()) { g_lastRefusal = RefusedHeld; return 0; }
+		if (!steady) { g_lastRefusal = RefusedSettling; return 0; }
+		if (!TakeCaster("path_sweep")) { g_lastRefusal = RefusedCasterBusy; return 0; }
+		PathSweepReq r; r.instance = instance; r.yaw = yaw; r.mask = mask;
+		for (int i = 0; i < 3; ++i) { r.offset[i] = offset[i]; r.disp[i] = disp[i]; }
+		const int result = PathSweepGuarded(tes, &r, out, max, &count, &micros);
+		GiveCaster();
+		if (result < 0) { g_lastRefusal = RefusedFault; g_sweepBackoff.Fault("path sweep"); return -1; }
 		return result;
 	}
 

@@ -2,12 +2,14 @@
 #include "log.h"
 #include "cellbake.h"
 #include "sitelogic.h"
+#include "spawnfloor.h"
 #include "addresses.h"
 #include "game.h"
 #include "prefetch.h"
 #include "navmap.h"
 #include "navfield.h"
 #include "vehicleworld.h"
+#include "camera_visibility.h"
 #include <Windows.h>
 #include <algorithm>
 #include <array>
@@ -22,22 +24,34 @@ constexpr int kFlights=int(std::size(Slots));
 static_assert(kFlights==5+prefetch::kRayEnvironmentCount);
 constexpr std::uint64_t Solid=0xA5C12671Eull;
 constexpr unsigned long long kStartWindowMs=100;
+constexpr std::size_t kMaxQueries=256;
 struct Query {std::uint64_t key=0,mask=0;float from[3]={},to[3]={};prefetch::RayHit hit;unsigned long long asked=0,done=0,refused=0;bool inFlight=false;};
 std::vector<Query> queries;
 struct Flight {std::uint64_t key=0;float from[3]={},to[3]={};unsigned long long at=0;};
 std::array<Flight,kFlights> flights;
-std::uint64_t Key(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t mask){
+std::uint64_t Key(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t mask,bool camera=false){
  std::uint64_t h=owner^mask;
- for(const auto*p:{from,to})for(int i=0;i<3;++i){const auto v=std::int64_t(std::floor(p[i]*2));h^=std::uint64_t(v)+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);}
+ if(camera)h^=0xA3D139BA9C44BFD7ull;
+ for(const auto*p:{from,to})for(int i=0;i<3;++i){const auto v=std::int64_t(std::floor(p[i]*(camera?32:2)));h^=std::uint64_t(v)+0x9e3779b97f4a7c15ull+(h<<6)+(h>>2);}
  return h?h:1;
 }
 bool Same(const float a[3],const float b[3]){for(int i=0;i<3;++i)if(std::fabs(a[i]-b[i])>0.1)return false;return true;}
-bool Ray(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t mask,prefetch::RayHit&out,unsigned ttl=1000){
- const auto now=GetTickCount64(),key=Key(owner,from,to,mask);
+bool Ray(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t mask,prefetch::RayHit&out,unsigned ttl=1000,bool camera=false){
+ const auto now=GetTickCount64(),key=Key(owner,from,to,mask,camera);
  for(auto&q:queries)if(q.key==key){q.asked=now;if(q.done&&now-q.done<ttl){out=q.hit;
   logger::Observe("sensing.ray",owner,1u+unsigned(out.hit),"reason=cached_result query=%llX hit=%d age_ms=%llu layer=%u body=%08X hit_pos=%.2f,%.2f,%.2f",static_cast<unsigned long long>(key),out.hit,static_cast<unsigned long long>(now-q.done),out.layer,out.bodyId,out.x,out.y,out.z);return true;}
   logger::Observe("sensing.ray",owner,0,"reason=waiting query=%llX in_flight=%d from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f",static_cast<unsigned long long>(key),q.inFlight,from[0],from[1],from[2],to[0],to[1],to[2]);return false;}
- if(queries.size()>=256){logger::Observe("sensing.ray",owner,3,"reason=query_cache_full cached=%zu query=%llX",queries.size(),static_cast<unsigned long long>(key));return false;}
+ if(queries.size()>=kMaxQueries){
+  auto oldest=queries.end();
+  for(auto it=queries.begin();it!=queries.end();++it)
+   if(!it->inFlight&&now-it->asked>=kStartWindowMs&&(oldest==queries.end()||it->asked<oldest->asked))oldest=it;
+  if(oldest==queries.end()){
+   logger::Observe("sensing.ray",owner,3,"reason=query_cache_full cached=%zu query=%llX",queries.size(),static_cast<unsigned long long>(key));
+   return false;
+  }
+  logger::Observe("sensing.ray",owner,4,"reason=replaced_inactive_query cached=%zu idle_ms=%llu",queries.size(),now-oldest->asked);
+  queries.erase(oldest);
+ }
  Query q;q.key=key;q.mask=mask;q.asked=now;std::copy(from,from+3,q.from);std::copy(to,to+3,q.to);queries.push_back(q);return false;
 }
 world::VehicleInfo Vehicle(std::uint32_t id){
@@ -98,6 +112,14 @@ bool RayHit(const float from[3],const float to[3],double&x,double&y,double&z,boo
  hit=h.hit&&std::isfinite(h.x)&&std::isfinite(h.y)&&std::isfinite(h.z);if(hit){x=h.x;y=h.y;z=h.z;}
  return true;
 }
+bool CameraRay(std::uint32_t owner,const float from[3],const float to[3],bool& hit,double& distance){
+ prefetch::RayHit sample;
+ if(!Ray(owner,from,to,0x22806,sample,unsigned(cameravisibility::rules::rayMs),true)||
+    !Same(from,sample.from)||!Same(to,sample.to))return false;
+ hit=sample.hit;
+ distance=hit?std::hypot(double(sample.x)-from[0],double(sample.y)-from[1],double(sample.z)-from[2]):0;
+ return true;
+}
 unsigned Pending(){unsigned n=0;for(const auto&q:queries)if(!q.inFlight&&!q.done)++n;return n;}
 void Tick(){
  const auto now=GetTickCount64();
@@ -125,17 +147,27 @@ void Tick(){
   it->inFlight=true;prefetch::RequestRay(Slots[s],f.from,f.to,it->mask);
  }
 }
-static Site CheckFootprint(std::uint32_t self,const world::VehicleInfo& v,double x,double y,double z,double yaw,bool boarding){
+static Site CheckFootprint(std::uint32_t self,const world::VehicleInfo& v,double x,double y,double z,double yaw,bool boarding,bool publishFloor=true){
  Site out;if(!v.formId){out.reason="Vehicle bounds unavailable";return out;}
  const double w=std::max(double(v.half[0])+0.5,1.5),l=std::max(double(v.half[1])+0.5,2.0);
  const double rx=std::cos(yaw),ry=-std::sin(yaw),fx=std::sin(yaw),fy=std::cos(yaw);
+ auto tracePending=[&](const char* stage,int i,int j,const float* from,const float* to,std::uint64_t mask){
+#ifndef FVO_RELEASE
+  if(boarding)return;
+  const auto key=Key(self,from,to,mask);
+  const auto query=std::find_if(queries.begin(),queries.end(),[&](const Query& q){return q.key==key;});
+  const char* state=query==queries.end()?"not_queued":query->inFlight?"in_flight":query->refused?"native_refused":query->done?"cached_answer_expired":"waiting_to_start";
+  logger::Observe("spawn.support",v.formId,key,"stage=%s sample=%d,%d status=%s query=%llX site=%.2f,%.2f,%.2f from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f cached=%zu",stage,i,j,state,static_cast<unsigned long long>(key),x,y,z,from[0],from[1],from[2],to[0],to[1],to[2],queries.size());
+#endif
+ };
  std::array<double,9> heights;int index=0;bool pending=false;
  for(int j=-1;j<=1;++j)for(int i=-1;i<=1;++i){
   const float from[]={float(x+rx*w*i+fx*l*j),float(y+ry*w*i+fy*l*j),float(z+6)};
   const float to[]={from[0],from[1],float(z-120)};prefetch::RayHit hit;
-  if(!Ray(self,from,to,0x22806,hit)){pending=true;heights[index++]=0;continue;}
+  if(!Ray(self,from,to,0x22806,hit)){tracePending("floor",i,j,from,to,0x22806);pending=true;heights[index++]=0;continue;}
   if(!hit.hit||hit.layer==11||!std::isfinite(hit.z)||(hit.normalOk&&hit.nz<0.7f)){out.verdict=Verdict::Unsafe;out.reason="No dry, level support";return out;}
-  heights[index++]=hit.z;navmap::NoteGround(hit.x,hit.y,hit.z);
+  heights[index++]=hit.z;
+  if(publishFloor)navmap::NoteGround(hit.x,hit.y,hit.z);
  }
  if(pending)return out;
  if(!sitelogic::Support(heights)){out.verdict=Verdict::Unsafe;out.reason="Slope or platform edge";return out;}
@@ -145,14 +177,14 @@ static Site CheckFootprint(std::uint32_t self,const world::VehicleInfo& v,double
  for(int j=-1;j<=1;++j)for(int i=-1;i<=1;++i){
   const float from[]={float(x+rx*w*i+fx*l*j),float(y+ry*w*i+fy*l*j),float(out.ground+0.25)};
   const float to[]={from[0],from[1],float(out.ground+2.5+std::max(2.0,double(v.half[2])))};prefetch::RayHit hit;
-  if(!Ray(self,from,to,Solid,hit)){pending=true;continue;}
-  if(hit.hit&&hit.formId!=self){out.verdict=Verdict::Unsafe;out.reason="Vehicle clearance blocked";return out;}
+  if(!Ray(self,from,to,Solid,hit)){tracePending("headroom",i,j,from,to,Solid);pending=true;continue;}
+  if(hit.hit&&(!self||hit.formId!=self)){out.verdict=Verdict::Unsafe;out.reason="Vehicle clearance blocked";return out;}
   if(hit.hit&&hit.formId==self){
    // A first hit on our hull must not hide a ceiling above it.
    float above[]={from[0],from[1],float(v.pos[2]+v.half[2]+0.1)};
    if(above[2]<to[2]){
     prefetch::RayHit ceiling;
-    if(!Ray(self,above,to,Solid,ceiling)){pending=true;continue;}
+    if(!Ray(self,above,to,Solid,ceiling)){tracePending("above_body",i,j,above,to,Solid);pending=true;continue;}
     if(ceiling.hit){out.verdict=Verdict::Unsafe;out.reason="Ceiling above vehicle";return out;}
    }
   }
@@ -180,7 +212,7 @@ static Site CheckFootprint(std::uint32_t self,const world::VehicleInfo& v,double
  out.verdict=Verdict::Unsafe;out.reason="No usable boarding side";return out;
 }
 Site CheckSite(std::uint32_t self,double x,double y,double z,double yaw){return CheckFootprint(self,Vehicle(self),x,y,z,yaw,true);}
-Site SpawnSite(std::uint32_t base,double x,double y,double z,double yaw){
+Site SpawnSite(std::uint32_t base,double x,double y,double z,double yaw,bool publishFloor){
  world::VehicleInfo v{};double bottom=0;
  __try {
   const auto form=reinterpret_cast<std::uintptr_t(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(base);
@@ -193,56 +225,89 @@ Site SpawnSite(std::uint32_t base,double x,double y,double z,double yaw){
   }
   v.formId=base;
  }__except(EXCEPTION_EXECUTE_HANDLER){return {};}
- auto site=CheckFootprint(0,v,x,y,z,yaw,false);
+ auto site=CheckFootprint(0,v,x,y,z,yaw,false,publishFloor);
  // The reference origin is not necessarily the bottom of the hull.
  site.z=site.ground-bottom+0.1;return site;
 }
 Site AirSite(std::uint32_t base,double x,double y,double z,double yaw){
  Site out;out.x=x;out.y=y;out.z=z;
  double half[3]{};
+ double bottom=-1.5;  // hull bottom below the reference origin (model bounds; a mid-height guess without them)
  __try {
   const auto form=reinterpret_cast<std::uintptr_t(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(base);
   if(!form)return out;
   // A model without stored bounds (most mod vehicles) gets a generous default envelope rather than skipping the checks.
-  bool known=true;double read[3]{};
+  bool known=true;double read[3]{},lowZ=0;
   for(int i=0;i<3;++i){const double lo=*reinterpret_cast<float*>(form+0x50+i*4),hi=*reinterpret_cast<float*>(form+0x5C+i*4);
    if(!std::isfinite(lo)||!std::isfinite(hi)||hi<=lo||hi-lo>40||std::max(std::fabs(lo),std::fabs(hi))>40){known=false;break;}
-   read[i]=std::max(std::fabs(lo),std::fabs(hi))+2;
+   read[i]=std::max(std::fabs(lo),std::fabs(hi))+2;if(i==2)lowZ=lo;
   }
   const double fallback[3]={4.5,6.0,3.5};
   for(int i=0;i<3;++i)half[i]=known?read[i]:fallback[i];
+  if(known)bottom=lowZ;
  }__except(EXCEPTION_EXECUTE_HANDLER){return out;}
  // Ground guard (2026-10-29 late, the user: "guards that don't accept spawns like that"): 43 traffic vehicles were placed
  // 50-130 m underground on routes drawn below the terrain; with nothing mapped there the envelope test passed them, and many
  // fell through the world. The terrain there (the cell's baked grid, else the nav map's top surface) must be below the hull;
  // with neither known, the authored lane height is trusted.
+ // 2026-11-01 fix (road-level lanes): the guard used the whole envelope plus margin, so a lane
+ // point a metre over a road could never pass and road traffic was never placed near the player.
+ // Now only a hull whose real bottom is over 0.5 m underground is refused, and the envelope is
+ // tested from just above the ground.
+ double floorZ=z-half[2];
  {
   double ground=0;bool known=cellbake::Ground(x,y,ground)&&std::isfinite(ground);
   if(!known){const auto top=navmap::At(x,y,z+1000);if(top.haveGround&&std::isfinite(top.ground)){ground=top.ground;known=true;}}
-  if(known&&z-half[2]<ground+1){out.verdict=Verdict::Unsafe;out.reason="Spawn spot is under the ground";out.ground=ground;return out;}
+  if(known)out.ground=ground;
+  if(spawnfloor::Check(z,bottom,half[2],known,ground,floorZ)<0){out.verdict=Verdict::Unsafe;out.reason="Spawn spot is under the ground";return out;}
   // Unknown ground is not refused (2026-10-29 23:01 run: New Atlantis lanes at -100 m, ~60 m over its -160 m ground, were all
   // deferred by a 0 floor while the ground was still unloaded). The vehicle stays frozen until its pilot holds it.
  }
  bool pending=false;
+ // Road-level spot (2026-11-05: 64 spots on Roadrunner's deck refused, "flight envelope intersects mapped solid"): the hull sits on a
+ // measured surface. The flight margins (2 m every side, the envelope reaching into the road) do not apply: the footprint is the
+ // car plus 0.4 m, a solid counts only where a measured ray hit lies inside it (a 4 m map cell is too coarse for a railing),
+ // collision object boxes are left out (on roads they are whole deck pieces, as the drive map treats them), and the rays start
+ // just above the road. Spots in the air keep the full flight envelope.
+ double roadGround=0;bool roadLevel=false;
+ // The road under the spot, measured by one short ray straight down from just over the hull bottom (2026-11-05 06:04 run: the
+ // nav map keeps the highest surface, so on a stacked road it gave the upper deck and no lower-deck spot ever read as road level).
+ bool downPending=false;
+ {const double hull=z+bottom;const float from[]={float(x),float(y),float(hull+1.0)},to[]={float(x),float(y),float(hull-2.5)};prefetch::RayHit down;
+  if(!Ray(0,from,to,Solid,down))downPending=true;
+  else if(down.hit&&std::isfinite(down.z)&&hull-down.z>=-0.6){roadGround=down.z;roadLevel=true;}}
+ if(!roadLevel){const auto centre=navmap::At(x,y,z);const double hull=z+bottom;
+  if(centre.haveGround&&std::isfinite(centre.ground)&&hull-centre.ground>=-0.6&&hull-centre.ground<=2.5){roadGround=centre.ground;roadLevel=true;}
+  else if(out.ground!=0&&hull-out.ground>=-0.6&&hull-out.ground<=2.5){roadGround=out.ground;roadLevel=true;}}
+ // The down ray is answered a frame or two later (2026-11-05 06:14 run: judged at once as a flight spot, refused, raised 0.5 m: a new
+ // ray each time, so no road spot ever passed). Wait for it; the caller keeps the spot (behind the loading screen, where rays are
+ // not answered, the nav map's answer above stands).
+ if(downPending&&!roadLevel&&g_raysAnswered)return out;
+ if(roadLevel){for(int i=0;i<2;++i)half[i]=std::max(0.8,half[i]-1.6);floorZ=std::max(floorZ,roadGround+0.6);}
  // Check the envelope, including its interior, with vertical and horizontal
  // cross-sections. This is admission at authored flight height, not ground support.
  const double rx=std::cos(yaw),ry=-std::sin(yaw),fx=std::sin(yaw),fy=std::cos(yaw);
  for(int j=-1;j<=1;++j)for(int i=-1;i<=1;++i){
   const double px=x+rx*half[0]*i+fx*half[1]*j,py=y+ry*half[0]*i+fy*half[1]*j;
-  const float a[]={float(px),float(py),float(z-half[2])},b[]={float(px),float(py),float(z+half[2])};prefetch::RayHit hit;
+  const float a[]={float(px),float(py),float(floorZ)},b[]={float(px),float(py),float(z+half[2])};prefetch::RayHit hit;
   const auto mapped=navmap::At(px,py,z);
-  if(mapped.blocked||mapped.objBlocked||(mapped.haveGround&&mapped.ground>=z-half[2])){out.verdict=Verdict::Unsafe;out.reason="Flight envelope intersects mapped solid";return out;}
+  // Road-level spots allow 0.5 m of uneven ground under the footprint's corners.
+  if(roadLevel){double hz=0;
+   if(mapped.blocked&&navmap::HitNear(px,py,roadGround+0.6,z+half[2],0.4,&hz)){out.verdict=Verdict::Unsafe;out.reason="Road spot: a measured solid inside the car's footprint";return out;}
+   if(mapped.haveGround&&mapped.ground>roadGround+1.0){out.verdict=Verdict::Unsafe;out.reason="Road spot: the surface rises under the car's footprint";return out;}
+  }
+  else if(mapped.blocked||mapped.objBlocked||(mapped.haveGround&&mapped.ground>=floorZ+(floorZ>z-half[2]?0.5:0.0))){out.verdict=Verdict::Unsafe;out.reason="Flight envelope intersects mapped solid";return out;}
   if(!Ray(0,a,b,Solid,hit)){pending=true;continue;}
   if(hit.hit){out.verdict=Verdict::Unsafe;out.reason="Flight envelope intersects collision";return out;}
  }
  for(int k=-1;k<=1;++k)for(int j=-1;j<=1;++j){
-  const float a[]={float(x-rx*half[0]+fx*half[1]*j),float(y-ry*half[0]+fy*half[1]*j),float(z+k*half[2])};
+  const float a[]={float(x-rx*half[0]+fx*half[1]*j),float(y-ry*half[0]+fy*half[1]*j),float(k<0?std::max(z-half[2],floorZ+0.3):z+k*half[2])};
   const float b[]={float(x+rx*half[0]+fx*half[1]*j),float(y+ry*half[0]+fy*half[1]*j),a[2]};prefetch::RayHit hit;
   if(!Ray(0,a,b,Solid,hit)){pending=true;continue;}
   if(hit.hit){out.verdict=Verdict::Unsafe;out.reason="Flight envelope cross-section blocked";return out;}
  }
  if(pending)return out;
- out.verdict=Verdict::Safe;out.reason="Validated flight envelope";return out;
+ out.verdict=Verdict::Safe;out.reason=roadLevel?"Validated road spot":"Validated flight envelope";return out;
 }
 Site MappedSite(std::uint32_t base,double x,double y,double z,double yaw){
  Site out;out.x=x;out.y=y;out.z=z;

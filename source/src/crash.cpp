@@ -3,10 +3,12 @@
 #include "fvopaths.h"
 #include "log.h"
 #include "stallcapture.h"
+#include "dumpkeep.h"
 
 #include <Windows.h>
 #include <DbgHelp.h>
 #include <TlHelp32.h>
+#include <Psapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -33,6 +35,60 @@ namespace crash
 		constexpr unsigned kActions = 48;
 		ActionEntry g_actions[kActions];
 		std::atomic<unsigned> g_actionNext{ 0 };
+		// CR-1 (2026-11-08): per-thread last FVO activity, kept outside the small global rings so a worker thread's last touched object/action
+		// is never drowned out by ray lock crumbs or other threads.
+		struct ThreadSlot {
+			std::atomic<DWORD> thread{ 0 };
+			const char* crumbWhat = nullptr; int crumbArg = 0; ULONGLONG crumbAt = 0;
+			const char* objWhat = nullptr; unsigned objId = 0; ULONGLONG objAt = 0;
+			char actionWhat[28] = {}; unsigned actionId = 0; ULONGLONG actionAt = 0;
+		};
+		constexpr unsigned kThreadSlots = 64;
+		ThreadSlot g_threadSlots[kThreadSlots];
+		ThreadSlot* SlotForThread(DWORD tid)
+		{
+			const unsigned start = (tid * 2654435761u) % kThreadSlots;
+			for (unsigned p = 0; p < kThreadSlots; ++p) {
+				ThreadSlot& s = g_threadSlots[(start + p) % kThreadSlots];
+				DWORD cur = s.thread.load(std::memory_order_relaxed);
+				if (cur == tid) return &s;
+				if (cur == 0 && s.thread.compare_exchange_strong(cur, tid, std::memory_order_relaxed)) return &s;
+				if (cur == tid) return &s;
+			}
+			return nullptr;
+		}
+		bool GuardedReadU64(std::uintptr_t addr, std::uint64_t& out)
+		{
+			if (addr < 0x10000 || addr > 0x00007FFFFFFFFFFFull) return false;
+			__try { out = *reinterpret_cast<const volatile std::uint64_t*>(addr); return true; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		bool GuardedReadU32(std::uintptr_t addr, std::uint32_t& out)
+		{
+			if (addr < 0x10000 || addr > 0x00007FFFFFFFFFFFull) return false;
+			__try { out = *reinterpret_cast<const volatile std::uint32_t*>(addr); return true; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		bool GuardedReadU8(std::uintptr_t addr, std::uint8_t& out)
+		{
+			if (addr < 0x10000 || addr > 0x00007FFFFFFFFFFFull) return false;
+			__try { out = *reinterpret_cast<const volatile std::uint8_t*>(addr); return true; }
+			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		const char* MatchActionId(unsigned id, ULONGLONG now, long long& ageMs)
+		{
+			if (!id || id == 0xFFFFFFFFu) return nullptr;
+			for (unsigned k = 0; k < kActions; ++k) {
+				const ActionEntry& e = g_actions[k];
+				if (e.at && e.id == id) { ageMs = static_cast<long long>(now - e.at); return e.what; }
+			}
+			for (unsigned k = 0; k < kThreadSlots; ++k) {
+				const ThreadSlot& s = g_threadSlots[k];
+				if (s.actionAt && s.actionId == id) { ageMs = static_cast<long long>(now - s.actionAt); return s.actionWhat; }
+				if (s.objAt && s.objId == id) { ageMs = static_cast<long long>(now - s.objAt); return s.objWhat; }
+			}
+			return nullptr;
+		}
 		void LogActions()
 		{
 			const ULONGLONG now = GetTickCount64();
@@ -42,6 +98,19 @@ namespace crash
 				const ActionEntry& e = g_actions[(next + k) % kActions];
 				if (!e.at) continue;
 				logger::WriteUnlocked("    -%llu ms  thread %lu  %.27s %08X", now - e.at, e.thread, e.what, e.id);
+			}
+			const DWORD faultTid = GetCurrentThreadId();
+			logger::WriteUnlocked("  per-thread last FVO activity (faulting thread = %lu):", faultTid);
+			for (unsigned k = 0; k < kThreadSlots; ++k) {
+				const ThreadSlot& s = g_threadSlots[k];
+				const DWORD tid = s.thread.load(std::memory_order_relaxed);
+				if (!tid || (tid != faultTid && !s.actionAt && !s.objAt)) continue;
+				logger::WriteUnlocked("    %sthread %lu: action=\"%.27s %08X\" (-%lld ms) obj_crumb=\"%s %08X\" (-%lld ms) last_crumb=\"%s %d\" (-%lld ms)",
+					tid == faultTid ? "* " : "  ", tid,
+					s.actionAt ? s.actionWhat : "-", s.actionId, s.actionAt ? static_cast<long long>(now - s.actionAt) : -1LL,
+					s.objWhat ? s.objWhat : "-", s.objId, s.objAt ? static_cast<long long>(now - s.objAt) : -1LL,
+					s.crumbWhat ? s.crumbWhat : "-", s.crumbArg, s.crumbAt ? static_cast<long long>(now - s.crumbAt) : -1LL);
+			// end per-thread activity
 			}
 		}
 
@@ -126,6 +195,34 @@ namespace crash
 			return ok != FALSE;
 		}
 
+		// One line per address (16 at most per run) plus a short stack: no lock, no allocation (exception context).
+		void OwnFaultOutsideGameplay(EXCEPTION_POINTERS* info)
+		{
+			static std::atomic<std::uintptr_t> seen[16]{};
+			static std::atomic<int> count{ 0 };
+			const auto* rec = info->ExceptionRecord;
+			const auto addr = reinterpret_cast<std::uintptr_t>(rec->ExceptionAddress);
+			for (auto& s : seen) if (s.load(std::memory_order_relaxed) == addr) return;
+			const int k = count.fetch_add(1, std::memory_order_relaxed);
+			if (k >= 16) return;
+			seen[k].store(addr, std::memory_order_relaxed);
+			char where[160];
+			Describe(reinterpret_cast<DWORD64>(rec->ExceptionAddress), where, sizeof(where));
+			logger::WriteUnlocked("Load trace: fault inside FVO outside gameplay at %s (thread %lu), %s address 0x%llX; FVO's own guard may handle it",
+				where, GetCurrentThreadId(), rec->NumberParameters >= 2 ? (rec->ExceptionInformation[0] == 1 ? "write" : "read") : "?",
+				static_cast<unsigned long long>(rec->NumberParameters >= 2 ? rec->ExceptionInformation[1] : 0));
+			CONTEXT ctx = *info->ContextRecord;
+			for (int frame = 0; frame < 10 && ctx.Rip; ++frame) {
+				char fn[160];
+				Describe(ctx.Rip, fn, sizeof(fn));
+				logger::WriteUnlocked("  #%02d %s", frame, fn);
+				DWORD64 imageBase = 0;
+				auto* entry = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+				if (!entry) { ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp); ctx.Rsp += 8; continue; }
+				void* handlerData = nullptr; DWORD64 establisher = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, entry, &ctx, &handlerData, &establisher, nullptr);
+			}
+		}
 		// Thread stacks and modules only, a few MB: fast enough to take during a hitch, where a full dump would make it longer.
 		bool WriteStallDump(const std::wstring& path, DWORD& error)
 		{
@@ -210,6 +307,9 @@ namespace crash
 			GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 				reinterpret_cast<LPCSTR>(rec->ExceptionAddress), &faulting);
 			if (faulting == g_self && rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+				// 2026-11-15 load trace (crash loading a save from a running game, nothing logged): outside gameplay (a save
+				// loading, the loading screen, the main menu) a fault inside this DLL is named once per address, with its stack.
+				if (!g_gameplay.load(std::memory_order_relaxed) && !t_unhandled) OwnFaultOutsideGameplay(info);
 				return EXCEPTION_CONTINUE_SEARCH;
 			}
 			// The same goes for the other plugins of this mod set (each guards its own reads and ignores its own faults above): two of them in one game must not report each
@@ -279,6 +379,87 @@ namespace crash
 			}
 
 			LogActions();
+			// CR-1 (2026-11-08): safely inspect registers and their first 0x90 bytes (18 qwords) for Starfield.exe vtable objects,
+			// TESForm/Actor/REFR form IDs (+0x38, type +0x2E, base +0x98), and matches against FVO's recent engine actions.
+			{
+				const bool prevExpected = t_expected;
+				t_expected = true;
+				const ULONGLONG now = GetTickCount64();
+				std::uintptr_t gameBase = g_gameBase, gameEnd = 0;
+				if (!gameBase) gameBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleA(nullptr));
+				if (gameBase) {
+					std::uint32_t peOff = 0, imgSize = 0;
+					if (GuardedReadU32(gameBase + 0x3C, peOff) && peOff < 0x1000 && GuardedReadU32(gameBase + peOff + 0x50, imgSize) && imgSize > 0)
+						gameEnd = gameBase + imgSize;
+				}
+				auto describePtr = [&](std::uintptr_t p, char* buf, size_t cap) -> bool {
+					std::uint64_t vt = 0;
+					if ((p & 7) != 0 || !GuardedReadU64(p, vt)) return false;
+					if (!gameBase || !gameEnd || vt < gameBase || vt >= gameEnd) return false;
+					std::uint8_t fType = 0; std::uint32_t fId = 0, baseId = 0; std::uint8_t baseType = 0;
+					GuardedReadU8(p + 0x2E, fType);
+					GuardedReadU32(p + 0x38, fId);
+					std::uint64_t basePtr = 0;
+					if (GuardedReadU64(p + 0x98, basePtr) && (basePtr & 7) == 0) {
+						std::uint64_t bvt = 0;
+						if (GuardedReadU64(basePtr, bvt) && bvt >= gameBase && bvt < gameEnd) {
+							GuardedReadU32(basePtr + 0x38, baseId);
+							GuardedReadU8(basePtr + 0x2E, baseType);
+						}
+					}
+					long long actAge = -1;
+					const char* actWhat = MatchActionId(fId, now, actAge);
+					if (!actWhat && baseId) actWhat = MatchActionId(baseId, now, actAge);
+					const bool looksForm = fId != 0 && fId != 0xFFFFFFFFu && fType > 0 && fType < 170 &&
+						((fId >> 24) == 0xFF || (fId >> 24) == 0xFE || (fId >> 24) == 0xFD || (fId >> 24) <= 0x20 || actWhat != nullptr);
+					if (looksForm) {
+						std::snprintf(buf, cap, "vt=Starfield.exe+0x%llX form=%08X type=%u base=%08X base_type=%u fvo_match=%s(%lldms)",
+							static_cast<unsigned long long>(vt - gameBase), fId, unsigned(fType), baseId, unsigned(baseType),
+							actWhat ? actWhat : "-", actAge);
+					} else {
+						std::snprintf(buf, cap, "vt=Starfield.exe+0x%llX q38=%08X", static_cast<unsigned long long>(vt - gameBase), fId);
+					}
+					return true;
+				};
+				struct RegItem { const char* name; std::uintptr_t val; bool dumpRecord; };
+				const RegItem regs[] = {
+					{ "rax", c->Rax, false }, { "rbx", c->Rbx, true }, { "rcx", c->Rcx, false }, { "rdx", c->Rdx, false },
+					{ "rsi", c->Rsi, true },  { "rdi", c->Rdi, true }, { "rbp", c->Rbp, false },
+					{ "r8",  c->R8,  false }, { "r9",  c->R9,  false }, { "r10", c->R10, false }, { "r11", c->R11, false },
+					{ "r12", c->R12, false }, { "r13", c->R13, false }, { "r14", c->R14, true },  { "r15", c->R15, false }
+				};
+				logger::WriteUnlocked("  register objects and record inspection (0x90-byte scan):");
+				for (const auto& r : regs) {
+					std::uint64_t firstQ = 0;
+					if (!GuardedReadU64(r.val, firstQ)) continue;
+					char desc[200] = {};
+					if (describePtr(r.val, desc, sizeof desc)) {
+						logger::WriteUnlocked("    %s=%llX -> %s", r.name, static_cast<unsigned long long>(r.val), desc);
+					}
+					char recLine[512] = {}; int rw = 0;
+					for (unsigned off = 0; off < 0x90; off += 8) {
+						std::uint64_t q = 0;
+						if (!GuardedReadU64(r.val + off, q)) break;
+						if (r.dumpRecord && q != 0 && rw < static_cast<int>(sizeof recLine) - 32) {
+							rw += std::snprintf(recLine + rw, sizeof recLine - rw, "%s+%02X=%llX", rw ? " " : "", off, static_cast<unsigned long long>(q));
+						}
+						char sub[200] = {};
+						if (describePtr(static_cast<std::uintptr_t>(q), sub, sizeof sub)) {
+							logger::WriteUnlocked("    %s+0x%02X -> %llX (%s)", r.name, off, static_cast<unsigned long long>(q), sub);
+						} else {
+							const unsigned lo = static_cast<unsigned>(q & 0xFFFFFFFFull);
+							long long actAge = -1;
+							if (const char* actWhat = MatchActionId(lo, now, actAge)) {
+								logger::WriteUnlocked("    %s+0x%02X has formId %08X matching FVO action \"%s\" (-%lld ms)", r.name, off, lo, actWhat, actAge);
+							}
+						}
+					}
+					if (r.dumpRecord && rw > 0) {
+						logger::WriteUnlocked("    %s[0..0x88]: %s", r.name, recLine);
+					}
+				}
+				t_expected = prevExpected;
+			}
 			// Unwind the faulting thread's stack.
 			CONTEXT ctx = *c;
 			for (int frame = 0; frame < 24 && ctx.Rip; ++frame) {
@@ -332,15 +513,31 @@ namespace crash
 
 	void Crumb(const char* what, int arg)
 	{
+		// crumb slot
+		const DWORD tid = GetCurrentThreadId();
+		const ULONGLONG now = GetTickCount64();
+		// crumb slot
 		const unsigned i = g_crumbNext.fetch_add(1) % kCrumbs;
-		g_crumbs[i] = { what, arg, GetCurrentThreadId(), GetTickCount64() };
+		g_crumbs[i] = { what, arg, tid, now };
+		if (ThreadSlot* s = SlotForThread(tid)) {
+			s->crumbWhat = what; s->crumbArg = arg; s->crumbAt = now;
+			const unsigned u = static_cast<unsigned>(arg);
+			if (u != 0 && (u & 0xFFFF0000u) != 0) { s->objWhat = what; s->objId = u; s->objAt = now; }
+		}
 	}
 	void Action(const char* what, unsigned id)
 	{
 		ActionEntry& e = g_actions[g_actionNext.fetch_add(1) % kActions];
 		std::strncpy(e.what, what ? what : "?", sizeof e.what - 1);
 		e.what[sizeof e.what - 1] = 0;
-		e.id = id; e.thread = GetCurrentThreadId(); e.at = GetTickCount64();
+		const DWORD tid = GetCurrentThreadId();
+		const ULONGLONG now = GetTickCount64();
+		e.id = id; e.thread = tid; e.at = now;
+		if (ThreadSlot* s = SlotForThread(tid)) {
+			std::strncpy(s->actionWhat, e.what, sizeof s->actionWhat - 1);
+			s->actionWhat[sizeof s->actionWhat - 1] = 0;
+			s->actionId = id; s->actionAt = now;
+		}
 	}
 
 	namespace
@@ -446,6 +643,14 @@ namespace crash
 						ResumeThread(thread);
 					}
 					CloseHandle(thread);
+					if (pass == 0) {  // PF-2: a thread in the game allocator's endless out-of-memory retry (13:11 freeze: the broadphase rebuild sat there)
+						const char* where = c.Rip >= gameBase ? dumpkeep::AllocatorSpinAt(c.Rip - gameBase) : nullptr;
+						bool retrying = false;
+						for (std::size_t i = 0; i < n && !retrying; ++i) retrying = words[i] == gameBase + dumpkeep::kRetryReturn;
+						if (where || retrying)
+							logger::WriteUnlocked("OBS system=freeze.alloc event=spinning thread=%lu at=%s rip=%llX r12=%llX retry_frame_on_stack=%d reason=game_heap_out_of_memory_retry",
+								ids[t], where ? where : "callee of the retry loop", static_cast<unsigned long long>(c.Rip - gameBase + 0x140000000ull), static_cast<unsigned long long>(c.R12), int(retrying));
+					}
 					if (c.Rip >= gameBase + kRvaLockSpin && c.Rip < gameBase + kRvaLockSpin + kLockSpinSize) {
 						Found f{ ids[t], c.Rdi, 0, 0, 0, 0, true };
 						ReadU32(c.Rdi + 0x208, f.state); ReadU32(c.Rdi + 0x210, f.readers); ReadU32(c.Rdi + 0x214, f.waiting); ReadU32(c.Rdi + 0x230, f.owner);
@@ -472,6 +677,35 @@ namespace crash
 			for (unsigned i = 0; i < count; ++i)
 				logger::WriteUnlocked("OBS system=freeze.locks event=%s thread=%lu lock=%llX state=%X readers=%X waiting=%X owner=%u", found[i].spin ? "spinning" : "waiting", found[i].tid, static_cast<unsigned long long>(found[i].lock), found[i].state, found[i].readers, found[i].waiting, found[i].owner);
 		}
+		// PF-2: a dated copy of each dump, the newest dumpkeep::kKeep* kept, so the next run (or a false alarm) cannot overwrite the evidence.
+		void KeepCopy(const std::wstring& source, const wchar_t* kind, int keep, bool foreground)
+		{
+			const auto slash = source.find_last_of(L"\\/");
+			const std::wstring dir = slash == std::wstring::npos ? std::wstring() : source.substr(0, slash + 1);
+			SYSTEMTIME st{}; GetLocalTime(&st);
+			const std::wstring name = dumpkeep::Name(kind, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, foreground);
+			const BOOL copied = CopyFileW(source.c_str(), (dir + name).c_str(), FALSE);
+			std::vector<std::wstring> names;
+			WIN32_FIND_DATAW fd{};
+			if (const HANDLE find = FindFirstFileW((dir + kind + L"-*.dmp").c_str(), &fd); find != INVALID_HANDLE_VALUE) {
+				do names.push_back(fd.cFileName); while (FindNextFileW(find, &fd));
+				FindClose(find);
+			}
+			int deleted = 0;
+			for (const auto& old : dumpkeep::ToDelete(names, kind, keep)) deleted += DeleteFileW((dir + old).c_str()) ? 1 : 0;
+			char narrow[64] = {}; for (std::size_t i = 0; i < name.size() && i + 1 < sizeof narrow; ++i) narrow[i] = char(name[i]);
+			logger::WriteUnlocked("OBS system=freeze.keep event=%s file=%s kept_max=%d deleted=%d error=%lu", copied ? "copied" : "copy_failed", narrow, keep, deleted, copied ? 0ul : GetLastError());
+		}
+		// PF-2: the process's memory every 10 s, so heap growth over a run shows (13:11: the game heap ran dry while Windows had room).
+		void TraceMemory()
+		{
+			PROCESS_MEMORY_COUNTERS_EX pm{}; pm.cb = sizeof pm;
+			MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms;
+			if (!K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pm), sizeof pm) || !GlobalMemoryStatusEx(&ms)) return;
+			constexpr double mb = 1024.0 * 1024.0;
+			logger::WriteUnlocked("OBS system=freeze.memory private_mb=%.0f peak_commit_mb=%.0f working_mb=%.0f peak_working_mb=%.0f system_free_ram_mb=%.0f system_free_commit_mb=%.0f",
+				pm.PrivateUsage / mb, pm.PeakPagefileUsage / mb, pm.WorkingSetSize / mb, pm.PeakWorkingSetSize / mb, ms.ullAvailPhys / mb, ms.ullAvailPageFile / mb);
+		}
 		DWORD WINAPI FreezeWatch(void*)
 		{
 			static std::uintptr_t stack[0x1000];
@@ -487,7 +721,7 @@ namespace crash
 			stallcapture::Policy stall;
 			ULONGLONG watchAt=0,healthAt=0,recoveryReported=0;
 			stallcapture::Gate previousGate=stallcapture::Gate::NoBeat;
-			ULONGLONG dumpTriedAt = 0, runWrittenAt = 0;
+			ULONGLONG dumpTriedAt = 0, runWrittenAt = 0, memoryAt = 0;
 			for (;;) {
 				Sleep(1000);
 				const ULONGLONG beat = g_beatAt.load(std::memory_order_relaxed);
@@ -505,7 +739,7 @@ namespace crash
 						const bool written = WriteStallDump(path, error);
 						stall.Result(now,beat,written);
 						logger::WriteUnlocked("Freeze recorder: stall %llu ms into a hitch in play: stack dump %u of 3 %s in %llu ms (last-stall-%u.dmp); error %lu; attempt %u successes %u", now - beat, index, written ? "written" : "FAILED", GetTickCount64() - at, index, error,stall.attempts,stall.successes);
-						if(written)LogLocks(gameBase);
+						if(written){LogLocks(gameBase);KeepCopy(path,L"stall",dumpkeep::kKeepStall,foreground);}
 				}
 				const auto recovered=g_recoveredBeat.load(std::memory_order_acquire);
 				if(recovered&&recovered!=recoveryReported){recoveryReported=recovered;
@@ -515,12 +749,14 @@ namespace crash
 				previousGate=gate;watchAt=now;
 				// Cloud-folder state writes cannot postpone the three-second capture check.
 				if (now - runWrittenAt >= 5000) { runWrittenAt = now; WriteRunState(); }
+				if (now - memoryAt >= 10000) { memoryAt = now; TraceMemory(); }  // PF-2
 				if (beat && !hangDumped && dumpAttempts < 3 && now - beat >= g_hangDelay && (!dumpTriedAt || now - dumpTriedAt >= 10000)) {
 					dumpTriedAt = now; ++dumpAttempts;
 					if (dumpAttempts == 1) { LogLocks(gameBase); LogActions(); }
 					DWORD error = 0;
 					hangDumped = WriteHangDump(g_hangPath, error);
 					logger::WriteUnlocked("Freeze recorder: all-thread hang dump %s (last-hang.dmp next to settings.ini); error %lu, attempt %u/3", hangDumped ? "written" : "FAILED", error, dumpAttempts);
+					if (hangDumped) KeepCopy(g_hangPath, L"hang", dumpkeep::kKeepHang, foreground);  // PF-2
 				}
 				if (!beat || !id || beat == toldFor || GetTickCount64() - beat < 6000 || lines >= 12) continue;
 				toldFor = beat; ++lines;

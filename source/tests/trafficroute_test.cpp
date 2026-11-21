@@ -1,6 +1,7 @@
 #include "trafficroute.h"
 #include "trafficcycle.h"
 #include <cstdio>
+#include <cmath>
 
 static int g_fail = 0;
 static void Check(bool ok, const char* what) { if (!ok) { ++g_fail; std::printf("FAIL %s\n", what); } }
@@ -124,6 +125,30 @@ int main()
         const auto loop=Build(r);Vec position{0,0,0};Trip trip=StartLap(loop,0,position);
         const int completed=Fly(loop,trip,position,10,8000);if(completed<0)std::printf("rounded debug: p %.2f %.2f %.2f leg %d u %.3f travelled %.3f span %.3f target %.3f\n",position.x,position.y,position.z,int(trip.leg),trip.lastU,trip.travelled,loop.Span(),trip.targetU);
         Check(completed>0,"rounded dense loop makes full lap progress instead of rejecting jumps of three sample indices");
+    }
+    {   // LB-1 (2026-11-12): a lane wider than a corner can hold never folds back. A hairpin of short segments (each 2 m, turning 30 deg) with
+        // lanes 10 m apart: the inside lane would loop; after the build every lane step runs with the spine (within 60 deg) and the cut is recorded.
+        trafficdata::Route r; r.name = "lb1_hairpin"; r.ring = false; r.closed = false; r.lanes = 2; r.width = 20;
+        double x = 0, y = 0, yaw = 0; r.points.push_back({x, y, 0});
+        for (int i = 0; i < 6; ++i) { y += 10; r.points.push_back({x, y, 0}); }
+        for (int i = 0; i < 6; ++i) { yaw += 3.14159265358979 / 6; x += 2 * std::sin(yaw); y += 2 * std::cos(yaw); r.points.push_back({x, y, 0}); }
+        for (int i = 0; i < 6; ++i) { x += 10 * std::sin(yaw); y += 10 * std::cos(yaw); r.points.push_back({x, y, 0}); }
+        const auto l = Build(r);
+        Check(!l.error, "LB-1: the hairpin builds");
+        int against = 0;
+        for (int lane = 0; lane < 2; ++lane) for (int i = 0; i + 1 < l.Count(); ++i) {
+            const auto& L = l.lane[lane]; const double lx = L[i + 1].x - L[i].x, ly = L[i + 1].y - L[i].y;
+            const double sx = r.points.size() > 1 ? 0 : 0; (void)sx;
+            if (std::hypot(lx, ly) < 1e-6) continue;
+            if (i > 0) { const double px = L[i].x - L[i - 1].x, py = L[i].y - L[i - 1].y; const double pl = std::hypot(px, py), cl = std::hypot(lx, ly);
+                if (pl > 1e-6 && (px * lx + py * ly) / (pl * cl) < -.5) ++against; } }
+        std::printf("  LB-1 hairpin: %d stations, %zu cuts recorded, %d lane steps turning back\n", l.Count(), l.squeezed.size(), against);
+        Check(against == 0, "LB-1: no lane step turns back on the one before it (no fold) at a hairpin tighter than the lanes are wide");
+        Check(!l.squeezed.empty(), "LB-1: the cut is recorded for the editor (F7 lists it)");
+        trafficdata::Route straight; straight.name = "lb1_straight"; straight.ring = false; straight.closed = false; straight.lanes = 2; straight.width = 20;
+        for (int i = 0; i < 8; ++i) straight.points.push_back({0, i * 10.0, 0});
+        const auto ls = Build(straight);
+        Check(!ls.error && ls.squeezed.empty() && std::fabs(ls.lane[0][3].x - 10) < 1e-9 && std::fabs(ls.lane[1][3].x + 10) < 1e-9, "LB-1: a straight road keeps its lanes exactly where they were");
     }
     std::printf("%s: %d failure(s)\n", g_fail ? "FAILED" : "OK", g_fail);
     return g_fail ? 1 : 0;

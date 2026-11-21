@@ -75,24 +75,78 @@ inline const char* Glyph(char c)
     default: return "";  // space and anything unknown: a gap
     }
 }
+// The Future face (2026-11-11, user: "change font ... make it something more futuristic and nice"): squared letters with
+// cut corners, straight sides and open counters, on a half-unit grid of 8 x 12 (hex digits 0-9, a-c), drawn in the same
+// 4 x 6 cell as Classic. Characters it does not define fall back to the Classic glyph. The F7 editor draws this face.
+inline const char* FutureGlyph(char c)
+{
+    switch (std::toupper(static_cast<unsigned char>(c))) {
+    case 'A': return "0c 04 22 62 84 8c|07 87";
+    case 'B': return "06 66 84 82 60 00 0c 6c 8a 88 66";
+    case 'C': return "80 20 02 0a 2c 8c";
+    case 'D': return "00 60 82 8a 6c 0c 00";
+    case 'E': return "80 00 0c 8c|06 56";
+    case 'F': return "80 00 0c|06 56";
+    case 'G': return "80 20 02 0a 2c 6c 8a 87 47";
+    case 'H': return "00 0c|80 8c|06 86";
+    case 'I': return "20 60|40 4c|2c 6c";
+    case 'J': return "80 8a 6c 2c 0a 08";
+    case 'K': return "00 0c|06 36 80|36 8c";
+    case 'L': return "00 0c 8c";
+    case 'M': return "0c 00 20 46 60 80 8c";
+    case 'N': return "0c 00 20 8c 80";
+    case 'O': return "20 60 82 8a 6c 2c 0a 02 20";
+    case 'P': return "0c 00 60 82 84 66 06";
+    case 'Q': return "20 60 82 8a 6c 2c 0a 02 20|59 8c";
+    case 'R': return "0c 00 60 82 84 66 06|46 8c";
+    case 'S': return "80 20 02 04 26 66 88 8a 6c 0c";
+    case 'T': return "00 80|40 4c";
+    case 'U': return "00 0a 2c 6c 8a 80";
+    case 'V': return "00 06 4c 86 80";
+    case 'W': return "00 0c 2c 46 6c 8c 80";
+    case 'X': return "00 06 8c|80 86 0c";
+    case 'Y': return "00 04 46 84 80|46 4c";
+    case 'Z': return "00 80 0c 8c";
+    case '0': return "20 60 82 8a 6c 2c 0a 02 20|28 64";
+    case '1': return "22 40 4c|2c 6c";
+    case '2': return "00 60 82 84 66 26 08 0c 8c";
+    case '3': return "00 60 82 84 66 26|66 88 8a 6c 0c";
+    case '4': return "00 06 86|64 6c";
+    case '5': return "80 00 06 66 88 8a 6c 0c";
+    case '6': return "60 20 02 0a 2c 6c 8a 88 66 06";
+    case '7': return "00 80 82 3c";
+    case '8': return "20 60 82 84 66 26 04 02 20|26 08 0a 2c 6c 8a 88 66";
+    case '9': return "86 26 04 02 20 60 82 8a 6c 2c";
+    default: return "";
+    }
+}
+enum class Face { Classic, Future };
 struct Point { double x, y; };
 using Polyline = std::vector<Point>;
-constexpr double kAdvance = 5.5;  // grid units per character
+constexpr double kAdvanceClassic = 5.5;  // grid units per character, Classic
+constexpr double kAdvanceFuture = 6.0;   // Future: the same 4-unit letter with a 2-unit gap, so letters never touch
+constexpr double kAdvance = kAdvanceFuture;  // the default face's advance (Fit, and the editor's TextWidth)
 constexpr double kHeight = 6.0;
+inline double Advance(Face face) { return face == Face::Classic ? kAdvanceClassic : kAdvanceFuture; }
+// One coordinate of a glyph point in grid units: Classic digits are whole units, Future hex digits are half units.
+inline double Coord(char c, bool half) { const int v = c >= 'a' ? c - 'a' + 10 : c - '0'; return half ? v * 0.5 : double(v); }
 // The polylines of `text` with its top-left at (x, y), `unit` pixels per grid unit, at most `maxChars` characters.
-inline std::vector<Polyline> Layout(const std::string& text, double x, double y, double unit, std::size_t maxChars = std::string::npos)
+inline std::vector<Polyline> Layout(const std::string& text, double x, double y, double unit, std::size_t maxChars = std::string::npos, Face face = Face::Future)
 {
     std::vector<Polyline> out;
+    const double advance = Advance(face);
     std::size_t i = 0;
     for (const char c : text) {
         if (i >= maxChars) break;
-        const char* g = Glyph(c);
+        const char* future = face == Face::Future ? FutureGlyph(c) : "";
+        const bool half = *future != 0;
+        const char* g = half ? future : Glyph(c);
         Polyline line;
         for (const char* p = g; *p;) {
             if (*p == '|') { if (!line.empty()) out.push_back(line); line.clear(); ++p; continue; }
             if (*p == ' ') { ++p; continue; }
             if (!p[1]) break;
-            line.push_back({ x + (i * kAdvance + (p[0] - '0')) * unit, y + (p[1] - '0') * unit });
+            line.push_back({ x + (i * advance + Coord(p[0], half)) * unit, y + Coord(p[1], half) * unit });
             p += 2;
         }
         if (!line.empty()) out.push_back(line);
@@ -100,7 +154,7 @@ inline std::vector<Polyline> Layout(const std::string& text, double x, double y,
     }
     return out;
 }
-inline std::size_t Fit(double width, double unit) { return unit > 0 ? std::size_t(width / (kAdvance * unit)) : 0; }
+inline std::size_t Fit(double width, double unit, Face face = Face::Future) { return unit > 0 ? std::size_t(width / (Advance(face) * unit)) : 0; }
 // Word wrap into lines of at most `chars` characters (a word longer than a line is cut).
 inline std::vector<std::string> Wrap(const std::string& text, std::size_t chars)
 {

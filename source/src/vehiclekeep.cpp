@@ -11,13 +11,20 @@
 #include "npcvehicles.h"
 #include "trafficpair.h"
 #include "trafficpool.h"
+#include "cameraahead.h"
+#include "camera_visibility.h"
+#include "environment.h"
+#include "inputgate.h"
+#include "playclock.h"
 
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <mutex>
 #include <unordered_map>
@@ -35,13 +42,13 @@ namespace vehiclekeep
 		// Clearing (ref, 0) only clears 0x10000; persistence is undone with FUN_140b36c40(ref, 0, 1) (content.cpp uses it).
 		constexpr std::uint32_t kSetFullLod = 0x00B36640;
 		constexpr std::uint32_t kFullLodFlag = 0x10000, kPersistentFlag = 0x400, kDisabledFlag = 0x800, kDeletedFlag = 0x20;
-		constexpr ULONGLONG kEvalMs = 250, kReleaseOutOfSightMs = 10000, kForgetMs = 120000, kSettleMs = 10000;
+		constexpr ULONGLONG kEvalMs = 250, kReleaseOutOfSightMs = 10000, kForgetMs = 120000, kSettleMs = 10000, kNoCellHoldMs = 60000;  // kNoCellHoldMs: KW-1
 		constexpr double kCellMetres = 100.0;
 		// Where holding starts: a little inside the attached grid's half-width (grid entries, 25 for 5x5 -> 190 m).
 		// A visibility estimate only, not where the game's physics stops.
 		double HoldEdge(unsigned cells) { return cells ? std::max(120.0, std::sqrt(double(cells)) * 50.0 - 60.0) : 0.0; }
 
-		struct Held { bool setLod = false, setPersist = false; ULONGLONG since = 0, seen = 0; double maxDist = 0; bool had3DFar = false; };
+		struct Held { bool setLod = false, setPersist = false; ULONGLONG since = 0, seen = 0; double maxDist = 0; bool had3DFar = false; ULONGLONG noCellSince = 0; };  // noCellSince: KW-1
 
 		bool g_enabled = true;
 		float g_coneDeg = 60.0f;
@@ -55,7 +62,32 @@ namespace vehiclekeep
 
 		template <class T> T At(uptr p, std::uint32_t o) { return *reinterpret_cast<const T*>(p + o); }
 
-		struct RefView { std::uint32_t id = 0, flags = 0; game::Vec3 pos{}; uptr world = 0; bool has3D = false; };
+		struct RefView { std::uint32_t id = 0, flags = 0; game::Vec3 pos{}; uptr world = 0, cell = 0, cellWorld = 0; bool has3D = false; };
+
+		// The worldspace's persistent cell, as mapguard reads it (FUN_140BB54A0 without creating one): +0x1D8, else its parent
+		// world's when the world uses its parent's persistent references (+0xF2 bit 6, parent +0x1F0).
+		uptr PersistentCell(uptr ws)
+		{
+			__try {
+				for (int k = 0; ws && k < 4; ++k) {
+					if (const uptr c = At<uptr>(ws, 0x1D8)) return c;
+					if (!At<uptr>(ws, 0x1F0) || !((At<std::uint8_t>(ws, 0xF2) >> 6) & 1)) return 0;
+					ws = At<uptr>(ws, 0x1F0);
+				}
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+			return 0;
+		}
+		// Same world as the player. A persistent ref beyond the loaded cells (or one made Full LOD) is listed in the persistent cell,
+		// which on a planet world can be the PARENT world's, so its cell names the parent (2026-11-06 15:45: far traffic released
+		// as 'other world' after 3 s, 11 of 14 never held; suspected, traced by keep.world).
+		bool SameWorld(const RefView& v, uptr playerWorld)
+		{
+			if (!playerWorld) return false;
+			if (v.world == playerWorld) return true;
+			const uptr pc = PersistentCell(playerWorld);
+			return pc && v.cell == pc;
+		}
 
 		bool ReadRef(uptr ref, RefView& v)
 		{
@@ -64,7 +96,9 @@ namespace vehiclekeep
 				v.id = At<std::uint32_t>(ref, 0x28);
 				v.pos = At<game::Vec3>(ref, off::kRefPosition);
 				const uptr cell = At<uptr>(ref, off::kRefParentCell);
-				v.world = cell && !(At<std::uint8_t>(cell, 0x48) & 1) ? At<uptr>(cell, off::kCellWorldspace) : 0;
+				v.cell = cell;
+				v.cellWorld = cell ? At<uptr>(cell, off::kCellWorldspace) : 0;
+				v.world = cell && !(At<std::uint8_t>(cell, 0x48) & 1) ? v.cellWorld : 0;
 				const uptr loaded = At<uptr>(ref, off::kRefLoadedData);
 				v.has3D = loaded && At<uptr>(loaded, off::kLoadedData3D);
 				return std::isfinite(v.pos.x) && std::isfinite(v.pos.y) && std::isfinite(v.pos.z);
@@ -102,6 +136,31 @@ namespace vehiclekeep
 		{
 			__try { reinterpret_cast<void (*)(uptr, char, char)>(game::Base() + addr::kMarkerPost1)(ref, 0, 1); return true; }
 			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+
+		std::uint32_t FormIdOf(uptr form) { __try { return form ? At<std::uint32_t>(form, 0x28) : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+		std::uint8_t CellFlagsOf(uptr cell) { __try { return cell ? At<std::uint8_t>(cell, off::kCellFlags) : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; } }
+		// keep.world / keep.skip: the cell and worlds behind a world decision, once per vehicle and reason (2026-11-06 far traffic).
+		std::unordered_map<std::uint32_t, const char*> g_worldLogged, g_skipLogged;
+		void TraceWorld(std::uint32_t id, const RefView& v, uptr playerWorld, const char* event)
+		{
+			if (g_worldLogged.size() > 4096) g_worldLogged.clear();
+			auto& last = g_worldLogged[id];
+			if (last == event) return;
+			last = event;
+			const uptr pc = PersistentCell(playerWorld);
+			logger::Write("OBS system=keep.world vehicle=%08X event=%s cell=%08X cell_flags=0x%X cell_world=%08X player_world=%08X player_persistent_cell=%08X in_player_persistent=%d",
+				id, event, FormIdOf(v.cell), unsigned(CellFlagsOf(v.cell)), FormIdOf(v.cellWorld), FormIdOf(playerWorld), FormIdOf(pc), int(pc && v.cell == pc));
+		}
+		void TraceSkip(std::uint32_t id, const RefView& v, uptr playerWorld, const char* reason, double dPlayer, int health)
+		{
+			if (g_skipLogged.size() > 4096) g_skipLogged.clear();
+			auto& last = g_skipLogged[id];
+			if (last == reason) return;
+			last = reason;
+			logger::Write("OBS system=keep.skip vehicle=%08X event=not_held reason=%s distance=%.0f has_3d=%d flags=0x%X pair_health=%d",
+				id, reason, dPlayer, int(v.has3D), v.flags, health);
+			if (std::strcmp(reason, "other_world") == 0) TraceWorld(id, v, playerWorld, "skip_other_world");
 		}
 
 		uptr Resolve(std::uint32_t id, RefView& v)
@@ -181,15 +240,9 @@ namespace vehiclekeep
 		unsigned g_birthMax = 40;
 		void ReadSettings()
 		{
-			const auto& ini = fvopaths::Settings();
-			const bool enabled = GetPrivateProfileIntW(L"view", L"keepInSight", 1, ini.c_str()) != 0;
-			const float cone = std::clamp(float(GetPrivateProfileIntW(L"view", L"keepCone", 60, ini.c_str())), 5.0f, 89.0f);
-			const unsigned max = std::clamp(GetPrivateProfileIntW(L"view", L"keepMax", 16, ini.c_str()), 1u, 256u);
-			if (enabled != g_enabled || cone != g_coneDeg || max != g_max)
-				logger::Write("Keep in sight: %s, view cone %.0f deg, at most %u vehicles (settings.ini [view])", enabled ? "on" : "off", cone, max);
-			g_enabled = enabled; g_coneDeg = cone; g_max = max;
-			g_birthMax = std::min(GetPrivateProfileIntW(L"view", L"holdFromBirth", 40, ini.c_str()), 256u);
-			logger::Write("OBS system=keep.birth vehicle=00000000 event=settings max=%u", g_birthMax);
+			// Fixed (2026-11-05 settings strip; was settings.ini [view] keepInSight / keepCone / keepMax / holdFromBirth).
+			g_enabled = true; g_coneDeg = 60.0f; g_max = 16; g_birthMax = 40;
+			logger::Write("Keep in sight: on, view cone 60 deg, at most 16 vehicles; held from birth 40");
 		}
 
 		// Traffic vehicles held from birth, in view or not (2026-10-31, the foundation: 35-57 of 76-94 pairs never got a chassis because their model only loads when the player comes near,
@@ -268,9 +321,18 @@ namespace vehiclekeep
 				const bool busy = occupied[id] || npcvehicles::VehicleDriverId(id) != 0 || (wanted && (held || heldFromBirth < g_birthMax));
 				if (held) {
 					Held& h = g_held[id];
-					if (v.world != pv.world) { Release(id, "other world", dPlayer); continue; }
-					// The pair health record: a broken pair loses the far pass where nobody can see it go, and its model unloads; the removal rule can then take it.
-					if (!changes && !inSight && trafficpair::PairHealth(trafficpool::PairHealth(id)) == trafficpair::PairHealth::Broken && dPlayer >= edge && trafficpool::WellHiddenFar(id, dPlayer)) { Release(id, "its pair is broken", dPlayer); ++changes; continue; }
+					// KW-1 (2026-11-07, user: "build it"): past the loaded cells the game can report no parent cell at all (16:11 run: 6 held vehicles
+						// released as "other world" at ~510 m with cell=00000000 while the player's world was FF013B0E). No cell says nothing about the
+						// world: the hold stays, still bound by view, distance and every other release; a real cell in another world still releases.
+						// Bound: kNoCellHoldMs without any cell releases it ("no cell for too long").
+						if (!v.cell) {
+							if (!h.noCellSince) { h.noCellSince = now; TraceWorld(id, v, pv.world, "held_no_cell_world_unknown"); }
+							else if (now - h.noCellSince > kNoCellHoldMs) { TraceWorld(id, v, pv.world, "release_no_cell_too_long"); Release(id, "no cell for too long", dPlayer); continue; }
+						}
+						else { h.noCellSince = 0; if (!SameWorld(v, pv.world)) { TraceWorld(id, v, pv.world, "release_other_world"); Release(id, "other world", dPlayer); continue; } }
+					if (v.cell && v.world != pv.world) TraceWorld(id, v, pv.world, "held_in_persistent_cell");  // KW-1: not for no cell
+					// H1: Health's verdict through the Census copy (was the core's own pair health record, a second judge): a broken pair loses the far pass where nobody can see it go, and its model unloads; the removal rule can then take it.
+					if (!changes && !inSight && vehicleflight::CensusBroken(id) && dPlayer >= edge && trafficpool::WellHiddenFar(id, dPlayer)) { Release(id, "its pair is broken", dPlayer); ++changes; continue; }
 					if (inSight || busy) h.seen = now;
 					if (busy && id != own) { if (dPlayer > h.maxDist) h.maxDist = dPlayer; if (dPlayer > edge + 150.0 && v.has3D) h.had3DFar = true; continue; }
 					if (dPlayer > h.maxDist) h.maxDist = dPlayer;
@@ -282,8 +344,14 @@ namespace vehiclekeep
 					continue;
 				}
 				if (now - g_candidates[id] > kForgetMs) { g_candidates.erase(id); continue; }
-				if (!(inSight || busy) || dPlayer < edge || id == own || v.world != pv.world || g_native.count(id) || !trafficpair::MayHold(busy,decorative,g_max)) continue;
+				// Wanted (traffic from birth) but not held: the reason is traced once per change (keep.skip), never silent.
+				const char* skip = !(inSight || busy) ? nullptr : dPlayer < edge ? nullptr : id == own ? nullptr
+					: !SameWorld(v, pv.world) ? "other_world" : g_native.count(id) ? "native_full_lod" : !trafficpair::MayHold(busy,decorative,g_max) ? "budget"
+					: !trafficpair::MayHoldFar(trafficpair::PairHealth(trafficpool::PairHealth(id))) ? "pair_health" : nullptr;
+				if (wanted && skip) TraceSkip(id, v, pv.world, skip, dPlayer, trafficpool::PairHealth(id));
+				if (!(inSight || busy) || dPlayer < edge || id == own || !SameWorld(v, pv.world) || g_native.count(id) || !trafficpair::MayHold(busy,decorative,g_max)) continue;
 				if (!trafficpair::MayHoldFar(trafficpair::PairHealth(trafficpool::PairHealth(id)))) continue;  // the pair health record: no far pass until it is seated
+				if (v.world != pv.world) TraceWorld(id, v, pv.world, "hold_in_persistent_cell");
 				if (v.flags & kFullLodFlag) { g_native[id] = true; continue; }  // its plugin made it Full LOD: not ours
 				if (changes) continue;
 				++changes;
@@ -346,12 +414,188 @@ namespace vehiclekeep
 		std::lock_guard lock(g_wantedLock);
 		g_wanted.insert(id);
 	}
+#ifndef FVO_RELEASE
+	bool ReadCameraPose(float origin[3], float forward[3]) { return CameraView(origin, forward); }
+#endif
 	bool InCameraView(double x, double y, double z)
 	{
 		float o[3], f[3];
 		if (!CameraView(o, f)) return true;
 		const double cx = x - o[0], cy = y - o[1], cz = z - o[2], d = std::sqrt(cx * cx + cy * cy + cz * cz);
 		return d <= 1.0 || (cx * f[0] + cy * f[1] + cz * f[2]) / d >= std::cos(double(g_coneDeg) * 3.14159265358979 / 180.0);
+	}
+	// Card CP-1: camera prediction. Two camera samples at least cameraahead::rules::minGap apart give the turn; a stale pair
+	// (older than maxGap) reads as "turn unknown", which counts as seen. Sampled on demand: Retirement asks every frame while a
+	// broken pair waits, so the samples stay fresh exactly when they are needed. Any thread; the samples are under a lock.
+	static int CameraAheadForEnvelope(double x, double y, double z, double seconds, double* turnDegPerS, double radius)
+	{
+		static std::mutex lock;
+		static cameraahead::Sample prev, now;
+		float o[3], f[3];
+		if (!CameraView(o, f)) { if (turnDegPerS) *turnDegPerS = 0; return 3; }
+		const double t = GetTickCount64() / 1000.0;
+		cameraahead::Sample a, b;
+		{
+			std::lock_guard guard(lock);
+			if (now.t < 0 || t - now.t >= cameraahead::rules::minGap) { prev = now; now.t = t; for (int i = 0; i < 3; ++i) { now.o[i] = o[i]; now.f[i] = f[i]; } }
+			a = prev; b = now;
+		}
+		// Judge against the live camera (b's forward may be up to minGap old; the live one is the truth for "in view now").
+		const double od[3] = { o[0], o[1], o[2] }, fd[3] = { f[0], f[1], f[2] };
+		if (cameraahead::InCone(od, fd, x, y, z, std::cos(double(g_coneDeg) * 3.14159265358979 / 180.0), radius)) { if (turnDegPerS) *turnDegPerS = 0; return 1; }
+		return cameraahead::Judge(a, b, x, y, z, seconds, double(g_coneDeg), turnDegPerS, radius);
+	}
+	int CameraAhead(double x, double y, double z, double seconds, double* turnDegPerS)
+	{
+		return CameraAheadForEnvelope(x, y, z, seconds, turnDegPerS, 0);
+	}
+	namespace {
+		using cameravisibility::Evidence;
+		namespace sight = cameravisibility::rules;
+		using Point = std::array<float, 3>;
+		struct CameraProbe {
+			unsigned id = 0;
+			std::uint64_t at = 0;
+			Point origin{}, centre{};
+			std::array<Point, sight::sampleCount> ends{};
+			double hull = 0;
+			bool visible = false;
+		};
+		std::array<CameraProbe, sight::cacheSize> g_cameraProbes{};
+		std::uint64_t g_cameraLaunch = 0;
+		std::mutex g_lookLock;
+		struct LookHistory {
+			cameravisibility::Forecast sample;
+			cameravisibility::Mouse mouse;
+			double yawGain = 0, pitchGain = 0;
+		} g_look;
+
+		bool ReadLookPose(cameravisibility::Forecast& out)
+		{
+			Point origin{},forward{};
+			if(!CameraView(origin.data(),forward.data()))return false;
+			for(unsigned i=0;i<3;++i){out.origin[i]=origin[i];out.forward[i]=forward[i];}
+			out.coneDeg=g_coneDeg;
+			return true;
+		}
+		bool CurrentLook(cameravisibility::Forecast& out)
+		{
+			const auto now=GetTickCount64();
+			{
+				std::lock_guard lock(g_lookLock);
+				out=g_look.sample;
+			}
+			out.mouseAt=inputgate::LookMouse().at;
+			if(!cameravisibility::Fresh(out.at,now,sight::mouseMs)||
+			   !cameravisibility::Fresh(out.mouseAt,now,sight::mouseMs))out.yawRate=out.pitchRate=0;
+			return ReadLookPose(out);
+		}
+
+		double CameraDistance(const Point& a, const Point& b)
+		{
+			return std::hypot(double(a[0])-b[0], double(a[1])-b[1], double(a[2])-b[2]);
+		}
+		CameraProbe MakeCameraProbe(unsigned id, std::uint64_t now, const Point& origin, const Point& centre, double radius, double height)
+		{
+			CameraProbe probe;
+			probe.id=id; probe.at=now; probe.origin=origin; probe.centre=centre;
+			probe.hull=std::max(radius,height);
+			probe.ends.fill(centre);
+			const double dx=double(centre[0])-origin[0],dy=double(centre[1])-origin[1],planar=std::hypot(dx,dy);
+			const double rightX=planar>1e-3?-dy/planar:1, rightY=planar>1e-3?dx/planar:0;
+			probe.ends[1][0]+=float(radius*rightX); probe.ends[1][1]+=float(radius*rightY);
+			probe.ends[2][0]-=float(radius*rightX); probe.ends[2][1]-=float(radius*rightY);
+			probe.ends[3][2]+=float(height); probe.ends[4][2]-=float(height);
+			return probe;
+		}
+		Evidence ObserveCameraProbe(unsigned id, std::uint64_t now, const Point& origin, const Point& centre, double radius, double height)
+		{
+			if(CameraDistance(origin,centre)>sight::maxRange)return Evidence::Unknown;
+			auto probe=std::find_if(g_cameraProbes.begin(),g_cameraProbes.end(),[&](const CameraProbe& p){
+				return p.id==id&&cameravisibility::Fresh(p.at,now,sight::sampleMs)&&
+					CameraDistance(origin,p.origin)<=sight::drift&&CameraDistance(centre,p.centre)<=sight::drift;
+			});
+			if(probe==g_cameraProbes.end()){
+				if(cameravisibility::Fresh(g_cameraLaunch,now,sight::launchMs))return Evidence::Waiting;
+				probe=std::min_element(g_cameraProbes.begin(),g_cameraProbes.end(),[](const auto& a,const auto& b){return a.at<b.at;});
+				*probe=MakeCameraProbe(id,now,origin,centre,radius,height);g_cameraLaunch=now;
+			}
+			if(probe->visible)return Evidence::Visible;
+			unsigned blocked=0,visible=0;
+			for(const auto& end:probe->ends){
+				bool hit=false;double distance=0;
+				const bool answered=environment::CameraRay(id,probe->origin.data(),end.data(),hit,distance);
+				const auto evidence=cameravisibility::RayEvidence(answered,hit,distance,CameraDistance(probe->origin,end),probe->hull);
+				blocked+=evidence==Evidence::Occluded;visible+=evidence==Evidence::Visible;
+			}
+			const auto result=cameravisibility::Combine(blocked,visible);
+			probe->visible=result==Evidence::Visible;
+			logger::Observe("traffic.camera",id,unsigned(result),"event=envelope result=%d blocked=%u visible=%u range=%.1f",
+				int(result),blocked,visible,CameraDistance(origin,centre));
+			return result;
+		}
+	}
+	void UpdateTrafficLook()
+	{
+		cameravisibility::Forecast next;
+		const bool live=playclock::Running()&&ReadLookPose(next);
+		next.at=GetTickCount64();
+		std::lock_guard lock(g_lookLock);
+		if(!live){g_look={};return;}
+		auto& previous=g_look.sample;
+		if(previous.at&&next.at-previous.at<30)return;
+		const auto mouse=inputgate::LookMouse();
+		next.mouseAt=mouse.at;
+		if(cameravisibility::Fresh(previous.at,next.at,300)&&cameravisibility::Fresh(mouse.at,next.at,sight::mouseMs)){
+			const auto seconds=(next.at-previous.at)*.001;
+			const double yaw=cameravisibility::Wrap(cameravisibility::Yaw(next.forward)-cameravisibility::Yaw(previous.forward));
+			const double pitch=cameravisibility::Pitch(next.forward)-cameravisibility::Pitch(previous.forward);
+			next.yawRate=cameravisibility::MouseRate(yaw,double(mouse.x-g_look.mouse.x),seconds,g_look.yawGain);
+			next.pitchRate=cameravisibility::MouseRate(pitch,double(mouse.y-g_look.mouse.y),seconds,g_look.pitchGain);
+		}
+		previous=next;g_look.mouse=mouse;
+	}
+	static int ReadTrafficForecast(cameravisibility::Forecast* out)
+	{
+		return out&&CurrentLook(*out)&&(out->yawRate||out->pitchRate)?1:0;
+	}
+	bool HoldBirthForLook(double x,double y,double z,unsigned milliseconds)
+	{
+		cameravisibility::Forecast look;
+		if(!playclock::Running()||!CurrentLook(look))return false;
+		const auto radius=std::hypot(sight::fallbackRadius,sight::fallbackHeight);
+		const int eta=cameravisibility::EntryMs(look,x,y,z,radius,milliseconds);
+		if(eta<0)return false;
+		logger::Observe("traffic.camera",0,1,"event=birth_hold eta_ms=%d budget_ms=%u",eta,milliseconds);
+		return true;
+	}
+	cameravisibility::Evidence TrafficCameraEvidence(unsigned id,unsigned base,double x,double y,double z,bool driver)
+	{
+		constexpr double radians=3.14159265358979/180.0;
+		if(!id||!playclock::Running()||!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z))return Evidence::Unknown;
+		cameravisibility::Forecast look;
+		if(!CurrentLook(look))return Evidence::Unknown;
+		double radius=sight::driverRadius,height=sight::driverHeight;
+		if(!driver){
+			double half[3]{},bottom=0,top=0;
+			if(realvehicles::ReadModelBounds(runtimeforms::Lookup(base),half,bottom,top)){
+				radius=std::hypot(half[0],half[1])+1;height=half[2]+1;
+			}else{radius=sight::fallbackRadius;height=sight::fallbackHeight;}
+		}else z+=height;
+		const Point centre{float(x),float(y),float(z)};
+		const Point origin{float(look.origin[0]),float(look.origin[1]),float(look.origin[2])};
+		const double envelope=std::hypot(radius,height);
+		const auto now=GetTickCount64();
+		const int eta=cameravisibility::EntryMs(look,x,y,z,envelope,sight::retireMs);
+		const bool recent=cameravisibility::Fresh(look.mouseAt,now,sight::mouseMs);
+		const bool fringe=eta<0&&recent&&cameraahead::InCone(look.origin,look.forward,x,y,z,
+			std::cos((look.coneDeg+sight::fringeDeg)*radians),envelope);
+		if(eta<0&&!fringe)return Evidence::Outside;
+		const auto rays=ObserveCameraProbe(id,now,origin,centre,radius,height);
+		const auto result=(eta!=0&&rays==Evidence::Waiting)?Evidence::MouseTurn:rays;
+		logger::Observe("traffic.lookahead",id,unsigned(result),"event=retirement result=%d eta_ms=%d budget_ms=%u fringe=%d",
+			int(result),eta,sight::retireMs,fringe);
+		return result;
 	}
 	void ForEachHeld(void (*visit)(std::uint32_t))
 	{
@@ -360,6 +604,8 @@ namespace vehiclekeep
 
 	void Reset()
 	{
+		g_cameraProbes={};g_cameraLaunch=0;
+		{std::lock_guard lock(g_lookLock);g_look={};}
 		{ std::lock_guard lock(g_wantedLock); g_wanted.clear(); }
 		// The held refs belong to the save being left; the loaded save decides their state, and the journal (still listing
 		// them) releases any that came back held once the world settles.
@@ -370,4 +616,29 @@ namespace vehiclekeep
 		g_resetAt = GetTickCount64();
 		g_journalPending = true;
 	}
+}
+
+// Card CP-1: camera prediction for the addon's Retirement. Optional export: an older addon never calls it; an older core lacks it and
+// the addon keeps its far-and-out-of-sight rule. Returns vehiclekeep::CameraAhead's code; turnDegPerS may be null.
+extern "C" __declspec(dllexport) int FVO_CameraAheadV1(double x, double y, double z, double seconds, double* turnDegPerS)
+{
+	if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !(seconds >= 0) || seconds > 3) return 3;
+	return vehiclekeep::CameraAhead(x, y, z, seconds, turnDegPerS);
+}
+
+extern "C" __declspec(dllexport) int FVO_CameraEnvelopeAheadV1(double x, double y, double z, double seconds, double radius)
+{
+	if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+		!std::isfinite(seconds) || seconds < 0 || !std::isfinite(radius) || radius <= 0) return 3;
+	return vehiclekeep::CameraAheadForEnvelope(x, y, z, seconds, nullptr, radius);
+}
+
+extern "C" __declspec(dllexport) cameravisibility::Evidence FVO_TrafficCameraEvidenceV1(unsigned id,unsigned base,double x,double y,double z,bool driver)
+{
+	return vehiclekeep::TrafficCameraEvidence(id,base,x,y,z,driver);
+}
+
+extern "C" __declspec(dllexport) int FVO_TrafficLookForecastV1(cameravisibility::Forecast* out)
+{
+	return vehiclekeep::ReadTrafficForecast(out);
 }
