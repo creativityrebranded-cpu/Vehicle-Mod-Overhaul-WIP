@@ -566,6 +566,11 @@ namespace vehiclekeep
 	{
 		return out&&CurrentLook(*out)&&(out->yawRate||out->pitchRate)?1:0;
 	}
+	// The camera pose whenever it can be read, turning or not (2026-11-21: V1 answers only while the camera TURNS). yawRate/pitchRate are zero when the look is idle.
+	static int ReadTrafficLookPose(cameravisibility::Forecast* out)
+	{
+		return out&&CurrentLook(*out)?1:0;
+	}
 	bool HoldBirthForLook(double x,double y,double z,unsigned milliseconds)
 	{
 		cameravisibility::Forecast look;
@@ -648,4 +653,8 @@ extern "C" __declspec(dllexport) cameravisibility::Evidence FVO_TrafficCameraEvi
 extern "C" __declspec(dllexport) int FVO_TrafficLookForecastV1(cameravisibility::Forecast* out)
 {
 	return vehiclekeep::ReadTrafficForecast(out);
+}
+extern "C" __declspec(dllexport) int FVO_TrafficLookPoseV1(cameravisibility::Forecast* out)
+{
+	return vehiclekeep::ReadTrafficLookPose(out);
 }

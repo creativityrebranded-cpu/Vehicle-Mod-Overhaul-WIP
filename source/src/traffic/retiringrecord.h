@@ -51,7 +51,7 @@ namespace retiringrecord
     inline int RetiredRowKind(const wchar_t* key) {
         if (!key) return 0;
         if (!std::wcsncmp(key, L"factory_v1_", 11) || !std::wcsncmp(key, L"factory_v2_runtime_", 19)) return 1;
-        return std::wcsncmp(key, L"landing_", 8) ? 0 : 2;
+        return 0;  // landing_ rows belong to the landing store (generator SetLandingSpots / SaveLanding) and are left alone
     }
     inline PairRow ParseRetiredRow(int kind, const wchar_t* value) {
         if (kind == 1) return value ? ParsePair(value) : PairRow{};

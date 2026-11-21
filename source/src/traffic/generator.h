@@ -73,6 +73,7 @@ namespace generator
 	void Reset();         // a save load
 	void Rush(const FvoRushPlace* places, int count);  // any thread
 	void RushStatus(FvoRushState* out);                // any thread
+    void SetLandingSpots(const FvoPoolSpot* spots,const char* const* names,int count); // the world's landing spots (kept in trafficpool.ini per world)
     void SetSavedFleetJourney(bool (*matches)(unsigned vehicle,unsigned base,const char* world));
     void SetPanelCover(int (*covered)());
 }

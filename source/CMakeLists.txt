@@ -109,7 +109,7 @@ target_link_libraries(FlyingVehicleOverhaul PRIVATE sp_common Synchronization Dx
 
 # FVO Traffic addon (2026-10-29, was FVO City Placements): all traffic decisions; talks to core through src/traffic/traffic_api.h
 # (API v2) and fvo_addon_api.h. FVO Placements is only FVO_CityPlacements.esm now. See notes/TRAFFIC_ADDON_PROPOSAL_20261029.md.
-add_library(FVO_Traffic SHARED src/traffic/traffic_main.cpp src/traffic/generator.cpp)
+add_library(FVO_Traffic SHARED src/traffic/traffic_main.cpp src/traffic/generator.cpp src/traffic/everyday.cpp)
 sp_options(FVO_Traffic)
 target_link_libraries(FVO_Traffic PRIVATE Shell32 Ole32)
 

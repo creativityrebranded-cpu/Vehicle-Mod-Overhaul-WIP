@@ -29,6 +29,7 @@ inline constexpr int maxLookCovered = 32;           // Arbiter: slots looked at 
 inline constexpr unsigned long long seatProveMs = spawnhealth::rules::seatProveMs;  // minimum observed play time to record a terminal seat failure
 inline constexpr double fitMargin = .15;            // Siting: the body's half width needs this much room inside the box
 inline constexpr double departureGapRadii = 1.0;    // Siting: forward clearance in units of the new chassis radius
+inline constexpr unsigned long long noStepsHoldMs = 5000;  // PF-1 Health: a pilot with no physics steps this long (play time) is a self-reported fault
 inline constexpr unsigned long long noBodyMs = 30000;   // Health: staged with a model but no physics body this long is a fault
 inline constexpr double fellBelow = 200.0, fellBelowFloor = 20.0;  // Health: this far under its birth height (or the known floor), a pair has gone through the world
 inline constexpr double uncontrolledDownSpeed = 30.0, uncontrolledSideSpeed = 5.0;  // Health: falling through the world versus following a slope or descending normally
@@ -241,6 +242,8 @@ struct Facts {
 // SR-3 Demand: a new pair only when its route has trip room left beyond the pairs of that route still being proved. left < 0: unknown
 // (no limit applied).
 inline bool RouteHasRoom(int left, int provingSameRoute) { return left < 0 || provingSameRoute < left; }
+// KO-2a Handoff: a frozen (staged) pair the player took is released to the player; Handoff asks, the birth-hold service carries it out.
+inline bool ReleaseTaken(bool staged, bool taken) { return staged && taken; }
 // EV-1: is a handed-off traffic vehicle empty? Someone else in its driver's seat (the player, a companion, a job) is not empty: that is
 // not traffic's to judge. Returns the cause, or null.
 inline const char* EmptyCause(bool driverRef, bool driverDead, bool driverAboard, unsigned seatOccupant, unsigned driver) {
@@ -275,6 +278,12 @@ inline Judgement Judge(const Facts& f) {
 // What a pair still waits for, in the order the flow needs it (Ledger: a wait always names its reason).
 inline const char* Waiting(bool vehicleModel, bool driverModel, bool body, bool aboard, bool sitting) {
     return !vehicleModel ? "no_vehicle_model" : !driverModel ? "no_driver_model" : !body ? "no_physics_body" : !aboard ? "not_aboard" : !sitting ? "not_sitting" : "waiting_release";
+}
+
+// ---------- 8 Handoff ----------
+// Released once Health says healthy and the body stands where Siting put it (settled onto the floor, or up to the drop below it).
+inline bool Release(bool healthySeated, bool hasBody, double dx, double dy, double dropBelowBirth) {
+    return healthySeated && hasBody && std::hypot(dx, dy) < 1.5 && dropBelowBirth > -1.5 && dropBelowBirth < 4.0;
 }
 
 // ---------- 9 Retirement: the only remover ----------

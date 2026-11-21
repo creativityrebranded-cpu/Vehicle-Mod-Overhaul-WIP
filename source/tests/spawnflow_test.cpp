@@ -423,7 +423,14 @@ int main() {
     {   Check(RouteHasRoom(2, 1) && !RouteHasRoom(2, 2) && !RouteHasRoom(0, 0), "demand (SR-3): room left beyond the pairs still being proved");
         Check(RouteHasRoom(-1, 50), "demand (SR-3): unknown room (no such route here) applies no limit"); }
 
+    // 8 Handoff
+    Check(Release(true, true, .2, .1, .3), "handoff: settled after the drop");
+    Check(!Release(true, true, 0, 0, 6), "handoff: fell too far: no release");
+    Check(!Release(false, true, 0, 0, .3) && !Release(true, false, 0, 0, .3), "handoff: needs seated and a body");
     // KO-2a Handoff: a taken frozen pair is released to the player.
+    {   Check(ReleaseTaken(true, true), "handoff (KO-2a): a frozen pair the player took is released");
+        Check(!ReleaseTaken(true, false), "handoff (KO-2a): a frozen pair nobody took stays held");
+        Check(!ReleaseTaken(false, true), "handoff (KO-2a): a taken pair already released needs nothing"); }
     {
         BirthBudget budget;
         PopulationRequest path{PopulationAction::FleetPath};

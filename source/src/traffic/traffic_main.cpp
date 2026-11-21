@@ -31,6 +31,7 @@
 #include "observations.h"
 #include "fvolimits.h"
 #include "generator.h"
+#include "everyday.h"
 #include "fvopaths.h"
 #include "trafficdata.h"
 #include "trafficroute.h"
@@ -83,6 +84,7 @@ namespace
     FvoObservedModelProviderV1 g_storedModel=nullptr;
     int (*g_outOfTraffic)(const unsigned*,int)=nullptr;double g_outOfTrafficAt=-1;  // C4: core export FVO_VehiclesOutOfTrafficV1 (null: not exported)
     planowner::SnapshotV1 g_ownerSnapshot=nullptr;  // C2: the core's one owner/rank record, read-only (null: junctions see traffic only)
+    double g_coordLogAt=-1;
     using FvoNavWant_t=void(*)(double x,double y);
     FvoNavWant_t g_navWant=nullptr;
     bool g_corridorSupported=false;bool g_fieldSupported=false;
@@ -440,7 +442,7 @@ namespace
         std::lock_guard journeyLock(g_journeyMutex);
         if(profile==g_journeyProfile)return;g_journeyProfile=profile;g_journeyWritable=true;g_rememberedJourneys.clear();
         const auto path=std::filesystem::path(profile)/L"journeys.state";std::error_code error;const auto bytes=std::filesystem::file_size(path,error);if(error){if(error!=std::errc::no_such_file_or_directory)g_journeyWritable=false;return;}
-        if(bytes>64*1024*1024){g_journeyWritable=false;Log("FVO traffic: journey state too large; not resuming saved journeys");return;}
+        if(bytes>64*1024*1024){g_journeyWritable=false;Log("FVO traffic: journey state too large; keeping legacy route admission");return;}
         std::ifstream in(path,std::ios::binary);std::string magic,world,line;std::getline(in,line);std::istringstream header(line);unsigned version=0,count=0;if(!(header>>magic>>version>>count>>std::quoted(world))||magic!="FVO_JOURNEYS"||version!=1||count>4096){g_journeyWritable=false;return;}double seconds=0;if(header>>seconds){if(!std::isfinite(seconds)||seconds<0){g_journeyWritable=false;return;}}g_signalSeconds=seconds;g_signalLastTick=0;
         std::map<unsigned,Slot> loaded;for(unsigned i=0;i<count;++i){Slot s;if(!ReadJourney(in,s)||loaded.count(s.vehicleId)){g_journeyWritable=false;Log("FVO traffic: invalid journey state retained on disk; not resuming saved journeys");return;}loaded[s.vehicleId]=std::move(s);}g_rememberedJourneys=std::move(loaded);
     }
@@ -467,6 +469,7 @@ namespace
 		return it != g_emptyTrips.end() && it->second.first == route && GetTickCount64() - it->second.second < kEmptyTripMs;
 	}
 	bool g_cycleSupported = false;
+	ULONGLONG g_lastStart = 0;
 	int g_nextLane = 0, g_nextPlace = 0;
 	bool g_mixedPlace = false;
 
@@ -1687,6 +1690,33 @@ namespace
 
     Slot* VehicleSlot(unsigned vehicle,int& active){Slot* free=FreeSlot(active);if(vehicle)for(auto& s:g_slots)if(s.used&&s.vehicleId==vehicle)return &s;return free;}
 
+	int Offer(double x, double y, double z, unsigned vehicleId, FvoTripClaim* out)
+	{
+		Load();
+		const ULONGLONG now = GetTickCount64();
+		char world[201]{};
+		if (!g_worldName || !engineport::FunctionForward(g_worldName,"worldName","routes",0u,world, sizeof world)) return 0;
+		const auto rule = RuleFor(world);
+		int active = 0;
+		Slot* free = VehicleSlot(vehicleId,active);
+		if (!free || (g_lastStart && now - g_lastStart < ULONGLONG(rule.gap * 1000.0))) return 0;  // counts: Room()
+		return Begin(rule, world, free, x, y, z, vehicleId, out, false);
+	}
+
+	// The cold-start pool's trips: core asks once the spawned driver sits (pool vehicles do not count against `max`).
+	// Would a route of this world take one more vehicle from (x, y) now (within reach, active, with room)? Asked by core before
+	// it gives a baked parked vehicle a driver (PoolTrip with vehicleId 0 and out = null).
+	bool Wanted(const char* world, double x, double y)
+	{
+		const auto rule = RuleFor(world);
+		for (const auto& r : g_data.routes) {
+			if (!trafficdata::SameWorld(g_data, r.world, world) || !Allowed(r, rule) || !Room(r, rule, nullptr, true)) continue;
+			const auto l = trafficroute::Build(r);
+			const auto q = trafficroute::At(l, 0, trafficroute::Nearest(l, 0, x, y));
+			if (std::hypot(q.x - x, q.y - y) <= rule.reach) return true;
+		}
+		return false;
+	}
 	// SR-1: one trace line per change of a vehicle's trip answer (refused with its reason, or granted).
 	void TraceTrip(int spot, unsigned vehicle, int ok, int active) {
 		if (!vehicle) return;
@@ -1726,6 +1756,7 @@ namespace
 	{
 		char world[201]{};
 		if (!g_worldName || !engineport::FunctionForward(g_worldName,"worldName","routes",0u,world, sizeof world)) return RefuseTrip(vehicleId, "no_world_name");
+		if (!vehicleId && !out) return Wanted(world, x, y) ? 1 : 0;
 		int active = 0;
 		Slot* free = VehicleSlot(vehicleId,active);
 		if (!free) { RefuseTrip(vehicleId, "no_free_trip_slot", active, kSlots); TraceTrip(spot, vehicleId, 0, active); return 0; }
@@ -1905,6 +1936,11 @@ namespace
         }}
 
 		const ULONGLONG now = GetTickCount64();
+		if (!pool && !rule.anyVehicle) {
+			const unsigned base = g_baseOf ? engineport::FunctionForward(g_baseOf,"baseOf","routes",0u,vehicleId) : 0;
+			const bool ok = (rule.rev8 && base == 0xFE001033) || std::find(rule.bases.begin(), rule.bases.end(), base) != rule.bases.end();
+			if (!ok) return RefuseTrip(vehicleId, "model_not_in_world_rule");
+		}
 		// A test route asked for in the editor first (once per save, twice the reach), else the route of this world nearest the
 		// vehicle, within reach, active now and with room.
 		const trafficdata::Route* route = nullptr;
@@ -1912,11 +1948,13 @@ namespace
 		bool test = false;
         bool useInitial=!initial.empty()&&!EmptyHere(vehicleId,initial);
         if(useInitial){
+            bool excluded=false;  // its model is left out of its first route (vehicle rules): it takes any other route instead
             for(const auto& r:g_data.routes)if(r.name==initial&&trafficdata::SameWorld(g_data,r.world,world)){
                 if(Excluded(r,vehicleId,initialLane)){return RefuseTrip(vehicleId,"model_excluded_from_route");}
                 {int on=-1,want=-1;const char* rw="route_refused";if(Room(r,rule,nullptr,true,&on,&want,&rw)){route=&r;line=trafficroute::Build(r);}else RefuseTrip(vehicleId,rw,on,want);}  // RR-1: the exact reason  // SR-1
                 break;}
-            if(!route){if(!g_tripRefusal.count(vehicleId))RefuseTrip(vehicleId,"initial_route_missing");return 0;}
+            if(excluded)useInitial=false;
+            else if(!route){if(!g_tripRefusal.count(vehicleId))RefuseTrip(vehicleId,"initial_route_missing");return 0;}
         }
 		for (const auto& r : g_data.routes) {
             if(route)break;
@@ -1962,6 +2000,7 @@ namespace
         s.spec=*route;if(!AuthoredJourney(s,*route,world,home,rule.reach)){s.used=false;return RefuseTrip(vehicleId,"journey_not_authored");}
 		s.logged = s.trip.leg;
 		s.x = x; s.y = y; s.z = z; s.flown = 0; s.flownStart = true;
+		if (!pool) g_lastStart = now;
 		Log("FVO traffic: vehicle %08X goes onto route %s, lane %d, %s%s", vehicleId, route->name.c_str(), s.trip.lane, place ? "to " : "a lap and home",
 			place ? place->name.c_str() : "");
 		out->step = &Step;
@@ -2084,8 +2123,9 @@ namespace
         if(!g_trafficApi)return;
         const auto rule=RuleFor(world);
         const auto city=trafficdata::CityOf(g_data,world);
-        std::vector<FvoPoolSpot> origins;
-        for(const auto& p:g_data.places)if(trafficdata::SameWorld(g_data,p.world,world))origins.push_back({p.at.x,p.at.y,p.at.z,0});
+        std::vector<FvoPoolSpot> origins;std::vector<std::string> originNames;
+        for(const auto& p:g_data.places)if(trafficdata::SameWorld(g_data,p.world,world)){
+            origins.push_back({p.at.x,p.at.y,p.at.z,0});originNames.push_back("place."+p.name);}
         int target=0;
         for(const auto& r:g_data.routes)if(trafficdata::SameWorld(g_data,r.world,world)&&Allowed(r,rule)&&CityFlies(r,city)){
             const int peak=routeschedule::PeakVehicles(r.schedule,r.trafficMetres);
@@ -2137,6 +2177,7 @@ namespace
         std::vector<const char*> ptrs;for(const auto& n:names)ptrs.push_back(n.c_str());
         generator::SetSpots(world,spots.data(),int(spots.size()),reuse.data(),ptrs.data(),&PoolTrip);
         generator::SetTripReaders(&TripRefusalOf,&InitialRouteRoom);  // SR-1 / SR-3: facts the generator reads
+        {std::vector<const char*> landingNames;for(const auto& n:originNames)landingNames.push_back(n.c_str());generator::SetLandingSpots(origins.data(),landingNames.data(),int(origins.size()));}
         // Vehicle rules reach the models dealt out: a position on a route holds what that route allows; any other leaves from the ground and may take any route of
         // this world, so only a model every one of them leaves out is barred. (2026-10-31: the deal ignored them, and a left-out model on a lane got no trip and stayed there.)
         {
@@ -2357,11 +2398,11 @@ namespace
 
 	void ResetAll() {
         std::unique_lock journeyLock(g_journeyMutex);
-		for(auto& s:g_slots)s={};g_poolWorld.clear();g_poolStamp=~0ull;g_testDone.clear();
+		for(auto& s:g_slots)s={};g_poolWorld.clear();g_poolStamp=~0ull;g_testDone.clear();g_lastStart=0;
 		g_found.clear();g_read={};g_data={};g_stamp=~0ull;g_reloadWanted=true;g_poolResend=true;
 		g_initialSlots.clear();g_initialClockPending=false;g_emptyTrips.clear();
 		g_admissionLanes.clear();g_cruiseLast.clear();g_constraintMinute=-1;g_signalSeconds=g_signalLastTick=0;g_rememberedJourneys.clear();g_journeyProfile.clear();g_rightOfWay.Reset();g_roadDecision.clear();g_approachTiming.clear();g_otherApproachDistance.clear();g_roadStamp=~0ull;
-		journeyLock.unlock();generator::Reset();
+		journeyLock.unlock();generator::Reset();everyday::Reset();
 	}  // a save load or a different playthrough
 
 	void Attach()
@@ -2407,9 +2448,9 @@ namespace
 		// Core API v2: the traffic pairs (generator.cpp) run on core's frames through these hooks. The everyday Scan slot is kept in the
 		// frozen hook ABI (traffic_api.h) and left null: no everyday NPC trips.
 		if (const auto api = reinterpret_cast<FvoTrafficApi_t>(GetProcAddress(core, "FVO_TrafficApi"))) {
-			static const FvoTrafficHooks hooks = { &TrafficTick, &TrafficHousekeeping, &ResetAll, &StartSwap, &generator::RushStatus, nullptr, &RequestReload };
+			static const FvoTrafficHooks hooks = { &TrafficTick, &TrafficHousekeeping, &ResetAll, &StartSwap, &generator::RushStatus, &everyday::Scan, &RequestReload };
 			g_trafficApi = api(kFvoTrafficApiVersion, &hooks);
-			if (g_trafficApi) { generator::Attach(g_trafficApi, g_log); generator::SetSavedFleetJourney(&SavedFleetJourney); }
+			if (g_trafficApi) { generator::Attach(g_trafficApi, g_log); generator::SetSavedFleetJourney(&SavedFleetJourney); everyday::Attach(g_trafficApi, g_log, &Offer); }
 		}
 		if (!g_trafficApi) Log("FVO traffic: core offers no traffic API v%d (FlyingVehicleOverhaul.dll older or newer than FVO_Traffic.dll); no traffic", int(kFvoTrafficApiVersion));
 		if (!g_localTime) Log("FVO traffic: core has no FVO_LocalTime; scheduled routes wait (all-day routes run)");

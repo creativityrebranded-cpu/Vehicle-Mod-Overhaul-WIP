@@ -35,9 +35,9 @@ int main() {
     {   // Retired systems (2026-11-21): old factory / stock / landing rows are recognised, parsed and decided once on load.
         using retiringrecord::RetiredOutcome;
         Check(retiringrecord::RetiredRowKind(L"factory_v1_bay_a=1") == 1 && retiringrecord::RetiredRowKind(L"factory_v2_runtime_x=1") == 1 &&
-              retiringrecord::RetiredRowKind(L"landing_pad3=1") == 2 && retiringrecord::RetiredRowKind(L"pair_route.3=1") == 0 &&
+              retiringrecord::RetiredRowKind(L"landing_pad3=1") == 0 && retiringrecord::RetiredRowKind(L"pair_route.3=1") == 0 &&
               retiringrecord::RetiredRowKind(L"spot4=1") == 0 && retiringrecord::RetiredRowKind(L"factory_v3_x=1") == 0 && retiringrecord::RetiredRowKind(nullptr) == 0,
-              "retired rows: factory_v1_ and factory_v2_runtime_ are stock, landing_ is a landing spot; pair_, spot and unknown prefixes are not");
+              "retired rows: factory_v1_ and factory_v2_runtime_ are stock; landing_ (the kept landing store), pair_, spot and unknown prefixes are not");
         const auto stock = retiringrecord::ParseRetiredRow(1, L"FF000A01 FF000A02 0002C8A1 1 0 1 2 1.5 2.5 3.5 0 0 0");
         const auto landing = retiringrecord::ParseRetiredRow(2, L"FF000B01 0002C8A1");
         Check(stock.vehicle == 0xFF000A01 && stock.driver == 0xFF000A02 && stock.base == 0x0002C8A1 && stock.staged,

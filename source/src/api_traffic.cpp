@@ -1464,6 +1464,24 @@ extern "C" __declspec(dllexport) int FVO_TrafficBirthRefusalV1(std::uint64_t gra
     *out=best->row;out->size=sizeof(FvoBirthRefusalV1);
     return 1;
 }
+// Would the core's own concealment test refuse a birth at this pose right now? 1 = hidden, 0 = exposed, -1 = cannot say. Read only; additive.
+extern "C" __declspec(dllexport) int FVO_TrafficBirthHiddenV1(unsigned base,double x,double y,double z){
+    FvoTrafficPlayer pl{};
+    if(!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!ApiPlayer(&pl)||ApiPresentation()>=2)return -1;
+    return BirthHidden(base,x,y,z,pl.x,pl.y)?1:0;
+}
+// A model's REAL half extents (realvehicles::ReadModelBounds). 1 and the three halves filled, 0 = the base form is not readable. Read only; additive.
+extern "C" __declspec(dllexport) int FVO_TrafficModelBoundsV1(unsigned base,double* halfX,double* halfY,double* halfZ){
+    if(!base||!halfX||!halfY||!halfZ)return 0;
+    __try{
+        const auto form=runtimeforms::Lookup(base);if(!form)return 0;
+        double half[3]{},bottom=0,top=0;
+        if(!realvehicles::ReadModelBounds(form,half,bottom,top))return 0;
+        if(!std::isfinite(half[0])||!std::isfinite(half[1])||!std::isfinite(half[2]))return 0;
+        *halfX=half[0];*halfY=half[1];*halfZ=half[2];
+        return 1;
+    }__except(EXCEPTION_EXECUTE_HANDLER){return 0;}
+}
 extern "C" __declspec(dllexport) int FVO_TrafficRoadVehiclesV1(FvoTrafficVehicle* out,int max){
     uptr cell=0,ws=0;
     if(!out||max<=0||!PlayerCell(cell,ws)){

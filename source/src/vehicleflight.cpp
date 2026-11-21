@@ -9840,6 +9840,25 @@ extern "C" __declspec(dllexport) void FVO_TrafficCensusForgetV1(std::uint32_t ve
     g_owners.Release(vehicle);g_censusWhy.erase(vehicle);logger::Write("OBS system=plan.owner vehicle=%08X event=census_forget reason=pair_gone",vehicle);
 }
 // V2 preserves the V1 array stride and identifies the formerly unused default marker.
+#ifndef FVO_RELEASE  // diagnostic builds only, as before (the spot-motion proof exists only there)
+extern "C" __declspec(dllexport) int FVO_SpotMotionProofV1(
+    std::uint32_t vehicle, unsigned long long after, struct FvoSpotMotionProofV1* out)
+{
+    if (!vehicle || !out || out->size != sizeof(*out) || out->version != 1) return 0;
+    std::lock_guard lock(vehicleflight::g_spotLock);
+    const auto it = vehicleflight::g_spotProof.find(vehicle);
+    if (it == vehicleflight::g_spotProof.end() || it->second.started <= after) return 0;
+    const auto& proof = it->second;
+    out->body = proof.body;
+    out->direction = int(proof.direction);
+    out->started = proof.started;
+    out->completed = proof.completed;
+    out->builtAt = proof.builtAt;
+    out->steps = proof.steps;
+    out->moved = proof.moved;
+    return 1;
+}
+#endif
 extern "C" __declspec(dllexport) int FVO_RegisterFieldBoxV2(FvoFieldBoxProviderV1 provider){
     if(fieldboxapi::provider&&fieldboxapi::provider!=provider)return 0;
     fieldboxapi::provider=provider;logger::Write("OBS system=plan.field event=provider version=2 registered=%d reason=addon_offers_field_boxes",int(provider!=nullptr));return 1;
