@@ -287,6 +287,11 @@ int main() {
     Check(c[0].slot == 1 && c[1].slot == 3 && c[2].slot == 2 && c[3].slot == 0, "arbiter: nearest first, stable");
     Check(MayCreate(WindowNow(3, false, false), 0, 0) && !MayCreate(WindowNow(3, false, false), 1, 0), "arbiter: one create per tick");
     Check(!MayCreate(WindowNow(3, false, false), 0, rules::maxWaitingCovered), "arbiter: waiting cap");
+    Check(CreateLimit(WindowNow(3, false, false)) == rules::maxCreatePerTickCovered && CreateLimit(WindowNow(1, false, false, true)) == rules::maxCreatePerTick,
+          "arbiter: a batch of creates per tick under cover, one in play");
+    {   const auto w = WindowNow(3, false, false);
+        Check(MayCreate(w, rules::maxCreatePerTickCovered - 1, 0, CreateLimit(w)) && !MayCreate(w, rules::maxCreatePerTickCovered, 0, CreateLimit(w)),
+              "arbiter: the covered batch stops at its limit"); }
     Check(!MayCreate(WindowNow(1, false, false), 0, 0), "arbiter: closed window creates nothing");
     Check(WindowNow(2,true,false,false,true).open,"window: X can fill gaps while its panel covers the world");
     Check(!WindowNow(2,true,false,false,false).open,"window: the ordinary map cannot keep an expired X admission open");

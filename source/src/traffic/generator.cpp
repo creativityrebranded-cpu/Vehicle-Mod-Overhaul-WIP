@@ -3183,7 +3183,7 @@ namespace generator
         std::vector<spawnflow::Candidate> order;
         // In play, a direct birth waits out the pause after a refusal.
         const bool live=!window.cover;
-        budget.limit=spawnflow::rules::maxCreatePerTick;
+        budget.limit=spawnflow::CreateLimit(window);  // a batch under cover, one at a time in play
         // Covered preparation and live shortfalls use the same physical slot order (the dot-based live fill is removed).
         if(filling){
             for(int i=0;i<total;++i){

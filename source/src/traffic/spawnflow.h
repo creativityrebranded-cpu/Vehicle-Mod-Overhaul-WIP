@@ -24,7 +24,10 @@ namespace rules {
 inline constexpr double factoryPoseHorizontal = 2.0, factoryPoseVertical = 2.5;
 inline constexpr double dropMargin = .3;            // m: births stand this far above the field floor and drop (user, 2026-11-06)
 inline constexpr int maxCreatePerTick = 1;          // Arbiter: at most one create request per tick
-inline constexpr int maxWaitingCovered = 12;        // Arbiter: pairs still being proved at once (loading screen / X panel)
+inline constexpr int maxWaitingCovered = 24;        // Arbiter: pairs still being proved at once (loading screen / X panel); 12 until 2026-11-21
+// Batches under cover (2026-11-21, user: "batch them"): the loading screen's arrival window is ~5 s after the world is ready, so one
+// create per tick placed at most ~15-20 of 61. Under cover nothing is seen and the frame is held: up to 4 create requests per tick.
+inline constexpr int maxCreatePerTickCovered = 4;
 inline constexpr int maxLookCovered = 32;           // Arbiter: slots looked at per tick
 // Health's verdict values (models, spots, every stage, the seat time) live in spawnhealth::rules: one rule (card HR1).
 inline constexpr unsigned long long seatProveMs = spawnhealth::rules::seatProveMs;  // minimum observed play time to record a terminal seat failure
@@ -146,6 +149,8 @@ inline void Order(std::vector<Candidate>& c) {
 // createLimit: the Arbiter's per-tick create limit (default the design's 1). In flight: rules::maxWaitingCovered under cover, rules::maxWaitingPlay in play.
 inline bool MayCreate(const Window& w, int madeThisTick, int waiting, int createLimit = rules::maxCreatePerTick) { return w.open && madeThisTick < createLimit && waiting < (w.cover ? rules::maxWaitingCovered : rules::maxWaitingPlay); }
 // The speaker spends one grant on a fleet pair or a driver repair. Completing either operation spends no grant.
+// The per-tick create limit for this window: a batch under cover, one at a time in play.
+inline int CreateLimit(const Window& w) { return w.cover ? rules::maxCreatePerTickCovered : rules::maxCreatePerTick; }
 struct BirthBudget {
     int granted = 0;
     int limit = rules::maxCreatePerTick;   // creates per tick
