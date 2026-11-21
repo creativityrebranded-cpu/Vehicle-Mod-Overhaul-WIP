@@ -246,6 +246,14 @@ namespace generator
         bool g_off = false;
         int g_admission = -1; std::size_t g_cursor = 0; ULONGLONG g_admissionAt = 0, g_lastTick = 0;
         std::vector<FvoPoolSpot> g_initialScene;std::set<int> g_initialRejected,g_modelUnavailable;
+        // Background flow (2026-11-21, user: "yes I needed the background flow"): every route position is a car moving along its route
+        // all the time (traffic_main FlowPose). Without a real car it is only that pose; the fill makes the real car there when it may: under
+        // cover anywhere, in play only at the edge of the loaded area (kFlowEdgeMinM..liveRadius from the player). A real car that drives
+        // past kFlowReturnM (moved by the core's far model meanwhile) is retired out of sight and its position goes on simulated.
+        generator::FlowPose g_flowPose=nullptr;std::vector<FvoPoolSpot> g_slotPose;std::vector<char> g_slotPoseOk;
+        constexpr double kFlowEdgeMinM=120.0,kFlowReturnM=900.0;
+        ULONGLONG g_flowToldAt=0;
+        const FvoPoolSpot& SlotPose(int i){return g_flowPose&&i>=0&&i<int(g_slotPose.size())&&g_slotPoseOk[std::size_t(i)]?g_slotPose[std::size_t(i)]:g_initialScene[std::size_t(i)];}
         std::vector<bool> g_initialRoads;
         std::map<int,std::vector<FvoPoolSpot>> g_initialAlternatives;std::map<int,int> g_initialAttempt,g_initialFails;int g_initialCursor=0;
         bool g_initialMap=false;
@@ -2819,6 +2827,7 @@ namespace generator
     void SetModelRules(const std::vector<std::vector<unsigned>>& skip){g_slotSkip=skip;g_fitRejected.clear();g_modelUnavailable.clear();}
     void SetModelGate(ModelGate gate){g_modelGate=gate;}
     void SetSiteGate(SiteGate gate,RoadSpacingGate spacing){g_siteGate=gate;g_roadSpacing=spacing;}
+    void SetFlowPose(FlowPose pose){g_flowPose=pose;}
     void SetCensusPublisher(FvoTrafficCensusPublishV1 publish,FvoTrafficCensusForgetV1 forget){g_censusPublish=publish;g_censusForget=forget;}
     void SetBirthListener(FvoTrafficBirthFnV1 listener){g_birthListener=listener;}
     void SetHandoffListeners(handoff::ReadFacts facts,handoff::Release release,handoff::RetireShow retire){
@@ -3189,10 +3198,11 @@ namespace generator
             for(int i=0;i<total;++i){
                 const auto& q=g_pairs[i];
                 if(!SlotFree(q)||q.vehicle||q.vehiclePending||q.retired||now<q.at||g_passRefused.count(i))continue;
-                const auto distance=std::hypot(g_initialScene[i].x-pp.x,g_initialScene[i].y-pp.y);
+                const auto& slotAt=SlotPose(i);
+                const auto distance=std::hypot(slotAt.x-pp.x,slotAt.y-pp.y);
                 // In play only replace a real shortfall within the existing native
                 // service envelope. Ring order does not reject any candidate.
-                if(live&&distance>spawnflow::rules::liveRadius)continue;
+                if(live&&(distance>spawnflow::rules::liveRadius||(g_flowPose&&distance<kFlowEdgeMinM)))continue;  // flow: in play a car appears only at the loaded edge
                 order.push_back({i,distance,FleetRing(distance,reach)});
             }
         }
@@ -3201,7 +3211,7 @@ namespace generator
             g_initialRejected.erase(i);
             ++looked;g_initialCursor=(i+1)%total;
             const int attempt=g_initialAttempt[i];const auto alternatives=g_initialAlternatives.find(i);
-            auto at=attempt&&alternatives!=g_initialAlternatives.end()?alternatives->second[std::size_t(attempt-1)]:g_initialScene[i];
+            auto at=attempt&&alternatives!=g_initialAlternatives.end()?alternatives->second[std::size_t(attempt-1)]:SlotPose(i);
             // Hidden traffic waiting for its delete takes no fleet place (13:34 run: 186 old refs held the whole window).
             spawnflow::PopulationRequest request{spawnflow::PopulationAction::FleetBirth,window};
             request.profileHasRoom=trafficadmission::Capacity(resident,0,0,total);
@@ -3519,6 +3529,32 @@ namespace generator
         const Snap* occupancy=&snap;
         if(g_roadVehicles&&spawnflow::MayCreate(window,budget.granted,0))
             occupancy=ReadVehicles(held,true)?&held:nullptr;
+        if(g_flowPose){
+            const int slots=std::min(int(g_initialScene.size()),int(g_pairs.size()));
+            g_slotPose.resize(std::size_t(slots));g_slotPoseOk.resize(std::size_t(slots));
+            int real=0,simulated=0,returned=0;
+            for(int i=0;i<slots;++i){
+                auto& p=g_pairs[std::size_t(i)];
+                FvoTrafficRef v{};const bool haveCar=p.vehicle&&!p.retired&&Info(p.vehicle,v)&&v.usable;
+                const FvoPoolSpot car{v.x,v.y,v.z,0};
+                g_slotPoseOk[std::size_t(i)]=g_flowPose(i,haveCar?&car:nullptr,g_slotPose[std::size_t(i)])?1:0;
+                if(haveCar)++real;else ++simulated;
+                // Far past the loaded area: the car goes back to the flow (retired out of sight; its position keeps moving simulated).
+                if(presentation==1&&haveCar&&!p.proving&&!p.staged&&!p.handoffPending&&Driving(p)&&
+                   std::hypot(v.x-pp.x,v.y-pp.y)>kFlowReturnM){
+                    const auto order=DecideRetirement(p,p.driver,"returned_to_flow");
+                    if(order.decision.now){
+                        if(g_fleetRelease)g_fleetRelease(p.vehicle);
+                        Log("OBS system=traffic.flow vehicle=%08X driver=%08X event=returned_to_flow slot=%d distance=%.0f rule=%s",p.vehicle,p.driver,i,std::hypot(v.x-pp.x,v.y-pp.y),order.rule);
+                        SetLife(i,p,spawnflow::Life::Retiring,"returned_to_flow");ApplyRetirement(order);
+                        p=Pair{};p.st=St::Empty;SaveIds(i,p);++returned;
+                    }
+                }
+            }
+            if(now-g_flowToldAt>=10000){g_flowToldAt=now;
+                Log("OBS system=traffic.flow vehicle=00000000 event=state positions=%d real=%d simulated=%d returned=%d edge_min_m=%.0f live_max_m=%.0f return_m=%.0f",
+                    slots,real,simulated,returned,kFlowEdgeMinM,spawnflow::rules::liveRadius,kFlowReturnM);}
+        }
         LARGE_INTEGER sceneFrom{},sceneTo{},sceneHz{};QueryPerformanceFrequency(&sceneHz);QueryPerformanceCounter(&sceneFrom);
         InitialScene(snap,occupancy,pp,now,presentation,panelCover,window,budget);
         QueryPerformanceCounter(&sceneTo);

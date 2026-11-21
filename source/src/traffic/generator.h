@@ -45,6 +45,10 @@ namespace generator
     using SiteGate=int (*)(int slot,int attempt,unsigned base,double radius,double halfHeight,FvoPoolSpot& at,bool occupied,bool spotRejected,RoadSite& road,const char** why);
     using RoadSpacingGate=bool (*)(int slot,const RoadSite& road,const FvoPoolSpot& other,double& gap);
     void SetSiteGate(SiteGate gate,RoadSpacingGate spacing);
+    // Background flow (2026-11-21): the pose of a route position's car now. car: the real car of that position (its station follows it),
+    // or null while the position is only simulated (it moves along its route). Returns false when the position has no route geometry.
+    using FlowPose=bool (*)(int slot,const FvoPoolSpot* car,FvoPoolSpot& out);
+    void SetFlowPose(FlowPose pose);
     // Census copy for core readers (trafficcensusapi.h): optional; null when the core has no such export.
     void SetCensusPublisher(FvoTrafficCensusPublishV1 publish,FvoTrafficCensusForgetV1 forget);
     void SetBirthListener(FvoTrafficBirthFnV1 listener);

@@ -2250,6 +2250,36 @@ namespace
     // or the default box for a route without them; none for D11 shapes or unreadable boxes), the lane point at the slot's station, and the
     // model's bounds give one pose (floor + rest height + drop margin, so the car drops onto the floor) or one reason. Trusts the field as
     // built: no navmesh, no World levels, no site rays (the user, 2026-11-06). Replaces InitialField (roadfield) and InitialDeck (navmesh).
+    // ---- Background flow (2026-11-21, user: "yes I needed the background flow"): every route position is a car moving along its lane at
+    // the route speed all the time. Simulated, it is only a station; while a real car holds the position the station follows that car.
+    // The generator makes the real car at the current station (InitialSite below) and the core moves it (autopilot near, rail / far model far).
+    constexpr bool kBackgroundFlow=true;
+    struct FlowCar{double metres=0,speed=0;ULONGLONG at=0;bool seeded=false;};
+    std::vector<FlowCar> g_flow;
+    bool FlowPose(int slot,const FvoPoolSpot* car,FvoPoolSpot& out){
+        if(slot<0||slot>=int(g_admissionLanes.size())||!g_admissionLanes[slot]||!g_admissionLanes[slot]->route||slot>=int(g_initialSlots.size()))return false;
+        const auto& plan=*g_admissionLanes[slot];
+        if(plan.line.error||plan.stations.size()<2)return false;
+        const double length=plan.stations.back();if(!(length>1))return false;
+        if(g_flow.size()<g_initialSlots.size())g_flow.resize(g_initialSlots.size());
+        auto& f=g_flow[std::size_t(slot)];const ULONGLONG now=GetTickCount64();
+        if(!f.seeded){
+            f.metres=trafficinitial::StationAt(plan.stations,g_initialSlots[std::size_t(slot)].u);
+            f.speed=std::clamp(plan.route->speed,5.0,60.0)*(0.8+0.2*double((slot*37)%10)/9.0);  // each position its own steady pace
+            f.at=now;f.seeded=true;
+        }
+        const double dir=trafficroute::Direction(plan.line,plan.lane);
+        double station=0;
+        if(car&&trafficinitial::ProjectRoadStation(*plan.route,plan.line,plan.stations,{car->x,car->y,car->z},station))f.metres=station;
+        else f.metres+=dir*f.speed*std::min(5.0,double(now-f.at)/1000.0);
+        f.at=now;
+        if(plan.line.closed){f.metres=std::fmod(f.metres,length);if(f.metres<0)f.metres+=length;}
+        else if(f.metres>length||f.metres<0)f.metres=dir>0?0:length;  // an open route starts again at its beginning
+        const double u=trafficinitial::AtStation(plan.stations,f.metres);
+        const auto a=trafficroute::At(plan.line,plan.lane,u),b=trafficroute::At(plan.line,plan.lane,u+dir*.001);
+        out={a.x,a.y,a.z,std::atan2(b.x-a.x,b.y-a.y)};
+        return std::isfinite(out.x)&&std::isfinite(out.y)&&std::isfinite(out.z);
+    }
     int InitialSite(int slot,int attempt,unsigned base,double radius,double halfHeight,FvoPoolSpot& at,bool occupied,bool spotRejected,generator::RoadSite& road,const char** why){
         *why="no_admission_lane";
         if(slot<0||slot>=int(g_admissionLanes.size())||!g_admissionLanes[slot]||!g_admissionLanes[slot]->route)return 0;
@@ -2257,7 +2287,14 @@ namespace
         if(plan.line.error){*why="route_line_error";return 0;}
         const auto& seed=g_initialSlots[slot];
         double u=0;
-        if(seed.interval>0){
+        if(kBackgroundFlow&&seed.interval>0&&std::size_t(slot)<g_flow.size()&&g_flow[std::size_t(slot)].seeded&&plan.stations.size()>=2){
+            // The flow car's current station; an alternative attempt is a little behind it on the same lane.
+            const double dir=trafficroute::Direction(plan.line,plan.lane),length=plan.stations.back();
+            double metres=g_flow[std::size_t(slot)].metres-dir*double(std::max(0,attempt))*15.0;
+            if(plan.line.closed){metres=std::fmod(metres,length);if(metres<0)metres+=length;}else metres=std::clamp(metres,0.0,length);
+            u=trafficinitial::AtStation(plan.stations,metres);
+            road={metres,seed.interval};
+        }else if(seed.interval>0){
             if(!seed.eligible||attempt<0||std::size_t(attempt)>seed.backups.size()){*why="kilometre_slot_no_field_room";return 0;}
             u=attempt?seed.backups[std::size_t(attempt-1)].u:seed.u;
             road={trafficinitial::StationAt(plan.stations,u),seed.interval};
@@ -2446,6 +2483,7 @@ namespace
         ++g_initialPlanGeneration;
         if(int(g_initialSlots.size())>city.limit)g_initialSlots.resize(std::size_t(std::max(0,city.limit)));
         g_initialSiteOutput.assign(g_initialSlots.size(),{});
+        g_flow.assign(g_initialSlots.size(),{});  // a new plan: the flow starts again at the planned stations
         target=std::max(target,int(g_initialSlots.size()));
         for(int i=0;i<target;++i){
             spots.push_back(origins.empty()?FvoPoolSpot{}:origins[std::size_t(i)%origins.size()]);
@@ -2513,6 +2551,7 @@ namespace
         }
         generator::SetModelGate(&InitialModelFits);
         generator::SetSiteGate(&InitialSite,&InitialRoadGap);
+        generator::SetFlowPose(kBackgroundFlow?&FlowPose:nullptr);
         Log("Traffic arrival: %zu active route positions prepared; ground origins are only for later departures",initial.size());
         Log("FVO traffic: %s: stable fleet capacity %d, %zu authored ground origins, %zu total registry slots; additions require validated concealed departure",world,target,origins.size(),spots.size());
     }
@@ -2698,7 +2737,7 @@ namespace
 		for(auto& s:g_slots)s={};g_poolWorld.clear();g_poolStamp=~0ull;g_testDone.clear();g_lastStart=0;
 		g_found.clear();g_read={};g_data={};g_stamp=~0ull;g_reloadWanted=true;g_poolResend=true;
         g_factoryRoute.reset();g_factoryConfig={};g_factoryGeometry={};
-		g_initialSlots.clear();g_initialSiteOutput.clear();g_initialClockPending=false;g_emptyTrips.clear();
+		g_initialSlots.clear();g_initialSiteOutput.clear();g_flow.clear();g_initialClockPending=false;g_emptyTrips.clear();
 		g_admissionLanes.clear();g_cruiseLast.clear();g_constraintMinute=-1;g_signalSeconds=g_signalLastTick=0;g_rememberedJourneys.clear();g_journeyProfile.clear();g_rightOfWay.Reset();g_roadDecision.clear();g_approachTiming.clear();g_otherApproachDistance.clear();g_roadStamp=~0ull;
 		journeyLock.unlock();generator::Reset();everyday::Reset();
 	}  // a save load or a different playthrough
