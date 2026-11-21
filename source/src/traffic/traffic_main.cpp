@@ -31,6 +31,7 @@
 #include "observations.h"
 #include "fvolimits.h"
 #include "generator.h"
+#include "factorysite.h"
 #include "everyday.h"
 #include "fvopaths.h"
 #include "trafficdata.h"
@@ -85,6 +86,9 @@ namespace
     int (*g_outOfTraffic)(const unsigned*,int)=nullptr;double g_outOfTrafficAt=-1;  // C4: core export FVO_VehiclesOutOfTrafficV1 (null: not exported)
     planowner::SnapshotV1 g_ownerSnapshot=nullptr;  // C2: the core's one owner/rank record, read-only (null: junctions see traffic only)
     double g_coordLogAt=-1;
+    struct InitialSiteOutput { FvoPoolSpot pose{}; unsigned base=0; };
+    std::vector<InitialSiteOutput> g_initialSiteOutput;
+    std::uint64_t g_initialPlanGeneration=0;
     using FvoNavWant_t=void(*)(double x,double y);
     FvoNavWant_t g_navWant=nullptr;
     bool g_corridorSupported=false;bool g_fieldSupported=false;
@@ -184,6 +188,10 @@ namespace
 
 	trafficdata::Data g_data;       // as used: anchored worlds found in game are placed (moved into game coordinates)
 	trafficdata::Data g_read;       // as the files say
+    factorysite::Config g_factoryConfig;
+    trafficdata::Data g_factoryGeometry;
+    FvoSpotMotionProofQueryV1 g_factoryProof = nullptr;
+    FvoTrafficFactoryLeaseFnV1 g_factoryLease = nullptr;
 	unsigned long long g_stamp = ~0ull;
 	// Anchored worlds found in game: world name -> (the player's world then, the shift). Kept across file reloads; measured
 	// again when the player is in another world (a new landing lays the city down again).
@@ -275,22 +283,19 @@ namespace
 		g_stamp = stamp;
 		trafficdata::Data d;
 		std::sort(files.begin(), files.end());
-        // A FactoryBay.ini with a [factory.*] section is a retired factory-bay manifest (its private road must not become public
-        // traffic): skipped. One without such a section is an ordinary route file and is read as before.
-        auto factoryManifest = [](const std::string& text) {
-            std::istringstream in(text.starts_with("\xef\xbb\xbf") ? text.substr(3) : text);
-            for (std::string line; std::getline(in, line);) {
-                line = trafficdata::Trim(line.substr(0, line.find(';')));
-                if (line.size() > 1 && line[0] == '[' &&
-                    trafficdata::Lower(trafficdata::Trim(line.substr(1, line.find(']') - 1))).starts_with("factory.")) return true;
-            }
-            return false;
-        };
+        g_factoryConfig = {};
+        g_factoryGeometry = {};
         for (const auto& f : files) {
             const auto text = ReadFile(dir + L"\\" + f);
-            if (_wcsicmp(f.c_str(), L"FactoryBay.ini") == 0 && factoryManifest(text)) {
-                Log("FVO traffic: skipped %s (factory bay manifest; factory bays are retired)", Narrow(f).c_str());
-                continue;
+            if (_wcsicmp(f.c_str(), L"FactoryBay.ini") == 0) {
+                const auto site = factorysite::Parse(text);
+                if (site.recognized) {
+                    if (site.enabled) {
+                        g_factoryConfig = site.config;
+                        trafficdata::Read(text, Narrow(f), g_factoryGeometry, true);
+                    } else if (site.reason) Log("OBS system=traffic.factory_site event=inactive reason=%s", site.reason);
+                    continue;
+                }
             }
             trafficdata::Read(text, Narrow(f), d);
         }
@@ -304,6 +309,17 @@ namespace
 	}
 
     struct ScriptStop { trafficdata::Vec at;double dwell=0;std::vector<std::string> routes; };
+    enum class FactoryRoutePhase { None, Test, Departing, Arrival, StockReserved, StockCommitted };
+    struct FactoryRoute {
+        generator::FactoryBay bay;
+        trafficdata::Route lane;
+        trafficroute::Line line;
+        trafficlinks::Junction exit;
+        std::string world;
+        int privateLane = -1;
+        double arrivalU = 0;
+    };
+    std::optional<FactoryRoute> g_factoryRoute;
     std::atomic<std::uint64_t> g_journeyGeneration{0};
 	struct Slot {
         std::uint64_t generation=g_journeyGeneration.fetch_add(1,std::memory_order_relaxed)+1;
@@ -314,6 +330,12 @@ namespace
         const char* liftWhyLogged="";  // last traffic.lift rules choice logged
         placeaccess::Plan accessPlan,manoeuvrePlan;bool placeApproach=false,placePath=false,pickupWait=false;unsigned scriptSignal=0;const char* scriptReason="following journey";journeyplan::Plan authoredJourney;std::vector<ScriptStop> script;std::size_t scriptAt=0;double scriptDwell=0;bool scriptHolding=false;
         std::size_t itineraryAt=0;
+        FactoryRoutePhase factoryPhase=FactoryRoutePhase::None;
+        std::string factoryDestination;
+        FvoPoolSpot factoryArrival{};
+        double factoryArrivalU=0;
+        int stockRoadSlot=-1;
+        std::uint64_t stockRouteStamp=0;
         double stepAt=0,measuredSpeed=0,controlStopped=0;
         trafficdata::Vec stepVelocity;
         int completedControl=-1;
@@ -349,6 +371,9 @@ namespace
 		bool flownStart = false;
 	};
 	Slot g_slots[kSlots];
+    bool StockRoutePending(const Slot& s) {
+        return s.factoryPhase==FactoryRoutePhase::StockReserved||s.factoryPhase==FactoryRoutePhase::StockCommitted;
+    }
     roadnetwork::Network g_road;
     roadnetwork::Arbiter g_rightOfWay;
     unsigned long long g_roadStamp=~0ull;
@@ -434,7 +459,7 @@ namespace
     int SaveJourneys(){
         trafficprofileclient::Guard lock;if(!lock)return 0;std::lock_guard journeyLock(g_journeyMutex);if(g_journeyProfile.empty())return 1;if(!g_journeyWritable)return 0;
         const auto target=std::filesystem::path(g_journeyProfile)/L"journeys.state";auto temp=target;temp+=L".pending";
-        auto records=g_rememberedJourneys;for(auto& s:g_slots)if(s.used&&s.vehicleId)records[s.vehicleId]=s;
+        auto records=g_rememberedJourneys;for(auto& s:g_slots)if(s.used&&s.vehicleId&&s.factoryPhase==FactoryRoutePhase::None)records[s.vehicleId]=s;
         std::ofstream out(temp,std::ios::binary|std::ios::trunc);out.precision(17);out<<"FVO_JOURNEYS 1 "<<records.size()<<' '<<std::quoted(g_roadWorld)<<' '<<g_signalSeconds<<'\n';for(auto& [id,s]:records){(void)id;WriteJourney(out,s);}out.flush();if(!out)return 0;out.close();
         return MoveFileExW(temp.c_str(),target.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)?1:0;
     }
@@ -571,9 +596,9 @@ namespace
 		f.revisionReady = RevisionReady(r);
 		if (!f.revisionReady) return answer();
 		for (const auto& o : g_slots) {
-			if (!o.used || &o == except || o.dest == "your marker") continue;
+			if (!o.used || &o == except || o.dest == "your marker" || o.factoryPhase==FactoryRoutePhase::Test) continue;
 			++f.all;
-			if (o.route == r.name) ++f.onRoute;
+			if ((o.factoryPhase==FactoryRoutePhase::Departing ? o.factoryDestination : o.route) == r.name) ++f.onRoute;
 			if (o.route.rfind("ed_", 0) != 0 && o.dest != "your marker") ++f.ruled;
 		}
 		if (on) *on = f.onRoute;
@@ -829,7 +854,7 @@ namespace
     std::vector<LaneCar> g_laneCars;double g_laneCoordAt=-1;
     lanecoord::Reservations g_laneReserved;lanecoord::Blocks g_laneBlocks;lanecoord::Yields g_laneYields;
     std::map<std::pair<unsigned,int>,std::pair<double,int>> g_laneClosed;  // (vehicle, lane) -> when it was last closed, and why (hysteresis and the trace)
-    bool OnRoadLane(const Slot& s){return s.used&&s.vehicleId&&s.trip.leg==trafficroute::Leg::Follow&&!s.placePath&&s.turn.empty()&&!s.line.error&&!s.line.distance.empty();}
+    bool OnRoadLane(const Slot& s){return s.used&&!StockRoutePending(s)&&s.vehicleId&&s.trip.leg==trafficroute::Leg::Follow&&!s.placePath&&s.turn.empty()&&!s.line.error&&!s.line.distance.empty();}
     std::uint64_t RoadId(const Slot& s){std::uint64_t h=1469598103934665603ull;for(char c:s.world)h=(h^static_cast<unsigned char>(c))*1099511628211ull;h=(h^0x2Full)*1099511628211ull;
         for(char c:s.route)h=(h^static_cast<unsigned char>(c))*1099511628211ull;return h?h:1;}
     const LaneCar* LaneCarOf(unsigned vehicle){for(const auto& c:g_laneCars)if(c.vehicle==vehicle)return &c;return nullptr;}
@@ -1118,7 +1143,11 @@ namespace
         if(s->scriptAt<s->authoredJourney.stops.size()){const auto& stage=s->authoredJourney.stops[s->scriptAt];if(stage.speed>0)lane.speed=std::min(lane.speed,stage.speed);}
         // C3: the coordinator is the one writer of holds and stop lines; each rule below reports to it by name (its condition unchanged).
         coordinator::Holds<FvoLaneGuidanceV1> H(lane);unsigned& heldWhy=H.bits;  // traced below: which rule holds the lane
-        H.HoldIf(s->holding,coordinator::Holding);H.HoldIf(s->scriptHolding,coordinator::Script);H.HoldIf(s->connectionBlocked,coordinator::Connection);
+        H.HoldIf(s->holding||s->factoryPhase==FactoryRoutePhase::Test||s->factoryPhase==FactoryRoutePhase::Arrival||StockRoutePending(*s),coordinator::Holding);H.HoldIf(s->scriptHolding,coordinator::Script);H.HoldIf(s->connectionBlocked,coordinator::Connection);
+        if(s->factoryPhase==FactoryRoutePhase::Departing&&s->route==s->factoryDestination&&s->turn.empty()){
+            const double remaining=trafficroute::Ahead(s->line,s->trip.lane,u,s->factoryArrivalU);
+            if(std::isfinite(remaining))H.StopMin(remaining);
+        }
         // Exclusion lists choose which models traffic spawns and sends; your own Cruise is your choice and is never held by them (2026-11-04: FE00900A excluded on Roadrunner froze Cruise).
         if(s->dest!="cruise"&&((s->baseId&&trafficdata::LaneLeftOut(g_data.groups,r,s->trip.lane,s->baseId))||(!s->baseId&&!r.lanePlan.vehicles.lanes.empty()))){H.Hold(coordinator::ExcludedModel);}const auto restrictions=SpatialRestrictions(r,s->x,s->y,s->z);lane.speed=std::min(lane.speed,restrictions.speed);if(!restrictions.valid||restrictions.closure==2){H.Hold(coordinator::Zone);}
         if(!(restrictions.modes&(lane.travel==1?1:lane.travel==2?2:3))){H.Hold(coordinator::ZoneMode);}lane.identity=1469598103934665603ull;
@@ -1450,10 +1479,64 @@ namespace
         }
         s.turn.clear();s.turnFrom.clear();s.turnFromLine={};s.trip.uKnown=false;s.placePath=false;return false;
 	}
+    void StepFactoryRoute(Slot& s, double x, double y, double z, FvoTripGoal& out) {
+        const auto hold = [&] { out = {x, y, z, 1.0, 0, 0, 0.0f}; };
+        if(s.factoryPhase!=FactoryRoutePhase::Departing) { hold(); return; }
+        if(TurnGoal(s,x,y,z,&out)) { out.fly=0; return; }
+        const double u=trafficroute::NearestProgress(s.line,s.trip.lane,x,y,z,s.trip.uKnown,s.trip.lastU);
+        if(s.route!=s.factoryDestination&&!s.junctions.empty()) {
+            const auto exit=s.junctions.front();
+            if(trafficroute::DistanceAlong(s.line,s.trip.lane,u,exit.u)<=std::max(3.0,2.5*exit.radius)) {
+                if(TakeJunction(s,exit,true)) {
+                    if(TurnGoal(s,x,y,z,&out)) { out.fly=0; return; }
+                } else if(trafficroute::DistanceAlong(s.line,s.trip.lane,u,exit.u)<=1.0) {
+                    s.connectionBlocked=true;
+                    hold();
+                    return;
+                }
+            }
+        }
+        const double progress=trafficroute::NearestProgress(s.line,s.trip.lane,x,y,z,s.trip.uKnown,s.trip.lastU);
+        s.trip.lastU=progress;
+        s.trip.uKnown=true;
+        if(s.route==s.factoryDestination) {
+            if(spawnflow::FactoryPose(x-s.factoryArrival.x,y-s.factoryArrival.y,z-s.factoryArrival.z)) {
+                s.factoryPhase=FactoryRoutePhase::Arrival;
+                Log("OBS system=traffic.factory_site vehicle=%08X event=arrival_hold route=%s lane=%d",s.vehicleId,s.route.c_str(),s.trip.lane);
+                hold();
+            } else out={s.factoryArrival.x,s.factoryArrival.y,s.factoryArrival.z,1.0,0,0,float(s.speed)};
+            return;
+        }
+        const auto goal=trafficroute::At(s.line,s.trip.lane,trafficroute::LeadU(s.line,s.trip.lane,progress,trafficroute::kLead));
+        out={goal.x,goal.y,goal.z,1.0,1,0,float(s.speed)};
+    }
 	int Step(void* user, double x, double y, double z, FvoTripGoal* out)
 	{
         std::lock_guard journeyLock(g_journeyMutex);
 		Slot* s=slotcookie::Find(g_slots,user);if(!s||!s->used||!out)return 1;
+        if(StockRoutePending(*s)) {
+            s->seen=GetTickCount64();
+            const auto& at=s->factoryArrival;
+            if(s->factoryPhase!=FactoryRoutePhase::StockCommitted||!spawnflow::FactoryPose(x-at.x,y-at.y,z-at.z)) {
+                observations::Record(g_log,GetTickCount64(),"traffic.factory_route",s->vehicleId,0,
+                    "event=arrival_hold reason=await_destination_sample");
+                *out={x,y,z,1.0,0,0,0.0f};
+                return 0;
+            }
+            // Only the retained pilot may call this claim after Core applies the transfer. Seed the
+            // existing route follower with the destination sample, without inheriting a stock pose or speed.
+            s->trip=trafficroute::StartLap(s->line,s->trip.lane,{x,y,z});
+            s->trip.leg=trafficroute::Leg::Follow;
+            s->trip.lastU=trafficroute::NearestProgress(s->line,s->trip.lane,x,y,z,true,s->factoryArrivalU);
+            s->trip.uKnown=true;
+            s->x=x;s->y=y;s->z=z;
+            s->logged=s->trip.leg;
+            s->factoryPhase=FactoryRoutePhase::None;
+            s->stockRoadSlot=-1;
+            FindJunctions(*s);
+            Log("OBS system=traffic.factory_route vehicle=%08X event=active route=%s lane=%d reason=seated_arrival_goal_requested",
+                s->vehicleId,s->route.c_str(),s->trip.lane);
+        }
         static thread_local int depth=0;struct Depth{int& value;Depth(int& v):value(v){++value;}~Depth(){--value;}} depthGuard(depth);
         if(depth>4){out->x=x;out->y=y;out->z=z;out->stop=1;out->speed=0;out->fly=1;s->scriptReason="script transition budget; resume next update";return 0;}
 		s->seen = GetTickCount64();s->connectionBlocked=false;
@@ -1467,6 +1550,7 @@ namespace
         }
         s->stepAt=tick;
 		s->x = x; s->y = y; s->z = z;
+        if(s->factoryPhase!=FactoryRoutePhase::None) { StepFactoryRoute(*s,x,y,z,*out); return 0; }
         if(s->pickupWait){const auto* place=PlaceNamed(s->place);const int space=place?FreeSpace(*place,s):-1;if(!place||space<0){s->holding=true;out->x=x;out->y=y;out->z=z;out->stop=1;out->speed=0;out->fly=1;return 0;}s->pickupWait=false;s->holding=false;s->space=space;s->trip.dest=trafficdata::Spaces(*place)[std::size_t(space)];}
         if(TurnGoal(*s,x,y,z,out))return 0;
         if(s->trip.leg==trafficroute::Leg::Follow&&!s->itinerary.routes.empty()&&s->itineraryAt+1<s->itinerary.routes.size()) {
@@ -1682,17 +1766,21 @@ namespace
 		Slot* free = nullptr;
 		for (auto& s : g_slots) {
             if(s.used&&now-s.seen>kLostMs&&!(s.vehicleId&&g_trafficApi&&
-                (engineport::Forward<&FvoTrafficApi::usesVehicle>(g_trafficApi,"usesVehicle","routes",0u,s.vehicleId)||(g_trafficApi->tripActive&&engineport::Forward<&FvoTrafficApi::tripActive>(g_trafficApi,"tripActive","routes",0u,s.vehicleId))))){if(s.vehicleId)g_rememberedJourneys[s.vehicleId]=s;s.used=false;}
+                (engineport::Forward<&FvoTrafficApi::usesVehicle>(g_trafficApi,"usesVehicle","routes",0u,s.vehicleId)||(g_trafficApi->tripActive&&engineport::Forward<&FvoTrafficApi::tripActive>(g_trafficApi,"tripActive","routes",0u,s.vehicleId))))){if(s.vehicleId&&s.factoryPhase==FactoryRoutePhase::None)g_rememberedJourneys[s.vehicleId]=s;s.used=false;}
 			if (s.used) ++active; else if (!free) free = &s;
 		}
 		return free;
 	}
 
-    Slot* VehicleSlot(unsigned vehicle,int& active){Slot* free=FreeSlot(active);if(vehicle)for(auto& s:g_slots)if(s.used&&s.vehicleId==vehicle)return &s;return free;}
+    Slot* VehicleSlot(unsigned vehicle,int& active){Slot* free=FreeSlot(active);if(vehicle)for(auto& s:g_slots)if(s.used&&s.vehicleId==vehicle)return StockRoutePending(s)?nullptr:&s;return free;}
 
 	int Offer(double x, double y, double z, unsigned vehicleId, FvoTripClaim* out)
 	{
 		Load();
+        {
+            std::lock_guard lock(g_journeyMutex);
+            if(g_factoryRoute&&vehicleId==g_factoryRoute->bay.vehicle)return 0;  // reserved authored inventory
+        }
 		const ULONGLONG now = GetTickCount64();
 		char world[201]{};
 		if (!g_worldName || !engineport::FunctionForward(g_worldName,"worldName","routes",0u,world, sizeof world)) return 0;
@@ -1767,6 +1855,145 @@ namespace
 		TraceTrip(spot, vehicleId, ok, active);  // SR-1
 		return ok;
 	}
+
+    int FactoryTrip(generator::FactoryTripAction action,unsigned vehicle,double x,double y,double z,FvoTripClaim* claim) {
+        using Action=generator::FactoryTripAction;
+        std::lock_guard lock(g_journeyMutex);
+        Slot* current=nullptr;
+        for(auto& slot:g_slots)if(slot.used&&slot.vehicleId==vehicle){current=&slot;break;}
+        if(current&&StockRoutePending(*current))return 0;
+        if(action==Action::Complete) {
+            if(!current||current->factoryPhase!=FactoryRoutePhase::Arrival)return 0;
+            auto& s=*current;
+            s.factoryPhase=FactoryRoutePhase::None;
+            s.factoryDestination.clear();
+            s.plannedRoutes.clear();
+            s.plannedLinks.clear();
+            s.networkSnapshot=false;
+            s.home=s.route;
+            s.trip=trafficroute::StartLap(s.line,s.trip.lane,{x,y,z});
+            s.trip.leg=trafficroute::Leg::Follow;
+            s.trip.lastU=trafficroute::Nearest(s.line,s.trip.lane,x,y);
+            s.trip.uKnown=true;
+            s.repeat=g_cycleSupported;
+            FindJunctions(s);
+            return 1;
+        }
+        if(action==Action::Rollback) {
+            if(!current||current->factoryPhase==FactoryRoutePhase::None||
+                current->factoryPhase==FactoryRoutePhase::Arrival||current->route==current->factoryDestination)return 0;
+            current->factoryPhase=FactoryRoutePhase::Test;
+            current->factoryDestination.clear();
+            current->connectionBlocked=false;
+            return 1;
+        }
+        if(!g_factoryRoute||vehicle!=g_factoryRoute->bay.vehicle)return 0;
+        const auto& site=*g_factoryRoute;
+        if(action==Action::Dispatch) {
+            if(!current||current->factoryPhase!=FactoryRoutePhase::Test||current->world!=site.world||
+                routecache::Key(current->spec)!=routecache::Key(site.lane))return 0;
+            const auto* road=trafficlinks::Find(WorldRoutes(current->world.c_str()),site.exit.other);
+            const auto rule=RuleFor(current->world.c_str());
+            if(!road||!Allowed(*road,rule)||!Room(*road,rule,current,true)||Excluded(*road,vehicle,site.exit.toLane))return 0;
+            current->plannedRoutes={site.lane,*road};
+            current->junctions={site.exit};
+            current->networkSnapshot=true;
+            current->factoryDestination=road->name;
+            current->factoryArrival=site.bay.arrival;
+            current->factoryArrivalU=site.arrivalU;
+            current->factoryPhase=FactoryRoutePhase::Departing;
+            return 1;
+        }
+        if(action!=Action::Test||!claim||g_rememberedJourneys.contains(vehicle)||
+            (current&&current->factoryPhase!=FactoryRoutePhase::Test))return 0;
+        if(!current) { int active=0;current=FreeSlot(active); }
+        if(!current)return 0;
+        const unsigned base=g_baseOf?engineport::FunctionForward(g_baseOf,"baseOf","routes",0u,vehicle):0;
+        if(!base||Excluded(site.lane,vehicle,site.privateLane))return 0;
+        if(!current->used) {
+            auto& s=*current;
+            s=Slot{};
+            s.used=true;s.vehicleId=vehicle;s.baseId=base;s.world=site.world;
+            s.route=site.lane.name;s.home=s.route;s.spec=site.lane;s.line=site.line;
+            s.x=x;s.y=y;s.z=z;s.speed=RoleSpeed(site.lane);
+            s.trip=trafficroute::StartLap(s.line,site.privateLane,{x,y,z});
+            s.trip.leg=trafficroute::Leg::Follow;
+            s.trip.lastU=trafficroute::Nearest(s.line,site.privateLane,x,y);
+            s.trip.uKnown=true;
+            s.factoryPhase=FactoryRoutePhase::Test;
+        }
+        current->seen=GetTickCount64();
+        *claim={&Step,current,"factory bay spot test"};
+        return 1;
+    }
+
+    // Route owns the reserved public lane and its journey cookie. The Generator owns the
+    // destination proof and passes it to Core while this cookie still publishes a hold.
+    int StockRoute(generator::StockRouteAction action,int roadSlot,unsigned vehicle,const FvoPoolSpot& at,FvoTripClaim* claim) {
+        using Action=generator::StockRouteAction;
+        if(claim)*claim={};
+        if(!vehicle)return 0;
+        std::lock_guard lock(g_journeyMutex);
+        const auto it=std::find_if(std::begin(g_slots),std::end(g_slots),[=](const Slot& s){return s.used&&s.vehicleId==vehicle;});
+        Slot* current=it==std::end(g_slots)?nullptr:&*it;
+        if(action==Action::Cancel) {
+            if(!current||!StockRoutePending(*current)||current->stockRoadSlot!=roadSlot)return 0;
+            Log("OBS system=traffic.factory_route vehicle=%08X event=cancelled route=%s lane=%d slot=%d",
+                vehicle,current->route.c_str(),current->trip.lane,roadSlot);
+            *current=Slot{};
+            return 1;
+        }
+
+        if(roadSlot<0||roadSlot>=int(g_initialSlots.size())||g_initialClockPending)return RefuseTrip(vehicle,"stock_road_slot_unavailable");
+        if(!std::isfinite(at.x)||!std::isfinite(at.y)||!std::isfinite(at.z)||!std::isfinite(at.heading))return RefuseTrip(vehicle,"stock_bad_destination");
+        const auto& seed=g_initialSlots[std::size_t(roadSlot)];
+        const auto samePose=[&](const FvoPoolSpot& other){return at.x==other.x&&at.y==other.y&&at.z==other.z&&at.heading==other.heading;};
+        char world[201]{};
+        if(!g_worldName||!engineport::FunctionForward(g_worldName,"worldName","routes",vehicle,world,sizeof world))return RefuseTrip(vehicle,"stock_world_unavailable");
+        const auto same=current&&StockRoutePending(*current)&&current->stockRoadSlot==roadSlot&&current->stockRouteStamp==g_initialPlanGeneration&&
+            current->world==world&&current->route==seed.route&&current->trip.lane==seed.lane&&
+            samePose(current->factoryArrival);
+        const auto* route=trafficlinks::Find(WorldRoutes(world),seed.route);
+        const auto rule=RuleFor(world);
+        int on=-1,want=-1;
+        const char* reason="stock_route_has_no_room";
+        if(!route||route->removed||!seed.eligible||!Allowed(*route,rule)||route->journey.enabled)return RefuseTrip(vehicle,"stock_route_unavailable");
+        if(!Room(*route,rule,current,true,&on,&want,&reason))return RefuseTrip(vehicle,reason,on,want);
+        if(action==Action::Commit) {
+            if(!same||!claim||routecache::Key(*route)!=routecache::Key(current->spec))return RefuseTrip(vehicle,"stock_reservation_changed");
+            current->factoryPhase=FactoryRoutePhase::StockCommitted;
+            current->seen=GetTickCount64();
+            *claim={&Step,current,"factory delivery"};
+            return 1;
+        }
+        if(action!=Action::Reserve||g_rememberedJourneys.contains(vehicle)||(current&&!same))return RefuseTrip(vehicle,"stock_journey_already_exists");
+        if(same)return 1;
+        if(std::any_of(std::begin(g_slots),std::end(g_slots),[=](const Slot& s){return s.used&&StockRoutePending(s)&&s.stockRoadSlot==roadSlot&&s.world==world;}))
+            return RefuseTrip(vehicle,"stock_road_slot_reserved");
+        const unsigned base=g_baseOf?engineport::FunctionForward(g_baseOf,"baseOf","routes",vehicle,vehicle):0;
+        if(!base||Excluded(*route,vehicle,seed.lane))return RefuseTrip(vehicle,"stock_model_excluded");
+        if(roadSlot>=int(g_initialSiteOutput.size()))return RefuseTrip(vehicle,"stock_destination_not_sited");
+        const auto& site=g_initialSiteOutput[std::size_t(roadSlot)];
+        if(site.base!=base||!samePose(site.pose))return RefuseTrip(vehicle,"stock_destination_not_sited");
+        auto line=trafficroute::Build(*route);
+        if(line.error||line.Count()<2||!trafficroute::HasLane(line,route->lanes,seed.lane))return RefuseTrip(vehicle,"stock_lane_unavailable");
+        const double station=trafficroute::NearestProgress(line,seed.lane,at.x,at.y,at.z,true,seed.u);
+        const auto zone=SpatialRestrictions(*route,at.x,at.y,at.z);
+        if(!zone.valid||!zone.admit||zone.closure!=0||!(zone.modes&1))return RefuseTrip(vehicle,"stock_road_destination_restricted");
+        int active=0;
+        auto* s=FreeSlot(active);
+        if(!s)return RefuseTrip(vehicle,"stock_no_free_trip_slot");
+        *s=Slot{};
+        s->used=true;s->vehicleId=vehicle;s->baseId=base;s->world=world;s->route=route->name;s->home=s->route;
+        s->spec=*route;s->line=std::move(line);s->speed=RoleSpeed(*route);s->repeat=g_cycleSupported;
+        s->x=at.x;s->y=at.y;s->z=at.z;s->seen=GetTickCount64();s->dice=(std::uint64_t(vehicle)<<20)^s->seen;
+        s->trip=trafficroute::StartLap(s->line,seed.lane,{at.x,at.y,at.z});
+        if(SectionAt(*s,station).travel==routepolicy::Travel::Hover){*s=Slot{};return RefuseTrip(vehicle,"stock_road_destination_hover_only");}
+        s->factoryArrival=at;s->factoryArrivalU=station;
+        s->factoryPhase=FactoryRoutePhase::StockReserved;s->stockRoadSlot=roadSlot;s->stockRouteStamp=g_initialPlanGeneration;
+        Log("OBS system=traffic.factory_route vehicle=%08X event=reserved route=%s lane=%d slot=%d",vehicle,s->route.c_str(),seed.lane,roadSlot);
+        return 1;
+    }
 
 	// Auto on routes (2026-10-28, the user: a destination "with a traffic route nearby adds as one of the vehicles and uses it to
 	// get to the nearest exit to the destination and then continue from there"). The player's vehicle takes a slot like traffic
@@ -2058,6 +2285,7 @@ namespace
         *why=site.why;
         if(!site.ok)return 0;
         at={site.pose.x,site.pose.y,site.pose.z,site.pose.heading};
+        if(slot<int(g_initialSiteOutput.size()))g_initialSiteOutput[std::size_t(slot)]={at,base};
         return 1;
     }
     bool InitialRoadGap(int slot,const generator::RoadSite& road,const FvoPoolSpot& other,double& gap){
@@ -2119,8 +2347,57 @@ namespace
         if(removalWatch.Changed(fvopaths::Settings()))
             generator::SetRemovalPrediction(GetPrivateProfileIntW(L"traffic",L"removeByCameraPrediction",0,fvopaths::Settings().c_str())!=0);
     }
+    void ConfigureFactoryRoute(const char* world) {
+        std::lock_guard lock(g_journeyMutex);
+        g_factoryRoute.reset();
+        const auto publish=[&] {
+            generator::SetFactoryBay(g_factoryRoute?&g_factoryRoute->bay:nullptr,&FactoryTrip,g_factoryProof,g_factoryLease);
+        };
+        const auto reject=[&](const char* reason) {
+            Log("OBS system=traffic.factory_site event=inactive bay=%s reason=%s",g_factoryConfig.key.c_str(),reason);
+            publish();
+        };
+        if(!g_factoryConfig.vehicle||!trafficdata::SameWorld(g_data,g_factoryConfig.world,world)) { publish(); return; }
+        if(!g_factoryProof||!g_factoryLease) { reject("factory_core_exports_unavailable"); return; }
+        if(!g_factoryGeometry.problems.empty()||g_factoryGeometry.routes.size()!=1||g_factoryGeometry.links.size()!=1) {
+            reject("expected_one_private_route_and_exit");
+            return;
+        }
+        auto validation=g_data;
+        validation.routes.push_back(g_factoryGeometry.routes.front());
+        validation.links.push_back(g_factoryGeometry.links.front());
+        if(const auto* why=factorysite::Validate(g_factoryConfig,validation,world)) { reject(why); return; }
+        const auto* publicRoad=trafficlinks::Find(WorldRoutes(world),g_factoryConfig.publicRoute);
+        const auto& privateRoad=g_factoryGeometry.routes.front();
+        if(!publicRoad||!Allowed(*publicRoad,RuleFor(world))||
+            (privateRoad.road.enabled&&!g_fieldSupported)) { reject("route_policy_unavailable"); return; }
+        const auto links=trafficlinks::Of(g_factoryGeometry.links,{&privateRoad,publicRoad},privateRoad.name);
+        if(links.size()!=1) { reject("factory_exit_unavailable"); return; }
+        FactoryRoute route;
+        route.lane=privateRoad;
+        route.line=trafficroute::Build(privateRoad);
+        route.exit=links.front();
+        route.world=world;
+        route.privateLane=g_factoryConfig.privateLane;
+        route.bay.key=g_factoryConfig.key;
+        route.bay.vehicle=g_factoryConfig.vehicle;
+        route.bay.at=g_factoryConfig.pose;
+        const auto publicLine=trafficroute::Build(*publicRoad);
+        const auto turn=trafficlinks::TurnPath(route.line,route.privateLane,route.exit.u,
+            publicLine,route.exit.toLane,route.exit.otherU,route.exit.radius);
+        const auto point=turn.empty()?trafficroute::At(publicLine,route.exit.toLane,route.exit.otherU):turn.back();
+        route.arrivalU=trafficroute::NearestProgress(publicLine,route.exit.toLane,point.x,point.y,point.z,true,route.exit.otherU);
+        const auto before=trafficroute::At(publicLine,route.exit.toLane,trafficroute::LeadU(publicLine,route.exit.toLane,route.arrivalU,1.0,true));
+        const auto ahead=trafficroute::At(publicLine,route.exit.toLane,trafficroute::LeadU(publicLine,route.exit.toLane,route.arrivalU,1.0));
+        route.bay.arrival={point.x,point.y,point.z,std::atan2(ahead.x-before.x,ahead.y-before.y)};
+        g_factoryRoute=std::move(route);
+        Log("OBS system=traffic.factory_site vehicle=%08X event=ready bay=%s private=%s public=%s exit=%s",
+            g_factoryRoute->bay.vehicle,g_factoryRoute->bay.key.c_str(),privateRoad.name.c_str(),publicRoad->name.c_str(),g_factoryConfig.link.c_str());
+        publish();
+    }
     void SendPool(const char* world){
         if(!g_trafficApi)return;
+        ConfigureFactoryRoute(world);
         const auto rule=RuleFor(world);
         const auto city=trafficdata::CityOf(g_data,world);
         std::vector<FvoPoolSpot> origins;std::vector<std::string> originNames;
@@ -2166,7 +2443,9 @@ namespace
             }
         }
         g_initialSlots=trafficinitial::Interleave(perRoute,city.limit);
+        ++g_initialPlanGeneration;
         if(int(g_initialSlots.size())>city.limit)g_initialSlots.resize(std::size_t(std::max(0,city.limit)));
+        g_initialSiteOutput.assign(g_initialSlots.size(),{});
         target=std::max(target,int(g_initialSlots.size()));
         for(int i=0;i<target;++i){
             spots.push_back(origins.empty()?FvoPoolSpot{}:origins[std::size_t(i)%origins.size()]);
@@ -2194,6 +2473,24 @@ namespace
         }
         std::vector<FvoPoolSpot> initial;for(const auto& s:g_initialSlots)initial.push_back({s.at.x,s.at.y,s.at.z,s.heading});
         generator::SetInitialScene(initial.data(),int(initial.size()));
+        // Route geometry also seeds the stock search when its schedule requests no public cars.
+        std::vector<FvoPoolSpot> factoryAnchors;
+        for(const auto& r:g_data.routes){
+            if(!trafficdata::SameWorld(g_data,r.world,world)||!Allowed(r,rule)||!CityFlies(r,city))continue;
+            for(std::size_t j=1;j<r.points.size();++j){
+                const auto& a=r.points[j-1];const auto& b=r.points[j];
+                const double dx=b.x-a.x,dy=b.y-a.y,dz=b.z-a.z;
+                const double length=std::hypot(dx,dy);
+                if(!std::isfinite(length)||!std::isfinite(dz)||length<.1)continue;
+                const int segments=int(std::clamp(std::ceil(length/40),1.0,128.0));
+                const double heading=std::atan2(dx,dy);
+                for(int k=0;k<segments;++k){
+                    const double t=(k+.5)/segments;
+                    factoryAnchors.push_back({a.x+dx*t,a.y+dy*t,a.z+dz*t,heading});
+                }
+            }
+        }
+        generator::SetFactoryAnchors(std::move(factoryAnchors));
         {std::vector<std::string> keys;for(const auto& q:g_initialSlots)keys.push_back(spawnhealth::SpotKey(q.route,q.lane,q.at.x,q.at.y));generator::SetInitialSpotKeys(keys);}  // card HR1
         std::vector<bool> roads;for(const auto& slot:g_initialSlots){bool road=false;for(const auto& route:g_data.routes)if(route.name==slot.route){road=route.road.enabled||routepolicy::Resolve(route.travel,route.sections,std::size_t(slot.u)).travel==routepolicy::Travel::Drive;break;}roads.push_back(road);}generator::SetInitialRoads(roads);
         // A schedule awaiting the game clock does not stop the arbiter from
@@ -2237,7 +2534,7 @@ namespace
     bool FleetPath(unsigned vehicle,const FvoTrafficRef& pose,std::vector<FvoFleetRailPoint>& points,double& speed){
         std::lock_guard lock(g_journeyMutex);
         const auto it=std::find_if(std::begin(g_slots),std::end(g_slots),[vehicle](const Slot& slot){
-            return slot.used&&slot.vehicleId==vehicle;
+            return slot.used&&slot.vehicleId==vehicle&&slot.factoryPhase==FactoryRoutePhase::None;
         });
         if(it==std::end(g_slots)||!std::isfinite(pose.x)||!std::isfinite(pose.y)||!std::isfinite(pose.z))return false;
         const auto& slot=*it;
@@ -2400,7 +2697,8 @@ namespace
         std::unique_lock journeyLock(g_journeyMutex);
 		for(auto& s:g_slots)s={};g_poolWorld.clear();g_poolStamp=~0ull;g_testDone.clear();g_lastStart=0;
 		g_found.clear();g_read={};g_data={};g_stamp=~0ull;g_reloadWanted=true;g_poolResend=true;
-		g_initialSlots.clear();g_initialClockPending=false;g_emptyTrips.clear();
+        g_factoryRoute.reset();g_factoryConfig={};g_factoryGeometry={};
+		g_initialSlots.clear();g_initialSiteOutput.clear();g_initialClockPending=false;g_emptyTrips.clear();
 		g_admissionLanes.clear();g_cruiseLast.clear();g_constraintMinute=-1;g_signalSeconds=g_signalLastTick=0;g_rememberedJourneys.clear();g_journeyProfile.clear();g_rightOfWay.Reset();g_roadDecision.clear();g_approachTiming.clear();g_otherApproachDistance.clear();g_roadStamp=~0ull;
 		journeyLock.unlock();generator::Reset();everyday::Reset();
 	}  // a save load or a different playthrough
@@ -2418,6 +2716,16 @@ namespace
         g_outOfTraffic=core?reinterpret_cast<int(*)(const unsigned*,int)>(GetProcAddress(core,"FVO_VehiclesOutOfTrafficV1")):nullptr;  // C4, optional
         generator::SetSpotTest(core?reinterpret_cast<int(*)(unsigned)>(GetProcAddress(core,"FVO_SpotTestV1")):nullptr);  // ST-B, optional
         generator::SetRelocation(core?reinterpret_cast<FvoRelocationStatusFn>(GetProcAddress(core,"FVO_TrafficRelocationV1")):nullptr);  // relocation receipts, optional (a diagnostic core)
+        generator::SetStockDispatch(core?reinterpret_cast<FvoStockTransferFnV1>(GetProcAddress(core,"FVO_TrafficStockTransferV1")):nullptr,&StockRoute);
+        g_factoryProof=core?reinterpret_cast<FvoSpotMotionProofQueryV1>(GetProcAddress(core,"FVO_SpotMotionProofV1")):nullptr;
+        generator::SetFactoryStockQuery(core?reinterpret_cast<FvoFactoryStockQueryV1>(
+            GetProcAddress(core,"FVO_TrafficFactoryStockV1")):nullptr);
+        generator::SetFactoryBirth(
+            core?reinterpret_cast<FvoFactorySiteFnV1>(GetProcAddress(core,"FVO_TrafficFactorySiteV1")):nullptr,
+            core?reinterpret_cast<FvoFactoryBirthFnV1>(GetProcAddress(core,"FVO_TrafficFactoryBirthV1")):nullptr,
+            core?reinterpret_cast<FvoFactoryStockBindFnV1>(GetProcAddress(core,"FVO_TrafficFactoryStockBindV1")):nullptr,
+            core?reinterpret_cast<FvoFactoryStockObserveFnV1>(GetProcAddress(core,"FVO_TrafficFactoryStockObserveV1")):nullptr);
+        g_factoryLease=core?reinterpret_cast<FvoTrafficFactoryLeaseFnV1>(GetProcAddress(core,"FVO_TrafficFactoryLeaseV1")):nullptr;
         generator::SetHealthSources(core?reinterpret_cast<int(*)(unsigned,FvoPairHealthSampleV1*)>(GetProcAddress(core,"FVO_PairHealthSampleV1")):nullptr,
             core?reinterpret_cast<void(*)(unsigned)>(GetProcAddress(core,"FVO_SpotTestRequestV1")):nullptr);  // CH-1/CH-4, optional
         generator::SetPlayClock(core?reinterpret_cast<unsigned(*)()>(GetProcAddress(core,"FVO_PlayClockV1")):nullptr);  // W1, optional
@@ -2525,7 +2833,7 @@ extern "C" __declspec(dllexport) int FVO_Traffic_PlanJourneyV1(const FvoJourneyR
 extern "C" __declspec(dllexport) int FVO_Traffic_InspectV1(const char* route,int index,FvoTrafficInspectV1* out){
     if(!out||out->size!=sizeof(*out)||out->version!=1||index<0)return 0;
     std::lock_guard guard(g_journeyMutex);
-    for(const auto& s:g_slots)if(s.used&&(!route||!*route||s.route==route)){
+    for(const auto& s:g_slots)if(s.used&&!StockRoutePending(s)&&(!route||!*route||s.route==route)){
         if(index--!=0)continue;FvoTrafficInspectV1 value;value.vehicle=s.vehicleId;value.lane=s.trip.lane;value.leg=int(s.trip.leg);
         value.holding=s.holding||s.scriptHolding||s.guidance.held;value.scriptStop=int(s.scriptAt);value.scriptCount=int(s.script.size());
         value.x=s.x;value.y=s.y;value.z=s.z;value.speed=s.measuredSpeed;value.at=s.seen;
@@ -2549,7 +2857,7 @@ extern "C" __declspec(dllexport) int FVO_Traffic_PopulationV1(int index,FvoPopul
 
 extern "C" __declspec(dllexport) int FVO_Traffic_InspectV2(const char* route,int index,FvoTrafficInspectV2* out){
     if(!out||out->size!=sizeof(*out)||out->version!=2||index<0)return 0;std::lock_guard guard(g_journeyMutex);const int requested=index;
-    for(auto& s:g_slots)if(s.used&&(!route||!*route||s.route==route)){if(index--!=0)continue;FvoTrafficInspectV2 value;if(!FVO_Traffic_InspectV1(route,requested,&value.journey))return 0;const auto restrictions=SpatialRestrictions(Spec(s),s.x,s.y,s.z);value.draining=restrictions.closure==1;value.turning=!s.turn.empty();for(const auto& current:g_data.routes)if(current.name==s.route)value.olderPlan=routecache::Key(current)!=routecache::Key(Spec(s))||journeyplan::Write(current.journey)!=journeyplan::Write(Spec(s).journey);
+    for(auto& s:g_slots)if(s.used&&!StockRoutePending(s)&&(!route||!*route||s.route==route)){if(index--!=0)continue;FvoTrafficInspectV2 value;if(!FVO_Traffic_InspectV1(route,requested,&value.journey))return 0;const auto restrictions=SpatialRestrictions(Spec(s),s.x,s.y,s.z);value.draining=restrictions.closure==1;value.turning=!s.turn.empty();for(const auto& current:g_data.routes)if(current.name==s.route)value.olderPlan=routecache::Key(current)!=routecache::Key(Spec(s))||journeyplan::Write(current.journey)!=journeyplan::Write(Spec(s).journey);
         const char* why=s.pickupWait?"pickup full; retaining the existing vehicle":s.scriptHolding?s.scriptReason:s.connectionBlocked?"connection or manoeuvre reservation busy":s.holding?"waiting for a lane gap":restrictions.closure==2||!restrictions.valid?restrictions.reason:s.guidance.held?"waiting for route or junction permission":"following committed plan";
         std::snprintf(value.waitReason,sizeof value.waitReason,"%s",why);std::snprintf(value.restriction,sizeof value.restriction,"%s",restrictions.reason);*out=value;return 1;}return 0;
 }

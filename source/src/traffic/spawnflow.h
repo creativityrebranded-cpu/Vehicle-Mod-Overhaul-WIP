@@ -21,6 +21,7 @@
 namespace spawnflow {
 // The rules table: every spawn decision value (mandate card item 7).
 namespace rules {
+inline constexpr double factoryPoseHorizontal = 2.0, factoryPoseVertical = 2.5;
 inline constexpr double dropMargin = .3;            // m: births stand this far above the field floor and drop (user, 2026-11-06)
 inline constexpr int maxCreatePerTick = 1;          // Arbiter: at most one create request per tick
 inline constexpr int maxWaitingCovered = 12;        // Arbiter: pairs still being proved at once (loading screen / X panel)
@@ -51,10 +52,17 @@ inline constexpr int maxLookPlay = 8;               // Arbiter in play: slots lo
 inline constexpr double liveRadius = 240.0;         // Demand: a slot within this horizontal distance of the player is in the live stretch (the loaded area's wall is ~250 m: loadedarea notes)
 }
 
+// Factory Siting checks the live reference against the authored bay or road join.
+inline bool FactoryPose(double dx, double dy, double dz) {
+    return std::hypot(dx, dy) <= rules::factoryPoseHorizontal &&
+           std::abs(dz) <= rules::factoryPoseVertical;
+}
+
 // ---------- 1 Window: when spawning may happen ----------
 struct Window { bool open = false, cover = false; const char* why = ""; bool live = false; };  // live: the play road window (LV-3); generator.cpp builds Windows by aggregate {open, cover, why}
 // screen: 3 loading screen, 2 local map / X panel, 1 play, 0 none. reset: X's fill is running. clockPending: routes wait for the clock.
 // live: the play rule (spawnrule::LiveOpen, decided by the caller from the settle time) also opens it in play, for the road fill only.
+// The lab (StepFactory) builds its own concealed play window for runtime stock; this live road window adds nothing to it.
 inline Window WindowNow(int screen, bool reset, bool clockPending, bool live = false, bool panelCover = true) {
     Window w; w.cover = screen >= 2;
     if (!screen) { w.why = "no_screen"; return w; }
@@ -310,7 +318,7 @@ inline Removal MayRemove(bool worldOwned, bool cover, bool unseen) {
     if (unseen) return { true, "out_of_sight" };
     return { false, "waiting_unseen" };
 }
-enum class PopulationAction { FleetBirth, DriverRepair, Retirement, FleetPath };
+enum class PopulationAction { FleetBirth, DriverRepair, Retirement, FleetPath, StockDriver };
 struct PopulationRequest {
     PopulationAction action;
     Window window{};

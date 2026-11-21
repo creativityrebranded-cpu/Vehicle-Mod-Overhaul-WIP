@@ -471,6 +471,10 @@ add_executable(roadvisual_test tests/roadvisual_test.cpp)
 target_include_directories(roadvisual_test PRIVATE src)
 target_compile_features(roadvisual_test PRIVATE cxx_std_20)
 
+add_executable(factorysite_test tests/factorysite_test.cpp)
+target_include_directories(factorysite_test PRIVATE src)
+target_compile_features(factorysite_test PRIVATE cxx_std_20)
+
 add_executable(relocation_test tests/relocation_test.cpp)
 target_include_directories(relocation_test PRIVATE src)
 target_compile_features(relocation_test PRIVATE cxx_std_20)

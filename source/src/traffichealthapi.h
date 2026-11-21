@@ -56,9 +56,19 @@ struct FvoTripClaim;
 // Optional diagnostic capability. A lease belongs to one admitted seated
 // job in the current world. It is never saved or restored.
 enum class FvoTrafficFactoryLeaseActionV1 : unsigned { Start, Status, Depart, Cancel, StartStock };
-// 32 since 2026-11-20 (was 16): the authored stock identities of FVO_FactoryPlacements.esm, from local id 0x800. The core still recognises
-// those vehicles (its lease machinery); the stock-row query that used to read them is gone.
+using FvoTrafficFactoryLeaseFnV1 = int (*)(FvoTrafficFactoryLeaseActionV1, unsigned, unsigned,
+                                          std::uint64_t*, const FvoTripClaim*);
+// 32 since 2026-11-20 (was 16). Both DLLs index the same FVO_FactoryPlacements.esm range from local id 0x800; the query below passes the caller's
+// capacity, so an older add-on (16 rows) still gets 16 and a newer add-on on an older core (which caps at 16) gets 16. A plugin with fewer
+// placed stock vehicles leaves the extra rows empty (vehicle == 0, skipped by every reader).
 inline constexpr int kFvoFactoryStockCountV1 = 32;
+struct FvoFactoryStockV1 {
+    unsigned local = 0, vehicle = 0, base = 0;
+    int usable = 0, modelLoaded = 0, inPlayerCell = 0, inPlayerWorld = 0;
+    double x = 0, y = 0, z = 0;
+};
+// Returns the number of authored stock identities when their plugin is loaded.
+using FvoFactoryStockQueryV1 = int (*)(FvoFactoryStockV1*, int);
 using FvoTrafficHealthReasonV1 = int (*)(unsigned, char*, int);
 using FvoTrafficHealthSpotQueryV1 = int (*)(const char*, int, FvoTrafficHealthSpotV1*);
 }

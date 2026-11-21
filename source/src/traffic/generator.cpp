@@ -19,6 +19,8 @@
 #include "spawnflow.h"
 #include "roadclearance.h"
 #include "retiringrecord.h"  // SW-1 / SW-2
+#include "factoryrecord.h"
+#include "labpool.h"
 #include "healthscore.h"
 #include "trustzone.h"
 #include <cstring>
@@ -90,8 +92,59 @@ namespace generator
         unsigned long long g_revision=0,g_appliedRevision=~0ull;
 
 		enum class St { Unknown, Empty, Created, Ready, Started, Failed };
+        enum class FactoryPhase { Standby, Seating, Test, Ready, Departure, Road, Suspended, Transfer };
+        std::optional<FactoryBay> g_wantFactory, g_factoryBay;
+        FvoFactoryStockQueryV1 g_factoryStockQuery=nullptr;
+        FvoFactorySiteFnV1 g_factorySite=nullptr;
+        FvoFactoryBirthFnV1 g_factoryBirth=nullptr;
+        FvoFactoryStockBindFnV1 g_factoryBind=nullptr;
+        FvoFactoryStockObserveFnV1 g_factoryObserve=nullptr;
+        FvoStockTransferFnV1 g_stockTransfer=nullptr;
+        StockRoute g_stockRoute=nullptr;
+        ULONGLONG g_stockSearchAt=0;
+        unsigned g_stockInFlight=0;
+        bool StockDispatchAvailable(){return g_stockTransfer&&g_stockRoute;}
+        ULONGLONG g_factoryStockAt=0;
+        ULONGLONG g_factorySearchAt=0;
+        ULONGLONG g_factoryCandidateAt=0;
+        std::size_t g_factorySearchCursor=0;
+        ULONGLONG g_factoryCoverWorkUntil=0;
+        std::vector<FvoPoolSpot> g_factoryAnchors;
+        std::map<std::string,FactoryBay> g_belowStock;
+        FactoryTrip g_factoryTrip = nullptr;
+        FvoSpotMotionProofQueryV1 g_factoryProof = nullptr;
+        FvoTrafficFactoryLeaseFnV1 g_factoryLease = nullptr;
+        std::map<unsigned,unsigned> g_factoryArchived;
+        constexpr char kFactorySlotPrefix[] = "factory:";
+        constexpr char kBelowStockPrefix[] = "factory:below_world_";
+        constexpr char kRuntimeStockPrefix[] = "factory:runtime_";
+        constexpr wchar_t kRuntimeStockKey[] = L"factory_v2_runtime_";
+        bool FactorySlotName(const std::string& name) { return name.starts_with(kFactorySlotPrefix); }
+        std::string FactorySlotName(const FactoryBay& bay) { return kFactorySlotPrefix + bay.key; }
+        constexpr double kSpareReach=400.0;  // m: spares relocate only inside the loaded area
 		struct Pair {
             bool handoffForeign = false;
+            FactoryPhase factory = FactoryPhase::Standby;
+            const char* factoryWhy = "factory_standby";
+            std::uint64_t factoryLease = 0, factoryStarted = 0, factoryArrivalStep = 0;
+            bool factoryReleased = false, factoryArrivalSample = false;
+            bool factoryLoaded = false, factoryCommitted = false, factoryRevoked = false;
+            bool factoryDriverUnsettled = false;
+            ULONGLONG factoryDriverWriteAt = 0; // Consumed result awaits a registry write, never another create.
+            bool factoryVehicleUnsettled = false;
+            ULONGLONG factoryChassisWriteAt = 0;
+            bool factoryPublicRecovered = false; // The public row won recovery; clear this source before creating stock.
+            FvoRoadSiteV1 factoryOrigin{};
+            FvoPoolSpot factoryArrival{};
+            FvoStockTransferV1 stockTransfer{};
+            std::string stockRoadName;
+            std::size_t stockSearch=0;
+            ULONGLONG stockPendingAt=0, stockTryAt=0;
+            bool stockRoadWritten=false;
+            // Lab pool (labpool.h): stranded = the player left this pair's cell; yields = proof deadlines missed in a row.
+            bool labStranded=false;
+            ULONGLONG labStrandedAt=0, labLeaseHoldUntil=0;
+            int labYields=0;
             handoff::Progress handoff;
             bool handoffPending=false;
             bool handoffEligible=false, takeoverQueued=false;
@@ -137,7 +190,7 @@ namespace generator
             // Card HR1 evidence: the pair's spot key (Demand), which stages it has reported, and where it was released (drive stage).
             std::string spotKey; bool bothLoadedOnce = false, brokenEvidenceJudged = false, bodyJudged = false, releaseAttempted = false, releaseJudged = false, driveJudged = false; double relX = 0, relY = 0;
             double radius=8,halfHeight=6;
-            bool vehiclePending=false,driverPending=false;
+            bool vehiclePending=false,driverPending=false; int relocating=0;
             bool vehicleIssued=false,driverIssued=false;
             std::uint64_t birthGrant=0;
             FvoBirthSource driverSource=FvoBirthSource::Fleet;
@@ -161,7 +214,28 @@ namespace generator
 		std::vector<int> g_reuse;  // 1: a parking spot: a parked vehicle there gets a driver when a route wants one
 		std::vector<std::string> g_names;  // stable spot names (the addon's place / spawn / lane names); empty: by index
 		std::vector<Pair> g_pairs;
+        bool Info(unsigned id,FvoTrafficRef& r);
+        bool ClearRecoveredFactorySource(int slot,Pair& p);
+        bool IsFactorySlot(int slot) {
+            return slot >= 0 && slot < int(g_names.size()) && FactorySlotName(g_names[std::size_t(slot)]);
+        }
+        bool IsRuntimeStock(int slot) {
+            return slot>=0&&slot<int(g_names.size())&&g_names[std::size_t(slot)].starts_with(kRuntimeStockPrefix);
+        }
+        bool FactoryStock(unsigned id) {
+            if (!id) return false;
+            if (g_factoryBay && g_factoryBay->vehicle == id) return true;
+            for(const auto& [name,stock]:g_belowStock)if(stock.vehicle==id)return true;
+            if(const auto archived=g_factoryArchived.find(id);archived!=g_factoryArchived.end()){
+                FvoTrafficRef ref{};
+                if(Info(id,ref)&&retiringrecord::VehicleStillOurs(true,ref.isActor!=0,ref.baseId,archived->second))return true;
+            }
+            for (int slot = 0; slot < int(g_pairs.size()); ++slot)
+                if (IsFactorySlot(slot) && g_pairs[slot].vehicle == id) return true;
+            return false;
+        }
 		ULONGLONG g_createdAt = 0;
+        ULONGLONG g_factoryCreatedAt = 0;
         // Population belongs to the world, never to the player's position or a
         // schedule evaluation. Creation is admitted at real, validated origins.
         struct WorldPool {std::vector<FvoPoolSpot> spots;std::vector<int> reuse;std::vector<std::string> names;std::vector<Pair> pairs;};
@@ -331,6 +405,28 @@ namespace generator
 			const bool named = i < int(g_names.size()) && !g_names[std::size_t(i)].empty();
 			return named ? L"pair_" + Wide(g_names[std::size_t(i)]) : L"spot" + std::to_wstring(i);
 		}
+        std::wstring FactoryKey(int i) {
+            if(IsRuntimeStock(i))return kRuntimeStockKey+Wide(g_names[std::size_t(i)].substr(sizeof kRuntimeStockPrefix-1));
+            return L"factory_v1_" + Wide(g_names[std::size_t(i)].substr(sizeof kFactorySlotPrefix - 1));
+        }
+        void LoadFactoryIds(int i, Pair& p) {
+            wchar_t text[384]{};
+            GetPrivateProfileStringW(Wide(g_world).c_str(), FactoryKey(i).c_str(), L"", text, DWORD(std::size(text)), Ini().c_str());
+            const bool runtime=IsRuntimeStock(i);
+            const auto stock=runtime?factoryrecord::Read(text):factoryrecord::Stock{};
+            const auto row=runtime?stock.pair:retiringrecord::ParsePair(text);
+            p.vehicle=row.vehicle;p.driver=row.driver;p.base=row.base;
+            p.factoryCommitted=row.staged;p.factoryRevoked=row.surplus;
+            unsigned unsettled=0;
+            std::swscanf(text,L"%*x %*x %*x %*x %*x %x",&unsettled);
+            p.factoryDriverUnsettled=unsettled!=0;
+            if(runtime){
+                p.factoryOrigin=stock.origin;
+                p.factoryVehicleUnsettled=stock.vehicleUnsettled;
+                p.factoryDriverUnsettled=stock.driverUnsettled;
+            }
+            p.factoryLoaded=true;
+        }
         bool WriteRegistry(const wchar_t* section, const wchar_t* key, const wchar_t* value) {
 #ifndef FVO_GENERATOR_TEST
             // Lock only the file operation, never engine queries/mutations made by Tick.
@@ -348,6 +444,17 @@ namespace generator
 		}
 		bool SaveIds(int i, const Pair& p)
 		{
+            if(IsFactorySlot(i)){
+                // A lease and its readiness verdict must be re-proved after loading a save.
+                const retiringrecord::PairRow pair{p.vehicle,p.driver,p.base,p.factoryCommitted,p.factoryRevoked};
+                const bool runtime=IsRuntimeStock(i);
+                auto value=runtime?factoryrecord::Write({pair,p.factoryDriverUnsettled,p.factoryVehicleUnsettled,p.factoryOrigin}):
+                    retiringrecord::FormatPair(pair);
+                if(value.empty())return false;
+                if(!runtime&&p.factoryDriverUnsettled)value+=L" 1";
+                if(p.vehicle&&p.base)g_factoryArchived[p.vehicle]=p.base;
+                return WriteRegistry(Wide(g_world).c_str(),FactoryKey(i).c_str(),p.vehicle||p.factoryVehicleUnsettled?value.c_str():nullptr);
+            }
 			const auto value=retiringrecord::FormatPair({p.vehicle,p.driver,p.base,p.staged,p.retired});
 			const auto key=p.storedKey.empty()?PairKey(i):p.storedKey;
 			return WriteRegistry(Wide(g_world).c_str(),key.c_str(),value.c_str());
@@ -767,7 +874,9 @@ namespace generator
         std::map<unsigned,ParkedGrant> g_parkedGrants;
         constexpr ULONGLONG kParkedRetryMs=2000;
         RetirementOrder DecideRetirement(Pair& pair,unsigned driver,const char* why,bool protectedIdentity=false){
-            const bool owned=protectedIdentity||pair.life==spawnflow::Life::World||
+            // A stock pair the player left behind in another cell is the lab's to recycle (labpool::NeedsRecycle); other stock stays the world's.
+            const bool privateStock=pair.factory!=FactoryPhase::Road&&!pair.labStranded&&FactoryStock(pair.vehicle);
+            const bool owned=protectedIdentity||privateStock||pair.life==spawnflow::Life::World||
                 (pair.vehicle&&g_api->playerTook&&engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","generator",pair.vehicle,pair.vehicle));
             const bool cover=SightAt(0,0,0).Covered();
             bool unseen=false;
@@ -1058,9 +1167,31 @@ namespace generator
             const auto key=p.storedKey.empty()?PairKey(i):p.storedKey;
             SetLife(i,p,spawnflow::Life::Retiring,"fleet_target_reduced");
             ApplyRetirement(order);
-            WriteRegistry(Wide(g_world).c_str(),key.c_str(),nullptr);
+            if(IsFactorySlot(i))SaveIds(i,Pair{});
+            else WriteRegistry(Wide(g_world).c_str(),key.c_str(),nullptr);
             p=Pair{};p.retired=true;p.st=St::Empty;
             return true;
+        }
+        bool TakeSpare(unsigned base,Spare& out,bool* waiting=nullptr){
+            if(waiting)*waiting=false;
+            LoadSpares();
+            auto retiring=g_spares.end();
+            // Disabled flags precede asynchronous model/physics retirement. Do not move or rebuild either half while its old
+            // model is still present, or while a visibility command can arrive after reuse (map-refill review, 2026-11-01).
+            for(auto it=g_spares.begin();it!=g_spares.end();++it){
+                FvoTrafficRef v{},d{};
+                if(it->base!=base||Retiring(it->vehicle)||Retiring(it->driver)||!Info(it->vehicle,v)||!Info(it->driver,d)||v.baseId!=base||!d.isActor||d.dead)continue;
+                if(!v.disabled||!d.disabled||v.has3D||d.has3D||
+                    (g_api->mutationPending&&(engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->vehicle,"enable")||engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->vehicle,"disable")||
+                    engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->driver,"enable")||engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->driver,"disable")))){
+                    if(retiring==g_spares.end())retiring=it;continue;
+                }
+                out=*it;g_spares.erase(it);SaveSpares();return true;
+            }
+            // Reserve waiting stock in the slot as well: this releases the map's fill panel without creating another pair.
+            // FinishBirth drains its old models/visibility before issuing either move, including after the map closes.
+            if(waiting&&retiring!=g_spares.end()){*waiting=true;out=*retiring;g_spares.erase(retiring);SaveSpares();return true;}
+            return false;
         }
 
 		// Traffic NPCs: pool vehicles and their drivers are a fixed pool, made once and reused: both persistent (moved into the
@@ -1208,6 +1339,11 @@ namespace generator
                 return FvoBirthWindow::FleetShortfall;
             return screen==3?FvoBirthWindow::Loading:screen==2?FvoBirthWindow::Panel:FvoBirthWindow::Diagnostic;
         }
+        FvoBirthWindow StockBirthWindow(int slot,int screen,const spawnflow::Window& window){
+            if(IsRuntimeStock(slot)&&StockDispatchAvailable()&&screen==1&&window.open&&!window.cover)
+                return FvoBirthWindow::FactoryConcealed;
+            return BirthWindow(screen,window,FvoBirthSource::DriverRepair);
+        }
         std::uint64_t SpeakBirth(spawnflow::BirthBudget& budget,const spawnflow::PopulationRequest& request,FvoBirthSource source,int slot,unsigned base,unsigned vehicle,const FvoPoolSpot& at) {
             const auto decision=spawnflow::ArbitratePopulation(request,&budget);
             if(!decision.now)return 0;
@@ -1235,13 +1371,105 @@ namespace generator
         }
         int FleetCount(){
             int n=0;
-            for(const auto& p:g_pairs)if(p.vehicle||p.vehiclePending)++n;
+            for(std::size_t i=0;i<g_pairs.size();++i){
+                const auto& p=g_pairs[i];
+                const bool privateStock=IsFactorySlot(int(i))&&p.factory!=FactoryPhase::Road&&
+                    (IsRuntimeStock(int(i))||g_names[i].starts_with(kBelowStockPrefix));
+                if(!privateStock&&!p.factoryRevoked&&(p.vehicle||p.vehiclePending))++n;
+            }
             return n;
+        }
+        // Pool bookkeeping over the runtime stock slots: local pairs (and births in flight), pairs stranded in another cell, empty slots,
+        // and the pairs that proved motion and wait for delivery (phase Ready).
+        labpool::Counts LabCounts(int* ready=nullptr){
+            labpool::Counts c;
+            if(ready)*ready=0;
+            for(std::size_t i=0;i<g_pairs.size();++i){
+                if(!IsRuntimeStock(int(i)))continue;
+                const auto& p=g_pairs[i];
+                if(p.retired)continue;
+                if(p.vehicle||p.vehiclePending){
+                    if(p.labStranded)++c.stranded;
+                    else if(!p.factoryRevoked){++c.local;if(ready&&p.factory==FactoryPhase::Ready)++*ready;}
+                }else ++c.empty;
+            }
+            return c;
+        }
+        bool ObserveFactoryStock(const Snap& snap,ULONGLONG now){
+            if(g_factoryStockAt&&now-g_factoryStockAt<spawnflow::rules::readinessEveryMs)return false;
+            g_factoryStockAt=now;
+            FvoFactoryStockV1 rows[kFvoFactoryStockCountV1]{};
+            const int count=g_factoryStockQuery?std::clamp(g_factoryStockQuery(rows,kFvoFactoryStockCountV1),0,kFvoFactoryStockCountV1):0;
+            int resolved=0,models=0,bodies=0;
+            bool changed=false;
+            for(auto& [name,stock]:g_belowStock)stock.driverOriginReady=false;
+            for(int i=0;i<count;++i){
+                const auto& row=rows[i];
+                if(!row.vehicle)continue;
+                ++resolved;models+=row.usable&&row.modelLoaded;
+                const bool body=HasBody(row.vehicle,snap);
+                bodies+=body;
+                if(row.inPlayerWorld&&std::isfinite(row.x)&&std::isfinite(row.y)&&std::isfinite(row.z)){
+                    const std::string name=kBelowStockPrefix+std::to_string(row.local);
+                    if(!g_belowStock.contains(name)){
+                        g_belowStock.emplace(name,FactoryBay{name,row.vehicle,{row.x,row.y,row.z,0},{}});
+                        changed=true;
+                    }
+                    g_belowStock.at(name).driverOriginReady=row.inPlayerCell!=0;
+                }
+                const auto state=unsigned(row.usable)|(unsigned(row.modelLoaded)<<1)|(unsigned(body)<<2)|(unsigned(row.inPlayerCell)<<3);
+                observations::Record(g_logFn,now,"traffic.factory_stock",row.vehicle,state,
+                    "event=stock_observed local=%03X base=%08X usable=%d model=%d body=%d player_cell=%d pos=%.2f,%.2f,%.2f",
+                    row.local,row.base,row.usable,row.modelLoaded,int(body),row.inPlayerCell,row.x,row.y,row.z);
+            }
+            const int requested=int(g_initialScene.size()), resident=FleetCount();
+            const auto runtime=std::count_if(g_pairs.begin(),g_pairs.end(),[](const Pair& p){
+                return p.vehicle&&IsRuntimeStock(int(&p-g_pairs.data()));
+            });
+            // The real dispatch capability and the real stock counts (no fixed text): which function pointers are attached, how many
+            // pairs are ready to deliver, local to this cell, stranded in another, and how many slots are empty.
+            int ready=0;
+            const auto lab=LabCounts(&ready);
+            const unsigned capability=unsigned(g_stockTransfer!=nullptr)|(unsigned(g_stockRoute!=nullptr)<<1)|
+                (unsigned(g_relocation!=nullptr)<<2)|(unsigned(g_siteGate!=nullptr)<<3);
+            observations::Record(g_logFn,now,"traffic.factory_dispatch",0,
+                std::uint64_t(count)|(std::uint64_t(resolved)<<8)|(std::uint64_t(bodies)<<16)|(std::uint64_t(runtime)<<24)|
+                (std::uint64_t(capability)<<32)|(std::uint64_t(ready)<<40)|(std::uint64_t(lab.local)<<48)|(std::uint64_t(lab.stranded)<<56),
+                "event=status dispatch=%s transfer_fn=%d route_fn=%d relocation_fn=%d site_gate=%d ready_pairs=%d lab_local=%d lab_stranded=%d lab_empty=%d pool=%d reach_m=%.0f placed_stock=%d resolved=%d models=%d bodies=%d runtime_stock=%zu route_target=%d public_resident_or_pending=%d",
+                StockDispatchAvailable()&&g_relocation&&g_siteGate?"available":"capability_missing",
+                int(g_stockTransfer!=nullptr),int(g_stockRoute!=nullptr),int(g_relocation!=nullptr),int(g_siteGate!=nullptr),
+                ready,lab.local,lab.stranded,lab.empty,labpool::kPoolSize,factorydispatch::maxAxisShift,
+                count,resolved,models,bodies,std::size_t(runtime),requested,resident);
+            return changed;
+        }
+        int ResidentCount(){
+            int n=FleetCount();
+            for(const auto& l:g_landings)if(l.vehicle||l.pending)++n;return n;
         }
         // A request returning zero is not a failed birth while its owned command
         // or completion is outstanding. Poll the exact same request before any
         // health check, alternate model selection, or retry counter.
+        constexpr ULONGLONG kFactoryRegistryRetryMs=250;
+        bool SaveFactoryDriverResult(int slot,Pair& p,ULONGLONG now){
+            if(now<p.factoryDriverWriteAt)return false;
+            if(!SaveIds(slot,p)){
+                if(p.factoryDriverWriteAt==now)
+                    Log("OBS system=traffic.factory vehicle=%08X driver=%08X event=driver_receipt_write_deferred slot=%d",p.vehicle,p.driver,slot);
+                p.factoryDriverWriteAt=now+kFactoryRegistryRetryMs;
+                return false;
+            }
+            p.factoryDriverWriteAt=0;
+            return true;
+        }
         bool FinishBirth(int i,Pair& p,ULONGLONG now,int screen,const spawnflow::Window& window){
+            if(p.factoryDriverWriteAt&&!SaveFactoryDriverResult(i,p,now))return false;
+            if(p.relocating==4){
+                FvoTrafficRef v{},d{};
+                if(!Info(p.vehicle,v)||!Info(p.driver,d)||!v.disabled||!d.disabled||v.has3D||d.has3D||
+                    MutationPending(p.vehicle,"enable")||MutationPending(p.vehicle,"disable")||
+                    MutationPending(p.driver,"enable")||MutationPending(p.driver,"disable"))return false;
+                p.relocating=1;
+            }
             if(p.vehiclePending){
                 if(!p.vehicleIssued&&p.retired){
                     p.vehiclePending=p.driverPending=false;
@@ -1266,12 +1494,20 @@ namespace generator
                 if(!p.driverIssued&&(p.retired||
                     (g_api->playerTook&&engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","generator",p.vehicle,p.vehicle)))){
                     p.driverPending=false;
+                    if(IsFactorySlot(i)){
+                        p.factoryDriverUnsettled=false;p.factoryDriverWriteAt=now;
+                        return SaveFactoryDriverResult(i,p,now);
+                    }
                     return true;
                 }
-                const auto driverWindow=BirthWindow(screen,window,p.driverSource);
-                if(screen&&p.vehicle&&!p.driverIssued&&driverWindow==FvoBirthWindow::Closed){
+                const auto driverWindow=IsFactorySlot(i)?StockBirthWindow(i,screen,window):BirthWindow(screen,window,p.driverSource);
+                if(g_handoffFacts&&screen&&p.vehicle&&!p.driverIssued&&driverWindow==FvoBirthWindow::Closed){
                     p.driverPending=false;p.st=St::Failed;p.at=now;
+                    p.factoryDriverUnsettled=false;
                     Log("OBS system=traffic.birth vehicle=%08X event=partial_pair slot=%d reason=cover_closed_before_driver",p.vehicle,i);
+                    if(IsFactorySlot(i)){
+                        p.factoryDriverWriteAt=now;return SaveFactoryDriverResult(i,p,now);
+                    }
                     SaveIds(i,p);MakeTrafficPair(i,p);
                     return true;
                 }
@@ -1279,17 +1515,656 @@ namespace generator
                 if(reply.pending)return false;
                 p.driver=reply.id;
                 p.driverPending=false;p.st=p.driver?St::Created:St::Failed;p.at=now;
-                Log("OBS system=traffic.live vehicle=%08X event=driver_created slot=%d driver=%08X create_ms=%llu screen=%d",p.vehicle,i,p.driver,p.bornAt?now-p.bornAt:0ull,screen);
-                SaveIds(i,p);MakeTrafficPair(i,p);
+                if(!IsFactorySlot(i)){Log("OBS system=traffic.live vehicle=%08X event=driver_created slot=%d driver=%08X create_ms=%llu screen=%d",p.vehicle,i,p.driver,p.bornAt?now-p.bornAt:0ull,screen);}
+                p.factoryDriverUnsettled=reply.ambiguous&&IsFactorySlot(i);
+                if(IsFactorySlot(i)){
+                    if(p.driver&&!p.factoryRevoked)
+                        engineport::Forward<&FvoTrafficApi::makeTraffic>(g_api,"makeTraffic","factory",p.driver,p.driver,1);
+                    p.factoryDriverWriteAt=now;
+                    if(!SaveFactoryDriverResult(i,p,now))return false;
+                }else{SaveIds(i,p);MakeTrafficPair(i,p);}
+            }
+            if(p.relocating==1||p.relocating==2){
+                const unsigned id=p.relocating==1?p.vehicle:p.driver;
+                if(!engineport::Forward<&FvoTrafficApi::moveTo>(g_api,"moveTo","generator",0u,id,p.birth.x,p.birth.y,p.birth.z,p.birth.heading)){
+                    if(MutationPending(id,"move"))return false;
+                    SetLife(i,p,spawnflow::Life::Retiring,"spare_move_refused");RetireRequest(p.vehicle,p.driver,"spare_move_refused");  // R1p=Pair{};p.st=St::Empty;SaveIds(i,p);return false;
+                }
+                if(p.relocating++==1)return false;
+                p.relocating=3;engineport::Forward<&FvoTrafficApi::show>(g_api,"show","generator",0u,p.vehicle,1);engineport::Forward<&FvoTrafficApi::show>(g_api,"show","generator",0u,p.driver,1);
+            }
+            if(p.relocating==3){
+                FvoTrafficRef v{},d{};
+                if(!Info(p.vehicle,v)||!Info(p.driver,d)||!v.usable||!d.usable||v.disabled||d.disabled)return false;
+                p.relocating=0;if(g_api->holdBirth)engineport::Forward<&FvoTrafficApi::holdBirth>(g_api,"holdBirth","generator",0u,p.vehicle);p.at=now;
+                // A reused spare (2026-11-04 14:01: spots 38/43/49): the move left the disabled driver behind (44-117 m away), the seat
+                // snap could not reach and the 30 s check deleted the pair. Now enabled, the driver is moved to the vehicle and seated,
+                // and the check's clock starts from here.
+                {const double apart=std::hypot(std::hypot(v.x-d.x,v.y-d.y),v.z-d.z);
+                 if(apart>3.0&&g_api->moveTo)engineport::Forward<&FvoTrafficApi::moveTo>(g_api,"moveTo","generator",0u,p.driver,v.x,v.y,v.z,p.birth.heading);
+                 if(g_api->snapSeat)engineport::Forward<&FvoTrafficApi::snapSeat>(g_api,"snapSeat","generator",0u,p.driver,p.vehicle);
+                 if(p.proving){p.proveSince=p.proveTick=now;p.seatedSince=0;}p.tries=0;p.seatAt=0;
+                 Log("OBS system=traffic.spare vehicle=%08X event=relocated slot=%d driver=%08X apart=%.1f driver_moved=%d",p.vehicle,i,p.driver,apart,apart>3.0?1:0);}
             }
             return true;
         }
 
+        void FactoryState(int slot,Pair& p,FactoryPhase phase,const char* reason){
+            if(p.factory==phase&&!std::strcmp(p.factoryWhy,reason))return;
+            p.factory=phase;p.factoryWhy=reason;
+            Log("OBS system=traffic.factory vehicle=%08X driver=%08X bay=%s phase=%d reason=%s lease=%llu",
+                p.vehicle,p.driver,g_names[std::size_t(slot)].c_str(),int(phase),reason,
+                static_cast<unsigned long long>(p.factoryLease));
+        }
+        bool FactoryAt(const FvoTrafficRef& ref,const FvoPoolSpot& place){
+            return spawnflow::FactoryPose(ref.x-place.x,ref.y-place.y,ref.z-place.z);
+        }
+        bool FactorySeated(const Pair& p,const FvoTrafficRef& v,int& sit,double& apart){
+            FvoTrafficRef driver{};
+            if(!Info(p.driver,driver)||!driver.isActor||!driver.usable||driver.dead||!driver.has3D)return false;
+            sit=engineport::Forward<&FvoTrafficApi::sitState>(g_api,"sitState","factory",p.driver,p.driver);
+            apart=std::hypot(v.x-driver.x,v.y-driver.y,v.z-driver.z);
+            return SeatedPair(v.has3D!=0,true,Aboard(p.driver,p.vehicle),sit,apart);
+        }
+        void FactoryCancel(Pair& p){
+            if(g_factoryLease&&p.factoryLease)
+                g_factoryLease(FvoTrafficFactoryLeaseActionV1::Cancel,p.vehicle,p.driver,&p.factoryLease,nullptr);
+            p.factoryLease=0;p.factoryStarted=0;p.factoryReleased=false;p.factoryArrivalSample=false;
+        }
+        FvoPoolSpot FactoryOrigin(const FvoRoadSiteV1& origin){
+            return {origin.x,origin.y,origin.z,origin.heading};
+        }
+        bool CollectFactoryChassis(int slot,Pair& p,int screen,const spawnflow::Window& window,
+                                   const FvoFactorySiteProofV1* proof){
+            const auto at=FactoryOrigin(p.factoryOrigin);
+            const auto now=GetTickCount64();
+            if(!p.factoryChassisWriteAt){
+            const auto birthWindow=StockBirthWindow(slot,screen,window);
+                const FvoTrafficBirthV1 request{FvoBirthSource::FactoryStock,birthWindow,!p.vehicleIssued,
+                    p.birthGrant,slot,p.base,0,at.x,at.y,at.z,at.heading};
+                FvoBirthState state{};
+                const auto id=g_factoryBirth(&request,proof,&state);
+                if(state==FvoBirthState::Pending){p.vehicleIssued=true;return false;}
+                p.vehiclePending=false;
+                if(state==FvoBirthState::Missing&&p.vehicleIssued){
+                    FactoryState(slot,p,FactoryPhase::Suspended,"factory_chassis_receipt_needs_reconciliation");
+                    return false;
+                }
+                p.vehicle=id;p.factoryVehicleUnsettled=false;p.factoryChassisWriteAt=now;
+            }
+            if(now<p.factoryChassisWriteAt)return false;
+            if(!SaveIds(slot,p)){
+                p.factoryChassisWriteAt=now+kFactoryRegistryRetryMs;
+                FactoryState(slot,p,FactoryPhase::Suspended,"factory_chassis_receipt_write_refused");
+                return false;
+            }
+            p.factoryChassisWriteAt=0;
+            if(!p.vehicle){
+                p.at=now+kCreateGapMs;
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_create_refused");
+                return false;
+            }
+            p.birth=at;p.st=St::Created;
+            SetLife(slot,p,spawnflow::Life::Born,"factory_chassis_receipt");
+            SetLife(slot,p,spawnflow::Life::Proving,"factory_chassis_wait_driver");
+            FactoryState(slot,p,FactoryPhase::Seating,"factory_chassis_created");
+            return true;
+        }
+        void SearchFactorySite(int slot,Pair& p,const Pos& player,const Snap& snap,ULONGLONG now,int screen,
+                               const spawnflow::Window& window,spawnflow::BirthBudget& budget){
+            if(g_factoryAnchors.empty()){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_routes");return;
+            }
+            if(now<p.at||now<g_factorySearchAt||snap.size()>=kSnapMax||
+               budget.granted>=spawnflow::rules::maxCreatePerTick)return;
+            // The pool is keyed to the player's cell: only local pairs and births in flight count, stock left in another cell never does.
+            if(const auto lab=LabCounts();!labpool::MayBirth(lab)){
+                FactoryState(slot,p,FactoryPhase::Standby,lab.local>=labpool::kPoolSize?"factory_pool_full":"factory_pool_no_free_slot");return;
+            }
+            // World camera rays expire after 180 ms. Poll before the answer can expire.
+            g_factorySearchAt=now+50;
+            std::vector<std::size_t> nearby;
+            for(std::size_t i=0;i<g_factoryAnchors.size();++i){
+                const auto& origin=g_factoryAnchors[i];
+                if(std::hypot(origin.x-player.x,origin.y-player.y)<kSpawnNear)nearby.push_back(i);
+            }
+            if(nearby.empty()){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_no_route_anchor_near_player_cell");return;
+            }
+            std::stable_sort(nearby.begin(),nearby.end(),[&](std::size_t a,std::size_t b){
+                const auto& left=g_factoryAnchors[a];const auto& right=g_factoryAnchors[b];
+                return std::hypot(left.x-player.x,left.y-player.y)<std::hypot(right.x-player.x,right.y-player.y);
+            });
+            const std::size_t candidate=g_factorySearchCursor%nearby.size();
+            const std::size_t offset=g_factorySearchCursor/nearby.size();
+            constexpr double offsets[][2]={{0,0},{24,0},{0,24},{-24,0},{0,-24},{48,0},{0,48},{-48,0},{0,-48}};
+            const auto lane=nearby[candidate];
+            const auto& anchor=g_factoryAnchors[lane];
+            const auto& shift=offsets[offset%std::size(offsets)];
+            const auto base=VehicleBase(-1,int(g_factorySearchCursor%labpool::kSlotCount));
+            if(!base||!Measure(p,base)){
+                ++g_factorySearchCursor;
+                g_factoryCandidateAt=0;
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_no_known_model_bounds");return;
+            }
+            // The lab lives under the player's own cell (GTA-style local stock): the whole hull must sit inside the cell the
+            // player is in, or the site gate answers WrongCell (136 of 262 tries in the 2026-11-20 20:35 run). Clamp the
+            // candidate into that cell instead of letting an anchor or shift land across a cell edge.
+            constexpr double kLabCellM=100.0;  // off::kCellSize
+            const double labReach=p.radius+2.0;
+            const double cellX=std::floor(player.x/kLabCellM)*kLabCellM,cellY=std::floor(player.y/kLabCellM)*kLabCellM;
+            const double labX=std::clamp(anchor.x+shift[0],cellX+labReach,cellX+kLabCellM-labReach);
+            const double labY=std::clamp(anchor.y+shift[1],cellY+labReach,cellY+kLabCellM-labReach);
+            const FvoRoadSiteV1 draft{labX,labY,anchor.z,anchor.heading,p.radius,p.halfHeight};
+            FvoFactorySiteProofV1 proof{};
+            const auto result=g_factorySite(base,&draft,&proof);
+            observations::Record(g_logFn,now,"traffic.factory_site",unsigned(slot),unsigned(result),
+                "event=site slot=%d world=%s model=%08X anchor=%zu offset=%zu status=%d pos=%.2f,%.2f,%.2f",
+                slot,g_world.c_str(),base,lane,offset%std::size(offsets),int(result),draft.x,draft.y,draft.z);
+            if(result!=FvoFactorySiteStatusV1::Ready){
+                if(!g_factoryCandidateAt)g_factoryCandidateAt=now;
+                if(result!=FvoFactorySiteStatusV1::Pending||now-g_factoryCandidateAt>=3000){
+                    ++g_factorySearchCursor;
+                    g_factoryCandidateAt=0;
+                }else if(window.open&&window.cover&&screen==2)g_factoryCoverWorkUntil=now+300;
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_live_subsurface_site");return;
+            }
+            g_factoryCandidateAt=0;
+            if(window.open&&window.cover)g_factoryCoverWorkUntil=now+300;
+            if(StockBirthWindow(slot,screen,window)==FvoBirthWindow::Closed){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_site_ready_wait_cover");return;
+            }
+            const auto birthGap=StockDispatchAvailable()?factorybirth::rules::stockBirthGapMs:kCreateGapMs;
+            if(now-g_factoryCreatedAt<birthGap){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_birth_cooldown");return;
+            }
+            const auto at=FactoryOrigin(proof.site);
+            const auto grant=SpeakBirth(budget,{spawnflow::PopulationAction::FleetBirth,window},FvoBirthSource::FactoryStock,slot,base,0,at);
+            if(!grant)return;
+            p.base=base;p.factoryOrigin=proof.site;p.birthGrant=grant;
+            p.factoryVehicleUnsettled=true;
+            if(!SaveIds(slot,p)){
+                p.factoryVehicleUnsettled=false;
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_fence_write_refused");return;
+            }
+            ++g_factorySearchCursor;
+            g_factoryCreatedAt=now;p.vehiclePending=true;p.vehicleIssued=false;
+            FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_ticket");
+            CollectFactoryChassis(slot,p,screen,window,&proof);
+        }
+        // Demand/Siting/Arbiter: fill one explicitly authored chassis during normal covered admission.
+        // Birth uses the original DriverRepair grant and collects its exact receipt through FinishBirth.
+        void FactoryPrepare(int slot,Pair& p,const FactoryBay& bay,const Snap& snap,ULONGLONG now,int screen,
+          const spawnflow::Window& window,spawnflow::BirthBudget& budget){
+            if(StockBirthWindow(slot,screen,window)==FvoBirthWindow::Closed){FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_concealed_birth_window");return;}
+            if(!bay.driverOriginReady){FactoryState(slot,p,FactoryPhase::Standby,"factory_driver_birth_origin_not_in_player_cell");return;}
+            const bool privateStock=IsRuntimeStock(slot)||bay.key.starts_with(kBelowStockPrefix);
+            if(privateStock?g_factoryAnchors.empty():g_initialClockPending){
+                FactoryState(slot,p,FactoryPhase::Standby,privateStock?"factory_wait_routes":"factory_wait_route_clock");return;
+            }
+            if(!privateStock&&!trafficadmission::Capacity(FleetCount()-int(p.vehicle!=0),0,0,int(g_initialScene.size()))){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_profile_full");return;
+            }
+            if(p.reloads>=kMaxReloads){FactoryState(slot,p,FactoryPhase::Suspended,"factory_driver_birth_retries_exhausted");return;}
+            const auto birthGap=privateStock&&StockDispatchAvailable()?factorybirth::rules::stockBirthGapMs:kCreateGapMs;
+            if(now-g_factoryCreatedAt<birthGap||budget.granted>=spawnflow::rules::maxCreatePerTick)return;
+            if(std::any_of(g_pairs.begin(),g_pairs.end(),[&](const Pair& row){return &row!=&p&&row.vehicle==bay.vehicle;})||
+               Retiring(bay.vehicle)||std::any_of(g_spares.begin(),g_spares.end(),[&](const Spare& row){return row.vehicle==bay.vehicle;})){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_already_claimed");return;
+            }
+            FvoTrafficRef v{};
+            const auto loaded=std::find_if(snap.begin(),snap.end(),[&](const auto& row){return row.id==bay.vehicle;});
+            if(loaded==snap.end()||snap.size()>=kSnapMax||!loaded->hasBody||!Info(bay.vehicle,v)||
+               !v.usable||v.isActor||!v.has3D||!FactoryAt(v,bay.at)||!v.baseId||
+               (p.base&&p.base!=v.baseId)){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_placed_body_and_pose");return;
+            }
+            if(privateStock&&!IsRuntimeStock(slot)&&SightAt(v.x,v.y,v.z,v.baseId).Exposure()!=2){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_stock_visibility_unconfirmed");return;
+            }
+            if(loaded->driver||loaded->who==kFvoWhoPlayer||loaded->who==kFvoWhoNpc||
+               !g_api->canManagePlacement||!engineport::Forward<&FvoTrafficApi::canManagePlacement>(g_api,"canManagePlacement","factory",v.id,v.id)||
+               engineport::Forward<&FvoTrafficApi::usesVehicle>(g_api,"usesVehicle","factory",v.id,v.id)){
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_has_stronger_owner");return;
+            }
+            FvoPoolSpot at{v.x,v.y,v.z,bay.at.heading};
+            const auto action=privateStock?spawnflow::PopulationAction::StockDriver:spawnflow::PopulationAction::DriverRepair;
+            const auto grant=SpeakBirth(budget,{action,window},FvoBirthSource::DriverRepair,slot,kDriverBase,v.id,at);
+            if(!grant)return;
+            p.vehicle=v.id;p.base=v.baseId;p.birth=at;p.birthGrant=grant;p.driverSource=FvoBirthSource::DriverRepair;
+            p.driverAt=at;p.driverIssued=false;p.driverPending=true;p.at=now;
+            p.factoryDriverUnsettled=true;
+            if(!SaveIds(slot,p)){
+                p.driverPending=false;p.factoryDriverUnsettled=false;
+                FactoryState(slot,p,FactoryPhase::Standby,"factory_census_write_refused");
+                return;
+            }
+            ++p.reloads;
+            g_factoryCreatedAt=now;
+            Measure(p,p.base);
+            SetLife(slot,p,spawnflow::Life::Born,"factory_driver_granted");
+            SetLife(slot,p,spawnflow::Life::Proving,"factory_await_driver");
+            FactoryState(slot,p,FactoryPhase::Seating,"factory_driver_ticket");
+            FinishBirth(slot,p,now,screen,window);
+        }
+        // A factory proof is Health evidence. Route and Handoff still own the departure and arrival.
+        bool FactoryMotion(const Pair& p){
+            FvoSpotMotionProofV1 proof{};
+            return p.factoryReleased&&p.factoryStarted&&g_factoryProof(p.vehicle,p.factoryStarted-1,&proof)&&
+                proof.body&&proof.builtAt&&proof.steps&&proof.started<=proof.completed;
+        }
+        void FactoryArrive(int slot,Pair& p,const Snap& snap,ULONGLONG now){
+            FvoTrafficRef v{};int sit=-1;double apart=0;
+            const bool arrived=Info(p.vehicle,v)&&v.usable&&v.has3D&&v.baseId==p.base&&
+                HasBody(p.vehicle,snap)&&FactoryAt(v,p.factoryArrival)&&FactorySeated(p,v,sit,apart);
+            handoff::Facts facts{};
+            if(arrived&&g_handoffFacts)g_handoffFacts(p.vehicle,p.driver,&facts);
+            if(!facts.package||!facts.bound||!facts.sampled||!facts.recentStep){
+                p.factoryArrivalSample=false;return;
+            }
+            if(!p.factoryArrivalSample){
+                p.factoryArrivalSample=true;p.factoryArrivalStep=facts.step;return;
+            }
+            if(facts.step<=p.factoryArrivalStep||!g_factoryTrip||
+               !g_factoryTrip(FactoryTripAction::Complete,p.vehicle,v.x,v.y,v.z,nullptr))return;
+            p.st=St::Started;p.watchAt=now;
+            SetLife(slot,p,spawnflow::Life::Driving,"factory_public_arrival_proved");
+            FactoryState(slot,p,FactoryPhase::Road,"factory_public_arrival_proved");
+        }
+
+        int StockRoadIndex(const Pair& p){
+            const auto end=g_names.begin()+std::min(g_names.size(),g_initialScene.size());
+            const auto found=std::find(g_names.begin(),end,p.stockRoadName);
+            return found==end?-1:int(found-g_names.begin());
+        }
+
+        void EndStockTransfer(int slot,Pair& p,bool untouched,const char* why){
+            const int road=StockRoadIndex(p);
+            if(g_stockRoute)g_stockRoute(StockRouteAction::Cancel,road,p.vehicle,p.factoryArrival,nullptr);
+            if(road>=0&&!g_pairs[road].vehicle&&!p.stockRoadWritten)g_pairs[road].reserved=false;
+            g_stockInFlight=0;
+            p.stockTransfer={};p.stockRoadName.clear();p.stockPendingAt=0;
+            if(untouched){
+                p.factoryCommitted=false;
+                if(!SaveIds(slot,p))p.factoryCommitted=true;
+            }
+            if(p.factoryCommitted)FactoryCancel(p);
+            FactoryState(slot,p,p.factoryCommitted?FactoryPhase::Suspended:FactoryPhase::Ready,why);
+        }
+
+        void FinishStockTransfer(int slot,Pair& p,ULONGLONG now){
+            FvoRelocationStatusV1 receipt{};
+            if(!g_relocation||!g_relocation(p.vehicle,&receipt)||receipt.relocating||receipt.serial!=p.stockTransfer.serial){
+                if(now-p.stockPendingAt>=8000)EndStockTransfer(slot,p,false,"factory_transfer_receipt_unavailable");
+                return;
+            }
+            if(receipt.result!=1||!receipt.stepAfter){
+                EndStockTransfer(slot,p,receipt.result==2,"factory_transfer_not_applied");return;
+            }
+            const int road=StockRoadIndex(p);
+            if(road<0||!g_pairs[road].reserved||g_pairs[road].vehicle){
+                EndStockTransfer(slot,p,false,"factory_destination_reservation_lost");return;
+            }
+            FvoTrafficRef vehicle{};
+            int sit=0;double apart=0;
+            handoff::Facts facts{};
+            if(!Info(p.vehicle,vehicle)||!FactoryAt(vehicle,p.factoryArrival)||!FactorySeated(p,vehicle,sit,apart)||
+               !g_handoffFacts){
+                if(now-p.stockPendingAt>=8000)EndStockTransfer(slot,p,false,"factory_destination_pair_unproved");
+                return;
+            }
+            g_handoffFacts(p.vehicle,p.driver,&facts);
+            if(!facts.bound||!facts.sampled||!facts.package||!facts.recentStep){
+                if(now-p.stockPendingAt>=8000)EndStockTransfer(slot,p,false,"factory_destination_step_unproved");
+                return;
+            }
+            FvoTripClaim claim{};
+            if(!g_stockRoute(StockRouteAction::Commit,road,p.vehicle,p.factoryArrival,&claim)||!claim.step){
+                EndStockTransfer(slot,p,false,"factory_route_reservation_revoked");return;
+            }
+            Pair publicPair{};
+            publicPair.vehicle=p.vehicle;publicPair.driver=p.driver;publicPair.base=p.base;
+            publicPair.st=St::Started;publicPair.at=publicPair.watchAt=now;
+            publicPair.birth=p.factoryArrival;publicPair.bornAt=now;
+            publicPair.radius=p.radius;publicPair.halfHeight=p.halfHeight;
+            publicPair.spotKey=road<int(g_spotKeys.size())?g_spotKeys[road]:std::string();
+            publicPair.factory=FactoryPhase::Road;
+            if(!p.stockRoadWritten&&!SaveIds(road,publicPair)){
+                if(now-p.stockPendingAt>=8000)EndStockTransfer(slot,p,false,"factory_public_registry_unavailable");
+                return;
+            }
+            p.stockRoadWritten=true;
+            std::uint64_t serial=0;
+            using Action=FvoStockTransferActionV1;using Reply=FvoStockTransferResultV1;
+            const auto promote=g_stockTransfer(Action::Promote,&p.stockTransfer,&serial,&claim);
+            if(promote!=Reply::Promoted){
+                if(promote==Reply::Refused||now-p.stockPendingAt>=8000)EndStockTransfer(slot,p,false,"factory_promotion_refused");
+                return;
+            }
+            publicPair.life=spawnflow::Life::Proving;
+            g_pairs[road]=std::move(publicPair);
+            SetLife(road,g_pairs[road],spawnflow::Life::Driving,"factory_seated_public_handoff");
+            g_madeThisWindow.insert(road);
+            ++g_tally.made;if(g_rushFill)++g_rushMade;
+            Log("OBS system=traffic.factory_dispatch event=driving speaker=handoff serial=%llu vehicle=%08X driver=%08X stock_slot=%d road_slot=%d step=%llu",
+                static_cast<unsigned long long>(p.stockTransfer.serial),p.vehicle,p.driver,slot,road,static_cast<unsigned long long>(facts.step));
+            g_factoryArchived.erase(p.vehicle);
+            p={};p.factoryLoaded=true;p.at=now+factorybirth::rules::stockBirthGapMs;
+            if(!SaveIds(slot,p))p.factoryPublicRecovered=true;
+            g_stockInFlight=0;
+        }
+
+        void DispatchStock(int slot,Pair& p,const FvoTrafficRef& vehicle,const Pos& player,const Snap& snap,ULONGLONG now,int screen){
+            if(!StockDispatchAvailable()||!g_relocation||!g_siteGate||g_initialClockPending){
+                FactoryState(slot,p,FactoryPhase::Ready,"factory_dispatch_capability_unavailable");return;
+            }
+            if(screen!=1||!PlayTime()||g_stockInFlight||now<g_stockSearchAt||now<p.stockTryAt)return;
+            if(FleetCount()>=int(g_initialScene.size())){
+                FactoryState(slot,p,FactoryPhase::Ready,"factory_public_demand_satisfied");return;
+            }
+            g_stockSearchAt=now+50;
+            p.stockTryAt=now+95;
+            const int count=std::min(int(g_initialScene.size()),int(g_pairs.size()));
+            struct Candidate {int road,attempt;FvoPoolSpot at;double distance;};
+            std::vector<Candidate> candidates;
+            for(int road=0;road<count;++road){
+                const auto& q=g_pairs[road];
+                if(!SlotFree(q)||q.vehicle||q.reserved||q.retired||SlotSkips(road,p.base))continue;
+                if(g_routeRoom&&g_routeRoom(road,nullptr,nullptr,nullptr)==-1)continue;
+                if(g_modelGate&&!g_modelGate(road,p.base,p.radius,p.halfHeight,true))continue;
+                const auto add=[&](int attempt,const FvoPoolSpot& at){
+                    const FvoRoadSiteV1 target{at.x,at.y,at.z,at.heading,p.radius,p.halfHeight};
+                    // GTA rule: only slots inside the density ring around the player, nearest the player first; the core refuses a
+                    // destination in the player's sight, which moves this pair on to the next slot.
+                    const double fromPlayer=std::hypot(at.x-player.x,at.y-player.y);
+                    if(labpool::InRing(fromPlayer)&&
+                       factorydispatch::Reachable(vehicle.x,vehicle.y,vehicle.z,p.factoryOrigin.heading,target))
+                        candidates.push_back({road,attempt,at,fromPlayer});
+                };
+                add(0,g_initialScene[road]);
+                if(const auto alternatives=g_initialAlternatives.find(road);alternatives!=g_initialAlternatives.end())
+                    for(int i=0;i<int(alternatives->second.size());++i)add(i+1,alternatives->second[i]);
+            }
+            if(candidates.empty()){
+                FactoryState(slot,p,FactoryPhase::Ready,"factory_no_free_lane_in_density_ring");return;
+            }
+            std::stable_sort(candidates.begin(),candidates.end(),[](const auto& a,const auto& b){return labpool::NearestFirst(a.distance,b.distance);});
+            auto [road,attempt,at,distance]=candidates[p.stockSearch%candidates.size()];
+            const auto next=[&]{++p.stockSearch;p.stockPendingAt=0;};
+            RoadSite site{};const char* why="field_refused";double gap=0;
+            const bool spotRejected=road<int(g_spotKeys.size())&&g_health.SpotRejected(g_spotKeys[road]);
+            if(!g_siteGate(road,attempt,p.base,p.radius,p.halfHeight,at,false,spotRejected,site,&why)||
+               g_observedOrigins[g_world].count(OriginKey(at))||Occupied(road,at,snap,site,gap,&p)){
+                next();FactoryState(slot,p,FactoryPhase::Ready,"factory_destination_field_or_continuity_refused");return;
+            }
+            FvoStockTransferV1 transfer;
+            transfer.vehicle=p.vehicle;transfer.driver=p.driver;transfer.lease=p.factoryLease;
+            transfer.target={at.x,at.y,at.z,at.heading,p.radius,p.halfHeight};
+            if(!StockDispatchAvailable())return;
+            std::uint64_t serial=0;
+            using Action=FvoStockTransferActionV1;using Reply=FvoStockTransferResultV1;
+            const auto ready=g_stockTransfer(Action::Check,&transfer,&serial,nullptr);
+            if(ready!=Reply::Ready){
+                if(!p.stockPendingAt)p.stockPendingAt=now;
+                if(ready==Reply::Refused||now-p.stockPendingAt>=2500)next();
+                FactoryState(slot,p,FactoryPhase::Ready,ready==Reply::Refused?"factory_destination_transfer_refused":"factory_wait_destination_proof");return;
+            }
+            if(!g_stockRoute(StockRouteAction::Reserve,road,p.vehicle,at,nullptr)){
+                next();FactoryState(slot,p,FactoryPhase::Ready,"factory_route_has_no_vacancy");return;
+            }
+            p.stockRoadName=g_names[road];p.factoryArrival=at;p.factoryCommitted=true;
+            g_pairs[road].reserved=true;g_pairs[road].birth=at;
+            if(!SaveIds(slot,p)){
+                EndStockTransfer(slot,p,true,"factory_departure_fence_write_refused");return;
+            }
+            if(g_stockTransfer(Action::Start,&transfer,&serial,nullptr)!=Reply::Armed||!serial){
+                EndStockTransfer(slot,p,true,"factory_transfer_start_deferred");next();return;
+            }
+            transfer.serial=serial;p.stockTransfer=transfer;p.stockPendingAt=now;g_stockInFlight=p.vehicle;
+            FactoryState(slot,p,FactoryPhase::Transfer,"factory_seated_transfer_armed");
+            Log("OBS system=traffic.factory_dispatch event=armed speaker=arbiter serial=%llu vehicle=%08X driver=%08X slot=%d road=%d distance=%.2f",
+                static_cast<unsigned long long>(serial),p.vehicle,p.driver,slot,road,distance);
+        }
+        // Retirement of stock the player left behind, only when the lab lacks the empty slots its pool needs (labpool::NeedsRecycle). One pair per
+        // interval, the one stranded longest. The decision is Retirement's (cover or unseen); a refusal keeps the pair and asks again.
+        ULONGLONG g_labRecycleAt=0;
+        void RecycleStranded(int slot,Pair& p,ULONGLONG now){
+            if(now<g_labRecycleAt||!p.labStranded||!p.vehicle||p.vehiclePending)return;
+            const auto lab=LabCounts();
+            if(!labpool::NeedsRecycle(lab))return;
+            for(std::size_t i=0;i<g_pairs.size();++i){
+                const auto& other=g_pairs[i];
+                if(int(i)!=slot&&IsRuntimeStock(int(i))&&other.labStranded&&other.vehicle&&
+                   (other.labStrandedAt<p.labStrandedAt||(other.labStrandedAt==p.labStrandedAt&&int(i)<slot)))return;
+            }
+            const auto order=DecideRetirement(p,p.driver,"lab_stranded_other_cell");
+            if(!order.decision.now){
+                observations::Record(g_logFn,now,"traffic.lab_recycle",p.vehicle,0,
+                    "event=waiting slot=%d reason=lab_stranded_other_cell rule=%s stranded=%d local=%d empty=%d",slot,order.rule,lab.stranded,lab.local,lab.empty);
+                return;
+            }
+            g_labRecycleAt=now+labpool::kRecycleEveryMs;
+            Log("OBS system=traffic.lab_recycle vehicle=%08X driver=%08X event=retired slot=%d rule=%s stranded=%d local=%d empty=%d stranded_ms=%llu",
+                p.vehicle,p.driver,slot,order.rule,lab.stranded,lab.local,lab.empty,static_cast<unsigned long long>(now-p.labStrandedAt));
+            SetLife(slot,p,spawnflow::Life::Retiring,"lab_stranded_other_cell");
+            ApplyRetirement(order);
+            g_factoryArchived.erase(p.vehicle);
+            p={};p.st=St::Empty;p.factoryLoaded=true;p.at=now+factorybirth::rules::stockBirthGapMs;
+            SaveIds(slot,p);
+        }
+        // True when this slot is still private or needs reconciliation. A proved public trip reuses ordinary Step.
+        bool StepFactory(int slot,Pair& p,const Pos& player,const Snap& snap,ULONGLONG now,int screen,
+          spawnflow::Window window,spawnflow::BirthBudget& budget){
+            if(!p.factoryLoaded)LoadFactoryIds(slot,p);
+            if(IsRuntimeStock(slot)&&StockDispatchAvailable()&&screen==1&&PlayTime())window={true,false,"factory_live_concealed"};
+            if(p.factoryPublicRecovered&&!ClearRecoveredFactorySource(slot,p))return true;
+            if(p.factoryChassisWriteAt&&!CollectFactoryChassis(slot,p,screen,window,nullptr))return true;
+            if(p.factoryDriverWriteAt&&!FinishBirth(slot,p,now,screen,window))return true;
+            if(p.factory==FactoryPhase::Transfer){FinishStockTransfer(slot,p,now);return true;}
+            if(!p.factoryRevoked&&p.vehicle&&g_api->playerTook&&engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","factory",p.vehicle,p.vehicle)){
+                FactoryCancel(p);p.factoryRevoked=true;
+                SetLife(slot,p,spawnflow::Life::World,"factory_taken_by_player");
+                SaveIds(slot,p);
+            }
+            if(p.factoryRevoked){
+                if(p.driverPending)FinishBirth(slot,p,now,screen,window);
+                FactoryState(slot,p,FactoryPhase::Suspended,"factory_world_owns_pair");return true;
+            }
+            if(p.factory==FactoryPhase::Road)return false;
+            if(p.factory==FactoryPhase::Departure){FactoryArrive(slot,p,snap,now);return true;}
+            if(PhysicalFleetActive()) {
+                // Let old committed transactions finish above. The matched arbiter seeds the public fleet
+                // in its covered window, so private factory stock cannot launch a competing population path.
+                if(p.factoryLease)FactoryCancel(p);
+                return true;
+            }
+            if(p.factory==FactoryPhase::Test&&p.factoryLease&&p.factoryStarted&&g_factoryProof&&PlayTime()&&
+               now-p.factoryStarted>=factorybirth::rules::leaseProofLimitMs&&!FactoryMotion(p)){
+                FactoryCancel(p);
+                p.tripAt=now;
+                // The lease goes to the next stock pair and this one waits out a growing backoff before asking again, so one pair that never
+                // proves motion cannot keep taking the lease back (core refuses a second stock lease while one lacks proof).
+                ++p.labYields;
+                p.labLeaseHoldUntil=now+labpool::YieldBackoffMs(p.labYields);
+                Log("OBS system=traffic.factory vehicle=%08X driver=%08X event=lease_yielded slot=%d yields=%d backoff_ms=%llu proof_limit_ms=%llu",
+                    p.vehicle,p.driver,slot,p.labYields,static_cast<unsigned long long>(labpool::YieldBackoffMs(p.labYields)),
+                    static_cast<unsigned long long>(factorybirth::rules::leaseProofLimitMs));
+                FactoryState(slot,p,FactoryPhase::Seating,"factory_proof_deadline_yielded_lease");
+                return true;
+            }
+            if(p.factoryCommitted){
+                if(g_savedFleetJourney&&g_savedFleetJourney(p.vehicle,p.base,g_world.c_str())){
+                    p.st=St::Unknown;FactoryState(slot,p,FactoryPhase::Road,"factory_restored_public_journey");return false;
+                }
+                FactoryState(slot,p,FactoryPhase::Suspended,"factory_interrupted_departure_needs_reconciliation");return true;
+            }
+            const auto& name=g_names[std::size_t(slot)];
+            const auto stock=g_belowStock.find(name);
+            const bool runtime=IsRuntimeStock(slot);
+            const bool below=runtime||stock!=g_belowStock.end();
+            FactoryBay runtimeSite;
+            if(runtime){
+                if(!g_factorySite||!g_factoryBirth||!g_factoryBind){
+                    FactoryState(slot,p,FactoryPhase::Suspended,"factory_runtime_adapter_unavailable");return true;
+                }
+                if(p.vehiclePending){
+                    if(window.open&&window.cover)g_factoryCoverWorkUntil=now+300;
+                    if(!CollectFactoryChassis(slot,p,screen,window,nullptr))return true;
+                }
+                if(p.factoryVehicleUnsettled){
+                    FactoryState(slot,p,FactoryPhase::Suspended,"factory_chassis_receipt_needs_reconciliation");return true;
+                }
+                if(!p.vehicle){
+                    if((StockDispatchAvailable()||g_belowStock.empty())&&g_factoryProof&&g_factoryLease&&g_handoffFacts&&g_handoffRelease&&g_birthListener)
+                        SearchFactorySite(slot,p,player,snap,now,screen,window,budget);
+                    return true;
+                }
+                runtimeSite={name,p.vehicle,FactoryOrigin(p.factoryOrigin),{},false};
+                using Sight=FvoFactorySiteStatusV1;
+                // An older core has only bind, which answers zero for both a bad site and a sight query still in flight. With a lease in
+                // progress that zero is a pending query, never a cancellation (the lease proof deadline still bounds the wait).
+                const auto observation=g_factoryObserve?g_factoryObserve(p.vehicle,p.base,&p.factoryOrigin):
+                    (g_factoryBind(p.vehicle,p.base,&p.factoryOrigin)?Sight::Ready:(p.factoryLease?Sight::Pending:Sight::Unsafe));
+                runtimeSite.driverOriginReady=observation==Sight::Ready;
+                if(runtimeSite.driverOriginReady&&p.labStranded){
+                    p.labStranded=false;
+                    Log("OBS system=traffic.factory vehicle=%08X driver=%08X event=lab_readopted slot=%d reason=player_back_in_cell",p.vehicle,p.driver,slot);
+                }
+                if(!runtimeSite.driverOriginReady){
+                    if(p.driverPending&&p.driverIssued)FinishBirth(slot,p,now,screen,window);
+                    if(observation==Sight::WrongCell){
+                        // The player left this pair's cell. It stops counting against the pool; the lab births local stock instead, and when
+                        // the slots run short the oldest stranded pair is recycled through Retirement.
+                        if(!p.labStranded){
+                            p.labStranded=true;p.labStrandedAt=now;
+                            Log("OBS system=traffic.factory vehicle=%08X driver=%08X event=lab_stranded slot=%d reason=player_left_cell",p.vehicle,p.driver,slot);
+                        }
+                        FactoryCancel(p);
+                        FactoryState(slot,p,FactoryPhase::Standby,"factory_stock_in_other_cell");
+                        RecycleStranded(slot,p,now);
+                        return true;
+                    }
+                    if(observation==Sight::Pending||observation==Sight::Visible){
+                        FactoryState(slot,p,p.factory,observation==Sight::Pending?
+                            "factory_wait_sight_observation":"factory_wait_concealment");
+                        return true;
+                    }
+                    FactoryCancel(p);
+                    FactoryState(slot,p,FactoryPhase::Standby,"factory_runtime_origin_not_bound");return true;
+                }
+            }
+            const FactoryBay* site=runtime?&runtimeSite:below?&stock->second:g_factoryBay&&name==FactorySlotName(*g_factoryBay)?&*g_factoryBay:nullptr;
+            if(!site||(!below&&(!g_factoryTrip||!g_roadCheck))||!g_factoryProof||!g_factoryLease||
+               !g_handoffFacts||!g_handoffRelease||!g_birthListener){
+                if(p.driverPending&&p.driverIssued)FinishBirth(slot,p,now,screen,window);
+                else if(p.driverPending){p.driverPending=false;p.factoryDriverUnsettled=false;SaveIds(slot,p);}
+                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Suspended,"factory_profile_or_adapter_unavailable");return true;
+            }
+            const auto& bay=*site;
+            if(p.vehicle&&p.vehicle!=bay.vehicle){
+                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Suspended,"factory_saved_placement_mismatch");return true;
+            }
+            if(std::any_of(g_pairs.begin(),g_pairs.end(),[&](const Pair& other){
+                return &other!=&p&&((p.vehicle&&other.vehicle==p.vehicle)||(p.driver&&other.driver==p.driver));})){
+                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Suspended,"factory_saved_pair_already_claimed");return true;
+            }
+            if(!FinishBirth(slot,p,now,screen,window))return true;
+            if(p.factoryDriverUnsettled){
+                FactoryState(slot,p,FactoryPhase::Suspended,"factory_driver_receipt_needs_reconciliation");return true;
+            }
+            if(!p.driver){FactoryPrepare(slot,p,bay,snap,now,screen,window,budget);return true;}
+
+            FvoTrafficRef v{};
+            const bool body=Info(p.vehicle,v)&&v.usable&&v.has3D&&v.baseId==p.base&&HasBody(p.vehicle,snap);
+            int sit=-1;double apart=-1;
+            const bool seated=body&&FactorySeated(p,v,sit,apart);
+            handoff::Facts facts{};
+            if(seated)g_handoffFacts(p.vehicle,p.driver,&facts);
+            const bool bound=facts.package&&facts.bound&&facts.sampled;
+            if(p.factoryLease&&!g_factoryLease(FvoTrafficFactoryLeaseActionV1::Status,p.vehicle,p.driver,&p.factoryLease,nullptr))
+                FactoryCancel(p);
+            if(!body||!FactoryAt(v,bay.at)){
+                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Seating,"factory_wait_placed_body_and_pose");return true;
+            }
+            const bool hidden=runtime?runtimeSite.driverOriginReady:
+                (window.open&&window.cover)||(screen==1&&SightAt(v.x,v.y,v.z,v.baseId).Exposure()==2);
+            if(!seated){
+                FactoryCancel(p);
+                FactoryState(slot,p,FactoryPhase::Seating,"factory_wait_seated_driver");
+                if(hidden&&PlayTime()&&p.tries<kSeatTries&&now-p.seatAt>=(runtime?labpool::kSeatEveryMs:kSeatEveryMs)&&
+                   trafficpair::NeedsSnap(v.has3D!=0,apart>=0,sit,apart)){
+                    const auto who=std::find_if(snap.begin(),snap.end(),[&](const auto& row){return row.id==p.vehicle;});
+                    if(who==snap.end()||(who->driver&&who->driver!=p.driver))return true;
+                    p.seatAt=now;
+                    const int reply=engineport::Forward<&FvoTrafficApi::snapSeat>(g_api,"snapSeat","factory",p.driver,p.driver,p.vehicle);
+                    if(spawnflow::SeatAttemptSpent(reply,reply==0&&MutationPending(p.driver,"seat")))++p.tries;
+                }
+                return true;
+            }
+            if(p.life==spawnflow::Life::None)SetLife(slot,p,spawnflow::Life::Proving,"factory_restored_seated_pair");
+            if(!p.factoryLease){
+                if(!hidden||!PlayTime()||now-p.tripAt<kTripRetryMs)return true;
+                if(now<p.labLeaseHoldUntil){FactoryState(slot,p,FactoryPhase::Seating,"factory_lease_backoff_after_yield");return true;}
+                p.tripAt=now;
+                FvoTripClaim claim{};
+                if(!below&&(!g_factoryTrip(FactoryTripAction::Test,p.vehicle,v.x,v.y,v.z,&claim)||!claim.step)){
+                    FactoryState(slot,p,FactoryPhase::Seating,"factory_no_private_route_claim");return true;
+                }
+                const auto action=below?FvoTrafficFactoryLeaseActionV1::StartStock:FvoTrafficFactoryLeaseActionV1::Start;
+                if(!g_factoryLease(action,p.vehicle,p.driver,&p.factoryLease,below?nullptr:&claim)||!p.factoryLease){
+                    if(!below)g_factoryTrip(FactoryTripAction::Rollback,p.vehicle,v.x,v.y,v.z,nullptr);
+                    FactoryState(slot,p,FactoryPhase::Seating,"factory_private_lease_refused");return true;
+                }
+                p.factoryStarted=now;
+                FactoryState(slot,p,FactoryPhase::Test,"factory_private_lease_admitted");return true;
+            }
+            if(!p.factoryReleased){
+                if(hidden&&bound&&g_handoffRelease(p.vehicle,false))p.factoryReleased=true;
+                return true;
+            }
+            if(!bound||!FactoryMotion(p)){
+                FactoryState(slot,p,FactoryPhase::Test,"factory_wait_matched_pulse_and_steps");return true;
+            }
+            p.labYields=0;p.labLeaseHoldUntil=0;
+            if(below){
+                if(IsRuntimeStock(slot))DispatchStock(slot,p,v,player,snap,now,screen);
+                else FactoryState(slot,p,FactoryPhase::Ready,"factory_placed_stock_held");
+                return true;
+            }
+            if(p.factory!=FactoryPhase::Ready)FactoryState(slot,p,FactoryPhase::Ready,"factory_motion_proved");
+            if(!hidden||!PlayTime()||now-p.tripAt<kTripRetryMs)return true;
+            p.tripAt=now;
+            // Arrival Siting uses the current core clearance for the complete vehicle envelope.
+            FvoRoadProofV1 proof{};
+            const FvoRoadSiteV1 target{bay.arrival.x,bay.arrival.y,bay.arrival.z,bay.arrival.heading,p.radius,p.halfHeight};
+            if(g_roadCheck(&target,&proof)!=FvoRoadClearance::Clear||!proof.epoch||
+               !roadclearance::Fresh(proof.at,GetTickCount64(),roadclearance::ProofMs(screen==3))){
+                FactoryState(slot,p,FactoryPhase::Ready,"factory_wait_road_clearance");return true;
+            }
+            if(!g_factoryTrip(FactoryTripAction::Dispatch,p.vehicle,v.x,v.y,v.z,nullptr)){
+                FactoryState(slot,p,FactoryPhase::Ready,"factory_wait_compatible_route_vacancy");return true;
+            }
+            p.factoryCommitted=true;
+            if(!SaveIds(slot,p)){
+                g_factoryTrip(FactoryTripAction::Rollback,p.vehicle,v.x,v.y,v.z,nullptr);
+                p.factoryCommitted=false;
+                FactoryState(slot,p,FactoryPhase::Ready,"factory_census_write_refused");return true;
+            }
+            if(!g_factoryLease(FvoTrafficFactoryLeaseActionV1::Depart,p.vehicle,p.driver,&p.factoryLease,nullptr)){
+                g_factoryTrip(FactoryTripAction::Rollback,p.vehicle,v.x,v.y,v.z,nullptr);
+                p.factoryCommitted=false;SaveIds(slot,p);
+                FactoryState(slot,p,FactoryPhase::Ready,"factory_departure_authority_refused");return true;
+            }
+            p.factoryArrival=bay.arrival;
+            FactoryState(slot,p,FactoryPhase::Departure,"factory_departure_admitted");
+            return true;
+        }
 		void Step(int i, Pair& p, const FvoPoolSpot& s, const Pos& pp, const Snap& snap, ULONGLONG now,
             int screen,const spawnflow::Window& window,spawnflow::BirthBudget& budget)
 		{
 			g_clock=now;
             p.handoffEligible=false;
+            if(IsFactorySlot(i)&&StepFactory(i,p,pp,snap,now,screen,window,budget))return;
             if(p.staged&&p.vehicle&&!p.takeoverQueued&&g_api->playerTook&&g_api->playerTook(p.vehicle)){
                 p.takeoverQueued=true;g_takenRelease.insert(p.vehicle);
                 Log("OBS system=traffic.handoff vehicle=%08X event=release_requested slot=%d reason=taken_by_the_player",p.vehicle,i);
@@ -1630,12 +2505,34 @@ namespace generator
             Log("OBS system=traffic.spawn vehicle=00000000 event=x_prepare slots=%d reason=fill_gaps_keep_fleet",int(g_pairs.size()));
         }
 
+        // The lab (factory bay, below-world stock and runtime stock) is kept but not used yet (user, 2026-11-21: "keep the lab for now ...
+        // just kept but not used yet"; later uses: the X fill, vehicles leaving a worldspace). With this off no lab slot is made, so
+        // none of its steps run and saved lab rows stay untouched for when it is switched on.
+        constexpr bool kLabActive = false;
         void Reconcile(){
             std::lock_guard lock(g_lock);
             if(g_wantWorld!=g_world)return;
             auto old=std::move(g_pairs);auto oldNames=std::move(g_names);auto oldSpots=std::move(g_spots);auto oldReuse=std::move(g_reuse);
             std::set<unsigned> used;std::vector<bool> taken(old.size(),false);
             g_pairs.clear();g_names=g_wantNames;g_spots=g_wantSpots;g_reuse=g_wantReuse;
+            g_factoryBay=kLabActive&&g_belowStock.empty()?g_wantFactory:std::nullopt;
+            for(const auto& [name,stock]:g_belowStock){
+                if(!kLabActive)break;
+                g_names.push_back(name);g_spots.push_back(stock.at);g_reuse.push_back(0);
+            }
+            if(g_factoryBay){
+                if(g_names.size()<std::size_t(kMaxSpots)){
+                    g_names.push_back(FactorySlotName(*g_factoryBay));
+                    g_spots.push_back(g_factoryBay->at);
+                    g_reuse.push_back(0);
+                }else g_factoryBay.reset();
+            }
+            if(kLabActive&&g_factorySite&&g_factoryBirth&&g_factoryBind){
+                for(int i=0;i<labpool::kSlotCount;++i){
+                    g_names.push_back(kRuntimeStockPrefix+std::to_string(i));
+                    g_spots.emplace_back();g_reuse.push_back(0);
+                }
+            }
             for(std::size_t i=0;i<g_names.size();++i){
                 Pair pair;
                 for(std::size_t j=0;j<old.size();++j)if(!taken[j]&&oldNames[j]==g_names[i]){pair=old[j];taken[j]=true;break;}
@@ -1661,6 +2558,26 @@ namespace generator
         bool RecoverySlot(const Pair& p){
             return !p.vehicle&&!p.driver&&!p.vehiclePending&&!p.driverPending&&!p.reserved&&!p.retired;
         }
+        // A public identity can win over an archived stock record only when the committed private
+        // transfer and its durable public arrival describe the same exact pair.
+        std::map<unsigned,retiringrecord::PairRow> g_factoryPublicRecovery;
+        bool SameFactoryPair(const retiringrecord::PairRow& a,const retiringrecord::PairRow& b){
+            return a.vehicle&&a.driver&&a.base&&a.vehicle==b.vehicle&&a.driver==b.driver&&a.base==b.base;
+        }
+        bool RecoveredFactoryOnRoad(const retiringrecord::PairRow& row){
+            const auto it=g_factoryPublicRecovery.find(row.vehicle);
+            return it!=g_factoryPublicRecovery.end()&&SameFactoryPair(row,it->second);
+        }
+        bool ClearRecoveredFactorySource(int slot,Pair& p){
+            if(!p.factoryPublicRecovered)return true;
+            if(!SaveIds(slot,Pair{})){
+                FactoryState(slot,p,FactoryPhase::Suspended,"factory_source_clear_pending");
+                return false;
+            }
+            p=Pair{};p.factoryLoaded=true;
+            Log("OBS system=traffic.census event=duplicate_factory_source_cleared slot=%d",slot);
+            return true;
+        }
         void ClaimRecovered(int index,Pair pair,const FvoTrafficRef& v,ULONGLONG now,const char* source){
             pair.base=v.baseId;pair.at=now;Measure(pair,pair.base);
             g_pairs[index]=std::move(pair);
@@ -1670,51 +2587,36 @@ namespace generator
             Log("OBS system=traffic.census vehicle=%08X driver=%08X event=fleet_recovered slot=%d reason=%s",
                 p.vehicle,p.driver,index,source);
         }
-        // Rows older versions wrote for retired systems (factory bay slots, runtime stock, landing spots): retiringrecord.h
-        // RetiredRowKind / ParseRetiredRow / DecideRetiredRow, checked in traffic_rules_test.
-        struct RetiredSystemEntry { std::wstring key; retiringrecord::PairRow row; bool landing=false; };
-        // One pass on load: a car the public fleet already holds keeps that owner; a car whose saved journey names it is left to
-        // the journey recovery (RecoverJourneyPairs) to join the normal fleet; every other car that is still ours is retired
-        // through the arbiter (the request survives a save). The row is then deleted; a car that is not loaded keeps its row.
-        void RecoverRetiredSystems(const std::vector<RetiredSystemEntry>& rows,const std::set<unsigned>& vehicles,const std::set<unsigned>& drivers){
-            using retiringrecord::RetiredOutcome;
-            int counts[6]{};
-            const auto section=Wide(g_world);
-            for(const auto& old:rows){
-                const auto& row=old.row;
-                FvoTrafficRef v{},d{};
-                const bool loaded=row.vehicle&&Info(row.vehicle,v);
-                const bool vehicleOurs=loaded&&retiringrecord::VehicleStillOurs(true,v.isActor!=0,v.baseId,row.base);
-                const bool driverOurs=row.driver&&retiringrecord::DriverStillOurs(Info(row.driver,d),d.isActor!=0,d.baseId,kDriverBase);
-                const bool publicOwner=(row.vehicle&&vehicles.count(row.vehicle))||(row.driver&&drivers.count(row.driver))||
-                    std::any_of(g_deferredRegistry.begin(),g_deferredRegistry.end(),[&](const DeferredPair& p){return p.row.vehicle==row.vehicle;});
-                const bool journey=vehicleOurs&&g_savedFleetJourney&&g_savedFleetJourney(row.vehicle,v.baseId,g_world.c_str());
-                const auto outcome=retiringrecord::DecideRetiredRow(row.vehicle,publicOwner,loaded,vehicleOurs,journey);
-                ++counts[int(outcome)];
-                if(outcome==RetiredOutcome::Retire)
-                    RetireRequest(row.vehicle,driverOurs?row.driver:0,old.landing?"retired_landing_spot":"retired_factory_stock");
-                Log("OBS system=traffic.census vehicle=%08X driver=%08X event=retired_system_row key=%ls outcome=%s",row.vehicle,row.driver,old.key.c_str(),retiringrecord::RetiredOutcomeName(outcome));
-                if(outcome!=RetiredOutcome::NotLoadedKeep)WriteRegistry(section.c_str(),old.key.c_str(),nullptr);
-            }
-            if(!rows.empty())Log("OBS system=traffic.census vehicle=00000000 event=retired_system_rows total=%zu public_owner=%d journey=%d retired=%d gone=%d not_loaded=%d unreadable=%d",
-                rows.size(),counts[int(RetiredOutcome::PublicOwner)],counts[int(RetiredOutcome::JourneyRecovery)],counts[int(RetiredOutcome::Retire)],
-                counts[int(RetiredOutcome::Gone)],counts[int(RetiredOutcome::NotLoadedKeep)],counts[int(RetiredOutcome::Unreadable)]);
-        }
         void RecoverRegistry(){
             g_deferredRegistry.clear();g_registryRecoveryCursor=0;g_registryRecoveryAt=0;g_linkedRecoveryAt=0;
+            g_factoryArchived.clear();g_factoryPublicRecovery.clear();
             const auto now=GetTickCount64();
             // Read the entire historical registry: route-key churn used to orphan
             // old saved fleets. Adopt each valid physical pair at most once.
             std::vector<wchar_t> section(65536);
             GetPrivateProfileSectionW(Wide(g_world).c_str(),section.data(),DWORD(section.size()),Ini().c_str());
-            std::vector<RetiredSystemEntry> retiredRows;
+            constexpr wchar_t prefix[]=L"factory_v1_";
+            std::map<unsigned,retiringrecord::PairRow> committedFactory,publicRows;
+            std::set<unsigned> ambiguousFactory,ambiguousPublic;
             for(const wchar_t* item=section.data();*item;item+=wcslen(item)+1){
-                const int kind=retiringrecord::RetiredRowKind(item);
+                const bool factory=!wcsncmp(item,prefix,std::size(prefix)-1)||!wcsncmp(item,kRuntimeStockKey,std::size(kRuntimeStockKey)-1);
+                if(!factory&&wcsncmp(item,L"pair_",5)&&wcsncmp(item,L"spot",4))continue;
                 const auto value=wcschr(item,L'=');
-                if(!kind||!value)continue;
-                RetiredSystemEntry old;old.key.assign(item,value);old.landing=kind==2;
-                old.row=retiringrecord::ParseRetiredRow(kind,value+1);
-                retiredRows.push_back(std::move(old));
+                if(!value)continue;
+                const auto saved=retiringrecord::ParsePair(value+1);
+                if(factory&&saved.vehicle&&saved.base)g_factoryArchived[saved.vehicle]=saved.base;
+                if(!saved.vehicle||!saved.driver||!saved.base||saved.surplus)continue;
+                if(factory){
+                    if(saved.staged&&!committedFactory.emplace(saved.vehicle,saved).second)ambiguousFactory.insert(saved.vehicle);
+                }else{
+                    const auto [it,inserted]=publicRows.emplace(saved.vehicle,saved);
+                    if(!inserted&&!SameFactoryPair(it->second,saved))ambiguousPublic.insert(saved.vehicle);
+                }
+            }
+            for(const auto& [id,privateRow]:committedFactory){
+                const auto publicRow=publicRows.find(id);
+                if(!ambiguousFactory.count(id)&&!ambiguousPublic.count(id)&&publicRow!=publicRows.end()&&SameFactoryPair(privateRow,publicRow->second))
+                    g_factoryPublicRecovery.emplace(id,publicRow->second);
             }
             LoadRetiringSaved();
             const auto retiring=[&](const FvoTrafficRef& v){
@@ -1723,8 +2625,23 @@ namespace generator
                 });
             };
             std::set<unsigned> vehicles,drivers;
+            for(int i=0;i<int(g_pairs.size());++i)if(IsFactorySlot(i)){
+                auto& p=g_pairs[i];
+                if(!p.factoryLoaded)LoadFactoryIds(i,p);
+                if(p.factoryCommitted&&RecoveredFactoryOnRoad({p.vehicle,p.driver,p.base})){
+                    Log("OBS system=traffic.census vehicle=%08X driver=%08X event=public_factory_owner_restored slot=%d",p.vehicle,p.driver,i);
+                    p=Pair{};p.factoryLoaded=true;p.factoryPublicRecovered=true;
+                    ClearRecoveredFactorySource(i,p);
+                }else{
+                    if(p.vehicle)vehicles.insert(p.vehicle);
+                    if(p.driver)drivers.insert(p.driver);
+                }
+            }
             for(int i=0;i<int(g_pairs.size());++i){auto& p=g_pairs[i];
+                if(IsFactorySlot(i))continue;
                 if(!p.vehicle)LoadIds(i,p);
+                if(p.vehicle&&RecoveredFactoryOnRoad({p.vehicle,p.driver,p.base}))p.factory=FactoryPhase::Road;
+                else if(p.vehicle&&FactoryStock(p.vehicle))p={};
                 FvoTrafficRef v{},d{};
                 if(p.vehicle&&!Info(p.vehicle,v)){p={};p.st=St::Empty;p.at=now+kSavedSlotGraceMs;}
                 if(p.vehicle&&(v.isActor||!retiringrecord::RecoveryBaseMatches(p.base,v.baseId,kRev8)||vehicles.count(p.vehicle)||retiring(v)))p={};
@@ -1736,9 +2653,11 @@ namespace generator
                 if(wcsncmp(row,L"pair_",5)&&wcsncmp(row,L"spot",4))continue;
                 const auto eq=wcschr(row,L'=');if(!eq)continue;
                 const auto saved=retiringrecord::ParsePair(eq+1);
-                if(!saved.vehicle||vehicles.count(saved.vehicle)||(saved.driver&&drivers.count(saved.driver)))continue;
+                const bool publicFactory=RecoveredFactoryOnRoad(saved);
+                if(!saved.vehicle||(!publicFactory&&FactoryStock(saved.vehicle))||vehicles.count(saved.vehicle)||(saved.driver&&drivers.count(saved.driver)))continue;
                 Pair p;
                 p.vehicle=saved.vehicle;p.driver=saved.driver;p.base=saved.base;p.staged=saved.staged;
+                if(publicFactory)p.factory=FactoryPhase::Road;
                 FvoTrafficRef v{},d{};
                 const bool haveVehicle=Info(p.vehicle,v);
                 const bool haveDriver=p.driver&&Info(p.driver,d);
@@ -1752,7 +2671,8 @@ namespace generator
                     p.driver=0;  // an unlinked actor may belong to the world now
                 }
                 auto target=saved.surplus?g_pairs.end():
-                    std::find_if(g_pairs.begin(),g_pairs.end(),[&](const Pair& q){return RecoverySlot(q)&&now>=q.at;});
+                    std::find_if(g_pairs.begin(),g_pairs.end(),[&](const Pair& q){
+                        return !IsFactorySlot(int(&q-g_pairs.data()))&&RecoverySlot(q)&&now>=q.at;});
                 if(target==g_pairs.end()){
                     if(g_pairs.size()>=1024)break; // bound legacy-cache recovery, not physical admission
                     p.storedKey.assign(row,eq);p.retired=true;
@@ -1764,7 +2684,6 @@ namespace generator
                 vehicles.insert(p.vehicle);if(p.driver)drivers.insert(p.driver);
                 ClaimRecovered(int(target-g_pairs.begin()),std::move(p),v,now,"saved_registry");
             }
-            RecoverRetiredSystems(retiredRows,vehicles,drivers);
         }
 
         void RecoverDeferredRegistry(ULONGLONG now){
@@ -1796,6 +2715,7 @@ namespace generator
                     if(slot==end){++g_registryRecoveryCursor;continue;}
                 }
                 Pair pair;pair.vehicle=row.vehicle;pair.driver=linked?row.driver:0;pair.staged=row.staged;
+                if(RecoveredFactoryOnRoad(row))pair.factory=FactoryPhase::Road;
                 int target=int(slot-g_pairs.begin());
                 if(row.surplus){
                     if(g_pairs.size()>=1024){++g_registryRecoveryCursor;continue;}
@@ -1867,6 +2787,35 @@ namespace generator
 	}
 
     void SetStorage(const wchar_t* registry){std::lock_guard lock(g_lock);g_profileIni=registry?registry:L"";}
+    void SetFactoryStockQuery(FvoFactoryStockQueryV1 query){g_factoryStockQuery=query;}
+    void SetStockDispatch(FvoStockTransferFnV1 transfer,StockRoute route){g_stockTransfer=transfer;g_stockRoute=route;}
+    void SetFactoryBirth(FvoFactorySiteFnV1 site,FvoFactoryBirthFnV1 birth,FvoFactoryStockBindFnV1 bind,
+                         FvoFactoryStockObserveFnV1 observe){
+        g_factorySite=site;g_factoryBirth=birth;g_factoryBind=bind;g_factoryObserve=observe;
+    }
+    void SetFactoryAnchors(std::vector<FvoPoolSpot> anchors){g_factoryAnchors=std::move(anchors);}
+    void SetFactoryBay(const FactoryBay* bay,FactoryTrip trip,FvoSpotMotionProofQueryV1 proof,FvoTrafficFactoryLeaseFnV1 lease){
+        std::lock_guard lock(g_lock);
+        if(trip)g_factoryTrip=trip;
+        if(proof)g_factoryProof=proof;
+        if(lease)g_factoryLease=lease;
+        const auto finite=[](const FvoPoolSpot& pose){
+            return std::isfinite(pose.x)&&std::isfinite(pose.y)&&std::isfinite(pose.z)&&std::isfinite(pose.heading);
+        };
+        const bool valid=bay&&trip&&proof&&lease&&bay->vehicle&&!bay->key.empty()&&bay->key.size()<=80&&
+            std::all_of(bay->key.begin(),bay->key.end(),[](unsigned char c){return std::isalnum(c)||c=='_'||c=='-'||c=='.';})&&
+            finite(bay->at)&&finite(bay->arrival);
+        if(!valid){
+            if(g_wantFactory){g_wantFactory.reset();++g_revision;}
+            return;
+        }
+        const auto same=[](const FvoPoolSpot& a,const FvoPoolSpot& b){
+            return a.x==b.x&&a.y==b.y&&a.z==b.z&&a.heading==b.heading;
+        };
+        if(g_wantFactory&&g_wantFactory->key==bay->key&&g_wantFactory->vehicle==bay->vehicle&&
+           same(g_wantFactory->at,bay->at)&&same(g_wantFactory->arrival,bay->arrival))return;
+        g_wantFactory=*bay;++g_revision;
+    }
     void SetModelRules(const std::vector<std::vector<unsigned>>& skip){g_slotSkip=skip;g_fitRejected.clear();g_modelUnavailable.clear();}
     void SetModelGate(ModelGate gate){g_modelGate=gate;}
     void SetSiteGate(SiteGate gate,RoadSpacingGate spacing){g_siteGate=gate;g_roadSpacing=spacing;}
@@ -1894,7 +2843,7 @@ namespace generator
             return p.vehiclePending&&p.reserved&&p.base==v.baseId&&
                 std::hypot(v.x-p.birth.x,v.y-p.birth.y)<=2.0&&std::abs(v.z-p.birth.z)<=8.0;
         });
-        const bool claimed=protectedIdentity||preparingCensus||pendingSaved||savedJourney||pendingBirth||
+        const bool claimed=protectedIdentity||FactoryStock(vehicle)||preparingCensus||pendingSaved||savedJourney||pendingBirth||
             (activeWorld&&(PopulationTracks(vehicle,0)||Retiring(vehicle)||
                 std::any_of(g_spares.begin(),g_spares.end(),[=](const Spare& s){return s.vehicle==vehicle;})));
         const auto now=GetTickCount64();
@@ -2148,7 +3097,7 @@ namespace generator
         std::vector<Candidate> ordered;
         for(int i=0;i<int(g_pairs.size());++i){
             const auto& p=g_pairs[std::size_t(i)];
-            if(p.retired||!p.vehicle||!p.driver||p.staged||p.handoffPending||!Driving(p))continue;
+            if(IsFactorySlot(i)||p.retired||!p.vehicle||!p.driver||p.staged||p.handoffPending||!Driving(p))continue;
             const bool worldOwned=g_api->playerTook&&
                 engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","generator",p.vehicle,p.vehicle);
             if(worldOwned){g_fleetRelease(p.vehicle);continue;}
@@ -2406,7 +3355,8 @@ namespace generator
             const bool underCover=screen>=2&&panelCover;
             const char* holdWhy="";const int unproven=underCover?UnprovenUnderPanel(&holdWhy):0;  // CC-4: Health's output
             const auto elapsed=now-g_rushAt.load();
-            const bool work=underCover&&(InitialAdmissionsPending()||unproven>0);
+            const bool work=underCover&&(InitialAdmissionsPending()||unproven>0||
+                (now<g_factoryCoverWorkUntil&&elapsed<spawnrule::kSettleLimitMs));
             const bool nearbyPilot=underCover&&!work&&std::any_of(g_pairs.begin(),g_pairs.end(),[&](const Pair& p){
                 if(!p.vehicle||p.retired||(!p.staged&&!p.handoffPending))return false;
                 return std::any_of(snap.begin(),snap.end(),[&](const FvoTrafficVehicle& v){
@@ -2440,7 +3390,11 @@ namespace generator
         g_world.clear();g_spots.clear();g_reuse.clear();g_names.clear();g_pairs.clear();g_worldPools.clear();g_observedOrigins.clear();g_observeCursor=0;
         g_rush={};g_rushRequest=false;g_rushAt=0;g_rushSettlingAt=0;g_rushFill=false;g_rushMade=0;g_coverPassDone=false;g_rosterRecoveryPending=true;g_spares.clear();g_sparesWorld.clear();g_retiringWorld.clear();g_removeQueue.clear();g_parkedGrants.clear();  /* R1: ids are reused across saves */
         g_wantWorld.clear();g_wantSpots.clear();g_wantReuse.clear();g_wantNames.clear();
-        g_off=false;g_createdAt=g_lastTick=0;g_admission=-1;g_cursor=0;
+        g_wantFactory.reset();g_factoryBay.reset();g_factoryArchived.clear();
+        g_factoryStockAt=0;g_belowStock.clear();
+        g_factorySearchAt=0;g_factoryCandidateAt=0;g_factorySearchCursor=0;g_factoryCoverWorkUntil=0;
+        g_factoryAnchors.clear();
+        g_off=false;g_createdAt=g_factoryCreatedAt=g_lastTick=0;g_admission=-1;g_cursor=0;
         g_path={};g_coverEndedAt=g_zoneReportAt=0;g_zoneLostChecks=0;g_zoneRadius=0;
         g_initialScene.clear();g_initialRoads.clear();g_initialRejected.clear();g_initialAlternatives.clear();g_initialAttempt.clear();g_initialFails.clear();g_initialCursor=0;g_initialMap=false;
         g_initialClockPending=false;g_deferredRegistry.clear();g_registryRecoveryAt=0;g_linkedRecoveryAt=0;g_registryRecoveryCursor=0;g_takenRelease.clear();g_handoffCursor=0;
@@ -2506,8 +3460,11 @@ namespace generator
         {std::lock_guard lock(g_lock);if(g_wantWorld!=name)return;}
         if(g_world!=name){
             ClearFleetAssignments();
+            g_factoryStockAt=0;g_belowStock.clear();
+            g_factorySearchAt=0;g_factoryCandidateAt=0;g_factorySearchCursor=0;g_factoryCoverWorkUntil=0;
             g_parkedGrants.clear();
             g_admission=-1;g_lastTick=0;g_lastCoveredAt=GetTickCount64();
+            for(auto& p:g_pairs)if(p.factoryLease)FactoryCancel(p);
             if(!g_world.empty())g_worldPools[g_world]={g_spots,g_reuse,g_names,g_pairs};
             g_world=name;auto it=g_worldPools.find(name);
             if(it!=g_worldPools.end()){g_spots=it->second.spots;g_reuse=it->second.reuse;g_names=it->second.names;g_pairs=it->second.pairs;}
@@ -2521,6 +3478,7 @@ namespace generator
             for(auto& p:g_pairs)for(auto* t:{&p.at,&p.seatAt,&p.tripAt,&p.watchAt,&p.idleSince,&p.askAt,&p.busySince,&p.no3DSince,&p.noBodySince})if(*t)*t+=gap;
         }g_lastTick=now;
         Snap snap;if(!ReadVehicles(snap))return;
+        if(!PhysicalFleetActive()&&ObserveFactoryStock(snap,now))Reconcile();
         const int presentation=engineport::Forward<&FvoTrafficApi::presentation>(g_api,"presentation","generator",0u);
         RecoverSavedFleet(now,presentation);
         // Remember observable origins independently of which fleet member is
@@ -2566,7 +3524,7 @@ namespace generator
         for(std::size_t i=0;i<g_pairs.size();++i){const auto& pair=g_pairs[i];FvoPopulationInspectV1 row;row.vehicle=pair.vehicle;row.driver=pair.driver;row.state=int(pair.st);row.retired=pair.retired;row.staged=pair.staged;row.armed=pair.armed;row.vehiclePending=pair.vehiclePending;row.driverPending=pair.driverPending;row.at=now;
             std::snprintf(row.name,sizeof row.name,"%s",i<g_names.size()?g_names[i].c_str():"unnamed slot");
             const int fleetMode=pair.vehicle&&g_fleetState?g_fleetState(pair.vehicle):0;
-            const char* reason=fleetMode==2?"active journey; rail owns motion":fleetMode==3?"active journey; awaiting engine evidence":pair.retired?"retiring existing identity":pair.vehiclePending?"vehicle creation pending":pair.driverPending?"driver creation pending":pair.noBodySince?"waiting for physics body":pair.no3DSince?"waiting for driver model":pair.proving?"existing readiness validation":pair.handoffPending?"handoff proof pending":pair.sending?"existing departure pending":pair.staged?"staged; awaiting pilot handover":pair.st==St::Started?"active journey":pair.st==St::Ready?"ready; awaiting route assignment":pair.st==St::Created?"pair created; awaiting readiness":pair.st==St::Failed?"existing recovery pending":pair.st==St::Empty?"empty; awaiting admission":"reconciling saved identity";
+            const char* reason=fleetMode==2?"active journey; rail owns motion":fleetMode==3?"active journey; awaiting engine evidence":IsFactorySlot(int(i))?pair.factoryWhy:pair.retired?"retiring existing identity":pair.vehiclePending?"vehicle creation pending":pair.driverPending?"driver creation pending":pair.relocating?"existing placement pending":pair.noBodySince?"waiting for physics body":pair.no3DSince?"waiting for driver model":pair.proving?"existing readiness validation":pair.handoffPending?"handoff proof pending":pair.sending?"existing departure pending":pair.staged?"staged; awaiting pilot handover":pair.st==St::Started?"active journey":pair.st==St::Ready?"ready; awaiting route assignment":pair.st==St::Created?"pair created; awaiting readiness":pair.st==St::Failed?"existing recovery pending":pair.st==St::Empty?"empty; awaiting admission":"reconciling saved identity";
             std::snprintf(row.reason,sizeof row.reason,"%s",reason);inspected.push_back(row);
         }
         populationinspect::Publish(std::move(inspected));

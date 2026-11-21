@@ -10,6 +10,8 @@
 #include "traffic_api.h"
 #include "../fleetrail_api.h"
 #include "birth_api.h"
+#include "factorybirth_api.h"
+#include "factorydispatch_api.h"
 #include "../trafficcensusapi.h"
 #include "../relocationapi.h"
 #include "../traffichealthapi.h"
@@ -18,6 +20,18 @@ namespace generator
 {
 	void Attach(const FvoTrafficApi* api, FvoLog_t log);
     void SetStorage(const wchar_t* registry); // bind a stable playthrough path before starting a frame
+    // Optional save-profile prototype. The private and road phases share the same Route cookie.
+    struct FactoryBay { std::string key; unsigned vehicle=0; FvoPoolSpot at{}, arrival{}; bool driverOriginReady=true; };
+    enum class FactoryTripAction { Test, Dispatch, Rollback, Complete };
+    using FactoryTrip=int (*)(FactoryTripAction action,unsigned vehicle,double x,double y,double z,FvoTripClaim* claim);
+    void SetFactoryBay(const FactoryBay* bay,FactoryTrip trip,FvoSpotMotionProofQueryV1 proof,FvoTrafficFactoryLeaseFnV1 lease);
+    void SetFactoryStockQuery(FvoFactoryStockQueryV1 query);
+    void SetFactoryBirth(FvoFactorySiteFnV1 site, FvoFactoryBirthFnV1 birth, FvoFactoryStockBindFnV1 bind,
+                         FvoFactoryStockObserveFnV1 observe);
+    void SetFactoryAnchors(std::vector<FvoPoolSpot> anchors);
+    enum class StockRouteAction { Reserve, Commit, Cancel };
+    using StockRoute=int (*)(StockRouteAction,int roadSlot,unsigned vehicle,const FvoPoolSpot& at,FvoTripClaim* claim);
+    void SetStockDispatch(FvoStockTransferFnV1 transfer,StockRoute route);
 	// Authored ground origins for stable fleet names, then parking places with parking[i] = 1.
 	void SetSpots(const char* world, const FvoPoolSpot* spots, int count, const int* parking, const char* const* names, FvoPoolTrip trip);
     // Pure mod-owned gate consumes the hull dimensions already measured by admission.

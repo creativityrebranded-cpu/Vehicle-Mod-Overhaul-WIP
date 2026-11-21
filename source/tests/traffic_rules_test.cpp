@@ -32,29 +32,6 @@ int main() {
     { auto g = f; g.ruled = 10; g.editorRoute = true; Check(Is(roomrule::Decide(g), "room"), "room (RR-1): an editor route is not held by ruled max"); }
 
     // SW-1: the Census record round-trips and clears.
-    {   // Retired systems (2026-11-21): old factory / stock / landing rows are recognised, parsed and decided once on load.
-        using retiringrecord::RetiredOutcome;
-        Check(retiringrecord::RetiredRowKind(L"factory_v1_bay_a=1") == 1 && retiringrecord::RetiredRowKind(L"factory_v2_runtime_x=1") == 1 &&
-              retiringrecord::RetiredRowKind(L"landing_pad3=1") == 0 && retiringrecord::RetiredRowKind(L"pair_route.3=1") == 0 &&
-              retiringrecord::RetiredRowKind(L"spot4=1") == 0 && retiringrecord::RetiredRowKind(L"factory_v3_x=1") == 0 && retiringrecord::RetiredRowKind(nullptr) == 0,
-              "retired rows: factory_v1_ and factory_v2_runtime_ are stock; landing_ (the kept landing store), pair_, spot and unknown prefixes are not");
-        const auto stock = retiringrecord::ParseRetiredRow(1, L"FF000A01 FF000A02 0002C8A1 1 0 1 2 1.5 2.5 3.5 0 0 0");
-        const auto landing = retiringrecord::ParseRetiredRow(2, L"FF000B01 0002C8A1");
-        Check(stock.vehicle == 0xFF000A01 && stock.driver == 0xFF000A02 && stock.base == 0x0002C8A1 && stock.staged,
-              "retired rows: a runtime stock row (pair fields + origin) parses as its pair");
-        Check(landing.vehicle == 0xFF000B01 && landing.driver == 0 && landing.base == 0x0002C8A1 && !retiringrecord::ParseRetiredRow(2, L"FF000B01").vehicle,
-              "retired rows: a landing row is vehicle + base, no driver; a row without its base is unreadable");
-        Check(retiringrecord::DecideRetiredRow(0, false, true, true, false) == RetiredOutcome::Unreadable &&
-              retiringrecord::DecideRetiredRow(1, true, true, true, false) == RetiredOutcome::PublicOwner &&
-              retiringrecord::DecideRetiredRow(1, false, false, false, false) == RetiredOutcome::NotLoadedKeep &&
-              retiringrecord::DecideRetiredRow(1, false, true, false, true) == RetiredOutcome::Gone &&
-              retiringrecord::DecideRetiredRow(1, false, true, true, true) == RetiredOutcome::JourneyRecovery &&
-              retiringrecord::DecideRetiredRow(1, false, true, true, false) == RetiredOutcome::Retire,
-              "retired rows: public owner wins, an unloaded car keeps its row, a reused id is only forgotten, a saved journey joins the fleet, the rest is retired");
-        Check(!std::strcmp(retiringrecord::RetiredOutcomeName(RetiredOutcome::Retire), "retired") &&
-              !std::strcmp(retiringrecord::RetiredOutcomeName(RetiredOutcome::NotLoadedKeep), "not_loaded_row_kept"),
-              "retired rows: outcome names are the log words");
-    }
     std::vector<retiringrecord::Entry> list{ {0xFF100075, 0xFE004001, 0xFF100079, 0x001591EA}, {0xFF1000DC, 0xFE004001, 0, 0} };
     const auto text = retiringrecord::Format(list);
     const auto back = retiringrecord::Parse(text.c_str());
