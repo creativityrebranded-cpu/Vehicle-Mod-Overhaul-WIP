@@ -5,6 +5,7 @@
 // Missing data is not a shape: unknown space can add cost but can never block. World decides nothing: it answers.
 // Pure; tests: tests/planworld_test.cpp.
 #include "fieldbox.h"
+#include "relocationrebase.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -232,6 +233,7 @@ private:
 struct StillClock {
     double since = 0;
     double Step(double now, double speed) { if (speed >= .6) since = 0; else if (since <= 0) since = now; return since > 0 ? now - since : 0; }
+    void Rebase() { since = 0; }   // a relocation receipt: the old standing-still time says nothing about the new place
 };
 // PS-1 (2026-11-12): how far a vehicle really got over a window, sampled once a second. Rocking in place is no progress.
 struct ProgressClock {
@@ -243,6 +245,13 @@ struct ProgressClock {
         lastAt = now; t[head] = now; x[head] = px; y[head] = py; head = (head + 1) % kN; if (n < kN) ++n;
     }
     // Straight-line distance between now and the newest sample at least `window` s old; -1: not enough history yet.
+    // A relocation receipt (applied, once per serial, this vehicle only): the history is the old place, so net progress restarts from the new station.
+    // The jump is never counted as progress or as a stuck. Returns true when it re-based.
+    relocrebase::Seen relocSeen;
+    bool Rebase(double now, double px, double py, const relocrebase::Event& ev, std::uint32_t vehicle) {
+        if (!relocrebase::Take(relocSeen, ev, vehicle)) return false;
+        n = 0; head = 0; lastAt = -1; Step(now, px, py); return true;
+    }
     double Net(double now, double window) const {
         if (n == 0) return -1;
         const int cur = (head - 1 + kN) % kN;

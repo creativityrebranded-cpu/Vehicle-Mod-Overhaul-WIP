@@ -1,5 +1,6 @@
 #include "vehicleworld.h"
 #include "vehiclevel.h"  // VS-1
+#include "relocationconsumers.h"  // the relocation receipt: World forgets the old pose once per applied serial
 #include "traffic/coordinator.h"
 
 #include "addresses.h"
@@ -51,6 +52,7 @@ namespace world
 			float vel[3] = {};
 			LARGE_INTEGER at{};
 			bool have = false;
+			relocrebase::Seen relocSeen;  // the last applied relocation this vehicle's velocity history re-based on
 		};
 		std::unordered_map<std::uint32_t, Track> g_track;
 		// Per-vehicle cache (2026-10-27 FPS pass). The 16:03 run's 59-61 ms "Vehicle world spikes" were all "occupants":
@@ -291,8 +293,10 @@ namespace world
 			const auto t = g_track.find(id);
 			const bool moving = t != g_track.end() && t->second.have && std::hypot(t->second.vel[0], t->second.vel[1]) > 0.3f;
 			const uptr root = Root(r);
+			// A relocated pair's cached reading (position, bodies) is the old place: read it now, whatever the frame budget says.
+			const bool relocated = t != g_track.end() && relocrebase::Judge(t->second.relocSeen, relocconsumers::Poll(id), id) == relocrebase::Verdict::Apply;
 			const bool required = r == driven || id == g_services.owned() || g_services.inUse(id) || moving || c == g_cache.end() ||
-				!c->second.have || c->second.root != root;
+				!c->second.have || c->second.root != root || relocated;
 			order.push_back({ id, r, root, required, c == g_cache.end() ? 0 : c->second.sampledAt, false });
 		}
 		g_heldIds.clear();
@@ -381,6 +385,14 @@ namespace world
             const float mass=bodymass::observations.Read({v.bodyIds,v.bodyCount},now);
             v.nativeMass=mass>0;v.mass=v.nativeMass?mass:float(std::clamp(1500.0*double(v.half[0])*v.half[1]*v.half[2]/(1.25*2.3),100.0,100000.0));
             QueryPerformanceCounter(&partEnd);massMs+=milliseconds(partStart,partEnd);
+			if (t.have && relocrebase::Take(t.relocSeen, relocconsumers::Poll(id), id)) {
+				// Relocation receipt (applied, once per serial): the position jump is not speed. History restarts at the destination with zero velocity.
+				const auto ev = relocconsumers::Peek(id);
+				t.vel[0] = t.vel[1] = t.vel[2] = 0; t.last[0] = p.x; t.last[1] = p.y; t.last[2] = p.z; t.at = qpc;
+				logger::Write("OBS system=world.velocity vehicle=%08X event=rebased serial=%llu epoch=%llu to=%.2f,%.2f,%.2f reason=relocation_receipt_applied_velocity_history_restarted_at_destination",
+					id, static_cast<unsigned long long>(ev.serial), static_cast<unsigned long long>(ev.epoch), ev.to[0], ev.to[1], ev.to[2]);
+			}
+			else if (!t.have) relocrebase::Take(t.relocSeen, relocconsumers::Poll(id), id);   // a first sample has no history to restart; remember the serial so it is not applied later
 			if (t.have) {
 				const double dt = double(qpc.QuadPart - t.at.QuadPart) / double(freq.QuadPart);
 				const float jump = std::hypot(p.x - t.last[0], p.y - t.last[1]);

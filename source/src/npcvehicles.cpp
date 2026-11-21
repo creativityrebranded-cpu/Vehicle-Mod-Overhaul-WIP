@@ -48,6 +48,8 @@
 #include "coverfight.h"
 #include "hulllogic.h"
 #include "navmap.h"
+#include "cellbake.h"
+#include "farrail.h"
 #include "realvehicles.h"
 #include "fvopaths.h"
 #include <ShlObj.h>
@@ -313,7 +315,11 @@ namespace npcvehicles
 #ifndef FVO_RELEASE
         int g_pairMoveKey=0;
         bool g_pairMoveDown=false;
+        int g_fastSeatKey=0;
+        bool g_fastSeatDown=false;
         std::uint32_t g_testPairVehicle=0,g_testPairDriver=0;
+        int g_farKey=0;   // far tier test key (notes/FAR_TIER_TEST_20261121.md)
+        bool g_farDown=false;
 #endif
 		// The led aim point of each job that may fire, for vehicleaim's projectile launch hook (any thread): refreshed by
 		// Update() every frame while attacking; older than kAimSnapMs counts as gone.
@@ -912,13 +918,21 @@ namespace npcvehicles
 			g_keyChosen = true;
 			// Test keys only (the context engine does this job): board the faced NPC, exit all, escort <-> pursuit.
 			if (!controlmap::DebugKeys()) return;
-			// , . / ' are the user's test keys (2026-10-20): not used here. The escort/pursuit key (was .) is removed; the context engine does it.
+			// The escort/pursuit key was removed. The context engine handles it now.
 			g_walkKey = controlmap::ClaimFirst("npcveh", "board (debug)", { VK_OEM_1, VK_OEM_4 });  // ; first
 			g_exitKey = controlmap::Claim("npcveh", "exit (debug)", VK_INSERT) ? VK_INSERT : 0;
 #ifndef FVO_RELEASE
             g_pairMoveKey=controlmap::Claim("npcveh","move seated test pair (debug)",VK_NUMPAD3)?VK_NUMPAD3:0;
+            g_fastSeatKey=controlmap::Claim("npcveh","spawn and time a seated test driver",VK_OEM_PERIOD)?VK_OEM_PERIOD:0;
+            logger::Write("Fast seat test: aim at an empty vehicle and press %s",
+                g_fastSeatKey?controlmap::KeyName(g_fastSeatKey).c_str():"no available key");
             logger::Write("Pair move test: press %s after the debug-boarded NPC is seated and stopped",
                 g_pairMoveKey?controlmap::KeyName(g_pairMoveKey).c_str():"no available key");
+            // Starfield's own bindings can hold Numpad 1 (2026-11-21 log: no available key), so later keys are tried in turn.
+            g_farKey=controlmap::ClaimFirst("npcveh","far tier test: move the faced seated pair past the loaded wall (debug)",
+                {VK_NUMPAD1,VK_NUMPAD5,VK_NUMPAD6,VK_NUMPAD9,VK_NUMPAD7,VK_NUMPAD8});
+            logger::Write("Far tier test: aim at a seated NPC (or use the board pair) and press %s (stage 1 no rail; again = rail; again = walk back); logs OBS system=far.test",
+                g_farKey?controlmap::KeyName(g_farKey).c_str():"no available key");
 #endif
 			g_aggroKey = 0;
 			logger::Write("NPC vehicles: debug keys: BOARD %s, EXIT %s, PROFILE %s", g_walkKey ? controlmap::KeyName(g_walkKey).c_str() : "none",
@@ -2927,7 +2941,7 @@ namespace npcvehicles
 #ifndef FVO_RELEASE
                 if (j.factoryStock) {
                     routeguidance::Clear(j.pilot);
-                    g.nav.travel = travelmode::Default::Drive;
+                    g.nav.travel = travelmode::Default::Hover;  // lab stock waits and is spot-tested in FLIGHT (stockfloat.h); the route's own travel rule applies after transfer
                     g.hold = true;
                 } else
 #endif
@@ -5078,6 +5092,163 @@ namespace npcvehicles
 		}
 
 #ifndef FVO_RELEASE
+        struct FastSeatRun {
+            unsigned vehicle=0, driver=0, base=0, frame=0, receiptFrame=0, attempts=0;
+            std::uint64_t serial=0, requested=0, first3D=0, firstProcess=0, firstLink=0, firstSeat=0, seatedSince=0, lastSnap=0;
+            std::uint64_t lease=0, firstSpot=0, lastPilotAsk=0;
+            trafficpair::SeatPose offset{};
+        } g_fastSeat;
+        struct FastSeatEvidence {
+            trafficpair::SeatPose offset{};
+            unsigned count=0;
+            std::uint64_t total=0, fastest=0, slowest=0;
+        };
+        std::map<unsigned,FastSeatEvidence> g_fastSeatEvidence;
+        std::map<unsigned,unsigned> g_fastSeatDrivers;
+        std::uint64_t g_fastSeatSerial=0;
+        unsigned g_fastSeatMoveVehicle=0, g_fastSeatMoveDriver=0;
+        std::uint64_t g_fastSeatMoveLease=0;
+        constexpr std::uint64_t kFastSeatLimitMs=20000, kFastSeatRetryMs=250;
+
+        void FastSeatStart(uptr player)
+        {
+            const auto vehicle=FacingVehicle(player);
+            const auto id=vehicle?At<unsigned>(vehicle,off::kFormId):0;
+            const auto prev=g_fastSeatDrivers.find(id);
+            const auto previous=prev!=g_fastSeatDrivers.end()?RefById(prev->second):0;
+            const char* why=g_fastSeat.vehicle?"trial_pending":!id?"no_faced_vehicle":
+                previous&&!IsDead(previous)?"test_actor_already_exists":
+                (!Has3D(vehicle)||!CellAttached(vehicle)||!DriverSeatKeyword(vehicle))?"no_loaded_driver_seat":
+                (Busy(id)||UsesVehicle(id)||DriverOf(vehicle,player)||trafficpool::MadeVehicle(id)||
+                 trafficpool::PlayerOwnsHandoff(id))?"vehicle_occupied_or_claimed":nullptr;
+            if(why){
+                logger::Write("OBS system=seat.fast event=refused vehicle=%08X reason=%s",id,why);
+                notify::Show("Fast seat test needs a nearby empty vehicle");
+                return;
+            }
+            if(g_fastSeatMoveLease)CancelFactoryLease(g_fastSeatMoveVehicle,g_fastSeatMoveDriver,g_fastSeatMoveLease);
+            g_fastSeatMoveVehicle=g_fastSeatMoveDriver=0;g_fastSeatMoveLease=0;
+            g_fastSeat={};
+            auto& t=g_fastSeat;
+            t.vehicle=id;
+            if(const auto base=At<uptr>(vehicle,0x98))t.base=At<unsigned>(base,off::kFormId);
+            t.serial=++g_fastSeatSerial;
+            t.requested=GetTickCount64();
+            const auto learned=g_fastSeatEvidence.find(t.base);
+            t.offset=learned==g_fastSeatEvidence.end()?trafficpair::SeatPose{0,0,.3f}:learned->second.offset;
+            logger::Write("OBS system=seat.fast event=request trial=%llu vehicle=%08X base=%08X offset_source=%s",
+                t.serial,id,t.base,learned==g_fastSeatEvidence.end()?"chassis_origin":"measured_seat");
+        }
+
+        void FastSeatSnap(uptr actor,uptr vehicle,const FastSeatRun& t)
+        {
+            lifecycle::Post("fast-seat-snap:"+std::to_string(t.serial),t.driver,[=]()->lifecycle::Work {
+                const auto a=lifecycle::Keep(actor,t.driver),v=lifecycle::Keep(vehicle,t.vehicle);
+                if(!a||!v)return {};
+                return [=]()->std::uint64_t {
+                    const auto driver=reinterpret_cast<uptr>(a.get()),chassis=reinterpret_cast<uptr>(v.get());
+                    if(!lifecycle::InService()||IsDead(driver)||Disabled(chassis)||trafficpool::PlayerOwnsHandoff(t.vehicle))return 0;
+                    const auto linked=InVehicle(driver);
+                    if((linked&&linked!=chassis)||ProcessLevel(driver)!=0||!Has3D(driver)||!Has3D(chassis))return 0;
+                    if(SeatedNow(driver,chassis,linked==chassis))return 1;
+                    if(!trafficpair::NeedsSnap(true,true,SitState(driver),SeatDist(driver,chassis)))return 0;
+                    const auto result=SeatNewborn(driver,chassis);
+                    logger::Write("OBS system=seat.fast event=snap trial=%llu vehicle=%08X driver=%08X attempt=%u elapsed_ms=%llu result=%d sit=%d",
+                        t.serial,t.vehicle,t.driver,t.attempts,GetTickCount64()-t.requested,result,SitState(driver));
+                    return result>0;
+                };
+            });
+        }
+
+        void FastSeatTick(uptr player)
+        {
+            auto& t=g_fastSeat;
+            if(!t.vehicle)return;
+            const auto now=GetTickCount64();
+            ++t.frame;
+            if(!t.driver){
+                const auto receipt=trafficpool::FastSeatBirth(t.vehicle,t.serial,t.offset,t.requested);
+                if(!receipt)return;
+                t.driver=unsigned(*receipt);
+                if(!t.driver){
+                    logger::Write("OBS system=seat.fast event=refused trial=%llu vehicle=%08X reason=birth_service_refused",t.serial,t.vehicle);
+                    notify::Show("Fast seat test could not create the driver");
+                    t={};return;
+                }
+                g_fastSeatDrivers[t.vehicle]=t.driver;
+                t.receiptFrame=t.frame;
+            }
+            const auto v=RefById(t.vehicle),a=RefById(t.driver);
+            if(a&&Has3D(a)&&!t.first3D)t.first3D=now;
+            if(a&&ProcessLevel(a)==0&&!t.firstProcess)t.firstProcess=now;
+            const bool linked=a&&v&&InVehicle(a)==v;
+            if(linked&&!t.firstLink)t.firstLink=now;
+            const bool seated=linked&&SeatedNow(a,v,true);
+            if(seated){
+                if(!t.seatedSince)t.seatedSince=now;
+                if(!t.firstSeat){
+                    t.firstSeat=now;
+                    g_testPairVehicle=t.vehicle;g_testPairDriver=t.driver;
+                    logger::Write("OBS system=seat.fast event=first_seated trial=%llu vehicle=%08X driver=%08X elapsed_ms=%llu frames=%u frames_after_receipt=%u snaps=%u",
+                        t.serial,t.vehicle,t.driver,now-t.requested,t.frame,t.frame-t.receiptFrame,t.attempts);
+                    notify::Show("Driver seated in %llu ms. Look away for the spot test",now-t.requested);
+                }
+                if(!t.lease&&!Busy(t.vehicle)&&!InVehicle(player)&&now-t.lastPilotAsk>=kFastSeatRetryMs){
+                    t.lastPilotAsk=now;
+                    t.lease=StartFactoryStockLease(a,v);
+                    if(t.lease)logger::Write("OBS system=seat.fast event=spot_requested trial=%llu vehicle=%08X elapsed_ms=%llu lease=%llu",
+                        t.serial,t.vehicle,now-t.requested,t.lease);
+                }
+                if(t.lease){
+                    const auto pilot=PilotFor(t.vehicle);
+                    if(vehicleflight::HandoffPhysics(t.vehicle).live)FactoryLeaseReleased(t.vehicle);
+                    if(!t.firstSpot&&pilot>0&&vehicleflight::FactoryMotionProved(pilot,t.vehicle,t.lease)){
+                        t.firstSpot=now;
+                        logger::Write("OBS system=seat.fast event=spot_proved trial=%llu vehicle=%08X elapsed_ms=%llu",
+                            t.serial,t.vehicle,now-t.requested);
+                    }
+                }
+            }else {
+                t.seatedSince=0;
+                if(a&&v&&t.first3D&&ProcessLevel(a)==0&&t.attempts<6&&now-t.lastSnap>=kFastSeatRetryMs&&
+                   !lifecycle::Pending(t.driver,"fast-seat-snap")){
+                    t.lastSnap=now;
+                    ++t.attempts;
+                    FastSeatSnap(a,v,t);
+                }
+            }
+            const bool held=trafficpair::ProveHeld(t.seatedSince,now);
+            if((!held||!t.firstSpot)&&now-(t.firstSeat?t.firstSeat:t.requested)<kFastSeatLimitMs)return;
+            const auto elapsed=[&](std::uint64_t stage){return stage?static_cast<long long>(stage-t.requested):-1ll;};
+            logger::Write("OBS system=seat.fast event=complete trial=%llu vehicle=%08X driver=%08X held=%d first_3d_ms=%lld first_process_ms=%lld first_link_ms=%lld first_seated_ms=%lld spot_proved_ms=%lld total_ms=%llu",
+                t.serial,t.vehicle,t.driver,int(held),elapsed(t.first3D),elapsed(t.firstProcess),elapsed(t.firstLink),elapsed(t.firstSeat),elapsed(t.firstSpot),now-t.requested);
+            if(held&&t.firstSpot){
+                g_fastSeatMoveVehicle=t.vehicle;g_fastSeatMoveDriver=t.driver;g_fastSeatMoveLease=t.lease;
+                notify::Show("Spot test passed. Numpad 3 moves the seated pair");
+            }else {
+                if(t.lease)CancelFactoryLease(t.vehicle,t.driver,t.lease);
+                notify::Show("Fast seat test timed out. See seat.fast in the log");
+            }
+            game::Vec3 da{},dv{};
+            if(held&&t.base&&ScenePos(a,da)&&ScenePos(v,dv)){
+                auto& evidence=g_fastSeatEvidence[t.base];
+                const auto heading=At<game::Vec3>(v,off::kRefRotation).z;
+                const float dx=da.x-dv.x,dy=da.y-dv.y,dz=da.z-dv.z;
+                if(std::hypot(dx,dy,dz)<=trafficpair::kSnapReach){
+                    const float c=std::cos(heading),s=std::sin(heading);
+                    evidence.offset={dx*c-dy*s,dx*s+dy*c,dz};
+                }else if(!evidence.count)evidence.offset=t.offset;
+                const auto seat=t.firstSeat-t.requested;
+                evidence.fastest=evidence.count?std::min(evidence.fastest,seat):seat;
+                evidence.slowest=std::max(evidence.slowest,seat);
+                evidence.total+=seat;
+                ++evidence.count;
+                logger::Write("OBS system=seat.fast event=model_timing base=%08X samples=%u min_ms=%llu mean_ms=%llu max_ms=%llu",
+                    t.base,evidence.count,evidence.fastest,evidence.total/evidence.count,evidence.slowest);
+            }
+            t={};
+        }
+
         // ---- Seated-pair relocation experiment (diagnostic builds only; notes/RELOCATION_DOER_AND_COMMUNICATOR_20261120.md) ----
         // Numpad 3 relocates the seated NPC you face (else the pair made with the board key) 6 m ahead along its vehicle's heading.
         // Roles: this file is the Coordinator (relocation.h: grant, receipt, one delivery to every consumer); vehicleflight::relocate is the
@@ -5085,13 +5256,77 @@ namespace npcvehicles
         relocation::Coordinator g_reloc;
         std::uint64_t g_relocEpoch = 1, g_relocSerial = 0, g_relocArmedAt = 0, g_relocPendingLogAt = 0;
         std::uint32_t g_relocVehicle = 0, g_relocDriver = 0;
+        struct StockTransferGrant {
+            std::uint32_t driver=0;
+            std::uint64_t lease=0,serial=0;
+            relocation::Pose target{};
+        };
+        std::map<unsigned,StockTransferGrant> g_stockTransfers;
+        std::atomic<std::uint64_t> g_relocPose{1ull << 32}; // high word generation, low word vehicle with exclusive pose authority
         bool g_relocIssued = false, g_relocSubscribed = false;
+        // Long and cross-cell moves (2026-11-20): the doer writes one bounded hop at a time (relocation.h kMaxHopM); this Coordinator plans the hops from
+        // the measured position, reads each back before the next, walks a failed move back to its origin when the pair is still one live seated pair, and
+        // for a cross-cell move waits until the chassis reference is listed in the destination cell (the existing loadedarea refile) before it publishes.
+        relocation::Pose g_relocFrom{}, g_relocTo{}, g_relocHop{}, g_relocLastChassis{}, g_relocArrived{};
+        bool g_relocHopLast = false, g_relocFirstIssued = false, g_relocRestoring = false, g_relocCross = false, g_relocSettling = false, g_relocPoseReleased = false;
+        const char* g_relocFailWhy = "";
+        std::uint64_t g_relocAuthority = 0, g_relocSettleAt = 0, g_relocSettleLogAt = 0, g_relocRefileAt = 0;
+        // Consumers that compare positions over time (the drive-mode speed estimate, the plan's object memory) ask whether this vehicle's pose was
+        // moved: the mark changes when a relocation starts and when it ends, and its low bit says one is in progress.
+        std::mutex g_relocMarkLock;
+        std::map<std::uint32_t, std::uint64_t> g_relocMarks;
+        std::uint64_t g_relocMarkCounter = 0;
+        void NoteRelocationMark(std::uint32_t vehicle, bool active)
+        {
+            std::lock_guard lock(g_relocMarkLock);
+            g_relocMarks[vehicle] = (++g_relocMarkCounter << 1) | (active ? 1u : 0u);
+        }
+        void SetRelocationPoseOwner(std::uint32_t vehicle)
+        {
+            const auto generation = (g_relocPose.load(std::memory_order_relaxed) >> 32) + 1;
+            g_relocPose.store((generation << 32) | vehicle, std::memory_order_release);
+        }
+        void ReleaseRelocationPose()
+        {
+            if (g_relocPoseReleased) return;
+            g_relocPoseReleased = true;
+            SetRelocationPoseOwner(0);
+        }
+        void FinishRelocation()
+        {
+            if(g_relocSerial){vehicleflight::relocate::Disarm(g_relocSerial);NoteRelocationMark(g_relocVehicle,false);}
+            g_relocSerial=0;
+            g_relocIssued=false;
+            g_relocFirstIssued=g_relocRestoring=g_relocCross=g_relocSettling=g_relocHopLast=false;
+            g_relocFailWhy="";g_relocAuthority=0;
+            if(!g_relocPoseReleased)SetRelocationPoseOwner(0);
+            g_relocPoseReleased=false;
+        }
+        struct PairMoveObservation {
+            std::uint64_t serial = 0, startedAt = 0, nextSampleAt = 0, initialAutopilotStep = 0;
+            std::uint32_t vehicle = 0, driver = 0;
+            relocation::Pose arrival;
+            bool hasStepBaseline = false;
+        };
+        PairMoveObservation g_pairMoveObservation;
+        std::uint64_t g_pairMoveReceipt = 0;
+        constexpr std::uint64_t kPairMoveObserveMs = 10000, kPairMoveSampleMs = 200;
+        constexpr double kPairMoveProofM = 1.0;
+
         bool RelocLog(const relocation::Receipt& r, void*)
         {
             logger::Write("OBS system=relocation event=published serial=%llu epoch=%llu vehicle=%08X driver=%08X result=%s reason=%s from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f measured=%.2f,%.2f,%.2f displacement=%.2f step_before=%llu step_after=%llu seat_before=%d seat_after=%d live=%d",
                 (unsigned long long)r.serial, (unsigned long long)r.epoch, r.vehicle, r.driver, relocation::ResultName(r.result), r.reason,
                 r.from.x, r.from.y, r.from.z, r.to.x, r.to.y, r.to.z, r.measured.x, r.measured.y, r.measured.z, r.displacement,
                 (unsigned long long)r.stepBefore, (unsigned long long)r.stepAfter, r.seatedBefore ? 1 : 0, r.seatedAfter ? 1 : 0, r.physicsLive ? 1 : 0);
+            if (r.serial == g_pairMoveReceipt) {
+                g_pairMoveReceipt = 0;
+                if (r.result == relocation::Result::Applied) {
+                    const auto autopilot = vehicleflight::HandoffPhysics(r.vehicle);
+                    g_pairMoveObservation = {r.serial, r.publishedAtMs, r.publishedAtMs, autopilot.serial,
+                        r.vehicle, r.driver, r.measured, autopilot.bound};
+                }
+            }
             return true;
         }
         // The seated NPC in front of the player (the same facing rule as the board key): the actor and the vehicle it sits in.
@@ -5122,6 +5357,57 @@ namespace npcvehicles
         {
             logger::Write("OBS system=relocation event=refused vehicle=%08X driver=%08X reason=%s", v, d, reason);
         }
+        std::uint64_t ArmRelocation(relocation::Request q,const char* source,std::uint64_t authority=0)
+        {
+            if(g_relocSerial){RelocationRefuse(q.vehicle,q.driver,"previous_relocation_still_running");return 0;}
+            q.epoch=g_relocEpoch;
+            q.seatedBefore=true;
+            const double dx=q.to.x-q.from.x,dy=q.to.y-q.from.y,dz=q.to.z-q.from.z;
+            const double distance=std::sqrt(dx*dx+dy*dy+dz*dz);
+            {
+                const char* acceptable="";
+                if(!relocation::MoveAcceptable(distance,acceptable)){
+                    logger::Write("OBS system=relocation event=refused vehicle=%08X driver=%08X reason=%s distance=%.1f limit=%.0f source=%s",
+                        q.vehicle,q.driver,acceptable,distance,relocation::kMaxMoveM,source);
+                    return 0;
+                }
+            }
+            // Cross-cell: the destination must be in a loaded cell, else the chassis reference could not be refiled and would stand in a cell it is not listed in.
+            loadedarea::RelocationCell cell{};
+            if(loadedarea::RelocationDestination(q.vehicle,float(q.to.x),float(q.to.y),cell)){
+                q.crossCell=cell.crossCell;
+                if(cell.crossCell&&!cell.cellLoaded){
+                    logger::Write("OBS system=relocation event=refused vehicle=%08X driver=%08X reason=destination_cell_not_loaded from_cell=%d,%d to_cell=%d,%d distance=%.1f source=%s",
+                        q.vehicle,q.driver,cell.fromX,cell.fromY,cell.toX,cell.toY,distance,source);
+                    return 0;
+                }
+            }
+            if(!g_relocSubscribed){g_reloc.Subscribe("log",RelocLog,nullptr);g_relocSubscribed=true;}
+            const char* why="";
+            const auto serial=g_reloc.Arm(q,g_relocEpoch,why);
+            if(!serial){RelocationRefuse(q.vehicle,q.driver,why);return 0;}
+            const auto now=GetTickCount64();
+            logger::Write("OBS system=relocation event=grant serial=%llu epoch=%llu vehicle=%08X driver=%08X from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f delta=%.1f,%.1f,%.1f distance=%.1f hops=%u cross_cell=%d from_cell=%d,%d to_cell=%d,%d source=%s",
+                static_cast<unsigned long long>(serial),static_cast<unsigned long long>(q.epoch),q.vehicle,q.driver,
+                q.from.x,q.from.y,q.from.z,q.to.x,q.to.y,q.to.z,dx,dy,dz,distance,relocation::HopCount(distance),q.crossCell?1:0,
+                cell.fromX,cell.fromY,cell.toX,cell.toY,source);
+            g_relocPoseReleased=false;
+            SetRelocationPoseOwner(q.vehicle);
+            // The first hop starts from the vehicle reference (as the proven 6 m move did); later hops start from the measured chassis.
+            bool last=false;
+            const auto hop=relocation::NextHop(q.from,q.to,last);
+            if(const char* refusal=vehicleflight::relocate::Arm(q.vehicle,hop.x-q.from.x,hop.y-q.from.y,hop.z-q.from.z,serial,authority)){
+                g_reloc.Refuse(serial,refusal,now);
+                SetRelocationPoseOwner(0);
+                return 0;
+            }
+            g_relocSerial=serial;g_relocVehicle=q.vehicle;g_relocDriver=q.driver;g_relocArmedAt=now;
+            g_relocIssued=false;g_relocPendingLogAt=0;
+            g_relocFrom=q.from;g_relocTo=q.to;g_relocHop=hop;g_relocHopLast=last;g_relocAuthority=authority;g_relocLastChassis=q.from;
+            g_relocFirstIssued=g_relocRestoring=g_relocSettling=false;g_relocCross=q.crossCell;g_relocFailWhy="";
+            NoteRelocationMark(q.vehicle,true);
+            return serial;
+        }
         void RelocationStart(uptr player)
         {
             if (g_relocSerial) { RelocationRefuse(g_relocVehicle, g_relocDriver, "previous_relocation_still_running"); return; }
@@ -5131,53 +5417,25 @@ namespace npcvehicles
                 if (!v || !d || InVehicle(d) != v) { RelocationRefuse(g_testPairVehicle, g_testPairDriver, "no_seated_npc_in_front_and_no_board_pair"); return; }
             }
             const std::uint32_t vid = At<std::uint32_t>(v, off::kFormId), did = At<std::uint32_t>(d, off::kFormId);
+            if(const auto test=g_fastSeatDrivers.find(vid);test!=g_fastSeatDrivers.end()&&test->second==did&&
+               (g_fastSeatMoveVehicle!=vid||g_fastSeatMoveDriver!=did||!CheckFactoryLease(vid,did,g_fastSeatMoveLease))){
+                RelocationRefuse(vid,did,"fast_seat_spot_not_proved");return;
+            }
             if (Disabled(v) || trafficpool::MadeVehicle(vid) || trafficpool::PlayerOwnsHandoff(vid) || VehicleInCombat(vid)) { RelocationRefuse(vid, did, "vehicle_unavailable"); return; }
             if (!SeatedNow(d, v, true)) { RelocationRefuse(vid, did, "driver_not_seated"); return; }
             const auto vp = At<game::Vec3>(v, off::kRefPosition), vr = At<game::Vec3>(v, off::kRefRotation);
             const double dx = std::sin(vr.z) * 6.0, dy = std::cos(vr.z) * 6.0, dz = 0.3;
-            relocation::Request q;
-            q.vehicle = vid; q.driver = did; q.epoch = g_relocEpoch; q.stepBefore = 0; q.seatedBefore = true;
-            q.from = { vp.x, vp.y, vp.z, vr.z }; q.to = { vp.x + dx, vp.y + dy, vp.z + dz, vr.z };
-            if (!g_relocSubscribed) { g_reloc.Subscribe("log", RelocLog, nullptr); g_relocSubscribed = true; }
-            const char* why = "";
-            const std::uint64_t serial = g_reloc.Arm(q, g_relocEpoch, why);
-            if (!serial) { RelocationRefuse(vid, did, why); return; }
-            const ULONGLONG now = GetTickCount64();
-            logger::Write("OBS system=relocation event=grant serial=%llu epoch=%llu vehicle=%08X driver=%08X from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f delta=%.1f,%.1f,%.1f source=%s",
-                (unsigned long long)serial, (unsigned long long)g_relocEpoch, vid, did, q.from.x, q.from.y, q.from.z, q.to.x, q.to.y, q.to.z, dx, dy, dz,
-                (vid == g_testPairVehicle) ? "board_pair" : "faced_seated_npc");
-            if (const char* refusal = vehicleflight::relocate::Arm(vid, dx, dy, dz, serial)) {
-                g_reloc.Refuse(serial, refusal, now);
-                return;
-            }
-            g_relocSerial = serial; g_relocVehicle = vid; g_relocDriver = did; g_relocArmedAt = now; g_relocIssued = false; g_relocPendingLogAt = 0;
+            const auto serial = ArmRelocation({vid,did,{vp.x,vp.y,vp.z,vr.z},{vp.x+dx,vp.y+dy,vp.z+dz,vr.z}},
+                vid==g_testPairVehicle?"board_pair":"faced_seated_npc");
+            if (serial) g_pairMoveReceipt = serial;
         }
-        void RelocationTick()
+        // The read-back of the pair now, from the doer's last write (body record, completed steps) and the game's references.
+        bool RelocationReadback(relocation::Readback& rb, uptr& v, uptr& d, double& seatDist)
         {
-            if (!g_relocSerial) return;
-            const ULONGLONG now = GetTickCount64();
-            if (!g_relocIssued) {
-                vehicleflight::relocate::Facts f;
-                if (vehicleflight::relocate::Take(g_relocSerial, f)) {
-                    if (f.issued) {
-                        g_reloc.MarkIssued(g_relocSerial, now); g_relocIssued = true;
-                        logger::Write("OBS system=relocation event=issued serial=%llu vehicle=%08X driver=%08X ring_first_ok=%d com_near_body=%d speed=%.2f com_before=%.3f,%.3f,%.3f com_after=%.3f,%.3f,%.3f body_before=%.3f,%.3f,%.3f body_after=%.3f,%.3f,%.3f",
-                            (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, f.ringFirstOk ? 1 : 0, f.comNearBody ? 1 : 0, f.speed,
-                            f.comBefore[0], f.comBefore[1], f.comBefore[2], f.comAfter[0], f.comAfter[1], f.comAfter[2],
-                            f.bodyBefore[0], f.bodyBefore[1], f.bodyBefore[2], f.bodyAfter[0], f.bodyAfter[1], f.bodyAfter[2]);
-                    } else {
-                        g_reloc.Refuse(g_relocSerial, f.refusal, now);
-                        vehicleflight::relocate::Disarm(g_relocSerial); g_relocSerial = 0; return;
-                    }
-                } else if (now - g_relocArmedAt > 3000) {
-                    g_reloc.Refuse(g_relocSerial, "not_issued_in_time", now);   // the chassis took no physics step in 3 s (asleep, or not owned by a pilot)
-                    vehicleflight::relocate::Disarm(g_relocSerial); g_relocSerial = 0; return;
-                } else return;
-            }
-            const uptr v = RefById(g_relocVehicle), d = RefById(g_relocDriver);
-            relocation::Readback rb;
+            v = RefById(g_relocVehicle); d = RefById(g_relocDriver);
             vehicleflight::relocate::Chassis ch;
             const bool have = vehicleflight::relocate::Read(g_relocSerial, ch);
+            rb = {};
             rb.bodyValid = have && ch.bodyValid && v && d;
             rb.chassis = { ch.pos[0], ch.pos[1], ch.pos[2], 0 };
             if (d) { const auto dp = At<game::Vec3>(d, off::kRefPosition); rb.driver = { dp.x, dp.y, dp.z, 0 }; }
@@ -5186,26 +5444,687 @@ namespace npcvehicles
             rb.physicsLive = have && ch.live;
             rb.driverPoseKnown = false;   // the stored actor position may lag its seat: until the actor's own body is read, the seat link is the evidence
             rb.stepAfter = have ? ch.completedSteps : 0;
+            seatDist = (d && v) ? SeatDist(d, v) : -1.0;
+            if (have && ch.bodyValid) g_relocLastChassis = rb.chassis;
+            return have;
+        }
+        // Arm the next hop from the measured chassis toward `goal` (the destination, or the origin when walking back). False: the doer refused.
+        bool RelocationArmHop(const relocation::Pose& at, const relocation::Pose& goal, const char* why)
+        {
+            vehicleflight::relocate::Disarm(g_relocSerial);   // the previous hop's facts are consumed; Arm needs an idle doer
+            bool last = false;
+            const auto hop = relocation::NextHop(at, goal, last);
+            const char* refusal = vehicleflight::relocate::Arm(g_relocVehicle, hop.x - at.x, hop.y - at.y, hop.z - at.z, g_relocSerial, g_relocAuthority);
+            logger::Write("OBS system=relocation event=hop_armed serial=%llu vehicle=%08X driver=%08X hop=%u phase=%s last=%d from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f remaining=%.1f result=%s reason=%s",
+                (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, g_reloc.Hops(g_relocSerial) + 1, g_relocRestoring ? "restore" : "forward", last ? 1 : 0,
+                at.x, at.y, at.z, hop.x, hop.y, hop.z, relocation::Distance(at, goal), refusal ? "refused" : "armed", refusal ? refusal : why);
+            if (refusal) return false;
+            g_relocHop = hop; g_relocHopLast = last; g_relocArmedAt = GetTickCount64(); g_relocIssued = false; g_relocPendingLogAt = 0;
+            return true;
+        }
+        // The move cannot go on. A pair that is still one live seated pair is walked back to where it was; anything else is published failed with the
+        // last observed state. Single-hop moves keep the proven behaviour (Verify publishes their failure) and never reach here.
+        void RelocationHopFailed(const relocation::Readback& rb, const char* why, ULONGLONG now)
+        {
+            logger::Write("OBS system=relocation event=hop_failed serial=%llu vehicle=%08X driver=%08X hops=%u phase=%s reason=%s recoverable=%d chassis=%.2f,%.2f,%.2f steps=%llu seat=%d live=%d body_valid=%d",
+                (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, g_reloc.Hops(g_relocSerial), g_relocRestoring ? "restore" : "forward", why,
+                relocation::Recoverable(rb) ? 1 : 0, rb.chassis.x, rb.chassis.y, rb.chassis.z, (unsigned long long)rb.stepAfter, rb.seatedAfter ? 1 : 0, rb.physicsLive ? 1 : 0, rb.bodyValid ? 1 : 0);
+            if (g_relocRestoring) { g_reloc.Conclude(g_relocSerial, rb, false, "hop_failed_restore_failed", now); FinishRelocation(); return; }
+            if (!relocation::Recoverable(rb)) { g_reloc.Conclude(g_relocSerial, rb, false, why, now); FinishRelocation(); return; }
+            g_relocRestoring = true; g_relocFailWhy = why;
+            if (!RelocationArmHop(rb.chassis, g_relocFrom, "walking_back_after_failed_hop")) {
+                g_reloc.Conclude(g_relocSerial, rb, false, "hop_failed_restore_refused", now); FinishRelocation();
+            }
+        }
+        void RelocationTick()
+        {
+            if (!g_relocSerial) return;
+            const ULONGLONG now = GetTickCount64();
+            relocation::Readback rb; uptr v = 0, d = 0; double seatDist = -1;
+            if (g_relocSettling) {
+                // Cross-cell: the chassis is at the destination and the doer is idle. The existing refile (loadedarea) lists the reference in the destination
+                // cell; the receipt waits until it shows, with the seat link and both models verified after it.
+                RelocationReadback(rb, v, d, seatDist);
+                rb.chassis = g_relocArrived;   // the chassis position the last hop was judged at: a car that drives on while the refile settles is not "left behind"
+                const auto* act = g_reloc.Lookup(g_relocSerial);
+                const char* judged = "";
+                const auto res = act ? relocation::Judge(act->req, rb, judged) : relocation::Result::Failed;
+                loadedarea::RelocationSettle st{};
+                const bool known = loadedarea::RelocationSettled(g_relocVehicle, float(g_relocTo.x), float(g_relocTo.y), float(g_relocTo.z), st);
+                const bool models = v && d && Has3D(v) && Has3D(d);
+                const bool settled = known && st.atTarget && st.inDestinationCell && models;
+                if (now - g_relocSettleLogAt >= 500) {
+                    g_relocSettleLogAt = now;
+                    logger::Write("OBS system=relocation event=settle serial=%llu vehicle=%08X driver=%08X ref_known=%d at_target=%d gap=%.2f listed_grid=%d in_destination_cell=%d models=%d aboard=%d seated=%d seat_dist=%.2f judge=%s waited_ms=%llu",
+                        (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, known ? 1 : 0, st.atTarget ? 1 : 0, st.gap, st.listedGrid ? 1 : 0, st.inDestinationCell ? 1 : 0,
+                        models ? 1 : 0, rb.aboardAfter ? 1 : 0, rb.seatedAfter ? 1 : 0, seatDist, judged, (unsigned long long)(now - g_relocSettleAt));
+                }
+                if (res == relocation::Result::Failed) {   // the pair broke while settling: Verify publishes failed with Judge's own reason
+                    relocation::Receipt out; g_reloc.Verify(g_relocSerial, rb, now, out); FinishRelocation(); return;
+                }
+                if (settled && res == relocation::Result::Applied) {
+                    rb.refiled = true;
+                    relocation::Receipt out;
+                    if (g_reloc.Verify(g_relocSerial, rb, now, out)) FinishRelocation();
+                    return;
+                }
+                if (now - g_relocSettleAt > relocation::kSettleWindowMs) {
+                    g_reloc.Conclude(g_relocSerial, rb, false, "refile_not_settled", now); FinishRelocation(); return;
+                }
+                if (!known || !st.inDestinationCell || !st.atTarget) {
+                    if (now - g_relocRefileAt >= 500) { g_relocRefileAt = now; loadedarea::RefileRelocated(g_relocVehicle, g_relocDriver, float(g_relocTo.x), float(g_relocTo.y), float(g_relocTo.z)); }
+                }
+                return;
+            }
+            if (!g_relocIssued) {
+                vehicleflight::relocate::Facts f;
+                if (vehicleflight::relocate::Take(g_relocSerial, f)) {
+                    if (f.issued) {
+                        if (!g_relocFirstIssued) { g_reloc.MarkIssued(g_relocSerial, now); g_relocFirstIssued = true; }
+                        else g_reloc.HopIssued(g_relocSerial, now);
+                        g_relocIssued = true;
+                        logger::Write("OBS system=relocation event=issued serial=%llu vehicle=%08X driver=%08X hop=%u phase=%s ring_first_ok=%d com_near_body=%d speed=%.2f com_before=%.3f,%.3f,%.3f com_after=%.3f,%.3f,%.3f body_before=%.3f,%.3f,%.3f body_after=%.3f,%.3f,%.3f",
+                            (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, g_reloc.Hops(g_relocSerial), g_relocRestoring ? "restore" : "forward", f.ringFirstOk ? 1 : 0, f.comNearBody ? 1 : 0, f.speed,
+                            f.comBefore[0], f.comBefore[1], f.comBefore[2], f.comAfter[0], f.comAfter[1], f.comAfter[2],
+                            f.bodyBefore[0], f.bodyBefore[1], f.bodyBefore[2], f.bodyAfter[0], f.bodyAfter[1], f.bodyAfter[2]);
+                    } else if (!g_relocFirstIssued) {
+                        g_reloc.Refuse(g_relocSerial, f.refusal, now);
+                        FinishRelocation(); return;
+                    } else {   // a later hop refused by the doer's own checks: the pair already moved, so it is judged like a failed hop
+                        RelocationReadback(rb, v, d, seatDist);
+                        RelocationHopFailed(rb, f.refusal, now); return;
+                    }
+                } else if (now - g_relocArmedAt > 3000) {
+                    if (!g_relocFirstIssued) {
+                        g_reloc.Refuse(g_relocSerial, "not_issued_in_time", now);   // the chassis took no physics step in 3 s (asleep, or not owned by a pilot)
+                        FinishRelocation(); return;
+                    }
+                    RelocationReadback(rb, v, d, seatDist);
+                    RelocationHopFailed(rb, "hop_not_issued_in_time", now); return;
+                } else return;
+            }
+            RelocationReadback(rb, v, d, seatDist);
             if (now - g_relocPendingLogAt >= 500) {
                 g_relocPendingLogAt = now;
                 const auto vp = v ? At<game::Vec3>(v, off::kRefPosition) : game::Vec3{};
-                logger::Write("OBS system=relocation event=pending serial=%llu vehicle=%08X driver=%08X steps=%llu live=%d body_valid=%d chassis=%.2f,%.2f,%.2f vehicle_ref=%.2f,%.2f,%.2f driver_ref=%.2f,%.2f,%.2f aboard=%d seated=%d seat_dist=%.2f",
-                    (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, (unsigned long long)rb.stepAfter, rb.physicsLive ? 1 : 0, rb.bodyValid ? 1 : 0,
-                    rb.chassis.x, rb.chassis.y, rb.chassis.z, vp.x, vp.y, vp.z, rb.driver.x, rb.driver.y, rb.driver.z, rb.aboardAfter ? 1 : 0, rb.seatedAfter ? 1 : 0,
-                    (d && v) ? SeatDist(d, v) : -1.0);
+                logger::Write("OBS system=relocation event=pending serial=%llu vehicle=%08X driver=%08X hop=%u phase=%s steps=%llu live=%d body_valid=%d chassis=%.2f,%.2f,%.2f vehicle_ref=%.2f,%.2f,%.2f driver_ref=%.2f,%.2f,%.2f aboard=%d seated=%d seat_dist=%.2f",
+                    (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, g_reloc.Hops(g_relocSerial), g_relocRestoring ? "restore" : "forward", (unsigned long long)rb.stepAfter, rb.physicsLive ? 1 : 0, rb.bodyValid ? 1 : 0,
+                    rb.chassis.x, rb.chassis.y, rb.chassis.z, vp.x, vp.y, vp.z, rb.driver.x, rb.driver.y, rb.driver.z, rb.aboardAfter ? 1 : 0, rb.seatedAfter ? 1 : 0, seatDist);
             }
-            relocation::Receipt out;
-            if (g_reloc.Verify(g_relocSerial, rb, now, out)) {
-                vehicleflight::relocate::Disarm(g_relocSerial); g_relocSerial = 0; g_relocIssued = false;
+            const relocation::Pose& goal = g_relocRestoring ? g_relocFrom : g_relocTo;
+            const bool singleHop = g_reloc.Hops(g_relocSerial) <= 1 && g_relocHopLast && !g_relocRestoring;
+            if (!g_relocRestoring && g_relocHopLast) {
+                // The last hop of the move: the whole-move judgement (chassis at the target, seat link, live physics, a fresh step) as in the proven 6 m move.
+                const auto* act = g_reloc.Lookup(g_relocSerial);
+                const char* judged = "";
+                const auto res = act ? relocation::Judge(act->req, rb, judged) : relocation::Result::Failed;
+                if (res == relocation::Result::None) {
+                    relocation::Receipt out;
+                    if (g_reloc.Verify(g_relocSerial, rb, now, out)) FinishRelocation();   // the window ran out without a completed step
+                    return;
+                }
+                if (res == relocation::Result::Applied && g_relocCross) {
+                    // The doer is done. Release the pose so the existing refile may run (it yields to the doer), queue it now, then wait for it.
+                    g_relocSettling = true; g_relocArrived = rb.chassis; g_relocSettleAt = now; g_relocSettleLogAt = 0; g_relocRefileAt = now;
+                    ReleaseRelocationPose();
+                    const bool queued = loadedarea::RefileRelocated(g_relocVehicle, g_relocDriver, float(g_relocTo.x), float(g_relocTo.y), float(g_relocTo.z));
+                    logger::Write("OBS system=relocation event=settle_begin serial=%llu vehicle=%08X driver=%08X hops=%u refile_queued=%d to=%.2f,%.2f,%.2f reason=cross_cell_refile_before_receipt",
+                        (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, g_reloc.Hops(g_relocSerial), queued ? 1 : 0, g_relocTo.x, g_relocTo.y, g_relocTo.z);
+                    return;
+                }
+                if (res == relocation::Result::Failed && !singleHop && relocation::Recoverable(rb)) { RelocationHopFailed(rb, judged, now); return; }
+                relocation::Receipt out;
+                if (g_reloc.Verify(g_relocSerial, rb, now, out)) FinishRelocation();
+                return;
             }
+            // An intermediate forward hop, or any hop of a walk back: a waypoint judged on the doer's read-back alone.
+            const char* why = "";
+            const auto verdict = relocation::JudgeHop(rb, g_relocHop, g_relocHopLast ? relocation::kArriveToleranceM : relocation::kHopToleranceM, why);
+            if (verdict == relocation::HopVerdict::Wait) {
+                if (now - g_relocArmedAt > relocation::kHopWindowMs) RelocationHopFailed(rb, "no_completed_step", now);
+                return;
+            }
+            if (verdict == relocation::HopVerdict::Failed) { RelocationHopFailed(rb, why, now); return; }
+            if (g_relocRestoring && g_relocHopLast) {
+                g_reloc.Conclude(g_relocSerial, rb, true, "hop_failed_returned_to_origin", now);
+                logger::Write("OBS system=relocation event=restored serial=%llu vehicle=%08X driver=%08X cause=%s chassis=%.2f,%.2f,%.2f origin=%.2f,%.2f,%.2f",
+                    (unsigned long long)g_relocSerial, g_relocVehicle, g_relocDriver, g_relocFailWhy, rb.chassis.x, rb.chassis.y, rb.chassis.z, g_relocFrom.x, g_relocFrom.y, g_relocFrom.z);
+                FinishRelocation(); return;
+            }
+            if (g_reloc.Hops(g_relocSerial) >= relocation::kMaxHops * (g_relocRestoring ? 2u : 1u)) { RelocationHopFailed(rb, "too_many_hops", now); return; }
+            if (!RelocationArmHop(rb.chassis, goal, g_relocRestoring ? "walking_back" : "next_hop")) RelocationHopFailed(rb, "hop_arm_refused", now);
         }
+        void ObservePairMoveAutopilot()
+        {
+            auto& observed = g_pairMoveObservation;
+            const auto now = GetTickCount64();
+            if (!observed.serial || now < observed.nextSampleAt) return;
+            observed.nextSampleAt = now + kPairMoveSampleMs;
+            const bool anotherMove = g_relocSerial && g_relocVehicle == observed.vehicle;
+            const auto driver = RefById(observed.driver), vehicle = RefById(observed.vehicle);
+            const bool seated = driver && vehicle && InVehicle(driver) == vehicle && SeatedNow(driver, vehicle, true);
+            const bool playerTookOver = vehicleflight::PlayerDriving(observed.vehicle);
+            const auto autopilot = vehicleflight::HandoffPhysics(observed.vehicle);
+            if (autopilot.bound && !observed.hasStepBaseline) {
+                observed.initialAutopilotStep = autopilot.serial;
+                observed.hasStepBaseline = true;
+            }
+            const auto steps = observed.hasStepBaseline && autopilot.serial >= observed.initialAutopilotStep
+                ? autopilot.serial - observed.initialAutopilotStep : 0;
+            vehicleflight::relocate::ChassisNow chassis;
+            const bool readable = vehicleflight::relocate::ReadChassisNow(observed.vehicle, chassis);
+            const double travel = readable
+                ? std::hypot(chassis.pos[0] - observed.arrival.x, chassis.pos[1] - observed.arrival.y) : 0.0;
+            const bool resumed = !anotherMove && !playerTookOver && seated && autopilot.live && steps > 0 && travel >= kPairMoveProofM;
+            if (!resumed && !anotherMove && !playerTookOver && seated && now - observed.startedAt < kPairMoveObserveMs) return;
+
+            const char* reason = resumed ? "seated_pair_moved_after_fresh_autopilot_steps" :
+                anotherMove ? "another_relocation_started" : playerTookOver ? "player_took_control" :
+                !seated ? "driver_not_seated" : !readable ? "chassis_unreadable" :
+                !autopilot.live || !steps ? "no_fresh_autopilot_steps" : "no_measurable_travel";
+            logger::Write("OBS system=relocation event=autopilot_after_move serial=%llu vehicle=%08X driver=%08X outcome=%s reason=%s arrival=%.2f,%.2f,%.2f current=%.2f,%.2f,%.2f travel_m=%.2f elapsed_ms=%llu steps=%llu live=%d seated=%d body_readable=%d",
+                (unsigned long long)observed.serial, observed.vehicle, observed.driver, resumed ? "confirmed" : "not_confirmed", reason,
+                observed.arrival.x, observed.arrival.y, observed.arrival.z, chassis.pos[0], chassis.pos[1], chassis.pos[2], travel,
+                (unsigned long long)(now - observed.startedAt), (unsigned long long)steps, autopilot.live ? 1 : 0, seated ? 1 : 0, readable ? 1 : 0);
+            observed = {};
+        }
+
         void PairMoveKey(uptr player){
+            ObservePairMoveAutopilot();
             RelocationTick();
             const bool down=g_pairMoveKey&&Focused()&&(GetAsyncKeyState(g_pairMoveKey)&0x8000)!=0;
             const bool pressed=down&&!g_pairMoveDown;
             g_pairMoveDown=down;
             if(!pressed||!bindings::Allowed()||hoverui::IsScannerOpen()||InVehicle(player))return;
             RelocationStart(player);
+        }
+
+        // ---- Far tier test (diagnostic builds only; notes/FAR_TIER_TEST_20261121.md) ----
+        // Moves the seated pair the player faces N m along its heading PAST the loaded-area wall (300 m, +50 per run, 600 m at most), then observes
+        // (stage 1, no rail) or holds it on the kinematic rail (stage 2: vehicleflight::relocate::Rail*, height = terrain + ride), then walks it back
+        // and watches the handoff to a fully real car. This is a SEPARATE mover: relocation.h's 250 m limit and the "destination cell must be loaded"
+        // refusal in ArmRelocation stay exactly as they are for production; the hops reuse only the doer (Arm/Take/Read, 20 m per write).
+        // Press the key: Idle = start stage 1 | during/after stage 1 = start the rail (stage 2) | during the rail = walk back.
+        // Everything is logged as OBS system=far.test event=... (start, terrain_probe, arrived, sample, summary, return_check, return_summary, refused, ...).
+        constexpr std::uint32_t kFarLoadingFlag = 0x05E60AFA;   // the game's loading-screen byte (main_vehicle.cpp kLoadingScreenFlag)
+        constexpr std::uint64_t kFarSerialBase = 0xFA00000000000000ull;   // far test hop serials never meet relocation.h's (those count from 1)
+        constexpr int kFarProbeMax = 24;
+        enum class FarPhase { Idle, Probe, Out, Observe1, Parked1, Rail, Back, Check };
+        const char* FarPhaseName(FarPhase p)
+        {
+            switch (p) {
+            case FarPhase::Probe: return "probe"; case FarPhase::Out: return "out"; case FarPhase::Observe1: return "observe_no_rail";
+            case FarPhase::Parked1: return "parked_no_rail"; case FarPhase::Rail: return "rail"; case FarPhase::Back: return "back"; case FarPhase::Check: return "return_check";
+            default: return "idle";
+            }
+        }
+        struct FarAnswer { bool ok = false, pending = false; double z = 0; };
+        struct FarRun {
+            FarPhase phase = FarPhase::Idle;
+            unsigned finished = 0, id = 0;                      // runs finished (the next distance), this run's number
+            std::uint32_t vehicle = 0, driver = 0;
+            farrail::P3 start{}, goal{};
+            double dirX = 0, dirY = 1, yaw = 0, distance = 0, ride = 1.5, speed = farrail::kRailSpeed, arrivalZ = 0;
+            farrail::Source source = farrail::Source::None;
+            ULONGLONG runAt = 0, arrivedAt = 0, railAt = 0, backAt = 0, checkAt = 0, sampleAt = 0, probeAt = 0, hopArmedAt = 0, fillPendingAt = 0;
+            // terrain probe
+            int probeN = 0; bool probeDone[farrail::kSources][kFarProbeMax]{}; FarAnswer probe[farrail::kSources][kFarProbeMax]{};
+            int fillNext = 0, fillMiss = 0;
+            // hops
+            bool hopArmed = false, hopLast = false, back = false;
+            std::uint64_t hopSerial = 0, hopCounter = 0; unsigned hops = 0;
+            farrail::P3 hop{};
+            // observation
+            farrail::Tally tally1, tally2; bool summary1 = false, summary2 = false;
+            farrail::P3 prev{}; bool havePrev = false; double prevSpeed = 0;
+            unsigned driverGone = 0, unreadable = 0;
+            const char* backWhy = "";
+            // return check
+            unsigned chkSamples = 0, chkLive = 0, chkSeated = 0, chkMoving = 0, chkBroken = 0; double chkMinZ = 1e18;
+        };
+        FarRun g_far;
+        bool FarLoadingScreen()
+        {
+            __try { return *reinterpret_cast<volatile std::uint8_t*>(game::Base() + kFarLoadingFlag) != 0; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
+        }
+        // The game's cached terrain heightfield (the map reads it; window = uDefaultGameTerrainWidthInCells = 100 cells, 10 km): no objects here for __try.
+        bool FarCachedTerrain(double x, double y, double& z)
+        {
+            float xy[4] = { float(x), float(y), 0.0f, 0.0f }, h = 0.0f;
+            __try { if (!EngineFn<std::uint8_t (*)(void*, float*, float*)>(addr::kCachedTerrainHeight)(nullptr, xy, &h)) return false; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+            if (!std::isfinite(h)) return false;
+            z = h; return true;
+        }
+        FarAnswer FarAsk(farrail::Source s, double x, double y, double zRef, std::uint32_t self)
+        {
+            FarAnswer a;
+            switch (s) {
+            case farrail::Source::Cached: a.ok = FarCachedTerrain(x, y, a.z); break;
+            case farrail::Source::Cellbake: { double z = 0; a.ok = cellbake::Ground(x, y, z) && std::isfinite(z); a.z = z; break; }
+            case farrail::Source::NavMap: { const auto m = navmap::At(x, y, zRef + 1000.0); a.ok = m.haveGround && std::isfinite(m.ground); a.z = m.ground; break; }
+            case farrail::Source::Ray: {
+                environment::Ground g;
+                if (!environment::GroundAt(self, x, y, zRef + 1500.0, zRef - 1500.0, g)) a.pending = true;
+                else { a.ok = g.hit && std::isfinite(g.z); a.z = g.z; }
+                break;
+            }
+            default: break;
+            }
+            return a;
+        }
+        std::uint32_t g_farKeptQuery = 0; bool g_farKeptFound = false;
+        bool FarKept(std::uint32_t id)
+        {
+            g_farKeptQuery = id; g_farKeptFound = false;
+            vehiclekeep::ForEachHeld([](std::uint32_t v) { if (v == g_farKeptQuery) g_farKeptFound = true; });
+            return g_farKeptFound;
+        }
+        void FarRefuse(const char* reason, std::uint32_t v = 0, std::uint32_t d = 0)
+        {
+            logger::Write("OBS system=far.test event=refused reason=%s vehicle=%08X driver=%08X phase=%s", reason, v, d, FarPhaseName(g_far.phase));
+        }
+        double FarAlong(const farrail::P3& p) { return (p.x - g_far.start.x) * g_far.dirX + (p.y - g_far.start.y) * g_far.dirY; }
+        // Stop everything the test holds. The pose owner and the relocation mark are given back; the doer and the rail are idle.
+        void FarRelease(const char* why)
+        {
+            vehicleflight::relocate::RailStop();
+            if (g_far.hopSerial) vehicleflight::relocate::Disarm(g_far.hopSerial);
+            g_far.hopSerial = 0; g_far.hopArmed = false;
+            if (g_far.vehicle) NoteRelocationMark(g_far.vehicle, false);
+            if (!g_relocSerial) ReleaseRelocationPose();
+            logger::Write("OBS system=far.test event=released run=%u reason=%s vehicle=%08X phase=%s", g_far.id, why, g_far.vehicle, FarPhaseName(g_far.phase));
+            g_far.phase = FarPhase::Idle;
+        }
+        // The pair cannot be walked back. Driverless chassis: retire the pair through the existing job path; otherwise say loudly where it is.
+        void FarAbandon(const char* why)
+        {
+            const uptr v = RefById(g_far.vehicle), d = RefById(g_far.driver);
+            const bool aboard = v && d && InVehicle(d) == v;
+            vehicleflight::relocate::ChassisNow ch;
+            vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch);
+            logger::Write("OBS system=far.test event=abandoned run=%u reason=%s vehicle=%08X driver=%08X driver_aboard=%d chassis_readable=%d chassis=%.1f,%.1f,%.1f from_start=%.1f action=%s",
+                g_far.id, why, g_far.vehicle, g_far.driver, aboard ? 1 : 0, ch.bodyValid ? 1 : 0, ch.pos[0], ch.pos[1], ch.pos[2],
+                farrail::Dist({ ch.pos[0], ch.pos[1], ch.pos[2] }, g_far.start), aboard ? "left_to_existing_systems" : "pair_retired_via_EndJobOf");
+            const auto vid = g_far.vehicle;
+            FarRelease(why);
+            if (!aboard && vid) EndJobOf(vid, "far tier test: driver lost, pair retired");
+        }
+        void FarSummary(int stage, const farrail::Tally& t, bool cutShort)
+        {
+            const char* verdict = stage == 1 ? farrail::Stage1Verdict(t) : farrail::Stage2Verdict(t);
+            logger::Write("OBS system=far.test event=summary run=%u stage=%d verdict=%s samples=%u seconds=%.1f model_lost=%u not_seated=%u not_kept=%u physics_dead=%u unreadable=%u jumps=%u max_jump=%.1f fall=%.1f min_z=%.1f max_z=%.1f terrain_unknown=%u err_samples=%u max_abs_err=%.2f mean_abs_err=%.2f moving=%u max_speed=%.1f source=%s distance=%.0f cut_short=%d",
+                g_far.id, stage, verdict, t.samples, t.samples * 0.5, t.modelLost, t.notSeated, t.notKept, t.physicsDead, t.unreadable, t.jumps, t.maxJump, t.Fall(),
+                t.minZ < 1e17 ? t.minZ : 0.0, t.maxZ > -1e17 ? t.maxZ : 0.0, t.terrainUnknown, t.errSamples, t.maxAbsErr, t.MeanAbsErr(), t.moving, t.maxSpeed,
+                farrail::SourceName(g_far.source), g_far.distance, cutShort ? 1 : 0);
+        }
+        // Terrain profile along the path, filled ahead of the pair from the chosen source (the rail's physics thread only reads it).
+        void FarFill(double upToS)
+        {
+            if (g_far.source == farrail::Source::None) return;
+            int guard = 0;
+            while (g_far.fillNext < farrail::kProfileCap && g_far.fillNext * farrail::kProfileSpacingM <= upToS && g_far.fillNext * farrail::kProfileSpacingM <= farrail::kPathCapM && guard < 40) {
+                const double s = g_far.fillNext * farrail::kProfileSpacingM;
+                const auto a = FarAsk(g_far.source, g_far.start.x + g_far.dirX * s, g_far.start.y + g_far.dirY * s, g_far.start.z, g_far.vehicle);
+                if (a.pending) {
+                    const ULONGLONG now = GetTickCount64();
+                    if (!g_far.fillPendingAt) g_far.fillPendingAt = now;
+                    if (now - g_far.fillPendingAt < 3000) break;
+                }
+                g_far.fillPendingAt = 0;
+                if (a.ok) vehicleflight::relocate::RailSetTerrain(g_far.fillNext, a.z); else ++g_far.fillMiss;
+                ++g_far.fillNext; ++guard;
+            }
+        }
+        // ---- stage 0: ask every terrain source at every probe distance along the heading (the answer beyond the wall is the point) ----
+        // Returns true when every probe has an answer (rays may take a few frames; after 3 s a pending ray counts as not answered).
+        bool FarProbeStep(ULONGLONG now)
+        {
+            bool all = true;
+            const bool expired = now - g_far.probeAt > 3000;
+            for (int i = 0; i < g_far.probeN; ++i) {
+                const double s = farrail::ProbeDistance(i), x = g_far.start.x + g_far.dirX * s, y = g_far.start.y + g_far.dirY * s;
+                for (int k = 0; k < farrail::kSources; ++k) {
+                    if (g_far.probeDone[k][i]) continue;
+                    const auto a = FarAsk(farrail::Source(k), x, y, g_far.start.z, g_far.vehicle);
+                    if (a.pending && !expired) { all = false; continue; }
+                    g_far.probe[k][i] = a; g_far.probe[k][i].pending = false; g_far.probeDone[k][i] = true;
+                }
+            }
+            return all;
+        }
+        void FarProbeReport()
+        {
+            farrail::Coverage cov[farrail::kSources]{};
+            int beyondPoints = 0;
+            for (int i = 0; i < g_far.probeN; ++i) {
+                const double s = farrail::ProbeDistance(i);
+                if (s >= 250.0) ++beyondPoints;
+                logger::Write("OBS system=far.test event=terrain_probe run=%u dist=%.0f x=%.1f y=%.1f cached=%d,%.2f cellbake=%d,%.2f navmap=%d,%.2f ray=%d,%.2f",
+                    g_far.id, s, g_far.start.x + g_far.dirX * s, g_far.start.y + g_far.dirY * s,
+                    g_far.probe[0][i].ok ? 1 : 0, g_far.probe[0][i].z, g_far.probe[1][i].ok ? 1 : 0, g_far.probe[1][i].z,
+                    g_far.probe[2][i].ok ? 1 : 0, g_far.probe[2][i].z, g_far.probe[3][i].ok ? 1 : 0, g_far.probe[3][i].z);
+                for (int k = 0; k < farrail::kSources; ++k) if (g_far.probe[k][i].ok) { ++cov[k].all; if (s >= 250.0) ++cov[k].beyond; }
+            }
+            g_far.source = farrail::PickSource(cov, g_far.probeN, beyondPoints);
+            g_far.ride = farrail::RideFromStart(g_far.start.z, g_far.source != farrail::Source::None && g_far.probe[int(g_far.source)][0].ok ? g_far.probe[int(g_far.source)][0].z : 0.0,
+                g_far.source != farrail::Source::None && g_far.probe[int(g_far.source)][0].ok);
+            logger::Write("OBS system=far.test event=terrain_probe_summary run=%u points=%d beyond_wall_points=%d cached=%d/%d cellbake=%d/%d navmap=%d/%d ray=%d/%d beyond_wall_answers=cached:%d,cellbake:%d,navmap:%d,ray:%d picked=%s ride=%.2f",
+                g_far.id, g_far.probeN, beyondPoints, cov[0].all, g_far.probeN, cov[1].all, g_far.probeN, cov[2].all, g_far.probeN, cov[3].all, g_far.probeN,
+                cov[0].beyond, cov[1].beyond, cov[2].beyond, cov[3].beyond, farrail::SourceName(g_far.source), g_far.ride);
+            g_far.fillNext = 0; g_far.fillMiss = 0; g_far.fillPendingAt = 0;
+            vehicleflight::relocate::RailClearTerrain();
+        }
+        // ---- hops (the proven doer write, one bounded hop at a time, read back before the next) ----
+        bool FarArmHop(const farrail::P3& at, const char* why)
+        {
+            if (g_far.hopSerial) vehicleflight::relocate::Disarm(g_far.hopSerial);
+            const farrail::P3 goal = g_far.back ? farrail::P3{ g_far.start.x, g_far.start.y, g_far.start.z + 0.3 } : g_far.goal;
+            bool last = false;
+            const auto hop = farrail::NextHop(at, goal, last);
+            const auto serial = kFarSerialBase + (++g_far.hopCounter);
+            const char* refusal = vehicleflight::relocate::Arm(g_far.vehicle, hop.x - at.x, hop.y - at.y, hop.z - at.z, serial, 0);
+            logger::Write("OBS system=far.test event=hop_armed run=%u hop=%u phase=%s last=%d from=%.2f,%.2f,%.2f to=%.2f,%.2f,%.2f remaining=%.1f result=%s reason=%s",
+                g_far.id, g_far.hops + 1, g_far.back ? "back" : "out", last ? 1 : 0, at.x, at.y, at.z, hop.x, hop.y, hop.z, farrail::Dist(at, goal), refusal ? "refused" : "armed", refusal ? refusal : why);
+            if (refusal) { g_far.hopSerial = 0; g_far.hopArmed = false; return false; }
+            g_far.hopSerial = serial; g_far.hop = hop; g_far.hopLast = last; g_far.hopArmed = true; g_far.hopArmedAt = GetTickCount64(); ++g_far.hops;
+            return true;
+        }
+        enum class FarHopResult { Working, Arrived, Failed };
+        FarHopResult FarHopTick(ULONGLONG now, const char*& why)
+        {
+            why = "";
+            const uptr v = RefById(g_far.vehicle), d = RefById(g_far.driver);
+            if (!g_far.hopArmed) {
+                vehicleflight::relocate::ChassisNow ch;
+                if (!vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch)) { why = ch.bound ? "chassis_body_unreadable" : "no_physics_instance"; return FarHopResult::Failed; }
+                if (!FarArmHop({ ch.pos[0], ch.pos[1], ch.pos[2] }, g_far.hops ? "next_hop" : "first_hop")) { why = "hop_arm_refused"; return FarHopResult::Failed; }
+                return FarHopResult::Working;
+            }
+            const unsigned limit = farrail::kMaxHopsOut(g_far.distance) * (g_far.back ? 2u : 1u);
+            vehicleflight::relocate::Facts f;
+            if (!vehicleflight::relocate::Take(g_far.hopSerial, f)) {
+                if (now - g_far.hopArmedAt > farrail::kHopWindowMs) { why = "hop_not_issued_in_time"; return FarHopResult::Failed; }
+                return FarHopResult::Working;
+            }
+            if (!f.issued) { why = f.refusal && *f.refusal ? f.refusal : "doer_refused"; return FarHopResult::Failed; }
+            vehicleflight::relocate::Chassis ch;
+            const bool have = vehicleflight::relocate::Read(g_far.hopSerial, ch);
+            const bool seated = d && v && InVehicle(d) == v && SeatedNow(d, v, true);
+            const farrail::P3 at{ ch.pos[0], ch.pos[1], ch.pos[2] };
+            const bool expired = now - g_far.hopArmedAt > farrail::kHopWindowMs;
+            const auto verdict = farrail::JudgeHop(have && ch.bodyValid, have && ch.live, have ? ch.completedSteps : 0, farrail::Dist(at, g_far.hop),
+                g_far.hopLast ? farrail::kArriveToleranceM : farrail::kHopToleranceM, seated, !g_far.back, expired, why);
+            if (verdict == farrail::Hop::Wait) {
+                if (expired) { why = "no_completed_step"; return FarHopResult::Failed; }
+                return FarHopResult::Working;
+            }
+            if (verdict == farrail::Hop::Failed) return FarHopResult::Failed;
+            if (g_far.hopLast) return FarHopResult::Arrived;
+            if (g_far.hops >= limit) { why = "too_many_hops"; return FarHopResult::Failed; }
+            if (!FarArmHop(at, "next_hop")) { why = "hop_arm_refused"; return FarHopResult::Failed; }
+            return FarHopResult::Working;
+        }
+        void FarBeginBack(const char* why)
+        {
+            vehicleflight::relocate::RailStop();
+            if (g_far.hopSerial) vehicleflight::relocate::Disarm(g_far.hopSerial);
+            if (g_far.phase == FarPhase::Rail && !g_far.summary2) { FarSummary(2, g_far.tally2, true); g_far.summary2 = true; }
+            if (g_far.phase == FarPhase::Observe1 && !g_far.summary1) { FarSummary(1, g_far.tally1, true); g_far.summary1 = true; }
+            vehicleflight::relocate::ChassisNow ch;
+            const bool readable = vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch);
+            logger::Write("OBS system=far.test event=back_begin run=%u reason=%s from_phase=%s chassis=%.1f,%.1f,%.1f from_start=%.1f readable=%d",
+                g_far.id, why, FarPhaseName(g_far.phase), ch.pos[0], ch.pos[1], ch.pos[2], readable ? farrail::Dist({ ch.pos[0], ch.pos[1], ch.pos[2] }, g_far.start) : -1.0, readable ? 1 : 0);
+            if (!readable) { FarAbandon("chassis_unreadable_cannot_walk_back"); return; }
+            g_far.back = true; g_far.hops = 0; g_far.hopArmed = false; g_far.hopSerial = 0; g_far.backWhy = why; g_far.backAt = GetTickCount64();
+            SetRelocationPoseOwner(g_far.vehicle);   // while the doer writes, the engine-side refile yields (as in the relocation test)
+            g_relocPoseReleased = false;
+            g_far.phase = FarPhase::Back;
+        }
+        void FarBeginRail(const char* why)
+        {
+            const uptr v = RefById(g_far.vehicle), d = RefById(g_far.driver);
+            vehicleflight::relocate::ChassisNow ch;
+            if (!vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch)) { FarRefuse("rail_chassis_unreadable", g_far.vehicle, g_far.driver); return; }
+            if (!(d && v && InVehicle(d) == v && SeatedNow(d, v, true))) { FarRefuse("rail_pair_not_intact", g_far.vehicle, g_far.driver); return; }
+            if (g_far.phase == FarPhase::Observe1 && !g_far.summary1) { FarSummary(1, g_far.tally1, true); g_far.summary1 = true; }
+            const farrail::P3 at{ ch.pos[0], ch.pos[1], ch.pos[2] };
+            const double s0 = FarAlong(at);
+            const char* refusal = vehicleflight::relocate::RailStart(g_far.vehicle, g_far.start.x, g_far.start.y, g_far.dirX, g_far.dirY, s0, at.z, g_far.speed, g_far.ride);
+            logger::Write("OBS system=far.test event=rail_start run=%u reason=%s result=%s refusal=%s s0=%.1f z0=%.2f speed=%.1f ride=%.2f source=%s profile_known=%d lateral_offset=%.2f",
+                g_far.id, why, refusal ? "refused" : "started", refusal ? refusal : "", s0, at.z, g_far.speed, g_far.ride, farrail::SourceName(g_far.source),
+                vehicleflight::relocate::RailTerrainKnown(), std::fabs((at.x - g_far.start.x) * g_far.dirY - (at.y - g_far.start.y) * g_far.dirX));
+            if (refusal) return;
+            g_far.tally2 = {}; g_far.summary2 = false; g_far.havePrev = false; g_far.railAt = GetTickCount64(); g_far.sampleAt = 0;
+            g_far.driverGone = g_far.unreadable = 0;
+            g_far.phase = FarPhase::Rail;
+        }
+        // One observation (every 0.5 s in observe / parked / rail / return check): everything the open questions ask about, one line.
+        bool FarSample(ULONGLONG now, bool railOn, farrail::Sample& s, vehicleflight::relocate::ChassisNow& ch)
+        {
+            const uptr v = RefById(g_far.vehicle), d = RefById(g_far.driver);
+            const bool have = vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch);
+            s = farrail::Sample{};
+            s.bodyReadable = have && ch.bodyValid;
+            if (s.bodyReadable) { s.z = ch.pos[2]; s.speed = std::hypot(ch.vel[0], ch.vel[1]); }
+            s.modelLoaded = v && d && Has3D(v) && Has3D(d);
+            const bool aboard = v && d && InVehicle(d) == v;
+            s.seated = aboard && SeatedNow(d, v, true);
+            s.kept = FarKept(g_far.vehicle);
+            const auto ph = vehicleflight::HandoffPhysics(g_far.vehicle);
+            s.physicsBound = ph.bound; s.physicsLive = ph.live;
+            FarAnswer ground;
+            if (s.bodyReadable && g_far.source != farrail::Source::None) ground = FarAsk(g_far.source, ch.pos[0], ch.pos[1], ch.pos[2], g_far.vehicle);
+            s.terrainKnown = ground.ok;
+            if (railOn && ground.ok) s.errM = ch.pos[2] - (ground.z + g_far.ride);
+            const farrail::P3 cur{ ch.pos[0], ch.pos[1], ch.pos[2] };
+            if (s.bodyReadable && g_far.havePrev) {
+                const double dt = 0.5, expected = (std::max(g_far.prevSpeed, s.speed)) * dt * 1.5 + 3.0;
+                s.jumpM = farrail::UncommandedJump(g_far.prev, cur, expected);
+            }
+            if (s.bodyReadable) { g_far.prev = cur; g_far.havePrev = true; g_far.prevSpeed = s.speed; }
+            // cells at the chassis (is the cell there loaded, is the reference listed elsewhere)
+            loadedarea::RelocationCell cell{};
+            const bool cellKnown = s.bodyReadable && loadedarea::RelocationDestination(g_far.vehicle, float(ch.pos[0]), float(ch.pos[1]), cell);
+            const auto vp = v ? At<game::Vec3>(v, off::kRefPosition) : game::Vec3{};
+            game::Vec3 mp{};
+            const bool haveModel = v && ScenePos(v, mp);
+            vehicleflight::relocate::RailFacts rf;
+            const bool haveRail = railOn && vehicleflight::relocate::RailRead(rf);
+            const double t = (now - (g_far.phase == FarPhase::Rail ? g_far.railAt : g_far.phase == FarPhase::Check ? g_far.checkAt : g_far.arrivedAt)) / 1000.0;
+            logger::Write("OBS system=far.test event=sample run=%u phase=%s t=%.1f chassis=%.2f,%.2f,%.2f vel=%.1f,%.1f,%.1f from_start=%.1f along=%.1f vehicle_ref=%.1f,%.1f,%.1f ref_gap=%.1f model=%.1f,%.1f,%.1f model_gap=%.1f model3d=%d,%d seated=%d kept=%d physics_bound=%d live=%d steps=%llu terrain=%d,%.2f,%s ride=%.2f err=%.2f cell_known=%d cell=%d,%d at_cell=%d,%d at_cell_loaded=%d rail_s=%.1f rail_steps=%llu rail_holds=%llu rail_faults=%llu rail_fault=%s jump=%.1f",
+                g_far.id, FarPhaseName(g_far.phase), t, ch.pos[0], ch.pos[1], ch.pos[2], ch.vel[0], ch.vel[1], ch.vel[2], farrail::Dist(cur, g_far.start), FarAlong(cur),
+                vp.x, vp.y, vp.z, std::hypot(double(vp.x) - ch.pos[0], double(vp.y) - ch.pos[1]), mp.x, mp.y, mp.z, haveModel ? std::hypot(double(mp.x) - ch.pos[0], double(mp.y) - ch.pos[1]) : -1.0,
+                v && Has3D(v) ? 1 : 0, d && Has3D(d) ? 1 : 0, s.seated ? 1 : 0, s.kept ? 1 : 0, ph.bound ? 1 : 0, ph.live ? 1 : 0, static_cast<unsigned long long>(ph.serial),
+                ground.ok ? 1 : 0, ground.z, farrail::SourceName(g_far.source), g_far.ride, std::isfinite(s.errM) ? s.errM : 0.0,
+                cellKnown ? 1 : 0, cell.fromX, cell.fromY, cell.toX, cell.toY, cell.cellLoaded ? 1 : 0,
+                haveRail ? rf.s : 0.0, static_cast<unsigned long long>(haveRail ? rf.steps : 0), static_cast<unsigned long long>(haveRail ? rf.holds : 0),
+                static_cast<unsigned long long>(haveRail ? rf.faults : 0), haveRail && rf.fault ? rf.fault : "", s.jumpM);
+            return have;
+        }
+        // Common watchdog for the phases where the pair stands out there: lost driver / unreadable chassis / fall / rail fault.
+        // Returns true when it took the pair out of the phase (back or abandoned).
+        bool FarWatch(const farrail::Sample& s, bool have, bool railOn)
+        {
+            g_far.driverGone = (!s.seated) ? g_far.driverGone + 1 : 0;
+            g_far.unreadable = !have ? g_far.unreadable + 1 : 0;
+            if (g_far.unreadable >= 6) { FarAbandon("chassis_unreadable_for_3s"); return true; }
+            if (g_far.driverGone >= 3) { logger::Write("OBS system=far.test event=driver_lost run=%u samples=%u model3d=%d", g_far.id, g_far.driverGone, s.modelLoaded ? 1 : 0); FarBeginBack("driver_not_seated"); return true; }
+            if (railOn) {
+                vehicleflight::relocate::RailFacts rf;
+                if (vehicleflight::relocate::RailRead(rf) && !rf.active) { logger::Write("OBS system=far.test event=rail_stopped run=%u fault=%s faults=%llu", g_far.id, rf.fault, static_cast<unsigned long long>(rf.faults)); FarBeginBack("rail_stopped"); return true; }
+            } else if (have && s.z < g_far.arrivalZ - farrail::kFallAbortM) {
+                logger::Write("OBS system=far.test event=fall_abort run=%u z=%.1f arrival_z=%.1f", g_far.id, s.z, g_far.arrivalZ);
+                FarBeginBack("fell_below_arrival");
+                return true;
+            }
+            return false;
+        }
+        void FarStart(uptr player)
+        {
+            if (InVehicle(player)) { FarRefuse("player_in_vehicle"); return; }
+            if (FarLoadingScreen()) { FarRefuse("loading_screen"); return; }
+            if (g_relocSerial) { FarRefuse("relocation_test_running", g_relocVehicle, g_relocDriver); return; }
+            uptr d = 0, v = 0;
+            if (!FacedSeatedPair(player, d, v)) {
+                v = RefById(g_testPairVehicle); d = RefById(g_testPairDriver);
+                if (!v || !d || InVehicle(d) != v) { FarRefuse("no_seated_npc_in_front_and_no_board_pair", g_testPairVehicle, g_testPairDriver); return; }
+            }
+            const std::uint32_t vid = At<std::uint32_t>(v, off::kFormId), did = At<std::uint32_t>(d, off::kFormId);
+            if (Disabled(v) || trafficpool::MadeVehicle(vid) || trafficpool::PlayerOwnsHandoff(vid) || VehicleInCombat(vid)) { FarRefuse("vehicle_unavailable", vid, did); return; }
+            if (!SeatedNow(d, v, true)) { FarRefuse("driver_not_seated", vid, did); return; }
+            vehicleflight::relocate::ChassisNow ch;
+            if (!vehicleflight::relocate::ReadChassisNow(vid, ch)) { FarRefuse(ch.bound ? "chassis_body_unreadable" : "no_physics_instance", vid, did); return; }
+            const auto vr = At<game::Vec3>(v, off::kRefRotation);
+            const auto pp = At<game::Vec3>(player, off::kRefPosition);
+            auto& r = g_far;
+            const unsigned finished = r.finished; const unsigned id = r.id + 1;
+            r = FarRun{};
+            r.finished = finished; r.id = id; r.vehicle = vid; r.driver = did;
+            r.yaw = vr.z; r.dirX = std::sin(vr.z); r.dirY = std::cos(vr.z);
+            r.start = { ch.pos[0], ch.pos[1], ch.pos[2] };
+            r.distance = farrail::TargetDistance(finished);
+            r.goal = { r.start.x + r.dirX * r.distance, r.start.y + r.dirY * r.distance, r.start.z + 0.3 };
+            r.runAt = GetTickCount64();
+            r.probeN = std::min(kFarProbeMax, farrail::ProbeCount(r.distance + 150.0));
+            r.probeAt = r.runAt;
+            loadedarea::RelocationCell cell{};
+            loadedarea::RelocationDestination(vid, float(r.goal.x), float(r.goal.y), cell);
+            const bool destInView = vehiclekeep::InCameraView(r.goal.x, r.goal.y, r.goal.z);
+            logger::Write("OBS system=far.test event=start run=%u stage=1 vehicle=%08X driver=%08X distance=%.0f next_distance=%.0f max_distance=%.0f from=%.1f,%.1f,%.1f to=%.1f,%.1f,%.1f yaw=%.3f dir=%.3f,%.3f player=%.1f,%.1f,%.1f dest_in_camera_view=%d to_cell=%d,%d to_cell_loaded=%d hops_needed=%u rail_speed=%.1f source=%s",
+                r.id, vid, did, r.distance, farrail::TargetDistance(finished + 1), farrail::kMaxDistanceM, r.start.x, r.start.y, r.start.z, r.goal.x, r.goal.y, r.goal.z, r.yaw, r.dirX, r.dirY,
+                pp.x, pp.y, pp.z, destInView ? 1 : 0, cell.toX, cell.toY, cell.cellLoaded ? 1 : 0, farrail::HopsFor(r.distance), r.speed, "pending_probe");
+            NoteRelocationMark(vid, true);
+            r.phase = FarPhase::Probe;
+        }
+        void FarPress(uptr player)
+        {
+            switch (g_far.phase) {
+            case FarPhase::Idle: FarStart(player); break;
+            case FarPhase::Observe1: case FarPhase::Parked1: FarBeginRail("second_press"); break;
+            case FarPhase::Rail: FarBeginBack("press_during_rail"); break;
+            default: FarRefuse("busy_wait_for_the_current_step", g_far.vehicle, g_far.driver); break;
+            }
+        }
+        void FarReset()
+        {
+            if (g_far.phase != FarPhase::Idle) { vehicleflight::relocate::RailStop(); if (g_far.hopSerial) vehicleflight::relocate::Disarm(g_far.hopSerial); }
+            const auto finished = g_far.finished, id = g_far.id;
+            g_far = FarRun{}; g_far.finished = finished; g_far.id = id; g_farDown = false;
+        }
+        void FarTick(uptr player)
+        {
+            const bool down = g_farKey && Focused() && (GetAsyncKeyState(g_farKey) & 0x8000) != 0;
+            const bool pressed = down && !g_farDown;
+            g_farDown = down;
+            if (pressed && bindings::Allowed() && !hoverui::IsScannerOpen()) FarPress(player);
+            if (g_far.phase == FarPhase::Idle) return;
+            const ULONGLONG now = GetTickCount64();
+            if (FarLoadingScreen()) { FarAbandon("loading_screen_while_running"); return; }
+            switch (g_far.phase) {
+            case FarPhase::Probe:
+                if (FarProbeStep(now)) {
+                    FarProbeReport();
+                    logger::Write("OBS system=far.test event=out_begin run=%u distance=%.0f source=%s ride=%.2f", g_far.id, g_far.distance, farrail::SourceName(g_far.source), g_far.ride);
+                    SetRelocationPoseOwner(g_far.vehicle);
+                    g_relocPoseReleased = false;
+                    g_far.back = false; g_far.hops = 0;
+                    g_far.phase = FarPhase::Out;
+                }
+                break;
+            case FarPhase::Out: {
+                FarFill(g_far.distance + 200.0);
+                const char* why = "";
+                const auto res = FarHopTick(now, why);
+                if (res == FarHopResult::Failed) {
+                    const uptr v = RefById(g_far.vehicle), d = RefById(g_far.driver);
+                    vehicleflight::relocate::ChassisNow ch;
+                    const bool ok = vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch);
+                    logger::Write("OBS system=far.test event=hop_failed run=%u hop=%u phase=out reason=%s chassis=%.1f,%.1f,%.1f readable=%d seated=%d",
+                        g_far.id, g_far.hops, why, ch.pos[0], ch.pos[1], ch.pos[2], ok ? 1 : 0, (d && v && InVehicle(d) == v && SeatedNow(d, v, true)) ? 1 : 0);
+                    if (ok && v && d && InVehicle(d) == v) FarBeginBack("out_hop_failed"); else FarAbandon("out_hop_failed_not_recoverable");
+                } else if (res == FarHopResult::Arrived) {
+                    vehicleflight::relocate::ChassisNow ch;
+                    vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch);
+                    g_far.arrivalZ = ch.pos[2]; g_far.arrivedAt = now; g_far.sampleAt = 0; g_far.havePrev = false;
+                    vehicleflight::relocate::Disarm(g_far.hopSerial); g_far.hopSerial = 0; g_far.hopArmed = false;
+                    ReleaseRelocationPose();   // from here the engine-side systems (refile, wall pass, move-back) act as they would: that is what stage 1 observes
+                    loadedarea::RelocationCell cell{};
+                    const bool cellKnown = loadedarea::RelocationDestination(g_far.vehicle, float(ch.pos[0]), float(ch.pos[1]), cell);
+                    logger::Write("OBS system=far.test event=arrived run=%u hops=%u seconds=%.1f chassis=%.2f,%.2f,%.2f wanted=%.2f,%.2f,%.2f cell_known=%d from_cell=%d,%d to_cell=%d,%d to_cell_loaded=%d cross_cell=%d stage=1 observing_s=%.0f",
+                        g_far.id, g_far.hops, (now - g_far.runAt) / 1000.0, ch.pos[0], ch.pos[1], ch.pos[2], g_far.goal.x, g_far.goal.y, g_far.goal.z,
+                        cellKnown ? 1 : 0, cell.fromX, cell.fromY, cell.toX, cell.toY, cell.cellLoaded ? 1 : 0, cell.crossCell ? 1 : 0, farrail::kObserveSeconds);
+                    g_far.phase = FarPhase::Observe1;
+                }
+                break;
+            }
+            case FarPhase::Observe1: case FarPhase::Parked1: case FarPhase::Rail: {
+                const bool railOn = g_far.phase == FarPhase::Rail;
+                if (railOn) {
+                    vehicleflight::relocate::RailFacts rf;
+                    if (vehicleflight::relocate::RailRead(rf)) FarFill(rf.s + 200.0);
+                } else FarFill(g_far.distance + 200.0);
+                if (now - g_far.sampleAt < 500) break;
+                g_far.sampleAt = now;
+                farrail::Sample s; vehicleflight::relocate::ChassisNow ch;
+                const bool have = FarSample(now, railOn, s, ch);
+                (railOn ? g_far.tally2 : g_far.tally1).Add(s);
+                if (FarWatch(s, have, railOn)) break;
+                const double since = (now - (railOn ? g_far.railAt : g_far.arrivedAt)) / 1000.0;
+                if (railOn) {
+                    if (!g_far.summary2 && since >= farrail::kObserveSeconds) { FarSummary(2, g_far.tally2, false); g_far.summary2 = true; }
+                    if (since >= farrail::kRailAutoReturnS) FarBeginBack("rail_auto_return");
+                } else {
+                    if (!g_far.summary1 && since >= farrail::kObserveSeconds) { FarSummary(1, g_far.tally1, false); g_far.summary1 = true; g_far.phase = FarPhase::Parked1;
+                        logger::Write("OBS system=far.test event=parked run=%u hint=press_again_for_the_rail_or_wait_for_auto_return auto_return_in_s=%.0f", g_far.id, farrail::kParkedAutoReturnS - since); }
+                    if (since >= farrail::kParkedAutoReturnS) FarBeginBack("parked_auto_return");
+                }
+                break;
+            }
+            case FarPhase::Back: {
+                const char* why = "";
+                const auto res = FarHopTick(now, why);
+                if (res == FarHopResult::Failed) {
+                    vehicleflight::relocate::ChassisNow ch;
+                    vehicleflight::relocate::ReadChassisNow(g_far.vehicle, ch);
+                    logger::Write("OBS system=far.test event=hop_failed run=%u hop=%u phase=back reason=%s chassis=%.1f,%.1f,%.1f", g_far.id, g_far.hops, why, ch.pos[0], ch.pos[1], ch.pos[2]);
+                    FarAbandon("walk_back_failed");
+                } else if (res == FarHopResult::Arrived) {
+                    vehicleflight::relocate::Disarm(g_far.hopSerial); g_far.hopSerial = 0; g_far.hopArmed = false;
+                    ReleaseRelocationPose();
+                    NoteRelocationMark(g_far.vehicle, false);   // consumers act normally again: the next ten seconds ask whether the handoff to a fully real car is clean
+                    g_far.checkAt = now; g_far.sampleAt = 0; g_far.havePrev = false; g_far.chkSamples = g_far.chkLive = g_far.chkSeated = g_far.chkMoving = g_far.chkBroken = 0; g_far.chkMinZ = 1e18;
+                    logger::Write("OBS system=far.test event=returned run=%u hops=%u seconds=%.1f reason=%s", g_far.id, g_far.hops, (now - g_far.backAt) / 1000.0, g_far.backWhy);
+                    g_far.phase = FarPhase::Check;
+                }
+                break;
+            }
+            case FarPhase::Check: {
+                if (now - g_far.sampleAt < 500) break;
+                g_far.sampleAt = now;
+                farrail::Sample s; vehicleflight::relocate::ChassisNow ch;
+                FarSample(now, false, s, ch);
+                const bool broken = vehicleflight::CensusBroken(g_far.vehicle);
+                int jobPhase = -1, jobTask = -1;
+                for (const auto& j : g_jobs) if (j.vehicle == g_far.vehicle && j.phase != Phase::Idle) { jobPhase = int(j.phase); jobTask = int(j.task); break; }
+                ++g_far.chkSamples; g_far.chkLive += (s.physicsBound && s.physicsLive); g_far.chkSeated += s.seated; g_far.chkMoving += s.speed > 1.0; g_far.chkBroken += broken;
+                if (s.bodyReadable) g_far.chkMinZ = std::min(g_far.chkMinZ, s.z);
+                logger::Write("OBS system=far.test event=return_check run=%u t=%.1f physics_bound=%d live=%d seated=%d speed=%.1f census_broken=%d job_phase=%d job_task=%d z=%.2f start_z=%.2f",
+                    g_far.id, (now - g_far.checkAt) / 1000.0, s.physicsBound ? 1 : 0, s.physicsLive ? 1 : 0, s.seated ? 1 : 0, s.speed, broken ? 1 : 0, jobPhase, jobTask, s.z, g_far.start.z);
+                if (now - g_far.checkAt >= 10000) {
+                    const double fall = g_far.chkMinZ < 1e17 ? g_far.start.z - g_far.chkMinZ : 0.0;
+                    logger::Write("OBS system=far.test event=return_summary run=%u verdict=%s samples=%u live=%u seated=%u moving=%u census_broken=%u fall=%.1f stage_reached=%s",
+                        g_far.id, farrail::ReturnVerdict(g_far.chkSamples, g_far.chkLive, g_far.chkSeated, g_far.chkMoving, g_far.chkBroken, fall), g_far.chkSamples, g_far.chkLive, g_far.chkSeated,
+                        g_far.chkMoving, g_far.chkBroken, fall, g_far.summary2 ? "rail" : "no_rail");
+                    ++g_far.finished;
+                    logger::Write("OBS system=far.test event=done run=%u next_distance=%.0f", g_far.id, farrail::TargetDistance(g_far.finished));
+                    FarRelease("run_finished");
+                }
+                break;
+            }
+            default: break;
+            }
         }
 #endif
 
@@ -6001,7 +6920,12 @@ namespace npcvehicles
 		if (wdown && !g_walkDown) Force(player);
 		g_walkDown = wdown;
 #ifndef FVO_RELEASE
+        const bool fastDown=g_fastSeatKey&&Focused()&&(GetAsyncKeyState(g_fastSeatKey)&0x8000)!=0;
+        if(fastDown&&!g_fastSeatDown&&bindings::Allowed()&&!hoverui::IsScannerOpen()&&!InVehicle(player))FastSeatStart(player);
+        g_fastSeatDown=fastDown;
+        FastSeatTick(player);
         PairMoveKey(player);
+        FarTick(player);
 #endif
 		const bool xdown = g_exitKey && Focused() && (GetAsyncKeyState(g_exitKey) & 0x8000) != 0;
 		if (xdown && !g_exitDown) ExitAllJobs();
@@ -6469,6 +7393,29 @@ namespace npcvehicles
 		return player && v && DriverOf(v, player) != 0;
 	}
 
+    std::uint64_t RelocationMark(std::uint32_t vehicle)
+    {
+#ifndef FVO_RELEASE
+        std::lock_guard lock(g_relocMarkLock);
+        const auto found = g_relocMarks.find(vehicle);
+        return found == g_relocMarks.end() ? 0 : found->second;
+#else
+        (void)vehicle;
+        return 0;
+#endif
+    }
+
+    std::uint64_t PoseGeneration(std::uint32_t vehicle)
+    {
+#ifndef FVO_RELEASE
+        const auto value=g_relocPose.load(std::memory_order_acquire);
+        if(vehicle&&std::uint32_t(value)==vehicle)return 0;
+        return value>>32;
+#else
+        (void)vehicle;
+        return 1;
+#endif
+    }
 	bool RequestExit(std::uintptr_t actor, const vcontract::ExitRequest& req) { return StartExit(actor, req); }
 
 	int UnloadVehicle(std::uintptr_t vehicle, const vcontract::ExitRequest& req, bool includeDriver)
@@ -6946,6 +7893,81 @@ namespace npcvehicles
         return job && job->task == 9 && (job->phase == Phase::Boarding || job->phase == Phase::Following);
     }
 
+    static Job* SeatedFactoryStock(std::uintptr_t actor,std::uintptr_t vehicle,std::uint64_t lease)
+    {
+        if(!actor||!vehicle||IsDead(actor)||Disabled(vehicle))return nullptr;
+        const auto vehicleId=At<unsigned>(vehicle,off::kFormId),driverId=At<unsigned>(actor,off::kFormId);
+        auto* job=FactoryJob(vehicleId,driverId,lease);
+        if(!job||!job->factoryStock||job->task!=9||job->phase!=Phase::Following||job->questPending||
+           !job->factoryReleased||trafficpool::PlayerOwnsHandoff(vehicleId)||VehicleInCombat(vehicleId)||
+           !SeatedNow(actor,vehicle,InVehicle(actor)==vehicle))return nullptr;
+        const auto physics=vehicleflight::HandoffPhysics(vehicleId);
+        return physics.bound&&physics.live?job:nullptr;
+    }
+
+    bool FactoryStockTransferReady(std::uintptr_t actor,std::uintptr_t vehicle,std::uint64_t lease)
+    {
+        const auto* job=SeatedFactoryStock(actor,vehicle,lease);
+        return job&&vehicleflight::FactoryMotionProved(job->pilot,job->vehicle,lease);
+    }
+
+    bool FactoryStockTransferBusy(){return g_relocSerial!=0;}
+
+    std::uint64_t StartFactoryStockTransfer(std::uintptr_t actor,std::uintptr_t vehicle,std::uint64_t lease,
+        double x,double y,double z,double heading)
+    {
+        if(!FactoryStockTransferReady(actor,vehicle,lease))return 0;
+        const auto vehicleId=At<unsigned>(vehicle,off::kFormId),driverId=At<unsigned>(actor,off::kFormId);
+        if(auto found=g_stockTransfers.find(vehicleId);found!=g_stockTransfers.end()){
+            relocation::Receipt last{};
+            if(found->second.lease==lease&&(!g_reloc.LastFor(vehicleId,last)||last.serial!=found->second.serial||
+               last.result!=relocation::Result::Refused))return 0;
+            g_stockTransfers.erase(found);
+        }
+        const auto from=At<game::Vec3>(vehicle,off::kRefPosition);
+        const auto rotation=At<game::Vec3>(vehicle,off::kRefRotation);
+        const relocation::Pose target{x,y,z,heading};
+        const auto authority=trafficpool::CaptureWheelHandoff(vehicleId);
+        if(!authority)return 0;
+        const auto serial=ArmRelocation({vehicleId,driverId,{from.x,from.y,from.z,rotation.z},target},
+            "factory_stock_delivery",authority);
+        if(serial)g_stockTransfers[vehicleId]={driverId,lease,serial,target};
+        return serial;
+    }
+
+    bool PromoteFactoryStockTransfer(std::uintptr_t actor,std::uintptr_t vehicle,std::uint64_t lease,
+        std::uint64_t serial,double x,double y,double z,double heading,const FvoTripClaim& claim)
+    {
+        if(!claim.step||!claim.user||!serial)return false;
+        auto* job=SeatedFactoryStock(actor,vehicle,lease);
+        if(!job)return false;
+        const auto vehicleId=job->vehicle;
+        const auto grant=g_stockTransfers.find(vehicleId);
+        if(grant==g_stockTransfers.end()||grant->second.driver!=job->npc||grant->second.lease!=lease||
+           grant->second.serial!=serial||grant->second.target.x!=x||grant->second.target.y!=y||grant->second.target.z!=z||
+           grant->second.target.yaw!=heading)return false;
+        relocation::Receipt receipt{};
+        if(!g_reloc.LastFor(vehicleId,receipt)||receipt.epoch!=g_relocEpoch||receipt.serial!=serial||
+           receipt.driver!=job->npc||receipt.result!=relocation::Result::Applied||!receipt.seatedAfter||
+           !receipt.physicsLive||receipt.stepAfter<=receipt.stepBefore)return false;
+        const auto at=At<game::Vec3>(vehicle,off::kRefPosition);
+        if(!std::isfinite(at.x)||!std::isfinite(at.y)||!std::isfinite(at.z)||
+           relocation::Distance({at.x,at.y,at.z},grant->second.target)>2.0)return false;
+
+        vehicleflight::RebaseFactoryMotionAfterTransfer(job->pilot,vehicleId,lease);
+        job->trip=claim;
+        job->factoryLease=0;
+        job->factoryReleased=job->factoryStock=false;
+        job->homeX=at.x;job->homeY=at.y;job->haveHome=true;
+        job->originX=at.x;job->originY=at.y;job->haveOrigin=true;
+        job->since=job->taskAt=job->watchAt=job->watchTickAt=GetTickCount64();
+        routeguidance::Clear(job->pilot);
+        g_stockTransfers.erase(grant);
+        logger::Write("OBS system=factory.lease vehicle=%08X driver=%08X event=promoted token=%llu pilot=%d relocation_serial=%llu",
+            vehicleId,job->npc,static_cast<unsigned long long>(lease),job->pilot,static_cast<unsigned long long>(serial));
+        return true;
+    }
+
     bool DepartFactoryLease(std::uintptr_t actor, std::uintptr_t vehicle, std::uint64_t token)
     {
         if (!actor || !vehicle) return false;
@@ -6968,6 +7990,7 @@ namespace npcvehicles
     bool CancelFactoryLease(unsigned vehicle, unsigned driver, std::uint64_t token)
     {
         if (!FactoryJob(vehicle, driver, token)) return false;
+        g_stockTransfers.erase(vehicle);
         logger::Write("OBS system=factory.lease vehicle=%08X driver=%08X event=cancelled token=%llu reason=request",
             vehicle, driver, token);
         return EndJobOf(vehicle, "factory private lease cancelled");
@@ -7480,7 +8503,11 @@ namespace npcvehicles
 	void Reset()
 	{
 #ifndef FVO_RELEASE
-        g_testPairVehicle=0;g_testPairDriver=0;g_pairMoveDown=false;++g_relocEpoch;if(g_relocSerial)vehicleflight::relocate::Disarm(g_relocSerial);g_relocSerial=0;g_relocIssued=false;
+        g_fastSeat={};g_fastSeatDrivers.clear();g_fastSeatEvidence.clear();g_fastSeatDown=false;
+        g_fastSeatMoveVehicle=g_fastSeatMoveDriver=0;g_fastSeatMoveLease=0;
+        g_testPairVehicle=0;g_testPairDriver=0;g_pairMoveDown=false;
+        g_pairMoveReceipt=0;g_pairMoveObservation={};
+        ++g_relocEpoch;FinishRelocation();g_stockTransfers.clear();FarReset();
 #endif
 		g_passengerRequest = 0; g_passengerAttempt = {};
 		g_boardVehicle = 0; g_boardKeyword = 0; g_boardUntil = 0;

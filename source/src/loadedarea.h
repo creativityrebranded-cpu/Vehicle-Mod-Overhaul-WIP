@@ -34,4 +34,29 @@ namespace loadedarea
 	// Main thread: something moved an FVO-flown vehicle by (dx, dy, dz) without its driver (the game's vehicle build drops a
 	// vehicle onto ground within ~45 m): its job's driver, if seated in it, is moved by the same amount. True when moved.
 	bool CarryDriverOf(std::uint32_t vehicleId, float dx, float dy, float dz);
+
+	// Cross-cell relocation (2026-11-20, notes/RELOCATION_DOER_AND_COMMUNICATOR_20261120.md). Main thread only. These add no engine routine: the move
+	// of the chassis reference into the destination cell is the existing service path (Refile: FUN_140B48CA0 after the position setter, exactly what
+	// SyncOne queues for any flown vehicle that crosses a cell edge). The seated driver follows by the same direct write as every flown driver
+	// (CarryDriver); a seated actor is never refiled (the game's actor mover unseats it: 2026-10-30, 16:55 run).
+	struct RelocationCell {
+		bool known = false;        // the vehicle reference resolved and is listed in an exterior grid cell
+		bool crossCell = false;    // (x, y) is in another grid cell than the one it is listed in
+		bool cellLoaded = false;   // the cell at (x, y) exists now (FUN_140595DF0 without create)
+        bool cellAttached = false; // the cell actually reports the same attachment state used by the world inventory
+		int fromX = 0, fromY = 0, toX = 0, toY = 0;
+	};
+	bool RelocationDestination(std::uint32_t vehicleId, float x, float y, RelocationCell& out);
+	// Queue the existing cell move of the chassis reference to (x, y, z) and carry its driver. False: nothing queued (pose owner still holds the
+	// vehicle, no reference, or already queued). Call after the relocation pose owner released the vehicle.
+	bool RefileRelocated(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z);
+	// Fleet rail outside the attached cells (2026-11-21): queue a move of the chassis reference to (x, y, z) even inside its listed
+	// cell, refiling it when the point is in another existing cell, and carry its seated driver. Same service path as RefileRelocated.
+	bool StepReference(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z);
+	struct RelocationSettle {
+		bool refKnown = false, listedGrid = false, inDestinationCell = false, atTarget = false;
+		float gap = 0;             // m between the chassis reference and (x, y, z)
+	};
+	// Where the chassis reference stands now against the destination: settled when it is at the target and listed in the destination's cell.
+	bool RelocationSettled(std::uint32_t vehicleId, float x, float y, float z, RelocationSettle& out);
 }

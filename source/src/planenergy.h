@@ -61,31 +61,6 @@ struct Result {
     bool factorySpotPulse = false;            // this temporary result needs a matching live request
 };
 
-// A factory stock goal is an intentional hold with an optional scored test
-// pulse. No general navigation or recovery candidate can leave the bay.
-inline energyplan::Result SolveFactoryGoal(const bicycle::State& car, const bicycle::Spec& spec,
-                                           const planscene::Scene& scene, double now,
-                                           const energyplan::TestPulse& pulse) {
-    energyplan::Result held;
-    if (pulse.active) {
-        energyplan::Memory testMemory;
-        auto tested = energyplan::Plan(car, spec, 0, scene, testMemory, now, {}, std::nan(""),
-            nullptr, energyplan::Serial, &pulse);
-        if (tested.pulse) return tested;
-        held.testRefused = tested.testRefused;
-    }
-    held.best.kind = "factory private hold";
-    held.best.count = 1;
-    held.best.seg[0] = {car.input, 0, energyplan::kSteps * energyplan::kDt};
-    held.energy = energyplan::Score(held.best, car, spec, 0, scene, {}, nullptr, now, held.terms,
-        held.traj, held.minClearance);
-    held.ok = std::isfinite(held.energy);
-    held.candidates = 1;
-    held.feasible = int(held.ok);
-    held.why = held.best.kind;
-    return held;
-}
-
 // In Follow, track the lane that the rollout is trying to reach. Taking feed-forward curvature from the
 // rollout itself makes the correction depend on the latest yaw even while the lane and the decision are held.
 // Keep that rollout in Result::path. The local centre path is strictly a steering reference, not a second plan.
@@ -162,6 +137,7 @@ inline bool MaySubmit(double now, double lastAt, int inFlight) { return inFlight
 #if !defined(PLANENERGY_PURE)  // tests include only the pure part above (removal 2026-11-14: player builds plan too)
 #include "planinput.h"
 #include "corridor.h"
+#include "relocationconsumers.h"  // the relocation receipt: Plan drops its memory once per applied serial
 #include "log.h"
 #include <windows.h>
 #include <latch>
@@ -177,6 +153,7 @@ struct Snapshot {
     // A budgeted snapshot (a car other than yours: one thread, counted in g_plansInFlight), and for a car with no lane its goal scene inputs.
     bool floorPointCleared = false;
     const char* trafficHoldReason = "";
+    relocrebase::Event relocation;  // the vehicle's latest applied relocation, read on the game thread when the job was queued
     bool budgeted = false;
     bool goal = false; planinput::GoalAsk goalAsk; std::vector<planinput::FloorPoint> goalFloor; double want = 0;
 };
@@ -212,6 +189,7 @@ struct Driver {
     // Step 6: the car this driver plans for (memory and field restart when it changes, or between lane and goal scenes), and the game-thread
     // budget bookkeeping (only touched by the game thread).
     std::uint32_t vehicle = 0; bool goalKind = false;
+    relocrebase::Seen relocSeen;  // plan worker only: the last relocation serial this slot re-based on
     double submitAt = -1e9, floorRetryUntil = 0;
 };
 // Step 6: one driver per pilot slot (0 = your car: ED-1's driver, unchanged), made when first used.
@@ -320,8 +298,7 @@ inline void PlanGoal(Driver& d, Snapshot& s, std::chrono::steady_clock::time_poi
     { std::lock_guard lk(d.lock); field = d.field; fieldAt = d.fieldAt; gx = d.fieldGoalX; gy = d.fieldGoalY; }
     const double ageS = field ? (GetTickCount64() - fieldAt) / 1000.0 : 1e9;
     const bool carNearEdge = field && FieldStale(true, s.car.x, s.car.y, field->x0, field->y0, field->p.size, 0, 1e9, 10.0, 1e9);
-    if (!s.goalAsk.factoryHold &&
-        (!field || ageS > 2.0 || carNearEdge || std::hypot(gx - s.goalAsk.goal.x, gy - s.goalAsk.goal.y) > 3.0)) {
+    if (!field || ageS > 2.0 || carNearEdge || std::hypot(gx - s.goalAsk.goal.x, gy - s.goalAsk.goal.y) > 3.0) {
         double cx = s.goalAsk.goal.x, cy = s.goalAsk.goal.y;  // the window: between the car and the field's goal (the goal, or the mark)
         if (!scene.goalFinal && !scene.route.empty() && scene.route.back().station > 1e-6) {
             const double f = scene.goalStation / scene.route.back().station; cx = s.car.x + (cx - s.car.x) * f; cy = s.car.y + (cy - s.car.y) * f; }
@@ -329,23 +306,14 @@ inline void PlanGoal(Driver& d, Snapshot& s, std::chrono::steady_clock::time_poi
         { std::lock_guard lk(d.lock); d.field = built; d.fieldAt = GetTickCount64(); d.fieldGoalX = s.goalAsk.goal.x; d.fieldGoalY = s.goalAsk.goal.y; }
         field = built;
     }
-    energyplan::TestPulse pulse;
-    if (s.goalAsk.factoryHold && s.frame.test.active && s.frame.test.factory) {
-        pulse.active = true;
-        pulse.speed = -std::fabs(s.frame.test.speed);
-    }
-    const auto p = s.goalAsk.factoryHold ? SolveFactoryGoal(s.car, s.spec, scene, s.nowS, pulse)
-        : energyplan::Plan(s.car, s.spec, s.want, scene, d.memory, s.nowS, {}, std::nan(""),
-            scene.travel == 2 ? nullptr : field.get(), energyplan::Serial);
+    const auto p = energyplan::Plan(s.car, s.spec, s.want, scene, d.memory, s.nowS, {}, std::nan(""),
+        scene.travel == 2 ? nullptr : field.get(), energyplan::Serial);
     r.ok = p.ok; r.why = p.why; r.energy = p.energy; r.clearance = p.minClearance; r.gears = p.gearChanges; r.feasible = p.feasible; r.candidates = p.candidates; r.field = field != nullptr;
     r.path = DrivenPath(p.traj, energyplan::kSteps + 1, r.reverse);
     r.hoverPath = hoverfollow::FromTraj(p.traj, energyplan::kSteps + 1, energyplan::kDt);
     r.speed = p.first.speed; r.hover = p.firstMode == 1 || p.traj[1].mode == 1;
     if (r.reverse && r.speed > 0) r.speed = 0; if (!r.reverse && r.speed < 0) r.speed = 0;
-    r.pulse = p.pulse; r.testRefused = p.testRefused;
-    r.factorySpotPulse = p.pulse && s.frame.test.factory;
-    if (p.pulse || p.testRefused) r.spotPulseSerial = s.frame.test.serial;
-    r.kept = p.kept; r.rival = p.rival; r.rivalGap = p.rivalGap; r.switchWhy = p.switchWhy; r.offset = p.offset; r.speedAhead = r.factorySpotPulse ? r.speed : p.speedAhead; r.terms = p.terms; for (int q = 0; q < 6; ++q) r.rel[q] = p.rel[q]; r.fullSpeed = p.fullSpeed; r.fullEnergy = p.fullEnergy; r.fullTerms = p.fullTerms;
+    r.kept = p.kept; r.rival = p.rival; r.rivalGap = p.rivalGap; r.switchWhy = p.switchWhy; r.offset = p.offset; r.speedAhead = p.speedAhead; r.terms = p.terms; for (int q = 0; q < 6; ++q) r.rel[q] = p.rel[q]; r.fullSpeed = p.fullSpeed; r.fullEnergy = p.fullEnergy; r.fullTerms = p.fullTerms;
     r.rejectKinds = p.rejectKinds; for (int q = 0; q < p.rejectKinds; ++q) { r.rejectName[q] = p.rejectName[q]; r.rejectCount[q] = p.rejectCount[q]; } r.startGrade = p.startGrade; r.maxGrade = p.maxGrade; r.floorSetAside = p.floorSetAside;
     r.laneSpeedCount = p.laneSpeedCount; for (int q = 0; q < p.laneSpeedCount; ++q) r.laneSpeeds[q] = p.laneSpeeds[q];
     r.workerMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -405,6 +373,14 @@ inline void CALLBACK PlanWork(PTP_CALLBACK_INSTANCE inst, void* ctx) {
         auto& s = job->s; auto& f = s.frame; f.field = s.field.data(); f.fieldCount = int(s.field.size());
         // Step 6: a different car in this slot, or a switch between lane and goal scenes: the memory and the field are that car's no longer.
         if (d.vehicle != s.vehicle || d.goalKind != s.goal) { d.memory = {}; d.floorRetryUntil = 0; d.corridorShift = 0; d.corridorAt = -1; d.corridorMemory = {}; std::lock_guard lk(d.lock); d.field.reset(); d.vehicle = s.vehicle; d.goalKind = s.goal; }
+        // Relocation receipt (applied, once per serial, this vehicle only): the committed plan, its memory, the corridor edges, the cost-to-go field and the
+        // swept trail all describe the old surroundings. Dropped here; the plan below starts fresh at the destination. Plan decides nothing about the move.
+        if (relocrebase::Take(d.relocSeen, s.relocation, s.vehicle)) {
+            d.memory = {}; d.floorRetryUntil = 0; d.corridorShift = 0; d.corridorAt = -1; d.corridorMemory = {}; d.stillSince = -1; d.physicalStallLogged = false;
+            { std::lock_guard lk(d.lock); d.field.reset(); d.sweptTrail.clear(); d.sweepVehicle = 0; }
+            logger::Write("OBS system=plan.energy event=rebased vehicle=%08X serial=%llu epoch=%llu to=%.2f,%.2f,%.2f reason=relocation_receipt_applied_plan_memory_corridor_field_and_swept_trail_dropped",
+                s.vehicle, static_cast<unsigned long long>(s.relocation.serial), static_cast<unsigned long long>(s.relocation.epoch), s.relocation.to[0], s.relocation.to[1], s.relocation.to[2]);
+        }
         const energyplan::ForEach scoring = s.budgeted ? energyplan::ForEach(energyplan::Serial) : energyplan::ForEach(PoolForEach);  // budgeted cars: one thread each
         if (s.goal) PlanGoal(d, s, start);
         else {
@@ -533,6 +509,7 @@ inline void CALLBACK PlanWork(PTP_CALLBACK_INSTANCE inst, void* ctx) {
 
 // Hand a job to the pool; false (and the job freed) when it could not be submitted.
 inline bool Queue(std::unique_ptr<PlanJob> job) {
+    job->s.relocation = relocconsumers::Poll(job->s.vehicle);   // game thread: the Coordinator is read where it is written
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(&PlanWork), &job->module)) return false;
     auto* raw = job.release(); if (TrySubmitThreadpoolCallback(PlanWork, raw, nullptr)) return true;
     FreeLibrary(raw->module); delete raw; return false;
@@ -585,7 +562,7 @@ inline bool SubmitLane(int slot, std::uint32_t vehicle, const planrun::Frame& f,
 // D13: a car with no lane, from its goal, World shapes and measured floor points. Same budget.
 inline bool SubmitGoal(int slot, std::uint32_t vehicle, const planinput::GoalAsk& ask, const std::vector<planworld::Shape>& shapes,
                        const std::vector<planinput::FloorPoint>& floor, const bicycle::State& car, const bicycle::Spec& spec, double want,
-                       double nowS, const spottest::Ask& test = {}) {
+                       double nowS) {
     auto& d = For(slot);
     if (!budget::MaySubmit(nowS, d.submitAt, g_plansInFlight.load(std::memory_order_relaxed))) return false;
     if (d.planBusy.test_and_set(std::memory_order_acquire)) return false;
@@ -593,7 +570,6 @@ inline bool SubmitGoal(int slot, std::uint32_t vehicle, const planinput::GoalAsk
     try {
         auto job = std::make_unique<PlanJob>(); job->d = &d; auto& s = job->s;
         s.vehicle = vehicle; s.goal = true; s.goalAsk = ask; s.shapes = shapes; s.goalFloor = floor; s.car = car; s.spec = spec; s.want = want;
-        s.frame.test = test;
         s.budgeted = true; s.nowS = GetTickCount64() / 1000.0; s.frame.now = ask.now;
         if (Queue(std::move(job))) return true;
     } catch (...) {}

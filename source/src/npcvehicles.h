@@ -30,6 +30,10 @@ namespace npcvehicles
 	bool BeginPlayerExit();
 	// Every vehicle an NPC job has (not idle) and its NPC (form ids); returns how many were written. Main thread.
 	int FlownVehicles(std::uint32_t* vehicles, std::uint32_t* drivers, int max);
+    std::uint64_t PoseGeneration(std::uint32_t vehicle); // Zero while the relocation doer owns this pose.
+    // Changes when a relocation of this vehicle starts and when it ends (low bit set while it is in progress); 0 = never relocated (always in
+    // release builds). Consumers that compare positions over time re-base their baseline when it changes. Main thread.
+    std::uint64_t RelocationMark(std::uint32_t vehicle);
 	// The pilot (1..) whose NPC drives this vehicle (a job following), else 0.
 	int PilotFor(std::uint32_t vehicleId);
 	// Anyone (a job NPC, a gang driver, a stranger) sits in the driver seat of this vehicle.
@@ -139,6 +143,12 @@ namespace npcvehicles
     std::uint64_t StartFactoryLease(std::uintptr_t actor, std::uintptr_t vehicle, const FvoTripClaim& claim);
     std::uint64_t StartFactoryStockLease(std::uintptr_t actor, std::uintptr_t vehicle);
     bool CheckFactoryLease(unsigned vehicle, unsigned driver, std::uint64_t token);
+    bool FactoryStockTransferReady(std::uintptr_t actor, std::uintptr_t vehicle, std::uint64_t lease);
+    bool FactoryStockTransferBusy();
+    std::uint64_t StartFactoryStockTransfer(std::uintptr_t actor, std::uintptr_t vehicle, std::uint64_t lease,
+        double x, double y, double z, double heading);
+    bool PromoteFactoryStockTransfer(std::uintptr_t actor, std::uintptr_t vehicle, std::uint64_t lease,
+        std::uint64_t serial, double x, double y, double z, double heading, const FvoTripClaim& claim);
     bool DepartFactoryLease(std::uintptr_t actor, std::uintptr_t vehicle, std::uint64_t token);
     bool CancelFactoryLease(unsigned vehicle, unsigned driver, std::uint64_t token);
     void FactoryLeaseReleased(unsigned vehicle);

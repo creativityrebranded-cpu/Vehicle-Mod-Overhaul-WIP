@@ -196,12 +196,10 @@ struct GoalAsk {
     double now = 0, carX = 0, carY = 0, carBase = 0, halfLength = 2.3, stopGap = 1.0;
     planscene::Scene::Goal goal;
     int travel = 0; bool hoverPossible = true; double facing = std::numeric_limits<double>::quiet_NaN();
-    bool factoryHold = false;
 };
 inline planscene::Scene GoalScene(const GoalAsk& a, const planworld::Shape* shapes, int count, const FloorPoint* floorPts, int floorCount) {
     planscene::Scene scene;
     scene.travel = a.travel; scene.hoverPossible = a.hoverPossible; scene.facing = a.facing;
-    scene.managerHeld = a.factoryHold;
     std::vector<FloorPoint> floor(floorPts, floorPts + std::max(0, floorCount));
     scene.floor = [floor = std::move(floor)](double x, double y, double& z) {
         double best = 36; bool found = false;

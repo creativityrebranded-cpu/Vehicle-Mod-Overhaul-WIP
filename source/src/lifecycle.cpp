@@ -170,9 +170,9 @@ std::size_t Outstanding(const char* operation) {return requests.Outstanding(oper
 bool Pending(unsigned id,const char* operation) {HandOff();return requests.Pending(id,operation?operation:"");}
 bool Post(const std::string& key,unsigned id,const std::function<Work()>& factory) {
     HandOff();
-    // Finished posts are purged before the lookup, so a value here only means the table was full.
     tCurrentKey=key.c_str();
-    const bool taken=!requests.Poll(key,id,factory,Submit,true);
+    bool taken=false;
+    requests.Poll(key,id,factory,Submit,true,true,&taken);
     tCurrentKey=nullptr;
     logger::ObserveReference("lifecycle.post",id,unsigned(taken),"key=%s accepted_or_pending=%d outstanding=%zu in_service=%d",key.c_str(),taken,requests.Outstanding(""),InService());
     ReportRefused(key);return taken;

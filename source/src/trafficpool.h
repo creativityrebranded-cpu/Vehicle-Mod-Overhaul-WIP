@@ -1,15 +1,24 @@
 #pragma once
 #include <cstdint>
+#include <vector>
+#ifndef FVO_RELEASE
+#include <optional>
+namespace trafficpair { struct SeatPose; }
+#endif
 // Stable traffic fleet facade: the addon reconciles configuration and the core validates engine actions.
 namespace trafficpool
 {
 	void Tick();   // main thread, every frame
 	bool WellHiddenFar(unsigned vehicleId,double distance);  // past the distance that vehicle can be made out at
-	bool PutBack(unsigned id,double x,double y,double z);    // back to where it was, no sight check: undoes the game's own move (vehiclediag)
+	bool PutBack(unsigned id,double x,double y,double z,std::uint64_t generation); // Undo a builder drop under the same active birth hold.
 	int PairHealth(unsigned vehicleId);  // trafficpair::PairHealth as an int; a vehicle that is no traffic pair is 0 (unproven)
 	void Reset();  // a save load
 	bool MayHideParked(unsigned id,const char* reason,bool protectedPlacement);
 	bool MadeVehicle(std::uint32_t id);  // the traffic addon made or reused it since the load
+#ifndef FVO_RELEASE
+    std::optional<std::uint64_t> FastSeatBirth(unsigned vehicle, std::uint64_t trial,
+        const trafficpair::SeatPose& offset, std::uint64_t requestedAt);
+#endif
     void WorldActionsAllowed(bool allowed); // main scheduler: false during save loads and world teardown
     void ArrivalChecks(int& rayChecked,int& mapOnly,bool reset); // arrival placements since the last reset, by clearance check
 	// Start/Swap requests reconciliation; existing identities and live trips are retained.
@@ -27,6 +36,8 @@ namespace trafficpool
 	// KO-1 (2026-11-08): the player took this vehicle (pull-out, hand-over, hijack); traffic lets go of it and its birth hold releases to the player.
 	void NotePlayerTook(unsigned vehicle, const char* why);
     bool PlayerOwnsHandoff(unsigned vehicle);
+    std::vector<unsigned> SavePlayerTakeovers();
+    void RestorePlayerTakeovers(const std::vector<unsigned>& vehicles);
     std::uint64_t CaptureWheelHandoff(unsigned vehicle);
 	void ReloadFiles();
 }

@@ -2,8 +2,9 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current packaged version: **1.2.1**, with Traffic Addon 0.3.1, as a prerelease (Starfield 1.16.244, SFSE). The mod is listed on Nexus as *Flying Vehicle Overhaul*; this repository was
-first named *Vehicle Mod Overhaul*.
+Current packaged version: **1.3.0**, with Traffic Addon 0.4.0, as a prerelease that has passed offline checks only and has **not been run in
+game** (Starfield 1.16.244, SFSE). The previous release is 1.2.4 with Traffic Addon 0.3.1 (tag `v1.2.4`). The mod is listed on Nexus as
+*Flying Vehicle Overhaul*; this repository was first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
 map marker, or let a follower drive it. Followers jump into vehicles to defend you, enemies take vehicles to hunt you down, and
@@ -12,6 +13,19 @@ outside a fight the people around you drive, patrol and run errands on their own
 > **Work in progress.** Much of this mod is built but has **not been tested in game yet**. Every feature below is marked
 > **Tested** or **Untested**, and the [Status](#status) section lists exactly what has and has not been tried. Expect bugs, and please
 > send your log when something goes wrong (see [Reporting a problem](#reporting-a-problem)).
+
+## Mod Atlas
+
+The Mod Atlas is a node map of how the whole mod decides things, from the frame loop to traffic births, with links to the source
+lines behind every node.
+
+- **[Open the interactive Mod Atlas](https://raw.githack.com/creativityrebranded-cpu/Vehicle-Mod-Overhaul-WIP/main/docs/atlas/MOD_ATLAS.html)**
+  in your browser. Start with *Whole-mod decision map* and select a node to open its subsystem; source links open the file here on
+  GitHub.
+- [Text index](docs/atlas/MOD_ATLAS.md) of every view, node, code location and log line, readable directly on GitHub.
+- Offline: download [docs/atlas/MOD_ATLAS.html](docs/atlas/MOD_ATLAS.html) and open it in any browser.
+
+The atlas describes the 1.3.0 source (refreshed 2026-11-21).
 
 ---
 
@@ -35,7 +49,7 @@ outside a fight the people around you drive, patrol and run errands on their own
 | **Vehicle health** | Every compatible vehicle takes damage and wrecks at 0 health, occupied or empty; a seated driver takes a share of damage | Latest hit fixes need live verification |
 | **Friendly-fire protection** | Allied vehicle shots/rams and attributed native actor damage are blocked | Offline checks pass; needs live verification |
 | **NPC air ejection** | Wrecked NPC occupants and the airborne exit command release the seat without waiting for a landing | Offline checks pass; needs live verification |
-| **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Untested |
+| **Everyday traffic** | Outside fights, NPCs drive to far destinations, share rides, patrol outposts and run supply trips | Not in 1.3.0 (removed from the Traffic Addon); still in 1.2.x |
 | **Vehicles respect each other** | No more vehicles "magnetised" together; right of way decides who gives way | Untested |
 | **No more wall magnet** | Walls no longer pull the hover up their face; they become an early warning instead | Untested |
 | **Shared 3D navigation** | Altitude cost fields guide local trajectory plans; bounded recovery holds failed trips with Retry / Skip and T T (clear) | Untested in game; offline checks pass |
@@ -82,7 +96,7 @@ before installing or upgrading.
 
 ## Installation
 
-Release 1.2.1 is organized in a version folder with a main ZIP, separate optional
+Release 1.3.0 is organized in a version folder with a main ZIP, separate optional
 Extra Vehicles and Parked Vehicles patch ZIPs, and an alternative all-in-one
 FOMOD ZIP. Matching source and hashes are alongside them. See
 [release packaging](docs/RELEASE_PACKAGING.md). Published 0.73.0 archives predate
@@ -144,6 +158,26 @@ Version 0.73.0 gives each command its own binding row. Rebinding a row preserves
 Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation names; Xbox Cross/Circle/Square/Triangle are A/B/X/Y. Native aim, fire and look remain on the game's controls. Physical flight is experimental.
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
+
+## What's new in 1.3.0 (Traffic Addon 0.4.0)
+
+- **One traffic system:** every traffic car is a real vehicle with a real driver, moved by the core on a rail path or by the existing
+  autopilot. Empty route positions fill under the loading screen and the X panel, and in play real shortfalls near you are replaced.
+  Rings of visibility decide which cars and positions are served first; they never refuse a car.
+- **Removed:** the factory and below-world stock, landing spots, the virtual "dot" traffic, the spare-reuse teleport and every
+  fallback for older cores. Everyday NPC trips are not in 1.3.0.
+- **Update together:** Traffic Addon 0.4.0 needs core 1.3.0 (with an older core it loads but makes no traffic). Core 1.3.0 still
+  accepts the published Traffic Addon 0.3 and 0.3.1.
+- **Old saves:** saves, profiles, journeys, fleet snapshots and settings keep their readers. Cars left by the removed systems are
+  cleaned up once when a save loads.
+- **Validation:** offline checks only (all runnable test programs and mixed-DLL loading pass). Not run in game yet.
+
+Details: [release notes](docs/RELEASE_1.3.0.md).
+
+## What's new in 1.2.4 (Traffic Addon 0.3.1)
+
+Nexus bug fixes: menus keep their keys, loading a save from a running game, vehicles without a chassis after a reload, saved
+hover, passenger control. Details: [release notes](docs/RELEASE_1.2.4.md).
 
 ## What's new in 1.2.1 (Traffic Addon 0.3.1)
 
@@ -508,6 +542,8 @@ These follow-up changes need a game restart and live verification.
 ---
 
 ## Everyday traffic (outside fights)
+
+> Not in 1.3.0: everyday NPC trips were removed from the Traffic Addon. This section describes 1.2.x with Traffic Addon 0.3.1.
 
 When nobody near you is fighting, NPCs within 200 m use vehicles on their own (at most 2 at a time, so fights always have vehicles free):
 

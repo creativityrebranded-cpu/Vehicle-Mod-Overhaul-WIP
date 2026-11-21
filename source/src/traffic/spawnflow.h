@@ -21,7 +21,6 @@
 namespace spawnflow {
 // The rules table: every spawn decision value (mandate card item 7).
 namespace rules {
-inline constexpr double factoryPoseHorizontal = 2.0, factoryPoseVertical = 2.5;
 inline constexpr double dropMargin = .3;            // m: births stand this far above the field floor and drop (user, 2026-11-06)
 inline constexpr int maxCreatePerTick = 1;          // Arbiter: at most one create request per tick
 inline constexpr int maxWaitingCovered = 12;        // Arbiter: pairs still being proved at once (loading screen / X panel)
@@ -40,34 +39,25 @@ inline constexpr unsigned long long seatedNoTripMs = 60000;  // SR-2 Health: sea
 inline constexpr unsigned long long emptyConfirmMs = 30000;  // EV-1 Health: a handed-off traffic vehicle with nobody of its pair in the seat this long (play) is empty
 inline constexpr unsigned long long readinessEveryMs = 5000;  // Ledger: a waiting pair's readiness line
 // Card CP-1: Retirement by camera prediction (settings.ini [traffic] removeByCameraPrediction=1; default off = far and out of sight only).
-inline constexpr unsigned long long noStepsHoldMs = 5000;  // PF-1 Health: a pilot with no physics steps this long (play time) is a self-reported fault
 inline constexpr double predictSeconds = 0.5;       // Retirement: a half must stay out of view this long ahead, camera turn extrapolated
 inline constexpr double fallVisibilityRadius = 72.0;  // Retirement: covers the existing 40 m per-axis bounds plus hull padding
 inline constexpr double undergroundClearance = 200.0;  // Retirement: a confirmed fallen model this far under baked terrain counts as concealed
-// Test spawn around the player (card TS1; settings.ini [diagnostics] spawnNearPlayer=1; never in FVO_RELEASE builds).
-inline constexpr int maxWaitingPlay = 4;            // Arbiter in play: pairs still being proved at once
-inline constexpr int maxLookPlay = 4;               // Arbiter in play: slots looked at per tick
-inline constexpr double testRadius = 220.0;         // Demand: route positions within this of the player
-inline constexpr double testSpacing = 35.0;         // Demand: at least this far apart
-inline constexpr int testCount = 10;                // Demand: at most this many
-inline constexpr double testReplan = 120.0;         // Demand: re-planned when the player has moved this far
-inline constexpr double testLeaveBehind = 420.0;    // Health: a pair this far from the player is left behind (retired out of sight)
-}
-
-// Factory Siting checks the live reference against the authored bay or road join.
-inline bool FactoryPose(double dx, double dy, double dz) {
-    return std::hypot(dx, dy) <= rules::factoryPoseHorizontal &&
-           std::abs(dz) <= rules::factoryPoseVertical;
+// Live road fill in play (LV-3, 2026-11-20; replaces the test-only spawnNearPlayer mode, card TS1): the Arbiter's play limits. Every value is a first,
+// conservative choice: no creation cost was ever logged (the 2026-11-20 22:49 X fill: chassis 0.28 s and driver 0.12 s from queue to completion, no frame
+// data), so the build logs traffic.live create_ms and tick_ms for the next run to measure.
+inline constexpr int maxWaitingPlay = 2;            // Arbiter in play: pairs still being proved at once
+inline constexpr int maxLookPlay = 8;               // Arbiter in play: slots looked at per tick (checks are cheap; one create per tick at most)
+inline constexpr double liveRadius = 240.0;         // Demand: a slot within this horizontal distance of the player is in the live stretch (the loaded area's wall is ~250 m: loadedarea notes)
 }
 
 // ---------- 1 Window: when spawning may happen ----------
-struct Window { bool open = false, cover = false; const char* why = ""; };
+struct Window { bool open = false, cover = false; const char* why = ""; bool live = false; };  // live: the play road window (LV-3); generator.cpp builds Windows by aggregate {open, cover, why}
 // screen: 3 loading screen, 2 local map / X panel, 1 play, 0 none. reset: X's fill is running. clockPending: routes wait for the clock.
-// testNear: the test switch (card TS1) also opens it in play.
-inline Window WindowNow(int screen, bool reset, bool clockPending, bool testNear = false, bool panelCover = true) {
+// live: the play rule (spawnrule::LiveOpen, decided by the caller from the settle time) also opens it in play, for the road fill only.
+inline Window WindowNow(int screen, bool reset, bool clockPending, bool live = false, bool panelCover = true) {
     Window w; w.cover = screen >= 2;
     if (!screen) { w.why = "no_screen"; return w; }
-    if (testNear && screen == 1 && !clockPending) { w.open = true; w.why = "test_near_player"; return w; }
+    if (live && screen == 1 && !clockPending) { w.open = true; w.live = true; w.why = "live_road"; return w; }
     if (!spawnrule::Open(screen, reset)) { w.why = screen == 1 ? "in_play" : "map_without_x"; return w; }
     if (screen == 2 && !panelCover) { w.why = "x_panel_not_covering"; return w; }
     if (clockPending) { w.why = "clock_pending"; return w; }
@@ -144,16 +134,22 @@ inline void Order(std::vector<Candidate>& c) {
         return a.coverage==b.coverage?a.distance<b.distance:a.coverage<b.coverage;
     });
 }
-inline bool MayCreate(const Window& w, int madeThisTick, int waiting) { return w.open && madeThisTick < rules::maxCreatePerTick && waiting < (w.cover ? rules::maxWaitingCovered : rules::maxWaitingPlay); }
+// createLimit: the Arbiter's per-tick create limit (default the design's 1). In flight: rules::maxWaitingCovered under cover, rules::maxWaitingPlay in play.
+inline bool MayCreate(const Window& w, int madeThisTick, int waiting, int createLimit = rules::maxCreatePerTick) { return w.open && madeThisTick < createLimit && waiting < (w.cover ? rules::maxWaitingCovered : rules::maxWaitingPlay); }
 // The speaker spends one grant on a fleet pair or a driver repair. Completing either operation spends no grant.
 struct BirthBudget {
     int granted = 0;
+    int limit = rules::maxCreatePerTick;   // creates per tick
     bool Admit(const Window& window, bool repair) {
-        if (!window.open || (repair && !window.cover) || granted >= rules::maxCreatePerTick) return false;
+        if (!window.open || (repair && !window.cover) || granted >= limit) return false;
         ++granted;
         return true;
     }
 };
+
+// ---------- 4b Live road fill in play (LV-3, 2026-11-20) ----------
+// In play the arbiter fills a physical fleet shortfall in the same slot order as the covered fill; the N rings (trafficsight.h) only rank it.
+// Its limits are rules::maxWaitingPlay and rules::maxLookPlay above.
 
 // ---------- 5 Siting: the birth pose, or one reason ----------
 // Sources only: the field box at the slot (Field Provider), the model's bounds, other vehicles (occupied), Health's spot verdict.
@@ -245,8 +241,6 @@ struct Facts {
 // SR-3 Demand: a new pair only when its route has trip room left beyond the pairs of that route still being proved. left < 0: unknown
 // (no limit applied).
 inline bool RouteHasRoom(int left, int provingSameRoute) { return left < 0 || provingSameRoute < left; }
-// KO-2a Handoff: a frozen (staged) pair the player took is released to the player; Handoff asks, the birth-hold service carries it out.
-inline bool ReleaseTaken(bool staged, bool taken) { return staged && taken; }
 // EV-1: is a handed-off traffic vehicle empty? Someone else in its driver's seat (the player, a companion, a job) is not empty: that is
 // not traffic's to judge. Returns the cause, or null.
 inline const char* EmptyCause(bool driverRef, bool driverDead, bool driverAboard, unsigned seatOccupant, unsigned driver) {
@@ -283,12 +277,6 @@ inline const char* Waiting(bool vehicleModel, bool driverModel, bool body, bool 
     return !vehicleModel ? "no_vehicle_model" : !driverModel ? "no_driver_model" : !body ? "no_physics_body" : !aboard ? "not_aboard" : !sitting ? "not_sitting" : "waiting_release";
 }
 
-// ---------- 8 Handoff ----------
-// Released once Health says healthy and the body stands where Siting put it (settled onto the floor, or up to the drop below it).
-inline bool Release(bool healthySeated, bool hasBody, double dx, double dy, double dropBelowBirth) {
-    return healthySeated && hasBody && std::hypot(dx, dy) < 1.5 && dropBelowBirth > -1.5 && dropBelowBirth < 4.0;
-}
-
 // ---------- 9 Retirement: the only remover ----------
 // Never a pair the world owns; only under cover or out of sight.
 struct Removal { bool now = false; const char* why = ""; };
@@ -313,7 +301,7 @@ inline Removal MayRemove(bool worldOwned, bool cover, bool unseen) {
     if (unseen) return { true, "out_of_sight" };
     return { false, "waiting_unseen" };
 }
-enum class PopulationAction { FleetBirth, DriverRepair, Retirement };
+enum class PopulationAction { FleetBirth, DriverRepair, Retirement, FleetPath };
 struct PopulationRequest {
     PopulationAction action;
     Window window{};
@@ -322,6 +310,9 @@ struct PopulationRequest {
 inline Removal ArbitratePopulation(const PopulationRequest& request, BirthBudget* budget=nullptr) {
     if (request.action == PopulationAction::Retirement)
         return MayRemove(request.worldOwned, request.window.cover, request.unseen);
+    if (request.action == PopulationAction::FleetPath)
+        return request.worldOwned ? Removal{false, "world_owns_it"} :
+               !request.sited ? Removal{false, "no_committed_path"} : Removal{true, "fleet_path_granted"};
     if (!request.window.open) return {false, request.window.why};
     if (request.action == PopulationAction::FleetBirth) {
         if (!request.profileHasRoom) return {false, "traffic_profile_full"};

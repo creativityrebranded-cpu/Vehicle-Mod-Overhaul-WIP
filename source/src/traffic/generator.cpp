@@ -8,6 +8,7 @@
 // the game's create-reference for the vehicle and the driver (the driver is seated inside its creation), then, once both have
 // 3D, the driver must really sit (sit state > 0), else the instant seat every second, six tries at most.
 #include "generator.h"
+#include "../trafficsight.h"
 #include "../spawnrule.h"
 #include "trafficprofileclient.h"
 #include "admission.h"
@@ -15,11 +16,9 @@
 #include "fvolimits.h"
 #include "fvopaths.h"
 #include "trafficpair.h"
-#include "trustzone.h"
 #include "spawnflow.h"
 #include "roadclearance.h"
 #include "retiringrecord.h"  // SW-1 / SW-2
-#include "factoryrecord.h"
 #include "healthscore.h"
 #include <cstring>
 #include "../trafficcensusapi.h"
@@ -57,7 +56,7 @@ namespace generator
 			g_logFn(text);
 		}
 
-		constexpr unsigned kDriverBase = 0x001591EA;  // Starfield.esm LvlCitizen_UC (what the road traffic spawned)
+		constexpr unsigned kDriverBase = kFvoTrafficDriverBase;
         void BoundaryTrace(const engineport::Trace& event) {
 #ifndef FVO_RELEASE
             static observations::Gate gate;
@@ -74,10 +73,8 @@ namespace generator
 		constexpr ULONGLONG kCreateGapMs = 2500, kLoadWaitMs = 120000, kSeatEveryMs = 1000, kTripRetryMs = 2000, kWatchMs = 1000;
 		constexpr int kRestarts = 5;          // a pair whose trip ended at its spot is started again this often
 		constexpr ULONGLONG kIdleMs = 10000;  // ... after standing this long with no trip
-		constexpr double kNearSpot = 20.0;    // m: "near its spot" (a driver out elsewhere ended a trip: ordinary traffic now)
 		constexpr int kSeatTries = 6;
 		constexpr double kSpawnNear = 350.0;  // m: a parking spot's driver only while the spot is this close (its cell is loaded)
-		constexpr double kBakedNear = 3.5;    // m: a parked vehicle belongs to the spot it stands this close to
 		constexpr int kSnapMax = fvolimits::kVehicles;  // core's vehicle list capacity
 
 		std::mutex g_lock;
@@ -92,41 +89,8 @@ namespace generator
         unsigned long long g_revision=0,g_appliedRevision=~0ull;
 
 		enum class St { Unknown, Empty, Created, Ready, Started, Failed };
-        enum class FactoryPhase { Standby, Seating, Test, Ready, Departure, Road, Suspended };
-        std::optional<FactoryBay> g_wantFactory, g_factoryBay;
-        FvoFactoryStockQueryV1 g_factoryStockQuery=nullptr;
-        FvoFactorySiteFnV1 g_factorySite=nullptr;
-        FvoFactoryBirthFnV1 g_factoryBirth=nullptr;
-        FvoFactoryStockBindFnV1 g_factoryBind=nullptr;
-        ULONGLONG g_factoryStockAt=0;
-        ULONGLONG g_factorySearchAt=0;
-        ULONGLONG g_factoryCandidateAt=0;
-        std::size_t g_factorySearchCursor=0;
-        ULONGLONG g_factoryCoverWorkUntil=0;
-        std::vector<FvoPoolSpot> g_factoryAnchors;
-        std::map<std::string,FactoryBay> g_belowStock;
-        FactoryTrip g_factoryTrip = nullptr;
-        FvoSpotMotionProofQueryV1 g_factoryProof = nullptr;
-        FvoTrafficFactoryLeaseFnV1 g_factoryLease = nullptr;
-        std::map<unsigned,unsigned> g_factoryArchived;
-        constexpr char kFactorySlotPrefix[] = "factory:";
-        constexpr char kBelowStockPrefix[] = "factory:below_world_";
-        constexpr char kRuntimeStockPrefix[] = "factory:runtime_";
-        constexpr wchar_t kRuntimeStockKey[] = L"factory_v2_runtime_";
-        bool FactorySlotName(const std::string& name) { return name.starts_with(kFactorySlotPrefix); }
-        std::string FactorySlotName(const FactoryBay& bay) { return kFactorySlotPrefix + bay.key; }
-        constexpr double kSpareReach=400.0;  // m: spares relocate only inside the loaded area
 		struct Pair {
             bool handoffForeign = false;
-            FactoryPhase factory = FactoryPhase::Standby;
-            const char* factoryWhy = "factory_standby";
-            std::uint64_t factoryLease = 0, factoryStarted = 0, factoryArrivalStep = 0;
-            bool factoryReleased = false, factoryArrivalSample = false;
-            bool factoryLoaded = false, factoryCommitted = false, factoryRevoked = false;
-            bool factoryDriverUnsettled = false;
-            bool factoryVehicleUnsettled = false;
-            FvoRoadSiteV1 factoryOrigin{};
-            FvoPoolSpot factoryArrival{};
             handoff::Progress handoff;
             bool handoffPending=false;
             bool handoffEligible=false, takeoverQueued=false;
@@ -136,19 +100,18 @@ namespace generator
 			unsigned base = 0;         // the vehicle's base when the pair was made (0: an entry from before 2026-10-29)
             unsigned long long handoffLogAt = 0;  // throttles road_handoff_deferred (was ~100 lines/s per pair)
             unsigned long long handoffDeferSince = 0;  // first deferral: after 10 s the pair is released or cleaned up
-			ULONGLONG at = 0, seatAt = 0, tripAt = 0, watchAt = 0, idleSince = 0, askAt = 0, busySince = 0;
+			ULONGLONG at = 0, seatAt = 0, tripAt = 0, watchAt = 0, idleSince = 0, busySince = 0;
 			ULONGLONG refusedAt = 0;   // last "cannot start a trip yet" line (a new reason, or every 10 min for the same one)
 			unsigned refusedHash = 0;  // the reason last logged (2026-10-29: far spots waiting parked repeated it every 30 s)
 			int tries = 0, restarts = 0;
-			ULONGLONG no3DSince = 0, reloadAt = 0;  // the driver's 3D reload (see Started)
+			ULONGLONG reloadAt = 0;  // the driver's 3D reload (see Started)
 			int reloads = 0;
             bool observed = false, retired = false, routeWaitTold = false;
             std::wstring storedKey;     // archived row's exact original name, including legacy spot keys
             FvoPoolSpot birth{}; bool reserved = false;
             FvoRoadProofV1 roadProof{};
             bool staged = false;
-            bool armed = false; ULONGLONG bornAt = 0, fallCheckAt = 0;
-            ULONGLONG frozenAt = 0, rearmAt = 0; int rearms = 0; bool setDown = false; // fall guard pilot recovery
+            ULONGLONG bornAt = 0, fallCheckAt = 0;
             ULONGLONG noBodySince = 0; // staged with a model but no physics body (its cell left the physics world)
             spawnflow::ObservedWait provingBodyWait, provingSeatWait;
         healthscore::Account health;           // CH-3/CH-5: the continuous account (Health's only clock for a driving pair)
@@ -162,10 +125,8 @@ namespace generator
             // Step 7, Health: the verdict, and the facts a step saw that only Health judges. faultConcealed: removal waits for Concealed, not just unseen.
             spawnflow::Verdict verdict = spawnflow::Verdict::Proving; const char* verdictWhy = ""; ULONGLONG judgedAt = 0, readyAt = 0;
             const char* fault = nullptr; bool faultConcealed = false;
-            trustzone::Record zone; ULONGLONG zoneAt = 0, noPhysicsSince = 0; // its place in the trust zone; since when its pilot gets no physics steps (ZoneTick)
             ULONGLONG floatingSince = 0, floatingAskAt = 0; bool broughtTold = false; // the driver seen with no vehicle around them (see Created)
             ULONGLONG precheckAt = 0; bool precheckTold = false; // see PrecheckPair
-            bool fromSpare = false;      // this pair already came off the shelf: if it fails again it is not reused
             bool seatJudged = false, seatTested = false; ULONGLONG both3DSince = 0;          // per-model seat check (did its driver ever sit?)
             ULONGLONG seatPlayMs = 0, seatCheckAt = 0;                   // gameplay time both models were loaded and aboard without sitting
             ULONGLONG emptyPlayMs = 0, emptyCheckAt = 0; const char* emptyCause = nullptr; bool deadTold = false;
@@ -173,13 +134,13 @@ namespace generator
             // Card HR1 evidence: the pair's spot key (Demand), which stages it has reported, and where it was released (drive stage).
             std::string spotKey; bool bothLoadedOnce = false, brokenEvidenceJudged = false, bodyJudged = false, releaseAttempted = false, releaseJudged = false, driveJudged = false; double relX = 0, relY = 0;
             double radius=8,halfHeight=6;
-            bool vehiclePending=false,driverPending=false; int relocating=0;
+            bool vehiclePending=false,driverPending=false;
             bool vehicleIssued=false,driverIssued=false;
             std::uint64_t birthGrant=0;
             FvoBirthSource driverSource=FvoBirthSource::Fleet;
             FvoPoolSpot driverAt{};
             bool proving = false, sending = false; int proveSlot = -1;   // checked over the player before it joins traffic (trafficpair::ProveAt); then sent to birth
-            ULONGLONG proveSince = 0, proveTick = 0, seatedSince = 0, sendSince = 0, remoteTryAt = 0;
+            ULONGLONG proveSince = 0, proveTick = 0, seatedSince = 0, remoteTryAt = 0;
             // Spawn flow step 2, Census: the pair's one state. Written only by SetLife (Census); every other step reads it.
             spawnflow::Life life = spawnflow::Life::None; const char* lifeWhy = "";
 		};
@@ -197,40 +158,18 @@ namespace generator
 		std::vector<int> g_reuse;  // 1: a parking spot: a parked vehicle there gets a driver when a route wants one
 		std::vector<std::string> g_names;  // stable spot names (the addon's place / spawn / lane names); empty: by index
 		std::vector<Pair> g_pairs;
-        bool Info(unsigned id,FvoTrafficRef& r);
-        bool IsFactorySlot(int slot) {
-            return slot >= 0 && slot < int(g_names.size()) && FactorySlotName(g_names[std::size_t(slot)]);
-        }
-        bool IsRuntimeStock(int slot) {
-            return slot>=0&&slot<int(g_names.size())&&g_names[std::size_t(slot)].starts_with(kRuntimeStockPrefix);
-        }
-        bool FactoryStock(unsigned id) {
-            if (!id) return false;
-            if (g_factoryBay && g_factoryBay->vehicle == id) return true;
-            for(const auto& [name,stock]:g_belowStock)if(stock.vehicle==id)return true;
-            if(const auto archived=g_factoryArchived.find(id);archived!=g_factoryArchived.end()){
-                FvoTrafficRef ref{};
-                if(Info(id,ref)&&retiringrecord::VehicleStillOurs(true,ref.isActor!=0,ref.baseId,archived->second))return true;
-            }
-            for (int slot = 0; slot < int(g_pairs.size()); ++slot)
-                if (IsFactorySlot(slot) && g_pairs[slot].vehicle == id) return true;
-            return false;
-        }
 		ULONGLONG g_createdAt = 0;
         // Population belongs to the world, never to the player's position or a
         // schedule evaluation. Creation is admitted at real, validated origins.
-        bool g_off = false;
         struct WorldPool {std::vector<FvoPoolSpot> spots;std::vector<int> reuse;std::vector<std::string> names;std::vector<Pair> pairs;};
         std::map<std::string,WorldPool> g_worldPools;
         std::map<std::string,std::set<std::pair<long long,long long>>> g_observedOrigins;
         std::size_t g_observeCursor=0;
         auto OriginKey(const FvoPoolSpot& s){return std::pair{std::llround(s.x/4),std::llround(s.y/4)};}
-        int g_admission = -1; std::size_t g_cursor = 0; ULONGLONG g_admissionAt = 0, g_lastTick = 0;
+        ULONGLONG g_lastTick = 0;
         std::vector<FvoPoolSpot> g_initialScene;std::set<int> g_initialRejected,g_modelUnavailable;
         std::vector<bool> g_initialRoads;
-        std::map<int,std::vector<FvoPoolSpot>> g_initialAlternatives;std::map<int,int> g_initialAttempt,g_initialFails;int g_initialCursor=0;
-        std::vector<unsigned> g_initialCoverage;
-        bool g_initialMap=false;
+        std::map<int,std::vector<FvoPoolSpot>> g_initialAlternatives;std::map<int,int> g_initialAttempt;
         bool g_initialClockPending=false;
         // 2026-11-06 (notes/SPAWN_DESIGN_20261106.md): spawning happens only behind the loading screen or the X panel.
         std::set<int> g_passRefused;              // refused in this window: tried again in the next one
@@ -246,7 +185,21 @@ namespace generator
         spawnflow::Tally g_tally;
         // Cards HR1/HR2: Demand's spot key per slot; Health's file (kept across loads; written by Health only); the test switch (card TS1).
         std::vector<std::string> g_spotKeys;
-        bool g_testNear=false;
+        // LV-3 live road fill in play (spawnflow.h 4b). Times are GetTickCount64; the recycle slot is chosen once a tick (Tick) and read by Health.
+        ULONGLONG g_lastCoveredAt=0,g_liveToldAt=0;
+        FvoFleetRailAssignV1Fn g_fleetAssign=nullptr;
+        FvoFleetRailReleaseV1Fn g_fleetRelease=nullptr;
+        FvoFleetRailStateV1Fn g_fleetState=nullptr;
+        FleetPath g_fleetPath=nullptr;
+        ULONGLONG g_fleetRefreshAt=0;
+        std::atomic<double> g_fleetViewerSpeed{0};
+        // A refused live birth delays only its own slot. The core's own reason comes from FVO_TrafficBirthRefusalV1 and is logged in the add-on's own line.
+        FvoBirthRefusalFnV1 g_birthRefusal=nullptr;
+        bool CoreRefusal(std::uint64_t grant,int slot,FvoBirthRefusalV1& out){out={};out.size=sizeof out;return g_birthRefusal&&grant&&g_birthRefusal(grant,slot,&out)==1;}
+        void LogRefusal(const char* where,int slot,unsigned base,std::uint64_t grant,const FvoBirthRefusalV1* r){
+            Log("OBS system=traffic.live vehicle=00000000 event=create_refused where=%s slot=%d base=%08X grant=%llu core_known=%d stage=%s reason=%s retry=this_slot_only",
+                where,slot,base,static_cast<unsigned long long>(grant),int(r!=nullptr),r?r->stage:"-",r?r->reason:"core_recorded_no_reason_for_this_ticket");
+        }
         FvoRelocationStatusFn g_relocation=nullptr;  // the core's relocation status (optional; null on an older core)
         int (*g_spotTest)(unsigned)=nullptr;  // ST-B: Pair Facts, the core's spot test result (0 none, 1 passed, 2 suspect, 3 failed, 4 running)
         bool g_healthLoaded=false;ULONGLONG g_healthSavedAt=0;
@@ -295,18 +248,16 @@ namespace generator
         }
         // A pair Health called broken: its fail goes to the stage it never got past (only when that stage could be tested).
         void BrokenEvidence(int i,const Pair& p,const char* why){
-            if(why&&(!std::strcmp(why,"test_left_behind")||!std::strcmp(why,"taken_by_the_player")||!std::strcmp(why,"driver_dead")||!std::strcmp(why,"empty_vehicle")||!std::strcmp(why,"seated_no_trip")))return;  // SR-2: no trip is the route side's, not the model's or the spot's  // EV-1: an emptied car is the world's doing, not the model's or the spot's
+            if(why&&(!std::strcmp(why,"taken_by_the_player")||!std::strcmp(why,"driver_dead")||!std::strcmp(why,"empty_vehicle")||!std::strcmp(why,"seated_no_trip")))return;  // SR-2: no trip is the route side's, not the model's or the spot's  // EV-1: an emptied car is the world's doing, not the model's or the spot's
             if(!p.bothLoadedOnce){Log("OBS system=traffic.health vehicle=%08X event=not_tested slot=%d reason=%s why=models_never_loaded",p.vehicle,i,why?why:"");return;}
             if(p.releaseAttempted&&!p.releaseJudged)Evidence(i,p,spawnhealth::Stage::Release,false,why?why:"broken_before_release");
             else if(p.releaseJudged&&!p.driveJudged)Evidence(i,p,spawnhealth::Stage::Drive,false,why?why:"broken_while_driving");
         }
         FvoTrafficCensusPublishV1 g_censusPublish=nullptr;FvoTrafficCensusForgetV1 g_censusForget=nullptr;
-        SitedProof g_sitedProof=nullptr;  // change card C1: Siting's pose is the core's birth proof
         FvoTrafficBirthFnV1 g_birthListener=nullptr;
         FvoTrafficBirthFnV2 g_roadBirth=nullptr;
         FvoRoadCheckFnV1 g_roadCheck=nullptr;
         int (*g_roadVehicles)(FvoTrafficVehicle*,int)=nullptr;
-        int (*g_populationVehicles)(FvoTrafficVehicle*,int)=nullptr;
         std::set<int> g_madeThisWindow;   // card C2: slots given a birth in the open window (the Ledger's made vs kept)
 
 		struct Pos { double x = 0, y = 0, z = 0; };
@@ -375,28 +326,6 @@ namespace generator
 			const bool named = i < int(g_names.size()) && !g_names[std::size_t(i)].empty();
 			return named ? L"pair_" + Wide(g_names[std::size_t(i)]) : L"spot" + std::to_wstring(i);
 		}
-        std::wstring FactoryKey(int i) {
-            if(IsRuntimeStock(i))return kRuntimeStockKey+Wide(g_names[std::size_t(i)].substr(sizeof kRuntimeStockPrefix-1));
-            return L"factory_v1_" + Wide(g_names[std::size_t(i)].substr(sizeof kFactorySlotPrefix - 1));
-        }
-        void LoadFactoryIds(int i, Pair& p) {
-            wchar_t text[384]{};
-            GetPrivateProfileStringW(Wide(g_world).c_str(), FactoryKey(i).c_str(), L"", text, DWORD(std::size(text)), Ini().c_str());
-            const bool runtime=IsRuntimeStock(i);
-            const auto stock=runtime?factoryrecord::Read(text):factoryrecord::Stock{};
-            const auto row=runtime?stock.pair:retiringrecord::ParsePair(text);
-            p.vehicle=row.vehicle;p.driver=row.driver;p.base=row.base;
-            p.factoryCommitted=row.staged;p.factoryRevoked=row.surplus;
-            unsigned unsettled=0;
-            std::swscanf(text,L"%*x %*x %*x %*x %*x %x",&unsettled);
-            p.factoryDriverUnsettled=unsettled!=0;
-            if(runtime){
-                p.factoryOrigin=stock.origin;
-                p.factoryVehicleUnsettled=stock.vehicleUnsettled;
-                p.factoryDriverUnsettled=stock.driverUnsettled;
-            }
-            p.factoryLoaded=true;
-        }
         bool WriteRegistry(const wchar_t* section, const wchar_t* key, const wchar_t* value) {
 #ifndef FVO_GENERATOR_TEST
             // Lock only the file operation, never engine queries/mutations made by Tick.
@@ -414,32 +343,11 @@ namespace generator
 		}
 		bool SaveIds(int i, const Pair& p)
 		{
-            if(IsFactorySlot(i)){
-                // A lease and its readiness verdict must be re-proved after loading a save.
-                const retiringrecord::PairRow pair{p.vehicle,p.driver,p.base,p.factoryCommitted,p.factoryRevoked};
-                const bool runtime=IsRuntimeStock(i);
-                auto value=runtime?factoryrecord::Write({pair,p.factoryDriverUnsettled,p.factoryVehicleUnsettled,p.factoryOrigin}):
-                    retiringrecord::FormatPair(pair);
-                if(value.empty())return false;
-                if(!runtime&&p.factoryDriverUnsettled)value+=L" 1";
-                if(p.vehicle&&p.base)g_factoryArchived[p.vehicle]=p.base;
-                return WriteRegistry(Wide(g_world).c_str(),FactoryKey(i).c_str(),p.vehicle||p.factoryVehicleUnsettled?value.c_str():nullptr);
-            }
 			const auto value=retiringrecord::FormatPair({p.vehicle,p.driver,p.base,p.staged,p.retired});
 			const auto key=p.storedKey.empty()?PairKey(i):p.storedKey;
 			return WriteRegistry(Wide(g_world).c_str(),key.c_str(),value.c_str());
 		}
 
-        // A landing spot works like a placement: a vehicle waits there, one per spot, once the player is in range, and stays for later. Kept in trafficpool.ini per world; a remembered id is checked by its base.
-        struct Landing{FvoPoolSpot at{};std::string key;unsigned vehicle=0,base=0;bool loaded=false,pending=false;FvoPoolSpot requestAt{};};
-        std::vector<Landing> g_landings;
-        bool g_coldFilling=false;
-        ULONGLONG g_landingAt=0;
-        void SaveLanding(const Landing& l){
-            const std::wstring key=L"landing_"+std::wstring(l.key.begin(),l.key.end()),section(g_world.begin(),g_world.end());
-            wchar_t text[64]{};if(l.vehicle)swprintf_s(text,L"%08X %08X",l.vehicle,l.base);
-            WriteRegistry(section.c_str(),key.c_str(),l.vehicle?text:nullptr);
-        }
         constexpr double kRidFar = 350.0;  // no notice distance from the core: this far counts as far
         Pos g_playerAt{};
         // V1 (spawn one-place cards, strip build 3): the one answer to "can the player notice this point?". Every unseen rule below reads
@@ -459,11 +367,6 @@ namespace generator
             s.screen = g_api->presentation ? engineport::Forward<&FvoTrafficApi::presentation>(g_api, "presentation", "generator", 0u) : 0;
             return s;
         }
-        // Siting's rule for a landing spot: covered, or hidden from the player's line of sight.
-        bool LandingUnseen(double x,double y,double z){
-            if(!g_api->presentation)return false;
-            auto s=SightAt(x,y,z);return s.Covered()||s.Exposure()==2;
-        }
         // Birth's rule for a spot it acts at: the map covers it, or it is hidden and the player has never seen that spot.
         bool Concealed(const FvoPoolSpot& sp,Pair& p){
             if(!g_api->presentation||!g_api->exposure)return false;
@@ -477,10 +380,11 @@ namespace generator
         bool Measure(Pair& p,unsigned base){if(!g_api->hullSize||!engineport::Forward<&FvoTrafficApi::hullSize>(g_api,"hullSize","generator",0u,base,&p.radius,&p.halfHeight)){p.radius=8;p.halfHeight=6;return false;}return true;}  // no stored bounds: generous default
         bool Retiring(unsigned id);
         RoadSpacingGate g_roadSpacing=nullptr;
-        const char* Occupied(int self,const FvoPoolSpot& at,const Snap& snap,const RoadSite& road,double& gap){
-            const double radius=self>=0&&self<int(g_pairs.size())?g_pairs[self].radius:8;
-            const double height=self>=0&&self<int(g_pairs.size())?g_pairs[self].halfHeight:6;
-            const unsigned own=self>=0&&self<int(g_pairs.size())?g_pairs[self].vehicle:0;
+        const char* Occupied(int self,const FvoPoolSpot& at,const Snap& snap,const RoadSite& road,double& gap,const Pair* moving=nullptr){
+            const auto* shape=moving?moving:self>=0&&self<int(g_pairs.size())?&g_pairs[self]:nullptr;
+            const double radius=shape?shape->radius:8;
+            const double height=shape?shape->halfHeight:6;
+            const unsigned own=shape?shape->vehicle:0;
             const spawnflow::Pose site{at.x,at.y,at.z,at.heading};
             const auto spacing=[&](const FvoPoolSpot& other,double otherRadius,double otherHeight,bool onRoad){
                 const auto local=spawnflow::VehicleSpacing(site,radius,height,{other.x,other.y,other.z},otherRadius,otherHeight);
@@ -495,10 +399,11 @@ namespace generator
             }
             // Include pending native creations, not just this frame's stale snapshot.
             for(int j=0;j<int(g_pairs.size());++j){if(j==self)continue;const auto& q=g_pairs[std::size_t(j)];
+                if(own&&q.vehicle==own)continue;
                 FvoTrafficRef ref{};const bool live=Info(q.vehicle,ref);
                 const auto pos=live&&!q.proving&&!q.sending?FvoPoolSpot{ref.x,ref.y,ref.z,0}:q.birth;  // one being checked holds the place it is going to
                 if(live||q.reserved){
-                    const bool pending=q.vehiclePending||q.proving||q.sending||q.relocating;
+                    const bool pending=q.vehiclePending||q.proving||q.sending;
                     if(const auto why=spacing(pos,q.radius,q.halfHeight,live||pending))return why;
                 }
             }
@@ -518,9 +423,8 @@ namespace generator
         constexpr std::size_t kRegistryRecoveryBatch=12;
         int (*g_panelCover)()=nullptr;
         bool XPanelCovered(){return !g_panelCover||g_panelCover()!=0;}
-        // Spares (2026-10-30): traffic hidden under cover (leftovers, re-rolled models) is kept by model and brought back for a
-        // position that needs that model, instead of creating another vehicle and driver. Deleting them is not an option: deleting
-        // physics references crashed the game (mapguard notes). So the save's traffic stops growing.
+        // Spares: a list older versions saved (key `spares`: hidden vehicle/driver pairs kept for reuse). Nothing adds to it any more;
+        // CoverPass retires what is still listed and Retirement drops entries as they go, so the record empties itself.
         struct Spare{unsigned vehicle=0,driver=0,base=0;};std::vector<Spare> g_spares;std::string g_sparesWorld;
         // Retirement owns these ids until save reset, even after deletion is acknowledged. An orphan scan or stale
         // spare entry must never reclaim a reference while the engine still has deferred work for it.
@@ -542,11 +446,6 @@ namespace generator
                 FvoTrafficRef v{},d{};
                 if(sp.vehicle&&sp.base&&!Retiring(sp.vehicle)&&!Retiring(sp.driver)&&g_api->ref&&engineport::Forward<&FvoTrafficApi::ref>(g_api,"ref","generator",0u,sp.vehicle,&v)&&v.baseId==sp.base&&engineport::Forward<&FvoTrafficApi::ref>(g_api,"ref","generator",0u,sp.driver,&d)&&d.isActor&&!d.dead)g_spares.push_back(sp);
                 while(*c==L','||*c==L' ')++c;}
-        }
-        void AddSpare(unsigned vehicle,unsigned driver,unsigned base){
-            if(!vehicle||!driver||!base||Retiring(vehicle)||Retiring(driver))return;LoadSpares();
-            for(const auto& sp:g_spares)if(sp.vehicle==vehicle)return;
-            g_spares.push_back({vehicle,driver,base});SaveSpares();
         }
         // Only a pair on a trip, and not one just born: a new pair is still waiting for its models, its seat and its pilot.
         // A pair given up on (St::Failed) is bad too: it has no job, so nothing else ever looks at it again.
@@ -593,7 +492,7 @@ namespace generator
         // The line keeps the evidence the disband removes from view (the user: does this also find the cause?): the model, where the pair
         // was born and where each half ended up, so a run shows what the failures share.
         // Hidden now, deleted once the hide has landed (a disable is queued).
-        struct Doomed{unsigned id;ULONGLONG at;bool submitted=false;unsigned baseId=0;ULONGLONG retryAt=0,missingSince=0;int refused=0;unsigned chassis=0;};
+        struct Doomed{unsigned id;ULONGLONG at;bool submitted=false;unsigned baseId=0;ULONGLONG retryAt=0,missingSince=0;int refused=0;unsigned chassis=0;bool actor=false;};
         std::vector<Doomed> g_doomed;
         // SW-1 Census (2026-11-07, user: "yes write both but maintain mandate"): a pair being retired stays in the Census, saved per world
         // in trafficpool.ini under the additive key `retiring` (vehicle vbase driver dbase, comma separated), until Retirement reports it
@@ -636,11 +535,11 @@ namespace generator
             const char* rule;
             spawnflow::Removal decision;
         };
-        void (*g_retireShow)(unsigned,bool)=nullptr;
         handoff::RetireShow g_retireShowV2=nullptr;
         void ApplyRetirement(const RetirementOrder& order){
             if(!order.decision.now)return;
             const auto [vehicle,driver,why,rule,decision]=order;
+            if (vehicle && g_fleetRelease) g_fleetRelease(vehicle);
             Log("OBS system=traffic.retirement vehicle=%08X driver=%08X event=grant speaker=arbiter reason=%s rule=%s",vehicle,driver,why,rule);
             CensusRetiringSave(vehicle,driver,why);  // SW-1: kept in the Census until gone, across loads
             ++g_tally.retired;if(vehicle&&g_censusForget)g_censusForget(vehicle);  // Census: gone from traffic; the core copy forgets only traffic metadata
@@ -651,48 +550,58 @@ namespace generator
             for(const unsigned id:{vehicle,driver})if(id){
                 const bool camera=std::strncmp(rule,"deep_below_terrain",18)!=0;
                 if(g_retireShowV2)g_retireShowV2(id,vehicle,id==driver,camera);
-                else if(g_retireShow&&camera)g_retireShow(id,id==driver);
-                else if(g_api->show)engineport::Forward<&FvoTrafficApi::show>(g_api,"show","generator",0u,id,0); // preserve the retired state if an old enable completes late
                 if(g_retiring.insert(id).second){
                     FvoTrafficRef known{};Info(id,known);
-                    g_doomed.push_back({id,g_clock});g_doomed.back().baseId=known.baseId;g_doomed.back().chassis=vehicle;
+                    g_doomed.push_back({id,g_clock});
+                    g_doomed.back().baseId=known.baseId;
+                    g_doomed.back().chassis=vehicle;
+                    g_doomed.back().actor=id==driver;
                     Log("OBS system=traffic.retirement vehicle=%08X event=queued base=%08X lookup_ok=%d disabled=%d model=%d",id,known.baseId,known.id!=0,known.disabled,known.has3D);
                 }
             }
             if(g_spares.size()!=oldSize)SaveSpares();
+        }
+        auto FinishRetirement(std::vector<Doomed>::iterator entry,const char* reason){
+            if(reason)CensusRetiringClear(entry->id,reason);
+            g_retiring.erase(entry->id);
+            return g_doomed.erase(entry);
         }
         void DeleteTick(ULONGLONG now){
             int done=0;
             for(auto it=g_doomed.begin();it!=g_doomed.end();){
                 if(it->chassis&&g_api->playerTook&&g_api->playerTook(it->chassis)){
                     g_takenRelease.insert(it->chassis);
-                    CensusRetiringClear(it->id,"taken_by_the_player");
-                    g_retiring.erase(it->id);it=g_doomed.erase(it);continue;
+                    it=FinishRetirement(it,"taken_by_the_player");continue;
                 }
                 FvoTrafficRef r{};
                 if(now-it->at<2000){++it;continue;}
                 if(!Info(it->id,r)){
-                    if(it->submitted){Log("OBS system=traffic.retirement vehicle=%08X event=gone_after_delete",it->id);CensusRetiringClear(it->id,"gone_after_delete");it=g_doomed.erase(it);continue;}
+                    if(it->submitted){Log("OBS system=traffic.retirement vehicle=%08X event=gone_after_delete",it->id);it=FinishRetirement(it,"gone_after_delete");continue;}
                     if(!it->missingSince){it->missingSince=now;Log("OBS system=traffic.retirement vehicle=%08X event=lookup_failed base=%08X",it->id,it->baseId);}
                     if(now-it->missingSince<kDoomedMissingMs){++it;continue;}
-                    Log("OBS system=traffic.retirement vehicle=%08X event=gave_up lookup_failed_ms=%llu",it->id,now-it->missingSince);CensusRetiringClear(it->id,"gave_up_lookup_failed");
-                    it=g_doomed.erase(it);continue;
+                    Log("OBS system=traffic.retirement vehicle=%08X event=gave_up lookup_failed_ms=%llu",it->id,now-it->missingSince);
+                    it=FinishRetirement(it,"gave_up_lookup_failed");continue;
+                }
+                const bool same=(r.isActor!=0)==it->actor&&
+                    (it->baseId?r.baseId==it->baseId:!it->actor);
+                if(!same){
+                    Log("OBS system=traffic.retirement vehicle=%08X event=identity_changed base=%08X was=%08X actor=%d",it->id,r.baseId,it->baseId,r.isActor);
+                    it=FinishRetirement(it,"id_reused");continue;
                 }
                 if(it->missingSince){
                     // The id came back. The game reuses ids: act only if it still names what was retired, and nothing here uses it now. A driver's base is
                     // not checked by the core, so one whose base was never read is left alone.
                     const unsigned id=it->id;
-                    const bool same=it->baseId?r.baseId==it->baseId:!r.isActor;
                     const bool inUse=std::any_of(g_pairs.begin(),g_pairs.end(),[&](const Pair& q){return q.vehicle==id||q.driver==id;});
                     Log("OBS system=traffic.retirement vehicle=%08X event=lookup_returned after_ms=%llu base=%08X was=%08X actor=%d same=%d in_use=%d model=%d",id,now-it->missingSince,r.baseId,it->baseId,r.isActor,same,inUse,r.has3D);
-                    if(!same||inUse){g_retiring.erase(id);CensusRetiringClear(id,!same?"id_reused":"in_use_again");it=g_doomed.erase(it);continue;}
+                    if(inUse){it=FinishRetirement(it,"in_use_again");continue;}
                     it->missingSince=0;
                     if(!r.disabled&&g_api->show)engineport::Forward<&FvoTrafficApi::show>(g_api,"show","generator",0u,id,0);
                 }
                 if(now-it->at<30000&&!r.disabled){++it;continue;}
                 if(it->retryAt&&now<it->retryAt){++it;continue;}  // refused: waits without using this update's turns
                 if(++done>2)break;  // a few at a time, so no burst of teardowns lands in one frame
-                if(it->submitted&&r.disabled&&!r.has3D){Log("OBS system=traffic.retirement vehicle=%08X event=retired",it->id);CensusRetiringClear(it->id,"retired");it=g_doomed.erase(it);continue;}
+                if(it->submitted&&r.disabled&&!r.has3D){Log("OBS system=traffic.retirement vehicle=%08X event=retired",it->id);it=FinishRetirement(it,"retired");continue;}
                 if(!r.disabled){if(g_api->show)engineport::Forward<&FvoTrafficApi::show>(g_api,"show","generator",0u,it->id,0);++it;continue;}
                 // Disabling is asynchronous. Do not delete a reference while its model may still be used by a
                 // background update (18:10 crash: FF014591, Get3D returned null in FUN_141313D80).
@@ -708,7 +617,7 @@ namespace generator
                         // The game keeps refusing (engine_refused): it stays hidden and out of traffic, and stops counting against new traffic. A later load sweeps it.
                         if(it->refused>=kDeleteGiveUp){
                             Log("OBS system=traffic.retirement vehicle=%08X event=delete_given_up refused=%d",it->id,it->refused);
-                            it=g_doomed.erase(it);continue;
+                            it=FinishRetirement(it,nullptr);continue; // Keep the saved retirement for the next cover pass.
                         }
                     }
                 }
@@ -722,19 +631,17 @@ namespace generator
             const int sit=g_api->sitState?engineport::Forward<&FvoTrafficApi::sitState>(g_api,"sitState","generator",0u,p.driver):-1;
             SetLife(i,p,spawnflow::Life::Broken,why);SetLife(i,p,spawnflow::Life::Retiring,how);
             ApplyRetirement(order);
-            Log("Traffic pool: spot %d: pair %08X / %08X disbanded %s: %s; deleted, the position is filled from a landing spot; model %08X, state %d, born at (%.0f, %.0f, %.1f), vehicle at (%.0f, %.0f, %.1f) model %d, driver at (%.0f, %.0f, %.1f) model %d, %.1f m apart, ground %.1f (known %d), sit %d, aboard %d",
+            Log("Traffic pool: spot %d: pair %08X / %08X disbanded %s: %s; deleted, the position is filled again by the fleet; model %08X, state %d, born at (%.0f, %.0f, %.1f), vehicle at (%.0f, %.0f, %.1f) model %d, driver at (%.0f, %.0f, %.1f) model %d, %.1f m apart, ground %.1f (known %d), sit %d, aboard %d",
                 i,p.vehicle,p.driver,how,why,p.base,int(p.st),p.birth.x,p.birth.y,p.birth.z,v.x,v.y,v.z,v.has3D,d.x,d.y,d.z,d.has3D,
                 std::hypot(std::hypot(v.x-d.x,v.y-d.y),v.z-d.z),known&2?baked:nav,known,sit,engineport::Forward<&FvoTrafficApi::vehicleOf>(g_api,"vehicleOf","generator",0u,p.driver)==p.vehicle?1:0);
-            p=Pair{};p.st=St::Empty;SaveIds(i,p);g_initialRejected.erase(i);g_initialFails.erase(i);
+            p=Pair{};p.st=St::Empty;SaveIds(i,p);g_initialRejected.erase(i);
             const auto alternatives=g_initialAlternatives.find(i);const int next=g_initialAttempt[i]+1;
             if(alternatives!=g_initialAlternatives.end()&&next<=int(alternatives->second.size()))g_initialAttempt[i]=next;else g_initialAttempt.erase(i);
         }
         // Never where it can be noticed (the FVO Traffic mandate: no unexplained disappearances; the user, 2026-10-30: "needs to be far and out of sight"): under a cover,
         // or each half with no model, or far AND out of sight. Far alone proves nothing: the Full LOD pass exists to keep far vehicles visible (53 held, out to 1378 m, in the
         // 11:57 run), and someone on the ground can have a clear view. A pair given up on goes at the first such moment; any other bad pair after 10 s of being bad.
-        trustzone::PlayerPath g_path;
-        ULONGLONG g_coverEndedAt=0,g_zoneReportAt=0;unsigned g_zoneLostChecks=0;double g_zoneRadius=0;
-        // Card CP-1: the core's camera prediction (FVO_CameraAheadV1; null: an older core, the standing rule alone) and the user's switch.
+        // Card CP-1: the core's camera prediction (FVO_CameraAheadV1) and the user's switch.
         int (*g_cameraAhead)(double,double,double,double,double*)=nullptr;
         int (*g_cameraEnvelopeAhead)(double,double,double,double,double)=nullptr;
         cameravisibility::Reader g_cameraEvidence=nullptr;
@@ -743,9 +650,9 @@ namespace generator
         std::array<HealthAhead,cameravisibility::rules::healthBudget> g_healthAhead{};
         int (*g_healthSample)(unsigned,FvoPairHealthSampleV1*)=nullptr;  // CH-1: core FVO_PairHealthSampleV1; null: an older core
         void (*g_spotRequest)(unsigned)=nullptr;                          // CH-4: core FVO_SpotTestRequestV1; null: an older core
-        unsigned (*g_playClock)()=nullptr;  // W1: core FVO_PlayClockV1 (0 = play time runs); null: an older core, presentation as before
+        unsigned (*g_playClock)()=nullptr;  // W1: core FVO_PlayClockV1 (0 = play time runs)
         // W1 (spawn one-place cards): every play-time clock here reads this one answer.
-        bool PlayTime(){if(g_playClock)return g_playClock()==0u;return !g_api->presentation||engineport::Forward<&FvoTrafficApi::presentation>(g_api,"presentation","generator",0u)==1;}
+        bool PlayTime(){return g_playClock&&g_playClock()==0u;}
         void PrioritizeHealth(const Snap& snap,ULONGLONG now,int screen){
             g_healthAhead={};
             cameravisibility::Forecast look;
@@ -761,7 +668,7 @@ namespace generator
                 });
                 if(candidate->id&&candidate->eta<=eta)continue;
                 const auto pair=std::find_if(g_pairs.begin(),g_pairs.end(),[&](const Pair& p){
-                    return p.vehicle==v.id&&!p.retired&&!p.fallRetirementPending&&!p.vehiclePending&&!p.relocating&&!p.reloadAt;
+                    return p.vehicle==v.id&&!p.retired&&!p.fallRetirementPending&&!p.vehiclePending&&!p.reloadAt;
                 });
                 if(pair!=g_pairs.end()&&cameravisibility::AdvanceHealth(eta,now-pair->judgedAt,spawnflow::rules::judgeEveryMs))
                     *candidate={v.id,eta};
@@ -788,7 +695,7 @@ namespace generator
             // and far terrain often has no physics to hit, so the rays alone hardly ever clear a far pair).
             // Range gates retirement independently of confirmed occlusion. CP-1 is a separate, explicitly enabled camera rule.
             const bool fell=FellThroughWorld(p);
-            const bool predict=g_predictOn&&g_cameraAhead;
+            const bool predict=g_predictOn;
             const auto half=[&](unsigned id,const FvoTrafficRef& r,bool driver){
                 if(!r.has3D)return spawnflow::HalfUnseen(false,false,predict,3);
                 auto s=SightAt(r.x,r.y,r.z,r.baseId,driver);
@@ -838,7 +745,7 @@ namespace generator
         std::map<unsigned,ParkedGrant> g_parkedGrants;
         constexpr ULONGLONG kParkedRetryMs=2000;
         RetirementOrder DecideRetirement(Pair& pair,unsigned driver,const char* why,bool protectedIdentity=false){
-            const bool owned=protectedIdentity||FactoryStock(pair.vehicle)||pair.life==spawnflow::Life::World||
+            const bool owned=protectedIdentity||pair.life==spawnflow::Life::World||
                 (pair.vehicle&&g_api->playerTook&&engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","generator",pair.vehicle,pair.vehicle));
             const bool cover=SightAt(0,0,0).Covered();
             bool unseen=false;
@@ -862,6 +769,7 @@ namespace generator
             return {pair.vehicle,driver,why,rule,spawnflow::ArbitratePopulation(request)};
         }
         RetirementOrder DecideRetirement(unsigned vehicle,unsigned driver,const char* why){
+            if(vehicle)for(auto& pair:g_pairs)if(pair.vehicle==vehicle)return DecideRetirement(pair,driver,why);
             Pair pair;pair.vehicle=vehicle;pair.driver=driver;
             return DecideRetirement(pair,driver,why);
         }
@@ -950,9 +858,6 @@ namespace generator
                 else if(provingBodyFailed||(p.fault&&!std::strcmp(p.fault,"no_physics_body"))){p.bodyJudged=true;Evidence(i,p,spawnhealth::Stage::Body,false,"no_physics_body");}}
             if(p.releaseJudged&&!p.driveJudged&&haveV&&spawnhealth::DriveProved(v.x-p.relX,v.y-p.relY)){
                 p.driveJudged=true;Evidence(i,p,spawnhealth::Stage::Drive,true,"drove_from_release");}
-            // Card TS1 (test only): a pair the player has left far behind is retired out of sight, so its slot can be filled near the player again.
-            if(g_testNear&&!p.fault&&haveV&&std::hypot(v.x-g_playerAt.x,v.y-g_playerAt.y)>spawnflow::rules::testLeaveBehind){p.fault="test_left_behind";p.faultConcealed=false;
-                Log("OBS system=traffic.health vehicle=%08X event=fault slot=%d reason=test_left_behind distance=%.0f",p.vehicle,i,std::hypot(v.x-g_playerAt.x,v.y-g_playerAt.y));}
             const int record=g_api->pairHealth?engineport::Forward<&FvoTrafficApi::pairHealth>(g_api,"pairHealth","generator",0u,p.vehicle):0;
             spawnflow::Facts f;
             f.dead=haveD&&d.dead!=0;
@@ -984,8 +889,7 @@ namespace generator
             f.fault=p.fault?p.fault:handoffExpired?"handoff_unproved":provingBodyFailed?"no_physics_body":
                 !p.proving&&restoringSeat&&seatProofExpired?"restored_seat_unproven":nullptr;
             bool spotFailure=false;
-            {static bool told=false;if(!told){told=true;Log("OBS system=traffic.health vehicle=00000000 event=spot_test_source available=%d reason=%s",int(g_spotTest!=nullptr),g_spotTest?"core_exports_FVO_SpotTestV1":"older_core_no_spot_test");}
-             const int spot=g_spotTest?g_spotTest(p.vehicle):0;spotFailure=spot==3&&!p.proving;f.misplaced=spot==5&&!p.proving;}
+            {const int spot=g_spotTest?g_spotTest(p.vehicle):0;spotFailure=spot==3&&!p.proving;f.misplaced=spot==5&&!p.proving;}
             f.seated=sitting;
             // SR-2: how long it has sat while still being proved (waiting for its trip / release), play time only.
             if(p.proving&&f.seated){
@@ -1086,7 +990,7 @@ namespace generator
         }
         // Step 9, Retirement: the only remover of a pair Health called broken. Only under cover or out of sight. true: the slot is empty.
         bool RetireTick(int i,Pair& p,ULONGLONG now){
-            if(p.verdict!=spawnflow::Verdict::Broken||!p.vehicle)return false;
+            if(!p.vehicle||p.verdict!=spawnflow::Verdict::Broken)return false;
             if(p.uncontrolledFall&&!p.fallRetirementPending){
                 const bool taken=g_api->playerTook&&engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","generator",p.vehicle,p.vehicle);
                 if(spawnflow::QueueFallRetirement(p.verdict,p.life,p.uncontrolledFall,p.fallRetirementPending,taken)){
@@ -1102,8 +1006,8 @@ namespace generator
             const char* why=p.fallRetirementPending?"fell_through_world":p.verdictWhy;
             const auto order=DecideRetirement(p,p.driver,why);
             const auto may=order.decision;const char* rule=order.rule;
-            if(!may.now){observations::Record(g_logFn,now,"traffic.zone.fault",p.vehicle,std::uint64_t(int(p.verdict)),"driver=%08X event=%s slot=%d reason=%s rule=%s prediction=%d",p.driver,may.why,i,p.verdictWhy,rule,int(g_predictOn&&g_cameraAhead));return false;}
-            Log("OBS system=traffic.retirement vehicle=%08X driver=%08X event=retired slot=%d reason=%s how=%s rule=%s prediction=%d waited_ms=%llu",p.vehicle,p.driver,i,why,may.why,rule,int(g_predictOn&&g_cameraAhead),p.brokenAt?now-p.brokenAt:0ull);
+            if(!may.now){observations::Record(g_logFn,now,"traffic.zone.fault",p.vehicle,std::uint64_t(int(p.verdict)),"driver=%08X event=%s slot=%d reason=%s rule=%s prediction=%d",p.driver,may.why,i,p.verdictWhy,rule,int(g_predictOn));return false;}
+            Log("OBS system=traffic.retirement vehicle=%08X driver=%08X event=retired slot=%d reason=%s how=%s rule=%s prediction=%d waited_ms=%llu",p.vehicle,p.driver,i,why,may.why,rule,int(g_predictOn),p.brokenAt?now-p.brokenAt:0ull);
             if(p.proving){
                 // (HR1: the seat verdict is Health's own tick now; Retirement only reads it.)
                 SetLife(i,p,spawnflow::Life::Broken,why);SetLife(i,p,spawnflow::Life::Retiring,may.why);
@@ -1134,27 +1038,6 @@ namespace generator
             WriteRegistry(Wide(g_world).c_str(),key.c_str(),nullptr);
             p=Pair{};p.retired=true;p.st=St::Empty;
             return true;
-        }
-        bool TakeSpare(unsigned base,Spare& out,bool* waiting=nullptr){
-            if(waiting)*waiting=false;
-            LoadSpares();
-            auto retiring=g_spares.end();
-            // Disabled flags precede asynchronous model/physics retirement. Do not move or rebuild either half while its old
-            // model is still present, or while a visibility command can arrive after reuse (map-refill review, 2026-11-01).
-            for(auto it=g_spares.begin();it!=g_spares.end();++it){
-                FvoTrafficRef v{},d{};
-                if(it->base!=base||Retiring(it->vehicle)||Retiring(it->driver)||!Info(it->vehicle,v)||!Info(it->driver,d)||v.baseId!=base||!d.isActor||d.dead)continue;
-                if(!v.disabled||!d.disabled||v.has3D||d.has3D||
-                    (g_api->mutationPending&&(engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->vehicle,"enable")||engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->vehicle,"disable")||
-                    engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->driver,"enable")||engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",0u,it->driver,"disable")))){
-                    if(retiring==g_spares.end())retiring=it;continue;
-                }
-                out=*it;g_spares.erase(it);SaveSpares();return true;
-            }
-            // Reserve waiting stock in the slot as well: this releases the map's fill panel without creating another pair.
-            // FinishBirth drains its old models/visibility before issuing either move, including after the map closes.
-            if(waiting&&retiring!=g_spares.end()){*waiting=true;out=*retiring;g_spares.erase(retiring);SaveSpares();return true;}
-            return false;
         }
 
 		// Traffic NPCs: pool vehicles and their drivers are a fixed pool, made once and reused: both persistent (moved into the
@@ -1196,6 +1079,8 @@ namespace generator
             const int total=std::min(int(g_initialScene.size()),int(g_pairs.size()));
             for(int i=0;i<total;++i){auto& p=g_pairs[std::size_t(i)];
                 if(p.retired||!p.vehicle)continue;
+                if(p.proving||p.vehiclePending||p.driverPending||
+                   (g_fleetState&&g_fleetState(p.vehicle)>=2))continue;
                 ++judged;
                 if(HealthJudge(i,p,snap,now,true,true))continue;
                 if(p.verdict==spawnflow::Verdict::Broken)++broken;
@@ -1275,9 +1160,29 @@ namespace generator
 		}
 
 
+        // The model to make for a slot: `wanted` unless the profile's rules for this slot or Health's rejection forbid it; then the next model of the
+        // pool that the same rules allow (VehicleBase's own rules: spawnflow::Model). 0: none allowed. why: set when the model had to change.
+        unsigned FallbackModelFor(int slot,unsigned wanted,const char** why){
+            *why="";
+            std::vector<unsigned> order=TypePool();
+            if(order.empty()&&engineport::Forward<&FvoTrafficApi::formExists>(g_api,"formExists","generator",0u,kRev8))order.push_back(kRev8);
+            const auto at=wanted?std::find(order.begin(),order.end(),wanted):order.end();
+            if(wanted){
+                if(at==order.end())*why="model_not_in_the_profile_pool";
+                else if(SlotSkips(slot,wanted))*why="profile_rule_or_earlier_fit_refusal_for_this_slot";
+                else if(g_health.ModelRejected(wanted)&&!g_health.ModelTrial(wanted))*why="health_rejected_model";
+                else return wanted;
+            }
+            if(at!=order.end())std::rotate(order.begin(),at+1,order.end());
+            const char* w="";
+            return spawnflow::Model(order,0,[&](unsigned m){return m==wanted||SlotSkips(slot,m);},g_health,&w);
+        }
+
         bool MutationPending(unsigned id,const char* operation){return g_api->mutationPending&&engineport::Forward<&FvoTrafficApi::mutationPending>(g_api,"mutationPending","generator",id,id,operation);}
         FvoBirthWindow BirthWindow(int screen,const spawnflow::Window& window,FvoBirthSource source) {
             if(!window.open||(source==FvoBirthSource::DriverRepair&&!window.cover))return FvoBirthWindow::Closed;
+            if(screen==1&&source==FvoBirthSource::Fleet&&g_roadCheck&&g_roadBirth)
+                return FvoBirthWindow::FleetShortfall;
             return screen==3?FvoBirthWindow::Loading:screen==2?FvoBirthWindow::Panel:FvoBirthWindow::Diagnostic;
         }
         std::uint64_t SpeakBirth(spawnflow::BirthBudget& budget,const spawnflow::PopulationRequest& request,FvoBirthSource source,int slot,unsigned base,unsigned vehicle,const FvoPoolSpot& at) {
@@ -1296,87 +1201,26 @@ namespace generator
                 Log("OBS system=traffic.birth event=deferred reason=unissued_road_proof_expired slot=%d grant=%llu",slot,static_cast<unsigned long long>(grant));
                 return {};
             }
-            if(g_birthListener){
-                if(!issued&&window==FvoBirthWindow::Closed)return {0,true};
-                const FvoTrafficBirthV1 request{source,window,!issued,grant,slot,base,vehicle,at.x,at.y,at.z,at.heading};
-                FvoBirthState state{};
-                const auto id=road?g_roadBirth(&request,road,&state):g_birthListener(&request,&state);
-                if(state==FvoBirthState::Completed)return {id,false};
-                if(state==FvoBirthState::Pending){issued=true;return {0,true};}
-                if(issued)Log("OBS system=traffic.birth event=ticket_lost grant=%llu source=%s slot=%d base=%08X vehicle=%08X",static_cast<unsigned long long>(grant),BirthSourceName(source),slot,base,vehicle);
-                return {0,!issued,issued};
-            }
-            // Older cores lack collect-only. Wait for an open window before using their combined submit/poll entry.
-            if(window==FvoBirthWindow::Closed)return {0,true};
-            const auto id=vehicle
-                ?engineport::Forward<&FvoTrafficApi::createSeatedDriver>(g_api,"createSeatedDriver",BirthSourceName(source),vehicle,base,vehicle,at.x,at.y,at.z,at.heading,nullptr)
-                :engineport::Forward<&FvoTrafficApi::createVehicle>(g_api,"createVehicle",BirthSourceName(source),base,base,at.x,at.y,at.z,at.heading);
-            return {id,!id&&MutationPending(vehicle?vehicle:base,vehicle?"driver":"create")};
+            if(!issued&&window==FvoBirthWindow::Closed)return {0,true};
+            const FvoTrafficBirthV1 request{source,window,!issued,grant,slot,base,vehicle,at.x,at.y,at.z,at.heading};
+            FvoBirthState state{};
+            const auto id=road?g_roadBirth(&request,road,&state):g_birthListener(&request,&state);
+            if(state==FvoBirthState::Completed)return {id,false};
+            if(state==FvoBirthState::Pending){issued=true;return {0,true};}
+            if(issued)Log("OBS system=traffic.birth event=ticket_lost grant=%llu source=%s slot=%d base=%08X vehicle=%08X",static_cast<unsigned long long>(grant),BirthSourceName(source),slot,base,vehicle);
+            return {0,!issued,issued};
         }
         int FleetCount(){
             int n=0;
-            for(std::size_t i=0;i<g_pairs.size();++i){
-                const auto& p=g_pairs[i];
-                const bool privateStock=IsFactorySlot(int(i))&&p.factory!=FactoryPhase::Road&&
-                    (IsRuntimeStock(int(i))||g_names[i].starts_with(kBelowStockPrefix));
-                if(!privateStock&&!p.factoryRevoked&&(p.vehicle||p.vehiclePending))++n;
-            }
+            for(const auto& p:g_pairs)if(p.vehicle||p.vehiclePending)++n;
             return n;
-        }
-        bool ObserveFactoryStock(const Snap& snap,ULONGLONG now){
-            if(!g_factoryStockQuery||(g_factoryStockAt&&now-g_factoryStockAt<spawnflow::rules::readinessEveryMs))return false;
-            g_factoryStockAt=now;
-            FvoFactoryStockV1 rows[kFvoFactoryStockCountV1]{};
-            const int count=std::clamp(g_factoryStockQuery(rows,kFvoFactoryStockCountV1),0,kFvoFactoryStockCountV1);
-            int resolved=0,models=0,bodies=0;
-            bool changed=false;
-            for(auto& [name,stock]:g_belowStock)stock.driverOriginReady=false;
-            for(int i=0;i<count;++i){
-                const auto& row=rows[i];
-                if(!row.vehicle)continue;
-                ++resolved;models+=row.usable&&row.modelLoaded;
-                const bool body=HasBody(row.vehicle,snap);
-                bodies+=body;
-                if(row.inPlayerWorld&&std::isfinite(row.x)&&std::isfinite(row.y)&&std::isfinite(row.z)){
-                    const std::string name=kBelowStockPrefix+std::to_string(row.local);
-                    if(!g_belowStock.contains(name)){
-                        g_belowStock.emplace(name,FactoryBay{name,row.vehicle,{row.x,row.y,row.z,0},{}});
-                        changed=true;
-                    }
-                    g_belowStock.at(name).driverOriginReady=row.inPlayerCell!=0;
-                }
-                const auto state=unsigned(row.usable)|(unsigned(row.modelLoaded)<<1)|(unsigned(body)<<2)|(unsigned(row.inPlayerCell)<<3);
-                observations::Record(g_logFn,now,"traffic.factory_stock",row.vehicle,state,
-                    "event=stock_observed local=%03X base=%08X usable=%d model=%d body=%d player_cell=%d pos=%.2f,%.2f,%.2f",
-                    row.local,row.base,row.usable,row.modelLoaded,int(body),row.inPlayerCell,row.x,row.y,row.z);
-            }
-            const int requested=int(g_initialScene.size()), resident=FleetCount();
-            const auto runtime=std::count_if(g_pairs.begin(),g_pairs.end(),[](const Pair& p){
-                return p.vehicle&&IsRuntimeStock(int(&p-g_pairs.data()));
-            });
-            observations::Record(g_logFn,now,"traffic.factory_dispatch",0,
-                std::uint64_t(count)|(std::uint64_t(resolved)<<8)|(std::uint64_t(bodies)<<16)|(std::uint64_t(runtime)<<24),
-                "event=waiting reason=no_verified_seated_pair_transfer placed_stock=%d resolved=%d models=%d bodies=%d runtime_stock=%zu route_target=%d public_resident_or_pending=%d intra_cell=unavailable inter_cell=unavailable",
-                count,resolved,models,bodies,std::size_t(runtime),requested,resident);
-            return changed;
-        }
-        int ResidentCount(){
-            int n=FleetCount();
-            for(const auto& l:g_landings)if(l.vehicle||l.pending)++n;return n;
         }
         // A request returning zero is not a failed birth while its owned command
         // or completion is outstanding. Poll the exact same request before any
         // health check, alternate model selection, or retry counter.
         bool FinishBirth(int i,Pair& p,ULONGLONG now,int screen,const spawnflow::Window& window){
-            if(p.relocating==4){
-                FvoTrafficRef v{},d{};
-                if(!Info(p.vehicle,v)||!Info(p.driver,d)||!v.disabled||!d.disabled||v.has3D||d.has3D||
-                    MutationPending(p.vehicle,"enable")||MutationPending(p.vehicle,"disable")||
-                    MutationPending(p.driver,"enable")||MutationPending(p.driver,"disable"))return false;
-                p.relocating=1;
-            }
             if(p.vehiclePending){
-                if(g_birthListener&&!p.vehicleIssued&&p.retired){
+                if(!p.vehicleIssued&&p.retired){
                     p.vehiclePending=p.driverPending=false;
                     SetLife(i,p,spawnflow::Life::None,"profile_removed_unissued_birth");
                     p=Pair{};p.st=St::Empty;SaveIds(i,p);
@@ -1389,420 +1233,47 @@ namespace generator
                 p.vehiclePending=false;
                 // Birth failed (the core or the engine refused the create): the Census records it and the Ledger counts it (card C2).
                 if(!p.vehicle){SetLife(i,p,spawnflow::Life::None,"create_refused");g_tally.Refuse("create_refused");g_madeThisWindow.erase(i);
+                    if(!window.cover){FvoBirthRefusalV1 r;const bool known=CoreRefusal(p.birthGrant,i,r);LogRefusal("completion",i,p.base,p.birthGrant,known?&r:nullptr);}
                     p=Pair{};p.st=St::Empty;p.at=now+5000;SaveIds(i,p);g_initialRejected.insert(i);return false;}
                 Log("OBS system=traffic.birth event=completed slot=%d vehicle=%08X driver_pending=%d",i,p.vehicle,int(!p.retired));
+                Log("OBS system=traffic.live vehicle=%08X event=chassis_created slot=%d create_ms=%llu screen=%d",p.vehicle,i,p.bornAt?now-p.bornAt:0ull,screen);
                 p.driverPending=!p.retired;SaveIds(i,p);CensusPublish(i,p);
             }
             if(p.driverPending){
-                if(g_birthListener&&!p.driverIssued&&(p.retired||
+                if(!p.driverIssued&&(p.retired||
                     (g_api->playerTook&&engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","generator",p.vehicle,p.vehicle)))){
                     p.driverPending=false;
-                    if(IsFactorySlot(i)){p.factoryDriverUnsettled=false;SaveIds(i,p);}
                     return true;
                 }
                 const auto driverWindow=BirthWindow(screen,window,p.driverSource);
-                if(g_handoffFacts&&screen&&p.vehicle&&!p.driverIssued&&driverWindow==FvoBirthWindow::Closed){
+                if(screen&&p.vehicle&&!p.driverIssued&&driverWindow==FvoBirthWindow::Closed){
                     p.driverPending=false;p.st=St::Failed;p.at=now;
-                    p.factoryDriverUnsettled=false;
-                    SaveIds(i,p);if(!IsFactorySlot(i))MakeTrafficPair(i,p);
                     Log("OBS system=traffic.birth vehicle=%08X event=partial_pair slot=%d reason=cover_closed_before_driver",p.vehicle,i);
+                    SaveIds(i,p);MakeTrafficPair(i,p);
                     return true;
                 }
                 const auto reply=ListenBirth(p.birthGrant,p.driverSource,driverWindow,i,kDriverBase,p.vehicle,p.driverAt,p.driverIssued);
                 if(reply.pending)return false;
                 p.driver=reply.id;
                 p.driverPending=false;p.st=p.driver?St::Created:St::Failed;p.at=now;
-                p.factoryDriverUnsettled=reply.ambiguous&&IsFactorySlot(i);
-                SaveIds(i,p);
-                if(!IsFactorySlot(i))MakeTrafficPair(i,p);
-                else if(p.driver&&!p.factoryRevoked)engineport::Forward<&FvoTrafficApi::makeTraffic>(g_api,"makeTraffic","factory",p.driver,p.driver,1);
-            }
-            if(p.relocating==1||p.relocating==2){
-                const unsigned id=p.relocating==1?p.vehicle:p.driver;
-                if(!engineport::Forward<&FvoTrafficApi::moveTo>(g_api,"moveTo","generator",0u,id,p.birth.x,p.birth.y,p.birth.z,p.birth.heading)){
-                    if(MutationPending(id,"move"))return false;
-                    SetLife(i,p,spawnflow::Life::Retiring,"spare_move_refused");RetireRequest(p.vehicle,p.driver,"spare_move_refused");  // R1p=Pair{};p.st=St::Empty;SaveIds(i,p);return false;
-                }
-                if(p.relocating++==1)return false;
-                p.relocating=3;engineport::Forward<&FvoTrafficApi::show>(g_api,"show","generator",0u,p.vehicle,1);engineport::Forward<&FvoTrafficApi::show>(g_api,"show","generator",0u,p.driver,1);
-            }
-            if(p.relocating==3){
-                FvoTrafficRef v{},d{};
-                if(!Info(p.vehicle,v)||!Info(p.driver,d)||!v.usable||!d.usable||v.disabled||d.disabled)return false;
-                p.relocating=0;if(g_api->holdBirth)engineport::Forward<&FvoTrafficApi::holdBirth>(g_api,"holdBirth","generator",0u,p.vehicle);p.at=now;
-                // A reused spare (2026-11-04 14:01: spots 38/43/49): the move left the disabled driver behind (44-117 m away), the seat
-                // snap could not reach and the 30 s check deleted the pair. Now enabled, the driver is moved to the vehicle and seated,
-                // and the check's clock starts from here.
-                {const double apart=std::hypot(std::hypot(v.x-d.x,v.y-d.y),v.z-d.z);
-                 if(apart>3.0&&g_api->moveTo)engineport::Forward<&FvoTrafficApi::moveTo>(g_api,"moveTo","generator",0u,p.driver,v.x,v.y,v.z,p.birth.heading);
-                 if(g_api->snapSeat)engineport::Forward<&FvoTrafficApi::snapSeat>(g_api,"snapSeat","generator",0u,p.driver,p.vehicle);
-                 if(p.proving){p.proveSince=p.proveTick=now;p.seatedSince=0;}p.tries=0;p.seatAt=0;
-                 Log("OBS system=traffic.spare vehicle=%08X event=relocated slot=%d driver=%08X apart=%.1f driver_moved=%d",p.vehicle,i,p.driver,apart,apart>3.0?1:0);}
+                Log("OBS system=traffic.live vehicle=%08X event=driver_created slot=%d driver=%08X create_ms=%llu screen=%d",p.vehicle,i,p.driver,p.bornAt?now-p.bornAt:0ull,screen);
+                SaveIds(i,p);MakeTrafficPair(i,p);
             }
             return true;
         }
 
-        void FactoryState(int slot,Pair& p,FactoryPhase phase,const char* reason){
-            if(p.factory==phase&&!std::strcmp(p.factoryWhy,reason))return;
-            p.factory=phase;p.factoryWhy=reason;
-            Log("OBS system=traffic.factory vehicle=%08X driver=%08X bay=%s phase=%d reason=%s lease=%llu",
-                p.vehicle,p.driver,g_names[std::size_t(slot)].c_str(),int(phase),reason,
-                static_cast<unsigned long long>(p.factoryLease));
-        }
-        bool FactoryAt(const FvoTrafficRef& ref,const FvoPoolSpot& place){
-            return spawnflow::FactoryPose(ref.x-place.x,ref.y-place.y,ref.z-place.z);
-        }
-        bool FactorySeated(const Pair& p,const FvoTrafficRef& v,int& sit,double& apart){
-            FvoTrafficRef driver{};
-            if(!Info(p.driver,driver)||!driver.isActor||!driver.usable||driver.dead||!driver.has3D)return false;
-            sit=engineport::Forward<&FvoTrafficApi::sitState>(g_api,"sitState","factory",p.driver,p.driver);
-            apart=std::hypot(v.x-driver.x,v.y-driver.y,v.z-driver.z);
-            return SeatedPair(v.has3D!=0,true,Aboard(p.driver,p.vehicle),sit,apart);
-        }
-        void FactoryCancel(Pair& p){
-            if(g_factoryLease&&p.factoryLease)
-                g_factoryLease(FvoTrafficFactoryLeaseActionV1::Cancel,p.vehicle,p.driver,&p.factoryLease,nullptr);
-            p.factoryLease=0;p.factoryStarted=0;p.factoryReleased=false;p.factoryArrivalSample=false;
-        }
-        FvoPoolSpot FactoryOrigin(const FvoRoadSiteV1& origin){
-            return {origin.x,origin.y,origin.z,origin.heading};
-        }
-        bool CollectFactoryChassis(int slot,Pair& p,int screen,const spawnflow::Window& window,
-                                   const FvoFactorySiteProofV1* proof){
-            const auto at=FactoryOrigin(p.factoryOrigin);
-            const auto birthWindow=BirthWindow(screen,window,FvoBirthSource::DriverRepair);
-            const FvoTrafficBirthV1 request{FvoBirthSource::FactoryStock,birthWindow,!p.vehicleIssued,
-                p.birthGrant,slot,p.base,0,at.x,at.y,at.z,at.heading};
-            FvoBirthState state{};
-            const auto id=g_factoryBirth(&request,proof,&state);
-            if(state==FvoBirthState::Pending){p.vehicleIssued=true;return false;}
-            p.vehiclePending=false;
-            if(state==FvoBirthState::Missing&&p.vehicleIssued){
-                FactoryState(slot,p,FactoryPhase::Suspended,"factory_chassis_receipt_needs_reconciliation");
-                return false;
-            }
-            p.vehicle=id;p.factoryVehicleUnsettled=false;
-            if(!SaveIds(slot,p)){
-                p.factoryVehicleUnsettled=true;
-                FactoryState(slot,p,FactoryPhase::Suspended,"factory_chassis_receipt_write_refused");
-                return false;
-            }
-            if(!id){
-                p.at=GetTickCount64()+kCreateGapMs;
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_create_refused");
-                return false;
-            }
-            p.birth=at;p.st=St::Created;
-            SetLife(slot,p,spawnflow::Life::Born,"factory_chassis_receipt");
-            SetLife(slot,p,spawnflow::Life::Proving,"factory_chassis_wait_driver");
-            FactoryState(slot,p,FactoryPhase::Seating,"factory_chassis_created");
-            return true;
-        }
-        void SearchFactorySite(int slot,Pair& p,const Pos& player,const Snap& snap,ULONGLONG now,int screen,
-                               const spawnflow::Window& window,spawnflow::BirthBudget& budget){
-            if(g_factoryAnchors.empty()){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_routes");return;
-            }
-            if(now<p.at||now<g_factorySearchAt||snap.size()>=kSnapMax||
-               budget.granted>=spawnflow::rules::maxCreatePerTick)return;
-            // World camera rays expire after 180 ms. Poll before the answer can expire.
-            g_factorySearchAt=now+50;
-            std::vector<std::size_t> nearby;
-            for(std::size_t i=0;i<g_factoryAnchors.size();++i){
-                const auto& origin=g_factoryAnchors[i];
-                if(std::hypot(origin.x-player.x,origin.y-player.y)<kSpawnNear)nearby.push_back(i);
-            }
-            if(nearby.empty()){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_no_route_anchor_near_player_cell");return;
-            }
-            std::stable_sort(nearby.begin(),nearby.end(),[&](std::size_t a,std::size_t b){
-                const auto& left=g_factoryAnchors[a];const auto& right=g_factoryAnchors[b];
-                return std::hypot(left.x-player.x,left.y-player.y)<std::hypot(right.x-player.x,right.y-player.y);
-            });
-            const std::size_t candidate=g_factorySearchCursor%nearby.size();
-            const std::size_t offset=g_factorySearchCursor/nearby.size();
-            constexpr double offsets[][2]={{0,0},{24,0},{0,24},{-24,0},{0,-24},{48,0},{0,48},{-48,0},{0,-48}};
-            const auto lane=nearby[candidate];
-            const auto& anchor=g_factoryAnchors[lane];
-            const auto& shift=offsets[offset%std::size(offsets)];
-            const auto base=VehicleBase(-1,int(g_factorySearchCursor%kFvoFactoryStockCountV1));
-            if(!base||!Measure(p,base)){
-                ++g_factorySearchCursor;
-                g_factoryCandidateAt=0;
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_no_known_model_bounds");return;
-            }
-            const FvoRoadSiteV1 draft{anchor.x+shift[0],anchor.y+shift[1],anchor.z,anchor.heading,p.radius,p.halfHeight};
-            FvoFactorySiteProofV1 proof{};
-            const auto result=g_factorySite(base,&draft,&proof);
-            observations::Record(g_logFn,now,"traffic.factory_site",unsigned(slot),unsigned(result),
-                "event=site slot=%d world=%s model=%08X anchor=%zu offset=%zu status=%d pos=%.2f,%.2f,%.2f",
-                slot,g_world.c_str(),base,lane,offset%std::size(offsets),int(result),draft.x,draft.y,draft.z);
-            if(result!=FvoFactorySiteStatusV1::Ready){
-                if(!g_factoryCandidateAt)g_factoryCandidateAt=now;
-                if(result!=FvoFactorySiteStatusV1::Pending||now-g_factoryCandidateAt>=3000){
-                    ++g_factorySearchCursor;
-                    g_factoryCandidateAt=0;
-                }else if(window.open&&window.cover&&screen==2)g_factoryCoverWorkUntil=now+300;
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_live_subsurface_site");return;
-            }
-            g_factoryCandidateAt=0;
-            if(window.open&&window.cover)g_factoryCoverWorkUntil=now+300;
-            if(!window.open||!window.cover||now-g_createdAt<kCreateGapMs){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_site_ready_wait_cover");return;
-            }
-            const auto at=FactoryOrigin(proof.site);
-            const auto grant=SpeakBirth(budget,{spawnflow::PopulationAction::FleetBirth,window},FvoBirthSource::FactoryStock,slot,base,0,at);
-            if(!grant)return;
-            p.base=base;p.factoryOrigin=proof.site;p.birthGrant=grant;
-            p.factoryVehicleUnsettled=true;
-            if(!SaveIds(slot,p)){
-                p.factoryVehicleUnsettled=false;
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_fence_write_refused");return;
-            }
-            ++g_factorySearchCursor;
-            g_createdAt=now;p.vehiclePending=true;p.vehicleIssued=false;
-            FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_ticket");
-            CollectFactoryChassis(slot,p,screen,window,&proof);
-        }
-        // Demand/Siting/Arbiter: fill one explicitly authored chassis during normal covered admission.
-        // Birth uses the original DriverRepair grant and collects its exact receipt through FinishBirth.
-        void FactoryPrepare(int slot,Pair& p,const FactoryBay& bay,const Snap& snap,ULONGLONG now,int screen,
-          const spawnflow::Window& window,spawnflow::BirthBudget& budget){
-            if(!window.open||!window.cover){FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_cover");return;}
-            if(!bay.driverOriginReady){FactoryState(slot,p,FactoryPhase::Standby,"factory_driver_birth_origin_not_in_player_cell");return;}
-            const bool privateStock=IsRuntimeStock(slot)||bay.key.starts_with(kBelowStockPrefix);
-            if(privateStock?g_factoryAnchors.empty():g_initialClockPending){
-                FactoryState(slot,p,FactoryPhase::Standby,privateStock?"factory_wait_routes":"factory_wait_route_clock");return;
-            }
-            if(!privateStock&&!trafficadmission::Capacity(FleetCount()-int(p.vehicle!=0),0,0,int(g_initialScene.size()))){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_profile_full");return;
-            }
-            if(p.reloads>=kMaxReloads){FactoryState(slot,p,FactoryPhase::Suspended,"factory_driver_birth_retries_exhausted");return;}
-            if(now-g_createdAt<kCreateGapMs||budget.granted>=spawnflow::rules::maxCreatePerTick)return;
-            if(std::any_of(g_pairs.begin(),g_pairs.end(),[&](const Pair& row){return &row!=&p&&row.vehicle==bay.vehicle;})||
-               Retiring(bay.vehicle)||std::any_of(g_spares.begin(),g_spares.end(),[&](const Spare& row){return row.vehicle==bay.vehicle;})){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_already_claimed");return;
-            }
-            FvoTrafficRef v{};
-            const auto loaded=std::find_if(snap.begin(),snap.end(),[&](const auto& row){return row.id==bay.vehicle;});
-            if(loaded==snap.end()||snap.size()>=kSnapMax||!loaded->hasBody||!Info(bay.vehicle,v)||
-               !v.usable||v.isActor||!v.has3D||!FactoryAt(v,bay.at)||!v.baseId||
-               (p.base&&p.base!=v.baseId)){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_wait_placed_body_and_pose");return;
-            }
-            if(privateStock&&!IsRuntimeStock(slot)&&SightAt(v.x,v.y,v.z,v.baseId).Exposure()!=2){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_stock_visibility_unconfirmed");return;
-            }
-            if(loaded->driver||loaded->who==kFvoWhoPlayer||loaded->who==kFvoWhoNpc||
-               !g_api->canManagePlacement||!engineport::Forward<&FvoTrafficApi::canManagePlacement>(g_api,"canManagePlacement","factory",v.id,v.id)||
-               engineport::Forward<&FvoTrafficApi::usesVehicle>(g_api,"usesVehicle","factory",v.id,v.id)){
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_chassis_has_stronger_owner");return;
-            }
-            FvoPoolSpot at{v.x,v.y,v.z,bay.at.heading};
-            const auto grant=SpeakBirth(budget,{spawnflow::PopulationAction::DriverRepair,window},FvoBirthSource::DriverRepair,slot,kDriverBase,v.id,at);
-            if(!grant)return;
-            p.vehicle=v.id;p.base=v.baseId;p.birth=at;p.birthGrant=grant;p.driverSource=FvoBirthSource::DriverRepair;
-            p.driverAt=at;p.driverIssued=false;p.driverPending=true;p.at=now;g_createdAt=now;
-            p.factoryDriverUnsettled=true;
-            if(!SaveIds(slot,p)){
-                p.driverPending=false;p.factoryDriverUnsettled=false;
-                FactoryState(slot,p,FactoryPhase::Standby,"factory_census_write_refused");
-                return;
-            }
-            ++p.reloads;
-            Measure(p,p.base);
-            SetLife(slot,p,spawnflow::Life::Born,"factory_driver_granted");
-            SetLife(slot,p,spawnflow::Life::Proving,"factory_await_driver");
-            FactoryState(slot,p,FactoryPhase::Seating,"factory_driver_ticket");
-            FinishBirth(slot,p,now,screen,window);
-        }
-        // A factory proof is Health evidence. Route and Handoff still own the departure and arrival.
-        bool FactoryMotion(const Pair& p){
-            FvoSpotMotionProofV1 proof{};
-            return p.factoryReleased&&p.factoryStarted&&g_factoryProof(p.vehicle,p.factoryStarted-1,&proof)&&
-                proof.body&&proof.builtAt&&proof.steps&&proof.started<=proof.completed;
-        }
-        void FactoryArrive(int slot,Pair& p,const Snap& snap,ULONGLONG now){
-            FvoTrafficRef v{};int sit=-1;double apart=0;
-            const bool arrived=Info(p.vehicle,v)&&v.usable&&v.has3D&&v.baseId==p.base&&
-                HasBody(p.vehicle,snap)&&FactoryAt(v,p.factoryArrival)&&FactorySeated(p,v,sit,apart);
-            handoff::Facts facts{};
-            if(arrived&&g_handoffFacts)g_handoffFacts(p.vehicle,p.driver,&facts);
-            if(!facts.package||!facts.bound||!facts.sampled||!facts.recentStep){
-                p.factoryArrivalSample=false;return;
-            }
-            if(!p.factoryArrivalSample){
-                p.factoryArrivalSample=true;p.factoryArrivalStep=facts.step;return;
-            }
-            if(facts.step<=p.factoryArrivalStep||!g_factoryTrip||
-               !g_factoryTrip(FactoryTripAction::Complete,p.vehicle,v.x,v.y,v.z,nullptr))return;
-            p.st=St::Started;p.watchAt=now;
-            SetLife(slot,p,spawnflow::Life::Driving,"factory_public_arrival_proved");
-            FactoryState(slot,p,FactoryPhase::Road,"factory_public_arrival_proved");
-        }
-        // True when this slot is still private or needs reconciliation. A proved public trip reuses ordinary Step.
-        bool StepFactory(int slot,Pair& p,const Pos& player,const Snap& snap,ULONGLONG now,int screen,
-          const spawnflow::Window& window,spawnflow::BirthBudget& budget){
-            if(!p.factoryLoaded)LoadFactoryIds(slot,p);
-            if(!p.factoryRevoked&&p.vehicle&&g_api->playerTook&&engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","factory",p.vehicle,p.vehicle)){
-                FactoryCancel(p);p.factoryRevoked=true;
-                SetLife(slot,p,spawnflow::Life::World,"factory_taken_by_player");
-                SaveIds(slot,p);
-            }
-            if(p.factoryRevoked){
-                if(p.driverPending)FinishBirth(slot,p,now,screen,window);
-                FactoryState(slot,p,FactoryPhase::Suspended,"factory_world_owns_pair");return true;
-            }
-            if(p.factory==FactoryPhase::Road)return false;
-            if(p.factory==FactoryPhase::Departure){FactoryArrive(slot,p,snap,now);return true;}
-            if(p.factoryCommitted){
-                if(g_savedFleetJourney&&g_savedFleetJourney(p.vehicle,p.base,g_world.c_str())){
-                    p.st=St::Unknown;FactoryState(slot,p,FactoryPhase::Road,"factory_restored_public_journey");return false;
-                }
-                FactoryState(slot,p,FactoryPhase::Suspended,"factory_interrupted_departure_needs_reconciliation");return true;
-            }
-            const auto& name=g_names[std::size_t(slot)];
-            const auto stock=g_belowStock.find(name);
-            const bool runtime=IsRuntimeStock(slot);
-            const bool below=runtime||stock!=g_belowStock.end();
-            FactoryBay runtimeSite;
-            if(runtime){
-                if(!g_factorySite||!g_factoryBirth||!g_factoryBind){
-                    FactoryState(slot,p,FactoryPhase::Suspended,"factory_runtime_adapter_unavailable");return true;
-                }
-                if(p.vehiclePending){
-                    if(window.open&&window.cover)g_factoryCoverWorkUntil=now+300;
-                    if(!CollectFactoryChassis(slot,p,screen,window,nullptr))return true;
-                }
-                if(p.factoryVehicleUnsettled){
-                    FactoryState(slot,p,FactoryPhase::Suspended,"factory_chassis_receipt_needs_reconciliation");return true;
-                }
-                if(!p.vehicle){
-                    if(g_belowStock.empty()&&g_factoryProof&&g_factoryLease&&g_handoffFacts&&g_handoffRelease&&g_birthListener)
-                        SearchFactorySite(slot,p,player,snap,now,screen,window,budget);
-                    return true;
-                }
-                runtimeSite={name,p.vehicle,FactoryOrigin(p.factoryOrigin),{},false};
-                runtimeSite.driverOriginReady=g_factoryBind(p.vehicle,p.base,&p.factoryOrigin)!=0;
-                if(!runtimeSite.driverOriginReady){
-                    if(p.driverPending&&p.driverIssued)FinishBirth(slot,p,now,screen,window);
-                    FactoryCancel(p);
-                    FactoryState(slot,p,FactoryPhase::Standby,"factory_runtime_origin_not_bound");return true;
-                }
-            }
-            const FactoryBay* site=runtime?&runtimeSite:below?&stock->second:g_factoryBay&&name==FactorySlotName(*g_factoryBay)?&*g_factoryBay:nullptr;
-            if(!site||(!below&&(!g_factoryTrip||!g_roadCheck))||!g_factoryProof||!g_factoryLease||
-               !g_handoffFacts||!g_handoffRelease||!g_birthListener){
-                if(p.driverPending&&p.driverIssued)FinishBirth(slot,p,now,screen,window);
-                else if(p.driverPending){p.driverPending=false;p.factoryDriverUnsettled=false;SaveIds(slot,p);}
-                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Suspended,"factory_profile_or_adapter_unavailable");return true;
-            }
-            const auto& bay=*site;
-            if(p.vehicle&&p.vehicle!=bay.vehicle){
-                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Suspended,"factory_saved_placement_mismatch");return true;
-            }
-            if(std::any_of(g_pairs.begin(),g_pairs.end(),[&](const Pair& other){
-                return &other!=&p&&((p.vehicle&&other.vehicle==p.vehicle)||(p.driver&&other.driver==p.driver));})){
-                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Suspended,"factory_saved_pair_already_claimed");return true;
-            }
-            if(!FinishBirth(slot,p,now,screen,window))return true;
-            if(p.factoryDriverUnsettled){
-                FactoryState(slot,p,FactoryPhase::Suspended,"factory_driver_receipt_needs_reconciliation");return true;
-            }
-            if(!p.driver){FactoryPrepare(slot,p,bay,snap,now,screen,window,budget);return true;}
-
-            FvoTrafficRef v{};
-            const bool body=Info(p.vehicle,v)&&v.usable&&v.has3D&&v.baseId==p.base&&HasBody(p.vehicle,snap);
-            int sit=-1;double apart=-1;
-            const bool seated=body&&FactorySeated(p,v,sit,apart);
-            handoff::Facts facts{};
-            if(seated)g_handoffFacts(p.vehicle,p.driver,&facts);
-            const bool bound=facts.package&&facts.bound&&facts.sampled;
-            if(p.factoryLease&&!g_factoryLease(FvoTrafficFactoryLeaseActionV1::Status,p.vehicle,p.driver,&p.factoryLease,nullptr))
-                FactoryCancel(p);
-            if(!body||!FactoryAt(v,bay.at)){
-                FactoryCancel(p);FactoryState(slot,p,FactoryPhase::Seating,"factory_wait_placed_body_and_pose");return true;
-            }
-            const bool hidden=runtime?runtimeSite.driverOriginReady:
-                (window.open&&window.cover)||(screen==1&&SightAt(v.x,v.y,v.z,v.baseId).Exposure()==2);
-            if(!seated){
-                FactoryCancel(p);
-                FactoryState(slot,p,FactoryPhase::Seating,"factory_wait_seated_driver");
-                if(hidden&&PlayTime()&&p.tries<kSeatTries&&now-p.seatAt>=kSeatEveryMs&&
-                   trafficpair::NeedsSnap(v.has3D!=0,apart>=0,sit,apart)){
-                    const auto who=std::find_if(snap.begin(),snap.end(),[&](const auto& row){return row.id==p.vehicle;});
-                    if(who==snap.end()||(who->driver&&who->driver!=p.driver))return true;
-                    p.seatAt=now;
-                    const int reply=engineport::Forward<&FvoTrafficApi::snapSeat>(g_api,"snapSeat","factory",p.driver,p.driver,p.vehicle);
-                    if(spawnflow::SeatAttemptSpent(reply,reply==0&&MutationPending(p.driver,"seat")))++p.tries;
-                }
-                return true;
-            }
-            if(p.life==spawnflow::Life::None)SetLife(slot,p,spawnflow::Life::Proving,"factory_restored_seated_pair");
-            if(!p.factoryLease){
-                if(!hidden||!PlayTime()||now-p.tripAt<kTripRetryMs)return true;
-                p.tripAt=now;
-                FvoTripClaim claim{};
-                if(!below&&(!g_factoryTrip(FactoryTripAction::Test,p.vehicle,v.x,v.y,v.z,&claim)||!claim.step)){
-                    FactoryState(slot,p,FactoryPhase::Seating,"factory_no_private_route_claim");return true;
-                }
-                const auto action=below?FvoTrafficFactoryLeaseActionV1::StartStock:FvoTrafficFactoryLeaseActionV1::Start;
-                if(!g_factoryLease(action,p.vehicle,p.driver,&p.factoryLease,below?nullptr:&claim)||!p.factoryLease){
-                    if(!below)g_factoryTrip(FactoryTripAction::Rollback,p.vehicle,v.x,v.y,v.z,nullptr);
-                    FactoryState(slot,p,FactoryPhase::Seating,"factory_private_lease_refused");return true;
-                }
-                p.factoryStarted=now;
-                FactoryState(slot,p,FactoryPhase::Test,"factory_private_lease_admitted");return true;
-            }
-            if(!p.factoryReleased){
-                if(hidden&&bound&&g_handoffRelease(p.vehicle,false))p.factoryReleased=true;
-                return true;
-            }
-            if(!bound||!FactoryMotion(p)){
-                FactoryState(slot,p,FactoryPhase::Test,"factory_wait_matched_pulse_and_steps");return true;
-            }
-            if(below){FactoryState(slot,p,FactoryPhase::Ready,"factory_no_approved_seated_dispatch");return true;}
-            if(p.factory!=FactoryPhase::Ready)FactoryState(slot,p,FactoryPhase::Ready,"factory_motion_proved");
-            if(!hidden||!PlayTime()||now-p.tripAt<kTripRetryMs)return true;
-            p.tripAt=now;
-            // Arrival Siting uses the current core clearance for the complete vehicle envelope.
-            FvoRoadProofV1 proof{};
-            const FvoRoadSiteV1 target{bay.arrival.x,bay.arrival.y,bay.arrival.z,bay.arrival.heading,p.radius,p.halfHeight};
-            if(g_roadCheck(&target,&proof)!=FvoRoadClearance::Clear||!proof.epoch||
-               !roadclearance::Fresh(proof.at,GetTickCount64(),roadclearance::ProofMs(screen==3))){
-                FactoryState(slot,p,FactoryPhase::Ready,"factory_wait_road_clearance");return true;
-            }
-            if(!g_factoryTrip(FactoryTripAction::Dispatch,p.vehicle,v.x,v.y,v.z,nullptr)){
-                FactoryState(slot,p,FactoryPhase::Ready,"factory_wait_compatible_route_vacancy");return true;
-            }
-            p.factoryCommitted=true;
-            if(!SaveIds(slot,p)){
-                g_factoryTrip(FactoryTripAction::Rollback,p.vehicle,v.x,v.y,v.z,nullptr);
-                p.factoryCommitted=false;
-                FactoryState(slot,p,FactoryPhase::Ready,"factory_census_write_refused");return true;
-            }
-            if(!g_factoryLease(FvoTrafficFactoryLeaseActionV1::Depart,p.vehicle,p.driver,&p.factoryLease,nullptr)){
-                g_factoryTrip(FactoryTripAction::Rollback,p.vehicle,v.x,v.y,v.z,nullptr);
-                p.factoryCommitted=false;SaveIds(slot,p);
-                FactoryState(slot,p,FactoryPhase::Ready,"factory_departure_authority_refused");return true;
-            }
-            p.factoryArrival=bay.arrival;
-            FactoryState(slot,p,FactoryPhase::Departure,"factory_departure_admitted");
-            return true;
-        }
 		void Step(int i, Pair& p, const FvoPoolSpot& s, const Pos& pp, const Snap& snap, ULONGLONG now,
             int screen,const spawnflow::Window& window,spawnflow::BirthBudget& budget)
 		{
 			g_clock=now;
             p.handoffEligible=false;
-            if(IsFactorySlot(i)&&StepFactory(i,p,pp,snap,now,screen,window,budget))return;
             if(p.staged&&p.vehicle&&!p.takeoverQueued&&g_api->playerTook&&g_api->playerTook(p.vehicle)){
                 p.takeoverQueued=true;g_takenRelease.insert(p.vehicle);
                 Log("OBS system=traffic.handoff vehicle=%08X event=release_requested slot=%d reason=taken_by_the_player",p.vehicle,i);
             }
 			if(!FinishBirth(i,p,now,screen,window)){
-                observations::Record(g_logFn,now,"traffic.mutation-wait",p.vehicle,unsigned(p.relocating)|(std::uint64_t(p.vehiclePending)<<8)|(std::uint64_t(p.driverPending)<<9),
-                    "slot=%d driver=%08X base=%08X relocation=%d vehicle_pending=%d driver_pending=%d",i,p.driver,p.base,p.relocating,p.vehiclePending,p.driverPending);return;
+                observations::Record(g_logFn,now,"traffic.mutation-wait",p.vehicle,(std::uint64_t(p.vehiclePending)<<8)|(std::uint64_t(p.driverPending)<<9),
+                    "slot=%d driver=%08X base=%08X vehicle_pending=%d driver_pending=%d",i,p.driver,p.base,p.vehiclePending,p.driverPending);return;
             }
             observations::Record(g_logFn,now,"traffic.slot",p.vehicle,unsigned(p.st)|(std::uint64_t(p.staged)<<8)|(std::uint64_t(p.proving)<<9)|(std::uint64_t(p.retired)<<10),
                 "slot=%d driver=%08X base=%08X phase=%d staged=%d proving=%d reserved=%d retired=%d seat_tries=%d birth=%.2f,%.2f,%.2f target_slots=%zu",i,p.driver,p.base,int(p.st),p.staged,p.proving,p.reserved,p.retired,p.tries,p.birth.x,p.birth.y,p.birth.z,g_pairs.size());
@@ -1821,14 +1292,30 @@ namespace generator
                 if(p.fallRetirementPending)CensusRetiringClear(p.vehicle,"taken_by_the_player",p.driver);
                 // A receipt can supply a chassis after the first ownership check.
                 if(p.staged&&!p.takeoverQueued)g_takenRelease.insert(p.vehicle);
+                g_fleetRelease(p.vehicle);
 				SetLife(i,p,spawnflow::Life::World,"taken_by_the_player");  // Health: the world's now; never on the retire list
-				p=Pair{};p.st=St::Empty;SaveIds(i,p);g_initialRejected.erase(i);g_initialAttempt.erase(i);g_initialFails.erase(i);
+				p=Pair{};p.st=St::Empty;SaveIds(i,p);g_initialRejected.erase(i);g_initialAttempt.erase(i);
 				return;
 			}
             if(p.handoffForeign){
                 if(engineport::Forward<&FvoTrafficApi::usesVehicle>(g_api,"usesVehicle","generator",0u,p.vehicle))return;
                 p.handoffForeign=false;p.st=St::Created;p.at=now;
                 SetLife(i,p,spawnflow::Life::Proving,"previous_job_released");
+            }
+			// A managed rail may legitimately lack ground physics or a fresh pilot step. The
+            // core owns mode transitions, so those facts cannot trigger legacy road recovery.
+            if(p.vehicle&&!p.retired){
+                const int mode=g_fleetState(p.vehicle);
+                if(mode==2||mode==3){
+                    const bool activeTrip=engineport::Forward<&FvoTrafficApi::usesVehicle>(g_api,"usesVehicle","generator",p.vehicle,p.vehicle)!=0;
+                    FvoTrafficRef driver{},vehicle{};
+                    const bool dead=Info(p.driver,driver)&&driver.dead;
+                    const bool dismounted=driver.has3D&&Info(p.vehicle,vehicle)&&vehicle.has3D&&!Aboard(p.driver,p.vehicle);
+                    if(activeTrip&&!dead&&!dismounted)return;
+                    // A completed/abandoned journey releases the controller before this
+                    // same physical pair is offered another existing route.
+                    g_fleetRelease(p.vehicle);
+                }
             }
 			// Step 7 then step 9: every pair judged once, and only Retirement removes.
 			if(RetireSurplus(i,p,snap,now)||HealthJudge(i,p,snap,now)||RetireTick(i,p,now))return;
@@ -1855,8 +1342,7 @@ namespace generator
 						const bool armed=claimed&&engineport::Forward<&FvoTrafficApi::startArmed>(g_api,"startArmed","generator",0u,p.driver,p.vehicle,&claim);
 						Log("OBS system=traffic.remote_start vehicle=%08X driver=%08X event=%s slot=%d distance=%.0f waited_ms=%llu",p.vehicle,p.driver,armed?"started":!claimed?"no_trip":"refused",i,std::hypot(pendingVehicle.x-pp.x,pendingVehicle.y-pp.y),now-p.bornAt);
 						if(armed){p.st=St::Started;p.watchAt=now;p.proving=false;
-                        p.handoff={};p.handoffWait={};p.handoffPending=g_handoffFacts!=nullptr;
-                        if(!p.handoffPending)SetLife(i,p,spawnflow::Life::Driving,"far_pair_armed_pilot");
+                        p.handoff={};p.handoffWait={};p.handoffPending=true;
                         return;}
 					}
 					p.proveSince=now;p.seatedSince=0;return;
@@ -1885,7 +1371,7 @@ namespace generator
                     // the pilot recovery gives it a fresh pilot; one on the ground goes the ordinary way.
                     {FvoTrafficRef v{};
                      if(!p.staged&&g_api->holdBirth&&Info(p.vehicle,v)&&!Grounded({v.x,v.y,v.z})){
-                         engineport::Forward<&FvoTrafficApi::holdBirth>(g_api,"holdBirth","generator",0u,p.vehicle);p.staged=true;p.st=St::Started;p.at=p.watchAt=now;p.frozenAt=now-3000;p.rearms=0;p.rearmAt=0;
+                         engineport::Forward<&FvoTrafficApi::holdBirth>(g_api,"holdBirth","generator",0u,p.vehicle);p.staged=true;p.st=St::Started;p.at=p.watchAt=now;
                          MakeTrafficPair(i,p);SaveIds(i,p);SetLife(i,p,spawnflow::Life::Proving,"restored_in_the_air_frozen");
                          Log("Traffic pool: spot %d (%s): reusing vehicle %08X / driver %08X, saved in the air: frozen until a fresh pilot holds it",i,g_world.c_str(),p.vehicle,p.driver);
                          return;}}
@@ -1894,7 +1380,7 @@ namespace generator
 					p.st = seated ? St::Created : St::Started;
 					p.at = now;
 					MakeTrafficPair(i, p);
-                    if(g_handoffFacts&&seated)SetLife(i,p,spawnflow::Life::Proving,"restored_pair_needs_current_handoff");
+                    if(seated)SetLife(i,p,spawnflow::Life::Proving,"restored_pair_needs_current_handoff");
                     else SetLife(i,p,spawnflow::Life::Driving,"restored_from_save"); // Preserve legacy and unseated recovery.
 					Log("Traffic pool: spot %d (%s): reusing vehicle %08X / driver %08X (%s)", i, g_world.c_str(), p.vehicle, p.driver,
 						seated ? "driver aboard: starting it" : "driver out: it is ordinary traffic now");
@@ -1979,7 +1465,6 @@ namespace generator
             }
 			case St::Ready: {
                 if(p.retired)return;
-                if(!p.proving&&p.staged&&g_api->presentation&&engineport::Forward<&FvoTrafficApi::presentation>(g_api,"presentation","generator",0u)==3&&InitialAdmissionsPending())return;
 				if (p.tripAt && (now < p.tripAt || now - p.tripAt < kTripRetryMs)) return;  // tripAt may lie ahead (a back-off)
 				p.tripAt = now;
 				if (!Exists(p.vehicle) || !Exists(p.driver) || !Aboard(p.driver, p.vehicle)) { p.st = St::Created; p.at = now; p.tries = 0; return; }  // fell out: seat again
@@ -1992,18 +1477,16 @@ namespace generator
 				// Already driving under another job (e.g. reused aboard after a load): watch it, never claim a trip for it.
 				if (engineport::Forward<&FvoTrafficApi::usesVehicle>(g_api,"usesVehicle","generator",0u,p.vehicle)) {
                     p.st=St::Started;p.watchAt=now;
-                    if(g_handoffFacts){
-                        handoff::Facts facts{};
-                        g_handoffFacts(p.vehicle,p.driver,&facts);
-                        if(facts.package){
-                            p.proving=false;p.handoff={};p.handoff.beforeRelease=facts.step;
-                            p.handoffWait={};p.handoffPending=p.handoffEligible=true;
-                            SetLife(i,p,spawnflow::Life::Proving,"existing_traffic_job_needs_fresh_step");
-                        }else{
-                            p.handoffForeign=true;
-                            SetLife(i,p,spawnflow::Life::World,"existing_job_without_matching_traffic_package");
-                        }
-                    }else SetLife(i,p,spawnflow::Life::Driving,"already_on_an_npc_job");
+                    handoff::Facts facts{};
+                    g_handoffFacts(p.vehicle,p.driver,&facts);
+                    if(facts.package){
+                        p.proving=false;p.handoff={};p.handoff.beforeRelease=facts.step;
+                        p.handoffWait={};p.handoffPending=p.handoffEligible=true;
+                        SetLife(i,p,spawnflow::Life::Proving,"existing_traffic_job_needs_fresh_step");
+                    }else{
+                        p.handoffForeign=true;
+                        SetLife(i,p,spawnflow::Life::World,"existing_job_without_matching_traffic_package");
+                    }
                     return;
 				}
 				// Ask first, claim after: a trip claimed and then refused held an addon slot (and a route's count) every 2 s.
@@ -2035,12 +1518,11 @@ namespace generator
 				}
 				const bool ok = engineport::Forward<&FvoTrafficApi::startTrip>(g_api,"startTrip","generator",p.vehicle,p.driver, p.vehicle, &claim) != 0;
                 if(!ok)engineport::Report(engineport::Event::Refused,"startTrip","generator",p.vehicle,"adapter_returned_false");
-				Log("Traffic pool: spot %d: vehicle %08X with driver %08X starts a %s -> %s", i, p.vehicle, p.driver, claim.name ? claim.name : "trip", ok ? (g_handoffFacts?"accepted; awaiting handoff proof":"driving") : "refused");
+				Log("Traffic pool: spot %d: vehicle %08X with driver %08X starts a %s -> %s", i, p.vehicle, p.driver, claim.name ? claim.name : "trip", ok ? "accepted; awaiting handoff proof" : "refused");
 				if (ok) {
 					if(p.proving)Log("Traffic pool: spot %d: pair %08X / %08X passed its check after %.1f s",i,p.vehicle,p.driver,(now-p.proveSince)/1000.0);
-					p.st = St::Started; p.watchAt = now; p.proving=false; p.sending=sendOut; p.sendSince=now;
-					p.handoff={};p.handoffWait={};p.handoffPending=g_handoffFacts!=nullptr;
-                    if(!p.handoffPending)SetLife(i,p,spawnflow::Life::Driving,"seated_trip_started");
+					p.st = St::Started; p.watchAt = now; p.proving=false; p.sending=sendOut;
+					p.handoff={};p.handoffWait={};p.handoffPending=true;
 				}
 				return;
 			}
@@ -2070,7 +1552,7 @@ namespace generator
                     p.fallCheckAt=now;
                     FvoTrafficRef v{};
                     if(Info(p.vehicle,v)&&v.has3D&&!engineport::Forward<&FvoTrafficApi::pilotHolds>(g_api,"pilotHolds","generator",0u,p.vehicle)&&!Grounded({v.x,v.y,v.z})){
-                        engineport::Forward<&FvoTrafficApi::holdBirth>(g_api,"holdBirth","generator",0u,p.vehicle);p.staged=true;SaveIds(i,p);p.frozenAt=now;
+                        engineport::Forward<&FvoTrafficApi::holdBirth>(g_api,"holdBirth","generator",0u,p.vehicle);p.staged=true;SaveIds(i,p);
                         Log("OBS system=traffic.cleanup vehicle=%08X event=held_until_retired slot=%d pos=%.0f,%.0f,%.0f reason=no_pilot_holds_it_in_the_air",p.vehicle,i,v.x,v.y,v.z);
                     }
                 }
@@ -2089,10 +1571,8 @@ namespace generator
 				}
 				p.busySince = 0;
 				const bool aboard = Aboard(p.driver, p.vehicle);
-				const Pos vp = PosOf(p.vehicle);
 				// A driver aboard gets a new trip wherever the vehicle stopped (the journey goes on). M1: one who got out is no longer seated
 				// again here; that is Health's fact (driver_out) and Retirement replaces the pair once unseen.
-				(void)vp;
 				if (!aboard || p.restarts >= kRestarts) return;
 				if (!p.idleSince) { p.idleSince = now; return; }
 				if (now - p.idleSince < kIdleMs) return;
@@ -2118,8 +1598,8 @@ namespace generator
 
         void RushStep(){
             if(!g_rushRequest.exchange(false))return;
-            g_initialMap=true;g_passRefused.clear();g_rushSettlingAt=0;
-            g_initialRejected.clear();g_initialAttempt.clear();g_initialFails.clear();
+            g_passRefused.clear();g_rushSettlingAt=0;
+            g_initialRejected.clear();g_initialAttempt.clear();
             g_rosterRecoveryPending=true;
             std::lock_guard lock(g_rushLock);
             g_rush={};g_rush.phase=int(spawnrule::Preparation::Filling);g_rush.total=int(g_pairs.size());g_rush.done=g_rush.total;
@@ -2133,23 +1613,6 @@ namespace generator
             auto old=std::move(g_pairs);auto oldNames=std::move(g_names);auto oldSpots=std::move(g_spots);auto oldReuse=std::move(g_reuse);
             std::set<unsigned> used;std::vector<bool> taken(old.size(),false);
             g_pairs.clear();g_names=g_wantNames;g_spots=g_wantSpots;g_reuse=g_wantReuse;
-            g_factoryBay=g_belowStock.empty()?g_wantFactory:std::nullopt;
-            for(const auto& [name,stock]:g_belowStock){
-                g_names.push_back(name);g_spots.push_back(stock.at);g_reuse.push_back(0);
-            }
-            if(g_factoryBay){
-                if(g_names.size()<std::size_t(kMaxSpots)){
-                    g_names.push_back(FactorySlotName(*g_factoryBay));
-                    g_spots.push_back(g_factoryBay->at);
-                    g_reuse.push_back(0);
-                }else g_factoryBay.reset();
-            }
-            if(g_factorySite&&g_factoryBirth&&g_factoryBind){
-                for(int i=0;i<kFvoFactoryStockCountV1;++i){
-                    g_names.push_back(kRuntimeStockPrefix+std::to_string(i));
-                    g_spots.emplace_back();g_reuse.push_back(0);
-                }
-            }
             for(std::size_t i=0;i<g_names.size();++i){
                 Pair pair;
                 for(std::size_t j=0;j<old.size();++j)if(!taken[j]&&oldNames[j]==g_names[i]){pair=old[j];taken[j]=true;break;}
@@ -2170,7 +1633,7 @@ namespace generator
                     Log("OBS system=traffic.census vehicle=%08X driver=%08X event=surplus reason=fleet_target_reduced",pair.vehicle,pair.driver);
                 }
             }
-            g_admission=-1;g_appliedRevision=g_revision;
+            g_appliedRevision=g_revision;
         }
         bool RecoverySlot(const Pair& p){
             return !p.vehicle&&!p.driver&&!p.vehiclePending&&!p.driverPending&&!p.reserved&&!p.retired;
@@ -2184,21 +1647,51 @@ namespace generator
             Log("OBS system=traffic.census vehicle=%08X driver=%08X event=fleet_recovered slot=%d reason=%s",
                 p.vehicle,p.driver,index,source);
         }
+        // Rows older versions wrote for retired systems (factory bay slots, runtime stock, landing spots): retiringrecord.h
+        // RetiredRowKind / ParseRetiredRow / DecideRetiredRow, checked in traffic_rules_test.
+        struct RetiredSystemEntry { std::wstring key; retiringrecord::PairRow row; bool landing=false; };
+        // One pass on load: a car the public fleet already holds keeps that owner; a car whose saved journey names it is left to
+        // the journey recovery (RecoverJourneyPairs) to join the normal fleet; every other car that is still ours is retired
+        // through the arbiter (the request survives a save). The row is then deleted; a car that is not loaded keeps its row.
+        void RecoverRetiredSystems(const std::vector<RetiredSystemEntry>& rows,const std::set<unsigned>& vehicles,const std::set<unsigned>& drivers){
+            using retiringrecord::RetiredOutcome;
+            int counts[6]{};
+            const auto section=Wide(g_world);
+            for(const auto& old:rows){
+                const auto& row=old.row;
+                FvoTrafficRef v{},d{};
+                const bool loaded=row.vehicle&&Info(row.vehicle,v);
+                const bool vehicleOurs=loaded&&retiringrecord::VehicleStillOurs(true,v.isActor!=0,v.baseId,row.base);
+                const bool driverOurs=row.driver&&retiringrecord::DriverStillOurs(Info(row.driver,d),d.isActor!=0,d.baseId,kDriverBase);
+                const bool publicOwner=(row.vehicle&&vehicles.count(row.vehicle))||(row.driver&&drivers.count(row.driver))||
+                    std::any_of(g_deferredRegistry.begin(),g_deferredRegistry.end(),[&](const DeferredPair& p){return p.row.vehicle==row.vehicle;});
+                const bool journey=vehicleOurs&&g_savedFleetJourney&&g_savedFleetJourney(row.vehicle,v.baseId,g_world.c_str());
+                const auto outcome=retiringrecord::DecideRetiredRow(row.vehicle,publicOwner,loaded,vehicleOurs,journey);
+                ++counts[int(outcome)];
+                if(outcome==RetiredOutcome::Retire)
+                    RetireRequest(row.vehicle,driverOurs?row.driver:0,old.landing?"retired_landing_spot":"retired_factory_stock");
+                Log("OBS system=traffic.census vehicle=%08X driver=%08X event=retired_system_row key=%ls outcome=%s",row.vehicle,row.driver,old.key.c_str(),retiringrecord::RetiredOutcomeName(outcome));
+                if(outcome!=RetiredOutcome::NotLoadedKeep)WriteRegistry(section.c_str(),old.key.c_str(),nullptr);
+            }
+            if(!rows.empty())Log("OBS system=traffic.census vehicle=00000000 event=retired_system_rows total=%zu public_owner=%d journey=%d retired=%d gone=%d not_loaded=%d unreadable=%d",
+                rows.size(),counts[int(RetiredOutcome::PublicOwner)],counts[int(RetiredOutcome::JourneyRecovery)],counts[int(RetiredOutcome::Retire)],
+                counts[int(RetiredOutcome::Gone)],counts[int(RetiredOutcome::NotLoadedKeep)],counts[int(RetiredOutcome::Unreadable)]);
+        }
         void RecoverRegistry(){
             g_deferredRegistry.clear();g_registryRecoveryCursor=0;g_registryRecoveryAt=0;g_linkedRecoveryAt=0;
-            g_factoryArchived.clear();
             const auto now=GetTickCount64();
             // Read the entire historical registry: route-key churn used to orphan
             // old saved fleets. Adopt each valid physical pair at most once.
             std::vector<wchar_t> section(65536);
             GetPrivateProfileSectionW(Wide(g_world).c_str(),section.data(),DWORD(section.size()),Ini().c_str());
-            constexpr wchar_t prefix[]=L"factory_v1_";
+            std::vector<RetiredSystemEntry> retiredRows;
             for(const wchar_t* item=section.data();*item;item+=wcslen(item)+1){
-                if(wcsncmp(item,prefix,std::size(prefix)-1)&&wcsncmp(item,kRuntimeStockKey,std::size(kRuntimeStockKey)-1))continue;
+                const int kind=retiringrecord::RetiredRowKind(item);
                 const auto value=wcschr(item,L'=');
-                if(!value)continue;
-                const auto saved=retiringrecord::ParsePair(value+1);
-                if(saved.vehicle&&saved.base)g_factoryArchived[saved.vehicle]=saved.base;
+                if(!kind||!value)continue;
+                RetiredSystemEntry old;old.key.assign(item,value);old.landing=kind==2;
+                old.row=retiringrecord::ParseRetiredRow(kind,value+1);
+                retiredRows.push_back(std::move(old));
             }
             LoadRetiringSaved();
             const auto retiring=[&](const FvoTrafficRef& v){
@@ -2208,14 +1701,7 @@ namespace generator
             };
             std::set<unsigned> vehicles,drivers;
             for(int i=0;i<int(g_pairs.size());++i){auto& p=g_pairs[i];
-                if(IsFactorySlot(i)){
-                    if(!p.factoryLoaded)LoadFactoryIds(i,p);
-                    if(p.vehicle)vehicles.insert(p.vehicle);
-                    if(p.driver)drivers.insert(p.driver);
-                    continue;
-                }
                 if(!p.vehicle)LoadIds(i,p);
-                if(p.vehicle&&FactoryStock(p.vehicle))p={};
                 FvoTrafficRef v{},d{};
                 if(p.vehicle&&!Info(p.vehicle,v)){p={};p.st=St::Empty;p.at=now+kSavedSlotGraceMs;}
                 if(p.vehicle&&(v.isActor||!retiringrecord::RecoveryBaseMatches(p.base,v.baseId,kRev8)||vehicles.count(p.vehicle)||retiring(v)))p={};
@@ -2227,7 +1713,7 @@ namespace generator
                 if(wcsncmp(row,L"pair_",5)&&wcsncmp(row,L"spot",4))continue;
                 const auto eq=wcschr(row,L'=');if(!eq)continue;
                 const auto saved=retiringrecord::ParsePair(eq+1);
-                if(!saved.vehicle||FactoryStock(saved.vehicle)||vehicles.count(saved.vehicle)||(saved.driver&&drivers.count(saved.driver)))continue;
+                if(!saved.vehicle||vehicles.count(saved.vehicle)||(saved.driver&&drivers.count(saved.driver)))continue;
                 Pair p;
                 p.vehicle=saved.vehicle;p.driver=saved.driver;p.base=saved.base;p.staged=saved.staged;
                 FvoTrafficRef v{},d{};
@@ -2243,8 +1729,7 @@ namespace generator
                     p.driver=0;  // an unlinked actor may belong to the world now
                 }
                 auto target=saved.surplus?g_pairs.end():
-                    std::find_if(g_pairs.begin(),g_pairs.end(),[&](const Pair& q){
-                        return !IsFactorySlot(int(&q-g_pairs.data()))&&RecoverySlot(q)&&now>=q.at;});
+                    std::find_if(g_pairs.begin(),g_pairs.end(),[&](const Pair& q){return RecoverySlot(q)&&now>=q.at;});
                 if(target==g_pairs.end()){
                     if(g_pairs.size()>=1024)break; // bound legacy-cache recovery, not physical admission
                     p.storedKey.assign(row,eq);p.retired=true;
@@ -2256,6 +1741,7 @@ namespace generator
                 vehicles.insert(p.vehicle);if(p.driver)drivers.insert(p.driver);
                 ClaimRecovered(int(target-g_pairs.begin()),std::move(p),v,now,"saved_registry");
             }
+            RecoverRetiredSystems(retiredRows,vehicles,drivers);
         }
 
         void RecoverDeferredRegistry(ULONGLONG now){
@@ -2358,47 +1844,18 @@ namespace generator
 	}
 
     void SetStorage(const wchar_t* registry){std::lock_guard lock(g_lock);g_profileIni=registry?registry:L"";}
-    void SetFactoryStockQuery(FvoFactoryStockQueryV1 query){g_factoryStockQuery=query;}
-    void SetFactoryBirth(FvoFactorySiteFnV1 site,FvoFactoryBirthFnV1 birth,FvoFactoryStockBindFnV1 bind){
-        g_factorySite=site;g_factoryBirth=birth;g_factoryBind=bind;
-    }
-    void SetFactoryAnchors(std::vector<FvoPoolSpot> anchors){g_factoryAnchors=std::move(anchors);}
-    void SetFactoryBay(const FactoryBay* bay,FactoryTrip trip,FvoSpotMotionProofQueryV1 proof,FvoTrafficFactoryLeaseFnV1 lease){
-        std::lock_guard lock(g_lock);
-        if(trip)g_factoryTrip=trip;
-        if(proof)g_factoryProof=proof;
-        if(lease)g_factoryLease=lease;
-        const auto finite=[](const FvoPoolSpot& pose){
-            return std::isfinite(pose.x)&&std::isfinite(pose.y)&&std::isfinite(pose.z)&&std::isfinite(pose.heading);
-        };
-        const bool valid=bay&&trip&&proof&&lease&&bay->vehicle&&!bay->key.empty()&&bay->key.size()<=80&&
-            std::all_of(bay->key.begin(),bay->key.end(),[](unsigned char c){return std::isalnum(c)||c=='_'||c=='-'||c=='.';})&&
-            finite(bay->at)&&finite(bay->arrival);
-        if(!valid){
-            if(g_wantFactory){g_wantFactory.reset();++g_revision;}
-            return;
-        }
-        const auto same=[](const FvoPoolSpot& a,const FvoPoolSpot& b){
-            return a.x==b.x&&a.y==b.y&&a.z==b.z&&a.heading==b.heading;
-        };
-        if(g_wantFactory&&g_wantFactory->key==bay->key&&g_wantFactory->vehicle==bay->vehicle&&
-           same(g_wantFactory->at,bay->at)&&same(g_wantFactory->arrival,bay->arrival))return;
-        g_wantFactory=*bay;++g_revision;
-    }
     void SetModelRules(const std::vector<std::vector<unsigned>>& skip){g_slotSkip=skip;g_fitRejected.clear();g_modelUnavailable.clear();}
     void SetModelGate(ModelGate gate){g_modelGate=gate;}
     void SetSiteGate(SiteGate gate,RoadSpacingGate spacing){g_siteGate=gate;g_roadSpacing=spacing;}
     void SetCensusPublisher(FvoTrafficCensusPublishV1 publish,FvoTrafficCensusForgetV1 forget){g_censusPublish=publish;g_censusForget=forget;}
-    void SetSitedProof(SitedProof proof){g_sitedProof=proof;Log("OBS system=traffic.spawn vehicle=00000000 event=sited_proof_link available=%d reason=%s",proof!=nullptr,proof?"core_reads_siting":"core_has_no_sited_proof");}
     void SetBirthListener(FvoTrafficBirthFnV1 listener){g_birthListener=listener;}
     void SetHandoffListeners(handoff::ReadFacts facts,handoff::Release release,handoff::RetireShow retire){
         g_handoffFacts=release?facts:nullptr;g_handoffRelease=g_handoffFacts?release:nullptr;g_retireShowV2=retire;
     }
-    void SetPopulationVehicles(int (*read)(FvoTrafficVehicle*,int)){g_populationVehicles=read;}
+    // Required with the fleet exports (every core that has those has these): without them Tick creates no traffic.
     void SetRoadClearance(int (*read)(FvoTrafficVehicle*,int), FvoRoadCheckFnV1 check, FvoTrafficBirthFnV2 birth){
         const bool available=read&&check&&birth&&g_birthListener;
         g_roadVehicles=available?read:nullptr;g_roadCheck=available?check:nullptr;g_roadBirth=available?birth:nullptr;
-        if(!available)Log("OBS system=traffic.birth event=compatibility reason=legacy_core_no_road_clearance");
     }
     int DecideParkedRetirement(unsigned vehicle,const char* reason,bool protectedIdentity){
         if(!g_api)return 0;
@@ -2414,7 +1871,7 @@ namespace generator
             return p.vehiclePending&&p.reserved&&p.base==v.baseId&&
                 std::hypot(v.x-p.birth.x,v.y-p.birth.y)<=2.0&&std::abs(v.z-p.birth.z)<=8.0;
         });
-        const bool claimed=protectedIdentity||FactoryStock(vehicle)||preparingCensus||pendingSaved||savedJourney||pendingBirth||
+        const bool claimed=protectedIdentity||preparingCensus||pendingSaved||savedJourney||pendingBirth||
             (activeWorld&&(PopulationTracks(vehicle,0)||Retiring(vehicle)||
                 std::any_of(g_spares.begin(),g_spares.end(),[=](const Spare& s){return s.vehicle==vehicle;})));
         const auto now=GetTickCount64();
@@ -2447,10 +1904,20 @@ namespace generator
     int OutOfTraffic(unsigned* out,int max){int n=0;for(const auto& p:g_pairs)if(n<max&&p.vehicle&&!p.retired&&p.verdict==spawnflow::Verdict::Broken&&p.life!=spawnflow::Life::World)out[n++]=p.vehicle;return n;}
     void SetHealthSources(int (*sample)(unsigned,FvoPairHealthSampleV1*),void (*spot)(unsigned)){g_healthSample=sample;g_spotRequest=spot;}  // CH-1/CH-4, optional
     void SetPlayClock(unsigned (*fn)()){g_playClock=fn;Log("OBS system=traffic.window vehicle=00000000 event=play_clock_source available=%d reason=%s",int(fn!=nullptr),fn?"core_FVO_PlayClockV1":"older_core_presentation");}
+    void SetBirthRefusal(FvoBirthRefusalFnV1 refusal){g_birthRefusal=refusal;}
+    void SetPhysicalFleet(FvoFleetRailAssignV1Fn assign,FvoFleetRailReleaseV1Fn release,
+                          FvoFleetRailStateV1Fn state,FleetPath path){
+        const bool ready=assign&&release&&state&&path;
+        g_fleetAssign=ready?assign:nullptr;
+        g_fleetRelease=ready?release:nullptr;
+        g_fleetState=ready?state:nullptr;
+        g_fleetPath=ready?path:nullptr;
+    }
+    bool PhysicalFleetActive(){return g_fleetAssign!=nullptr;}
     void SetCameraAhead(int (*fn)(double,double,double,double,double*)){g_cameraAhead=fn;}  // CP-1, logged when the switch is read
     void SetCameraEnvelopeAhead(int (*fn)(double,double,double,double,double)){g_cameraEnvelopeAhead=fn;}
-    void SetCameraEvidence(cameravisibility::Reader reader,cameravisibility::ForecastReader forecast,void (*retireShow)(unsigned,bool)){
-        g_cameraEvidence=reader;g_lookForecast=forecast;g_retireShow=retireShow;
+    void SetCameraEvidence(cameravisibility::Reader reader,cameravisibility::ForecastReader forecast){
+        g_cameraEvidence=reader;g_lookForecast=forecast;
     }
     void SetRemovalPrediction(bool on){
         Log("OBS system=traffic.retirement vehicle=00000000 event=removal_rule prediction=%d core_export=%d reason=%s",int(on),int(g_cameraAhead!=nullptr),
@@ -2458,7 +1925,6 @@ namespace generator
         g_predictOn=on;}
     void SetRelocation(FvoRelocationStatusFn fn){g_relocation=fn;}
     void SetSpotTest(int (*fn)(unsigned)){g_spotTest=fn;}  // logged on the first Health judgement (the log is not attached yet here)
-    void SetTestNearPlayer(bool on){if(on!=g_testNear)Log("OBS system=traffic.spawn vehicle=00000000 event=test_near_player on=%d reason=settings_diagnostics_spawnNearPlayer",int(on));g_testNear=on;}
     bool HealthModel(unsigned model,FvoTrafficHealthModelV1& out){
         std::lock_guard lock(g_healthPubLock);const auto it=g_healthPub.find(model);if(it==g_healthPub.end())return false;const auto& r=it->second;
         out.known=1;out.rejected=r.rejected?1:0;out.allowed=r.allowed?1:0;out.stage=r.why;
@@ -2479,12 +1945,11 @@ namespace generator
             std::snprintf(out.stageName,sizeof out.stageName,"%s",spawnhealth::Name(spawnhealth::Stage(s)));return true;}
         return false;}
     void SetInitialScene(const FvoPoolSpot* spots,int count){
-        g_initialRoads.clear();g_initialCoverage.clear();
+        g_initialRoads.clear();
         g_initialScene.clear();if(spots&&count>0)g_initialScene.assign(spots,spots+std::min(count,kMaxSpots));g_initialRejected.clear();
-        g_initialAlternatives.clear();g_initialAttempt.clear();g_initialFails.clear();g_initialCursor=0;g_modelUnavailable.clear();g_fitRejected.clear();g_clearanceWaiting.clear();
+        g_initialAlternatives.clear();g_initialAttempt.clear();g_modelUnavailable.clear();g_fitRejected.clear();g_clearanceWaiting.clear();
     }
     void SetInitialRoads(const std::vector<bool>& roads){g_initialRoads=roads;}
-    void SetInitialCoverage(std::vector<unsigned> coverage){g_initialCoverage=std::move(coverage);}
     void SetInitialAlternatives(int slot,const FvoPoolSpot* spots,int count){if(slot>=0&&slot<int(g_initialScene.size())&&spots&&count>0)g_initialAlternatives[slot].assign(spots,spots+std::min(count,16));}
     void WaitForInitialClock(bool pending){g_initialClockPending=pending;}
     bool InitialVehicle(int spot){return spot>=0&&spot<int(g_pairs.size())&&g_pairs[spot].staged;}
@@ -2516,15 +1981,12 @@ namespace generator
         // fills their positions under this same cover, and the handoff keeps a new vehicle frozen until its driver really sits.
         int replaced=0;
         for(int i=0;i<total;++i){auto& p=g_pairs[std::size_t(i)];
+            if(p.vehicle&&g_fleetState&&g_fleetState(p.vehicle)>=2)continue;
             if(HealthJudge(i,p,snap,now,true))continue;
             if(RetireTick(i,p,now))++replaced;
         }
         if(replaced)Log("Traffic cover pass: %d bad pair(s) replaced",replaced);
         if(hiddenLeft)Log("Traffic cover pass: %d recorded retirement(s) handled",hiddenLeft);
-    }
-    void SetLandingSpots(const FvoPoolSpot* spots,const char* const* names,int count){
-        g_landings.clear();
-        for(int i=0;spots&&i<count;++i){Landing l;l.at=spots[i];l.key=names&&names[i]?names[i]:std::to_string(i);g_landings.push_back(l);}
     }
     // Handoff is the sole release arbiter. Step supplies eligible Census rows after Health.
     void ServiceHandovers(const Snap& snap,ULONGLONG now){
@@ -2603,7 +2065,7 @@ namespace generator
                 if(g_handoffFacts)p.handoffPending=true;
                 else SetLife(i,p,spawnflow::Life::Driving,"released_to_driving_pipeline");
                 if(p.bornAt){
-                    Log("Traffic arrival: vehicle %08X released to its pilot %.1f s after its birth (%s pilot)",p.vehicle,(now-p.bornAt)/1000.0,p.armed?"pre-armed":"ordinary");
+                    Log("Traffic arrival: vehicle %08X released to its pilot %.1f s after its birth (%s pilot)",p.vehicle,(now-p.bornAt)/1000.0,"ordinary");
                     Log("OBS system=traffic.placement vehicle=%08X event=handoff slot=%d driver=%08X model=%08X requested=%.3f,%.3f,%.3f observed=%.3f,%.3f,%.3f",
                         p.vehicle,i,p.driver,p.base,p.birth.x,p.birth.y,p.birth.z,hv.x,hv.y,hv.z);
                 }
@@ -2620,11 +2082,85 @@ namespace generator
         }
     }
 
+    // The same ring reach sorts covered placements and rolling path updates. Every
+    // candidate receives a rank, including beyond the outermost ring.
+    unsigned FleetRing(double distance,const trafficsight::Reach& reach){
+        if(distance<=trafficsight::rules::rangeM)return 0;
+        const double beyond=distance-trafficsight::rules::rangeM;
+        if(!(reach.stepM>0)||!(beyond<=reach.totalM))return unsigned(reach.rings+1);
+        return unsigned(std::ceil(beyond/reach.stepM));
+    }
+    struct FleetViewer {
+        Pos prior{};
+        ULONGLONG at=0;
+        double speed=0;
+        trafficsight::Reach Update(const Pos& position,ULONGLONG now,bool playing){
+            const auto elapsed=now-at;
+            if(!playing||!at||elapsed>1500)speed=0;
+            else if(elapsed>=100){
+                const double distance=std::hypot(position.x-prior.x,position.y-prior.y);
+                speed=distance<=150?std::min(150.0,distance*1000.0/double(elapsed)):0;
+            }
+            if(!at||!playing||elapsed>=100){prior=position;at=now;}
+            g_fleetViewerSpeed.store(speed,std::memory_order_relaxed);
+            return trafficsight::ReachOf(speed);
+        }
+    } g_fleetViewer;
+
+    unsigned FleetPriority(double distance){
+        return FleetRing(distance,trafficsight::ReachOf(g_fleetViewerSpeed.load(std::memory_order_relaxed)));
+    }
+
+    void ClearFleetAssignments(){
+        if(g_fleetRelease)g_fleetRelease(0);
+        g_fleetViewer={};
+        g_fleetViewerSpeed.store(0,std::memory_order_relaxed);
+        g_fleetRefreshAt=0;
+    }
+
+    void RefreshFleetPaths(const Pos& player,const trafficsight::Reach& reach,ULONGLONG now){
+        if(g_fleetRefreshAt&&now-g_fleetRefreshAt<750)return;
+        g_fleetRefreshAt=now;
+        struct Candidate { int slot; FvoTrafficRef vehicle; double distance; unsigned ring; };
+        std::vector<Candidate> ordered;
+        for(int i=0;i<int(g_pairs.size());++i){
+            const auto& p=g_pairs[std::size_t(i)];
+            if(p.retired||!p.vehicle||!p.driver||p.staged||p.handoffPending||!Driving(p))continue;
+            const bool worldOwned=g_api->playerTook&&
+                engineport::Forward<&FvoTrafficApi::playerTook>(g_api,"playerTook","generator",p.vehicle,p.vehicle);
+            if(worldOwned){g_fleetRelease(p.vehicle);continue;}
+            FvoTrafficRef vehicle{};
+            if(!Info(p.vehicle,vehicle)||!vehicle.usable||!Aboard(p.driver,p.vehicle))continue;
+            const double distance=std::hypot(vehicle.x-player.x,vehicle.y-player.y);
+            if(!std::isfinite(distance))continue;
+            ordered.push_back({i,vehicle,distance,FleetRing(distance,reach)});
+        }
+        std::stable_sort(ordered.begin(),ordered.end(),[](const Candidate& a,const Candidate& b){
+            if(a.ring!=b.ring)return a.ring<b.ring;
+            return a.distance<b.distance;
+        });
+        std::vector<FvoFleetRailPoint> points;
+        points.reserve(64);
+        for(const auto& item:ordered){
+            const auto& p=g_pairs[std::size_t(item.slot)];
+            double speed=0;
+            points.clear();
+            spawnflow::PopulationRequest request{spawnflow::PopulationAction::FleetPath};
+            request.sited=g_fleetPath(p.vehicle,item.vehicle,points,speed)&&points.size()>=2;
+            if(!spawnflow::ArbitratePopulation(request).now)continue;
+            const FvoFleetRailRequest assignment{p.vehicle,p.driver,points.data(),static_cast<unsigned>(points.size()),speed};
+            const int accepted=g_fleetAssign(&assignment);
+            observations::Record(g_logFn,now,"traffic.fleet",p.vehicle,unsigned(accepted)|(std::uint64_t(item.ring)<<8),
+                "event=path_result driver=%08X accepted=%d ring=%u points=%zu speed=%.1f",p.driver,accepted,item.ring,points.size(),speed);
+        }
+    }
+
+
     // (LandingStock removed 2026-11-07, spawn flow v3: it created vehicles in play outside the Window and was no longer called.)
     void InitialScene(const Snap& snap,const Snap* occupancy,const Pos& pp,ULONGLONG now,int screen,bool panelCover,
         const spawnflow::Window& window,spawnflow::BirthBudget& budget){
         if(!screen)return;
-        const bool covered=window.open;  // the spawn window (in play only with the test switch, card TS1)
+        const bool covered=window.open;  // the spawn window (in play: the live road window, LV-3, or the lab test switch)
         if(covered!=g_wasCovered){g_wasCovered=covered;if(covered){g_passRefused.clear();g_clearanceWaiting.clear();g_tally.Clear();g_madeThisWindow.clear();}
             Log("OBS system=traffic.spawn vehicle=00000000 event=window state=%s screen=%d reset=%d reason=%s",covered?"open":"closed",screen,g_rushFill,window.why);
             // Step 10, Ledger: one line per window.
@@ -2633,15 +2169,19 @@ namespace generator
             if(!covered){int empty=0,kept=0,made=0;for(int k=0;k<std::min(int(g_initialScene.size()),int(g_pairs.size()));++k){const auto& q=g_pairs[k];
                     if(q.vehicle){if(g_madeThisWindow.count(k))++made;else ++kept;}else if(SlotFree(q))++empty;}
                 g_tally.empty=empty;g_tally.kept=kept;g_tally.made=made;char line[600];g_tally.Line(line,sizeof line);Log("OBS system=traffic.ledger vehicle=00000000 event=window %s",line);}}
-        if(!(covered&&window.cover))g_coverPassDone=false;  // the next covered window runs the pass again (never in play)
+        if(!(covered&&window.cover)){
+            if(g_coverPassDone)g_passRefused.clear();
+            g_coverPassDone=false;
+        }  // the next covered window runs the pass again (never in play)
         if(covered&&window.cover&&!g_coverPassDone)CoverPass(snap,now);
         RetireRequestsTick(now);  // R1
         DeleteTick(now);
         if(g_initialClockPending){if(g_api->arrivalProgress)engineport::Forward<&FvoTrafficApi::arrivalProgress>(g_api,"arrivalProgress","generator",0u,std::max(1,int(g_initialScene.size())),0);return;}
         const int total=std::min(int(g_initialScene.size()),int(g_pairs.size()));
-        // Arrival and X use the same gap-fill path while their cover is active.
-        g_coldFilling=screen==3;
-        const bool filling=covered;
+        // Arrival and X use the same gap-fill path while their cover is active. Tick runs this only with the fleet exports.
+        const bool filling=covered&&(window.cover||window.live);
+        const auto reach=g_fleetViewer.Update(pp,now,screen==1&&PlayTime());
+        if(window.cover||(screen==1&&PlayTime()))RefreshFleetPaths(pp,reach,now);
         // One admission per update at the authored lane position. Pending operations and active model checks are paced
         // separately from the fleet target. The current handoff path budgets only observed readiness.
         int waiting=0,resident=FleetCount();std::set<int> slots;
@@ -2653,8 +2193,7 @@ namespace generator
             if(trafficpair::ProveHeld(q.seatedSince,now)){slots.insert(q.proveSlot);continue;}
             // Paused-map disables may retire only after play resumes. These reservations submit no work yet and must
             // not occupy the active-check throttle, otherwise a large reset cannot finish its loading panel.
-            if(q.relocating==4){slots.insert(q.proveSlot);continue;}
-            if(q.vehiclePending||q.driverPending||q.relocating||
+            if(q.vehiclePending||q.driverPending||
                (Info(q.vehicle,v)&&Info(q.driver,d)&&v.has3D&&d.has3D&&(!g_handoffFacts||HasBody(q.vehicle,snap))))++waiting;
             slots.insert(q.proveSlot);
         }
@@ -2669,20 +2208,32 @@ namespace generator
         }
         // Spawn flow step 4, Arbiter: spread the first grants along each route. Distance breaks ties between equally ranked slots.
         std::vector<spawnflow::Candidate> order;
-        if(filling)for(int i=0;i<total;++i){const auto& q=g_pairs[i];
-            if(!SlotFree(q)||q.vehicle||q.vehiclePending||q.retired||now<q.at||g_passRefused.count(i))continue;
-            const auto coverage=i<int(g_initialCoverage.size())?g_initialCoverage[i]:0;
-            order.push_back({i,std::hypot(g_initialScene[i].x-pp.x,g_initialScene[i].y-pp.y),coverage});}
+        // In play, a direct birth waits out the pause after a refusal.
+        const bool live=!window.cover;
+        budget.limit=spawnflow::rules::maxCreatePerTick;
+        // Covered preparation and live shortfalls use the same physical slot order (the dot-based live fill is removed).
+        if(filling){
+            for(int i=0;i<total;++i){
+                const auto& q=g_pairs[i];
+                if(!SlotFree(q)||q.vehicle||q.vehiclePending||q.retired||now<q.at||g_passRefused.count(i))continue;
+                const auto distance=std::hypot(g_initialScene[i].x-pp.x,g_initialScene[i].y-pp.y);
+                // In play only replace a real shortfall within the existing native
+                // service envelope. Ring order does not reject any candidate.
+                if(live&&distance>spawnflow::rules::liveRadius)continue;
+                order.push_back({i,distance,FleetRing(distance,reach)});
+            }
+        }
         spawnflow::Order(order);
-        for(int k=0,looked=0;k<int(order.size())&&looked<maxLook&&spawnflow::MayCreate(window,budget.granted,waiting);++k){const int i=order[std::size_t(k)].slot;auto& p=g_pairs[i];
+        for(int k=0,looked=0;k<int(order.size())&&looked<maxLook&&spawnflow::MayCreate(window,budget.granted,waiting,budget.limit);++k){const int i=order[std::size_t(k)].slot;auto& p=g_pairs[i];
             g_initialRejected.erase(i);
-            ++looked;g_initialCursor=(i+1)%total;
+            ++looked;
             const int attempt=g_initialAttempt[i];const auto alternatives=g_initialAlternatives.find(i);
             auto at=attempt&&alternatives!=g_initialAlternatives.end()?alternatives->second[std::size_t(attempt-1)]:g_initialScene[i];
             // Hidden traffic waiting for its delete takes no fleet place (13:34 run: 186 old refs held the whole window).
             spawnflow::PopulationRequest request{spawnflow::PopulationAction::FleetBirth,window};
             request.profileHasRoom=trafficadmission::Capacity(resident,0,0,total);
-            request.worldComplete=occupancy&&occupancy->size()<kSnapMax;
+            // The core proves the exact road footprint even if unrelated cells exceed the census buffer.
+            request.worldComplete=occupancy&&(occupancy->size()<kSnapMax||g_roadCheck);
             if(!request.profileHasRoom||!request.worldComplete){
                 const char* why=request.profileHasRoom?"world_vehicle_list_incomplete":"traffic_profile_full";
                 observations::Record(g_logFn,now,"traffic.birth",0,request.profileHasRoom?1u:2u,
@@ -2701,15 +2252,33 @@ namespace generator
                         continue;}}}
             // Step 3, Demand: the slot's model (your Types first, Health second; VehicleBase).
             if(g_modelUnavailable.erase(i))g_fitRejected.erase(i);
-            const unsigned base=VehicleBase(i);if(!base){g_modelUnavailable.insert(i);g_initialRejected.insert(i);p.at=now+5000;g_tally.Refuse("no_model");continue;}
+            unsigned base=VehicleBase(i);
+            if(!base){g_modelUnavailable.insert(i);g_initialRejected.insert(i);p.at=now+5000;g_tally.Refuse("no_model");continue;}
             g_modelUnavailable.erase(i);
-            const bool hullKnown=Measure(p,base);  // Model Bounds (source)
+            bool hullKnown=Measure(p,base);  // Model Bounds (source)
             if(hullKnown&&g_health.Fingerprint(base,p.radius,p.halfHeight))Log("OBS system=traffic.health event=model_record_reset model=%08X reason=bounds_changed_id_reused radius=%.2f half_height=%.2f",base,p.radius,p.halfHeight);
             if(g_modelGate&&!g_modelGate(i,base,p.radius,p.halfHeight,hullKnown)){
-                g_fitRejected[i].insert(base);p.at=now+100;g_tally.Refuse("lane_model_fit_or_rule");
+                g_fitRejected[i].insert(base);
                 Log("OBS system=traffic.admission vehicle=00000000 event=refused slot=%d model=%08X reason=lane_model_fit_or_rule",i,base);
-                continue;
+                // A slot never stays empty because of one model alone: the next pool model that fits this lane is made instead (2026-11-21: this
+                // fallback once served only the removed dot-world grants, so the covered fill gave up on the first model that did not fit).
+                unsigned fitted=0;
+                {
+                    const unsigned refused=base;const char* w="";
+                    for(int tries=0;tries<int(TypePool().size())+1&&!fitted;++tries){
+                        const unsigned alt=FallbackModelFor(i,0u,&w);if(!alt||alt==refused||SlotSkips(i,alt))break;
+                        const bool known=Measure(p,alt);
+                        if(!g_modelGate||g_modelGate(i,alt,p.radius,p.halfHeight,known)){fitted=alt;hullKnown=known;}
+                        else{g_fitRejected[i].insert(alt);Log("OBS system=traffic.admission vehicle=00000000 event=refused slot=%d model=%08X reason=lane_model_fit_or_rule",i,alt);}
+                    }
+                    if(fitted){Log("OBS system=traffic.admission vehicle=00000000 event=model_changed slot=%d from=%08X to=%08X reason=lane_model_fit_or_rule",i,refused,fitted);base=fitted;}
+                }
+                if(!fitted){
+                    p.at=now+100;g_tally.Refuse("lane_model_fit_or_rule");
+                    continue;
+                }
             }
+            // The core checks concealment at creation; its refusal reason is logged in the add-on's own line.
             // Step 5, Siting: one pose or one reason, from the field box, the model's bounds, other vehicles and Health's spot verdict only.
             // No navmesh, no World levels, no site rays (the user, 2026-11-06). A refusal tries the slot's next authored alternative; none
             // left: empty until the next window.
@@ -2742,29 +2311,26 @@ namespace generator
                 if(site==1)at=pose;
             }
             if(site!=1){
+                
                 ++fillRefused;g_tally.Refuse(why);
                 Log("OBS system=traffic.spawn vehicle=00000000 event=refused slot=%d model=%08X at=%.2f,%.2f,%.2f attempt=%d reason=%s",i,base,at.x,at.y,at.z,attempt,why);
                 if(gap>=0)Log("OBS system=traffic.spawn event=road_gap_refused slot=%d station_m=%.1f conflict_gap_m=%.1f nominal_interval_m=%.1f",i,road.station,gap,road.interval);
                 if(alternatives!=g_initialAlternatives.end()&&attempt<int(alternatives->second.size())){++g_initialAttempt[i];p.at=now+100;}
                 else if(g_clearanceWaiting.count(i)){g_initialAttempt[i]=0;p.at=now+250;}
-                else {g_initialAttempt[i]=0;g_passRefused.insert(i);g_initialRejected.insert(i);p.at=now+5000;}
+                else {g_initialAttempt[i]=0;if(window.cover)g_passRefused.insert(i);g_initialRejected.insert(i);p.at=now+(window.cover?5000:10000);}  // LV-3: a covered window asks again at its next opening; play asks again in 10 s (a car that blocked the spot will have moved)
                 continue;
             }
             g_clearanceWaiting.erase(i);
             Log("OBS system=traffic.spawn vehicle=00000000 event=sited slot=%d model=%08X at=%.2f,%.2f,%.2f heading=%.3f reason=%s",i,base,at.x,at.y,at.z,at.heading,why);
             if(road.interval>0)Log("OBS system=traffic.spawn event=road_station slot=%d station_m=%.1f nominal_interval_m=%.1f coverage_rank=%u attempt=%d",i,road.station,road.interval,order[std::size_t(k)].coverage,attempt);
             int slot=0;while(slots.count(slot))++slot;
-            const double ox=at.x,oy=at.y,oz=at.z,oh=at.heading;
-            // Step 6, Birth reads Siting's pose (card C1): the core's create proof is this pose, not a second site check.
-            if(!g_birthListener&&(!g_sitedProof||!g_sitedProof(base,ox,oy,oz,oh))){
-                const char* no=g_sitedProof?"core_refused_sited_pose":"core_has_no_sited_proof";
-                ++fillRefused;g_tally.Refuse(no);p.at=now+5000;g_initialRejected.insert(i);
-                Log("OBS system=traffic.spawn vehicle=00000000 event=refused slot=%d model=%08X at=%.2f,%.2f,%.2f attempt=%d reason=%s",i,base,ox,oy,oz,attempt,no);
-                continue;
-            }
+            // Step 6, Birth reads Siting's pose (card C1) through the core's birth listener (required with the fleet exports).
             request.sited=site==1;
             const auto grant=SpeakBirth(budget,request,FvoBirthSource::Fleet,i,base,0,at);
             if(!grant)break;
+            if(!window.cover){
+                Log("OBS system=traffic.live vehicle=00000000 event=grant slot=%d model=%08X distance=%.0f resident=%d cap=%d at=%.2f,%.2f,%.2f reason=%s",
+                    i,base,std::hypot(at.x-pp.x,at.y-pp.y),resident,total,at.x,at.y,at.z,"physical_fleet_shortfall");}
             p.birthGrant=grant;
             const auto birthWindow=BirthWindow(screen,window,FvoBirthSource::Fleet);
             p.vehicleIssued=false;
@@ -2775,9 +2341,12 @@ namespace generator
             if(!p.vehicle&&!reply.pending){
                 p.reserved=reserved;p.birth=previousBirth;
                 g_initialRejected.insert(i);p.at=now+5000;
-                Log("Traffic arrival: slot %d: creation not completed; still queued for the requested fleet, retry in 5 s",i);continue;
+                
+                Log("Traffic arrival: slot %d: creation not completed; still queued for the requested fleet, retry in 5 s",i);
+                if(!window.cover){FvoBirthRefusalV1 r;const bool known=CoreRefusal(grant,i,r);LogRefusal("request",i,base,grant,known?&r:nullptr);}
+                continue;
             }
-            p.base=base;p.birth=at;p.reserved=p.staged=true;p.at=now;p.bornAt=now;p.armed=false;p.vehiclePending=!p.vehicle;g_madeThisWindow.insert(i);
+            p.base=base;p.birth=at;p.reserved=p.staged=true;p.at=now;p.bornAt=now;p.vehiclePending=!p.vehicle;g_madeThisWindow.insert(i);
             p.roadProof=clearance;
             p.spotKey=spotKey;p.bothLoadedOnce=p.brokenEvidenceJudged=p.bodyJudged=p.releaseAttempted=p.releaseJudged=p.driveJudged=false;
             p.seatJudged=p.seatTested=false;p.seatPlayMs=p.seatCheckAt=0;
@@ -2794,6 +2363,12 @@ namespace generator
                 p.vehicle?"completed":"queued",i,p.vehicle,p.driver,at.x,at.y,at.z);
             ++g_rushMade;
         }
+        // The live fill's state, every 5 s while the live window is open.
+        if(live&&filling&&now-g_liveToldAt>=5000){
+            g_liveToldAt=now;
+            // The cap is the one the Arbiter applies above (FleetTarget(true, total) = every slot), not the old 32-car live cap.
+            Log("OBS system=traffic.live vehicle=00000000 event=state resident=%d cap=%d waiting=%d waiting_cap=%d",resident,total,waiting,spawnflow::rules::maxWaitingPlay);
+        }
         // Progress for the loading-screen log line: route positions that hold a vehicle with a living driver (placed now,
         // or kept from an earlier visit). Staged ones stay frozen until their autopilot takes them.
         int placed=0;
@@ -2807,8 +2382,7 @@ namespace generator
             const bool underCover=screen>=2&&panelCover;
             const char* holdWhy="";const int unproven=underCover?UnprovenUnderPanel(&holdWhy):0;  // CC-4: Health's output
             const auto elapsed=now-g_rushAt.load();
-            const bool work=underCover&&(InitialAdmissionsPending()||unproven>0||
-                (now<g_factoryCoverWorkUntil&&elapsed<spawnrule::kSettleLimitMs));
+            const bool work=underCover&&(InitialAdmissionsPending()||unproven>0);
             const bool nearbyPilot=underCover&&!work&&std::any_of(g_pairs.begin(),g_pairs.end(),[&](const Pair& p){
                 if(!p.vehicle||p.retired||(!p.staged&&!p.handoffPending))return false;
                 return std::any_of(snap.begin(),snap.end(),[&](const FvoTrafficVehicle& v){
@@ -2836,21 +2410,20 @@ namespace generator
         }
     }
     void Reset(){
+        ClearFleetAssignments();
         ++observations::epoch;
         std::scoped_lock lock(g_lock,g_rushLock);
         g_world.clear();g_spots.clear();g_reuse.clear();g_names.clear();g_pairs.clear();g_worldPools.clear();g_observedOrigins.clear();g_observeCursor=0;
         g_rush={};g_rushRequest=false;g_rushAt=0;g_rushSettlingAt=0;g_rushFill=false;g_rushMade=0;g_coverPassDone=false;g_rosterRecoveryPending=true;g_spares.clear();g_sparesWorld.clear();g_retiringWorld.clear();g_removeQueue.clear();g_parkedGrants.clear();  /* R1: ids are reused across saves */
         g_wantWorld.clear();g_wantSpots.clear();g_wantReuse.clear();g_wantNames.clear();
-        g_wantFactory.reset();g_factoryBay.reset();g_factoryArchived.clear();
-        g_factoryStockAt=0;g_belowStock.clear();
-        g_factorySearchAt=0;g_factoryCandidateAt=0;g_factorySearchCursor=0;g_factoryCoverWorkUntil=0;
-        g_factoryAnchors.clear();
-        g_off=false;g_createdAt=g_lastTick=0;g_admission=-1;g_cursor=0;
-        g_path={};g_coverEndedAt=g_zoneReportAt=0;g_zoneLostChecks=0;g_zoneRadius=0;
-        g_initialScene.clear();g_initialRoads.clear();g_initialCoverage.clear();g_initialRejected.clear();g_initialAlternatives.clear();g_initialAttempt.clear();g_initialFails.clear();g_initialCursor=0;g_initialMap=false;
+        g_createdAt=g_lastTick=0;
+        g_initialScene.clear();g_initialRoads.clear();g_initialRejected.clear();g_initialAlternatives.clear();g_initialAttempt.clear();
         g_initialClockPending=false;g_deferredRegistry.clear();g_registryRecoveryAt=0;g_linkedRecoveryAt=0;g_registryRecoveryCursor=0;g_takenRelease.clear();g_handoffCursor=0;
-        g_passRefused.clear();g_clearanceWaiting.clear();g_wasCovered=false;g_coldFilling=false;g_landings.clear();g_landingAt=0;g_doomed.clear();g_retiring.clear();
-        HealthSave(GetTickCount64(),true);g_tally.Clear();  // card HR2: Health's records last across loads (no Clear)g_slotSkip.clear();g_fitRejected.clear();g_modelUnavailable.clear();populationinspect::Publish({});
+        g_passRefused.clear();g_clearanceWaiting.clear();g_wasCovered=false;g_doomed.clear();g_retiring.clear();
+        HealthSave(GetTickCount64(),true);g_tally.Clear();  // card HR2: Health's records last across loads (no Clear)
+        // These clears were inside the comment above and never ran (found 2026-11-21): the model rules come back with the
+        // pool resend that ResetAll requests, and the inspection list must not show the previous save's pairs.
+        g_slotSkip.clear();g_fitRejected.clear();g_modelUnavailable.clear();populationinspect::Publish({});
     }
     void Rush(const FvoRushPlace*,int){
         std::lock_guard lock(g_rushLock);
@@ -2876,14 +2449,13 @@ namespace generator
     bool ReadVehicles(Snap& snap,bool includeHeld=false){
         snap.resize(kSnapMax);
         const int n=includeHeld&&g_roadVehicles?g_roadVehicles(snap.data(),kSnapMax):
-            includeHeld&&g_populationVehicles?g_populationVehicles(snap.data(),kSnapMax):
             engineport::Forward<&FvoTrafficApi::vehicles>(g_api,"vehicles","generator",0u,snap.data(),kSnapMax);
         if(n<0)return false;
         snap.resize(std::size_t(std::min(n,kSnapMax)));
         return true;
     }
     int CoverClosingNow(int kind){
-        if(!g_api||g_off||!engineport::Forward<&FvoTrafficApi::trafficOn>(g_api,"trafficOn","generator",0u)||!g_api->presentation)return -1;
+        if(!g_api||!engineport::Forward<&FvoTrafficApi::trafficOn>(g_api,"trafficOn","generator",0u)||!g_api->presentation)return -1;
         Pos pp;std::string name;if(!PlayerNow(pp,name))return -1;
         {std::lock_guard lock(g_lock);if(g_wantWorld!=name||g_world!=name)return -1;}
         Snap snap;if(!ReadVehicles(snap))return -1;
@@ -2891,16 +2463,22 @@ namespace generator
         return CoverClosing(snap,now,kind);
     }
     void Tick(){
-        if(!g_api||g_off||!engineport::Forward<&FvoTrafficApi::trafficOn>(g_api,"trafficOn","generator",0u)||!g_api->presentation||!engineport::Forward<&FvoTrafficApi::presentation>(g_api,"presentation","generator",0u))return;
+        // 2026-11-21: the dot-based live fill is removed. A core without the fleet rail exports gets no population at all,
+        // so two population systems can never run against each other.
+        if(!PhysicalFleetActive()){static bool told=false;if(!told){told=true;Log("OBS system=traffic.fleet event=refused reason=core_without_fleet_rail_exports effect=no_population");}return;}
+        // Every core with the fleet exports also has the birth listener and road clearance; their older-core fallbacks are gone,
+        // so a core missing one is refused the same way instead of running a second birth path.
+        if(!g_birthListener||!g_roadCheck){static bool told=false;if(!told){told=true;
+            Log("OBS system=traffic.fleet event=refused reason=core_without_required_export missing=%s effect=no_population",
+                !g_birthListener?"FVO_TrafficBirthRequestV1":"FVO_TrafficRoadVehiclesV1_FVO_TrafficRoadCheckV1_FVO_TrafficBirthRequestV2");}return;}
+        if(!g_api||!engineport::Forward<&FvoTrafficApi::trafficOn>(g_api,"trafficOn","generator",0u)||!g_api->presentation||!engineport::Forward<&FvoTrafficApi::presentation>(g_api,"presentation","generator",0u))return;
         Pos pp;std::string name;if(!PlayerNow(pp,name))return;
         HealthLoad();
         {std::lock_guard lock(g_lock);if(g_wantWorld!=name)return;}
         if(g_world!=name){
-            g_factoryStockAt=0;g_belowStock.clear();
-            g_factorySearchAt=0;g_factoryCandidateAt=0;g_factorySearchCursor=0;g_factoryCoverWorkUntil=0;
+            ClearFleetAssignments();
             g_parkedGrants.clear();
-            g_admission=-1;g_lastTick=0;
-            for(auto& p:g_pairs)if(p.factoryLease)FactoryCancel(p);
+            g_lastTick=0;g_lastCoveredAt=GetTickCount64();
             if(!g_world.empty())g_worldPools[g_world]={g_spots,g_reuse,g_names,g_pairs};
             g_world=name;auto it=g_worldPools.find(name);
             if(it!=g_worldPools.end()){g_spots=it->second.spots;g_reuse=it->second.reuse;g_names=it->second.names;g_pairs=it->second.pairs;}
@@ -2911,10 +2489,9 @@ namespace generator
         RushStep();
         const auto now=GetTickCount64();
         if(g_lastTick&&now-g_lastTick>1000){const auto gap=now-g_lastTick;
-            for(auto& p:g_pairs)for(auto* t:{&p.at,&p.seatAt,&p.tripAt,&p.watchAt,&p.idleSince,&p.askAt,&p.busySince,&p.no3DSince,&p.noBodySince})if(*t)*t+=gap;
+            for(auto& p:g_pairs)for(auto* t:{&p.at,&p.seatAt,&p.tripAt,&p.watchAt,&p.idleSince,&p.busySince,&p.noBodySince})if(*t)*t+=gap;
         }g_lastTick=now;
         Snap snap;if(!ReadVehicles(snap))return;
-        if(ObserveFactoryStock(snap,now))Reconcile();
         const int presentation=engineport::Forward<&FvoTrafficApi::presentation>(g_api,"presentation","generator",0u);
         RecoverSavedFleet(now,presentation);
         // Remember observable origins independently of which fleet member is
@@ -2923,30 +2500,37 @@ namespace generator
             const auto& origin=g_spots[g_observeCursor++%g_spots.size()];
             if(SightAt(origin.x,origin.y,origin.z).Exposure()==1)g_observedOrigins[g_world].insert(OriginKey(origin));  // V1
         }
-        // One candidate's physical queries at a time: no fleet burst, queue flood,
-        // or concurrent births hidden from the snapshot. Warm checks also run
-        // during play; actual admission is separately concealed and observable.
-        if(g_admission<0||g_admission>=int(g_pairs.size())||!SlotFree(g_pairs[g_admission])||now-g_admissionAt>5000){
-            g_admission=-1;
-            for(std::size_t j=0;j<g_pairs.size();++j){const auto i=(g_cursor+j)%g_pairs.size();
-                if(SlotFree(g_pairs[i])&&!g_pairs[i].retired){g_admission=int(i);g_cursor=(i+1)%g_pairs.size();g_admissionAt=now;break;}}
-        }
         const bool panelCover=presentation!=2||!g_rushFill||XPanelCovered();
         const bool preparing=g_rushFill&&GetTickCount64()-g_rushAt.load()<spawnrule::kResetLimitMs;
-        const auto window=spawnflow::WindowNow(presentation,preparing,false,g_testNear,panelCover);
+        // LV-3: the play rule (spawnrule::LiveOpen) after any cover or map has been gone long enough; the lab test switch is its own, separate window flag.
+        if(presentation!=1||!g_lastCoveredAt)g_lastCoveredAt=now;
+        const bool liveRoad=spawnrule::LiveOpen(presentation,false,now-g_lastCoveredAt);
+        const auto window=spawnflow::WindowNow(presentation,preparing,false,liveRoad,panelCover);
+        {   static bool liveWasOpen=false;
+            if(window.live!=liveWasOpen){liveWasOpen=window.live;Log("OBS system=traffic.live vehicle=00000000 event=window state=%s settle_ms=%llu fleet_cap=%d stretch_m=%.0f demand=%s",window.live?"open":"closed",spawnrule::kLiveSettleMs,int(g_initialScene.size()),spawnflow::rules::liveRadius,"physical_shortfall");}
+        }
         spawnflow::BirthBudget budget;
         PrioritizeHealth(snap,now,presentation);
         for(int i=0;i<int(g_pairs.size());++i)Step(i,g_pairs[i],g_spots[i],pp,snap,now,presentation,window,budget);
         ServiceHandovers(snap,now);
         Snap held;
         const Snap* occupancy=&snap;
-        if((g_populationVehicles||g_roadVehicles)&&spawnflow::MayCreate(window,budget.granted,0))
+        if(g_roadVehicles&&spawnflow::MayCreate(window,budget.granted,0))
             occupancy=ReadVehicles(held,true)?&held:nullptr;
+        LARGE_INTEGER sceneFrom{},sceneTo{},sceneHz{};QueryPerformanceFrequency(&sceneHz);QueryPerformanceCounter(&sceneFrom);
         InitialScene(snap,occupancy,pp,now,presentation,panelCover,window,budget);
+        QueryPerformanceCounter(&sceneTo);
+        if(window.live&&sceneHz.QuadPart){  // LV-3 cost: the fill's own time per tick, so the next run measures what a live fill costs the frame
+            static double worst=0,total=0;static int ticks=0;static ULONGLONG toldAt=0;
+            const double ms=1000.0*double(sceneTo.QuadPart-sceneFrom.QuadPart)/double(sceneHz.QuadPart);
+            worst=std::max(worst,ms);total+=ms;++ticks;
+            if(now-toldAt>=10000){toldAt=now;Log("OBS system=traffic.live vehicle=00000000 event=tick_cost ticks=%d average_ms=%.3f worst_ms=%.3f",ticks,total/std::max(1,ticks),worst);worst=total=0;ticks=0;}
+        }
         std::vector<FvoPopulationInspectV1> inspected;inspected.reserve(g_pairs.size());
-        for(std::size_t i=0;i<g_pairs.size();++i){const auto& pair=g_pairs[i];FvoPopulationInspectV1 row;row.vehicle=pair.vehicle;row.driver=pair.driver;row.state=int(pair.st);row.retired=pair.retired;row.staged=pair.staged;row.armed=pair.armed;row.vehiclePending=pair.vehiclePending;row.driverPending=pair.driverPending;row.at=now;
+        for(std::size_t i=0;i<g_pairs.size();++i){const auto& pair=g_pairs[i];FvoPopulationInspectV1 row;row.vehicle=pair.vehicle;row.driver=pair.driver;row.state=int(pair.st);row.retired=pair.retired;row.staged=pair.staged;row.armed=0;row.vehiclePending=pair.vehiclePending;row.driverPending=pair.driverPending;row.at=now;
             std::snprintf(row.name,sizeof row.name,"%s",i<g_names.size()?g_names[i].c_str():"unnamed slot");
-            const char* reason=IsFactorySlot(int(i))?pair.factoryWhy:pair.retired?"retiring existing identity":pair.vehiclePending?"vehicle creation pending":pair.driverPending?"driver creation pending":pair.relocating?"existing placement pending":pair.noBodySince?"waiting for physics body":pair.no3DSince?"waiting for driver model":pair.proving?"existing readiness validation":pair.handoffPending?"handoff proof pending":pair.sending?"existing departure pending":pair.staged?"staged; awaiting pilot handover":pair.st==St::Started?"active journey":pair.st==St::Ready?"ready; awaiting route assignment":pair.st==St::Created?"pair created; awaiting readiness":pair.st==St::Failed?"existing recovery pending":pair.st==St::Empty?"empty; awaiting admission":"reconciling saved identity";
+            const int fleetMode=pair.vehicle&&g_fleetState?g_fleetState(pair.vehicle):0;
+            const char* reason=fleetMode==2?"active journey; rail owns motion":fleetMode==3?"active journey; awaiting engine evidence":pair.retired?"retiring existing identity":pair.vehiclePending?"vehicle creation pending":pair.driverPending?"driver creation pending":pair.noBodySince?"waiting for physics body":pair.proving?"existing readiness validation":pair.handoffPending?"handoff proof pending":pair.sending?"existing departure pending":pair.staged?"staged; awaiting pilot handover":pair.st==St::Started?"active journey":pair.st==St::Ready?"ready; awaiting route assignment":pair.st==St::Created?"pair created; awaiting readiness":pair.st==St::Failed?"existing recovery pending":pair.st==St::Empty?"empty; awaiting admission":"reconciling saved identity";
             std::snprintf(row.reason,sizeof row.reason,"%s",reason);inspected.push_back(row);
         }
         populationinspect::Publish(std::move(inspected));

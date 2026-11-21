@@ -48,6 +48,24 @@ int main() {
     const auto authored=r.road.boxes[0];
     Check(tilebox::MaterializeMissing(r)>=0 && r.road.boxes[0].width==authored.width && r.road.boxes[0].yaw==authored.yaw, "update preserves authored box");
     r.road.boxesUnsupported = "junk"; Check(!tilebox::TileBox(r, line, 0, f), "unreadable road_boxes: treated as not authored");
+    {   // LV-1 (2026-11-20): a rounded corner crowds line samples into the end of a tile; the box must stay centred on its chord, so every lane point
+        // of the tile (the first metres included) is inside the box. Before: the centre sat at the middle line INDEX, 35 m off on the real ring road.
+        trafficdata::Route c; c.ring = false; c.lanes = 2; c.corridor = 5; c.travel = routepolicy::Travel::Both; c.width = 4;
+        c.points = { { 0, 0, 10 }, { 0, 100, 10 }, { 60, 150, 10 }, { 200, 150, 10 } };
+        c.rounding = { 0, 0, 25, 0 };
+        const auto cl = trafficroute::Build(c);
+        bool allCentred = !cl.error && cl.Count() > 4;
+        for (int tile = 0; allCentred && tile < tilebox::TileCount(c); ++tile) {
+            FvoFieldBoxV1 box; if (!tilebox::TileBox(c, cl, tile, box)) { allCentred = false; break; }
+            const auto a = tilebox::RouteAt(cl, cl.ToLine(double(tile))), e = tilebox::RouteAt(cl, cl.ToLine(double(tile + 1)));
+            allCentred = Near(box.cx, .5 * (a.x + e.x), .01) && Near(box.cy, .5 * (a.y + e.y), .01) && Near(box.cz - box.halfHeight, .5 * (a.z + e.z), .01);
+        }
+        Check(allCentred, "LV-1: every tile box is centred on the middle of its two end points, rounded corners included");
+        const auto first = tilebox::RouteAt(cl, cl.ToLine(1.0));
+        FvoFieldBoxV1 box1; fieldbox::Box inside;
+        const bool boxed = tilebox::TileBox(c, cl, 1, box1) && fieldboxapi::ToBox(box1, inside);
+        Check(boxed && fieldbox::Contains(inside, { first.x, first.y, first.z + .5 }), "LV-1: the first point of a tile after a rounded corner lies inside that tile's box");
+    }
     std::printf("%s\n", failed ? "FAILED" : "ALL PASS");
     return failed ? 1 : 0;
 }

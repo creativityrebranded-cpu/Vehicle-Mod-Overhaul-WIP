@@ -200,9 +200,20 @@ int main() {
     Check(!WindowNow(2, false, false).open, "window: the plain local map is closed");
     Check(!WindowNow(1, true, false).open && !std::strcmp(WindowNow(1, true, false).why, "in_play"), "window: never in play");
     Check(!WindowNow(3, false, true).open && !std::strcmp(WindowNow(3, false, true).why, "clock_pending"), "window: waits for the route clock");
-    Check(WindowNow(1, false, false, true).open && !WindowNow(1, false, false, true).cover && !std::strcmp(WindowNow(1, false, false, true).why, "test_near_player"), "window (TS1): the test switch opens it in play");
-    Check(!WindowNow(1, false, true, true).open && !WindowNow(2, false, false, true).open, "window (TS1): the test switch still waits for the clock; the plain map stays closed");
-    Check(MayCreate(WindowNow(1, false, false, true), 0, rules::maxWaitingPlay - 1) && !MayCreate(WindowNow(1, false, false, true), 0, rules::maxWaitingPlay), "arbiter (TS1): smaller waiting cap in play");
+    Check(WindowNow(1, false, false, true).open && !WindowNow(1, false, false, true).cover && !std::strcmp(WindowNow(1, false, false, true).why, "live_road"), "window (LV-3): the live rule opens it in play, uncovered");
+    Check(!WindowNow(1, false, true, true).open && !WindowNow(2, false, false, true).open, "window (LV-3): the live rule still waits for the clock; the plain map stays closed");
+    {   const auto road = WindowNow(1, false, false, true), plain = WindowNow(1, false, false);
+        Check(road.live && road.open && !road.cover && !plain.live && !plain.open, "window (LV-3): only the live rule makes the play window live");
+        Check(!WindowNow(3, false, false).live && !WindowNow(2, true, false).live, "window (LV-3): covered windows are not live");
+        const Window built = { true, false, "live_road" };
+        Check(built.open && !built.cover && !built.live, "window (LV-3): the generator's aggregate Windows keep working");
+    }
+    Check(MayCreate(WindowNow(1, false, false, true), 0, rules::maxWaitingPlay - 1) && !MayCreate(WindowNow(1, false, false, true), 0, rules::maxWaitingPlay), "arbiter (LV-3): smaller waiting cap in play");
+    Check(!spawnrule::LiveOpen(1, false, spawnrule::kLiveSettleMs - 1) && spawnrule::LiveOpen(1, false, spawnrule::kLiveSettleMs) && !spawnrule::LiveOpen(1, true, 99999) &&
+          !spawnrule::LiveOpen(2, false, 99999) && !spawnrule::LiveOpen(3, false, 99999) && !spawnrule::LiveOpen(0, false, 99999), "live rule: play only, after the settle time, never while the clock waits");
+    {   const auto w = WindowNow(1, false, false, true);   // DW-2: the global live pause is gone; the arbiter's per-tick limit is a parameter, the in-flight cap is the rule
+        Check(MayCreate(w, 0, 0) && !MayCreate(w, 1, 0) && MayCreate(w, 3, 0, 4) && !MayCreate(w, 4, 0, 4) && !MayCreate(w, 0, rules::maxWaitingPlay, 4), "arbiter: in play one create per tick by default, more only when the caller raises the limit; the in-flight cap stays rules::maxWaitingPlay");
+        BirthBudget b; b.limit = 3; Check(b.Admit(w, false) && b.Admit(w, false) && b.Admit(w, false) && !b.Admit(w, false), "arbiter: the birth budget follows its per-tick limit"); }
     const auto loading = WindowNow(3, false, false);
     const auto panel = WindowNow(2, true, false);
     BirthBudget repairFirst, fleetFirst, play;
@@ -210,8 +221,8 @@ int main() {
     Check(fleetFirst.Admit(panel, false) && !fleetFirst.Admit(panel, true), "birth arbiter: fleet and repair share the X tick's grant");
     Check(!play.Admit(WindowNow(2, false, false), false) && !play.Admit(WindowNow(1, false, false), true) && play.granted == 0,
           "birth arbiter: closed windows never spend the grant");
-    const auto diagnostic = WindowNow(1, false, false, true);
-    Check(!play.Admit(diagnostic, true) && play.Admit(diagnostic, false), "birth arbiter: the diagnostic window is for fleet requests only");
+    const auto diagnostic = WindowNow(1, false, false, true);  // the live window
+    Check(!play.Admit(diagnostic, true) && play.Admit(diagnostic, false), "birth arbiter: the live window is for fleet requests only");
     PopulationRequest fleetRequest{PopulationAction::FleetBirth,panel};
     BirthBudget population;
     fleetRequest.profileHasRoom=false;
@@ -222,6 +233,16 @@ int main() {
     Check(!ArbitratePopulation(fleetRequest,&population).now&&population.granted==0,"population: the field and spacing must accept the pose");
     fleetRequest.sited=true;
     Check(ArbitratePopulation(fleetRequest,&population).now,"population: an allowed birth spends the shared grant");
+    PopulationRequest existingVehicle{PopulationAction::FleetPath};
+    Check(ArbitratePopulation(existingVehicle, &population).now, "population: visible existing car receives its committed path outside birth window");
+    existingVehicle.unseen = true;
+    Check(ArbitratePopulation(existingVehicle, &population).now, "population: concealment is irrelevant to existing-car path assignment");
+    existingVehicle.worldOwned = true;
+    Check(!ArbitratePopulation(existingVehicle, &population).now, "population: a car owned by the player is outside traffic scope");
+    existingVehicle.worldOwned = false;
+    existingVehicle.sited = false;
+    Check(!ArbitratePopulation(existingVehicle, &population).now, "population: the executor needs a committed path");
+
     PopulationRequest retirement{PopulationAction::Retirement};
     Check(!ArbitratePopulation(retirement).now,"population: a visible retirement waits");
     retirement.unseen=true;
@@ -329,11 +350,6 @@ int main() {
     Check(!std::strcmp(Waiting(true, false, true, true, true), "no_driver_model"), "ledger: a wait names what is missing");
     Check(!std::strcmp(Waiting(true, true, false, false, false), "no_physics_body") && !std::strcmp(Waiting(true, true, true, true, false), "not_sitting") && !std::strcmp(Waiting(true, true, true, true, true), "waiting_release"), "ledger: in the order the flow needs it");
 
-    // 8 Handoff
-    Check(Release(true, true, .2, .1, .3), "handoff: settled after the drop");
-    Check(!Release(true, true, 0, 0, 6), "handoff: fell too far: no release");
-    Check(!Release(false, true, 0, 0, .3) && !Release(true, false, 0, 0, .3), "handoff: needs seated and a body");
-
     // 9 Retirement
     Check(!MayRemove(true, true, true).now, "retirement: never the world's");
     Check(MayRemove(false, true, false).now && MayRemove(false, false, true).now, "retirement: under cover or out of sight");
@@ -369,7 +385,7 @@ int main() {
     {   const auto w = WindowNow(3, false, false); Check(MayCreate(w, 0, 0), "flow: window open, arbiter may create");
         const auto site = Place(true, FlatBox(10), lane, car, false, false); Check(site.ok, "flow: sited");
         Check(Allowed(Life::None, Life::Born) && Allowed(Life::Born, Life::Proving), "flow: born, proving");
-        Facts p; p.proving = false; p.seated = true; Check(Judge(p).life == Life::Driving && Release(true, true, 0, 0, rules::dropMargin), "flow: healthy and released after the drop"); }
+        Facts p; p.proving = false; p.seated = true; Check(Judge(p).life == Life::Driving, "flow: healthy, ready for the handoff"); }
     // EV-1: empty vehicles (user: "empty vehicles need clearing ... cleanup should make sure it works on both").
     {   Check(!EmptyCause(true, false, true, 0x11, 0x11), "empty (EV-1): its own driver aboard is not empty");
         Check(!EmptyCause(true, false, false, 0x22, 0x11) && !EmptyCause(false, false, false, 0x22, 0x11), "empty (EV-1): someone else in the seat (player, companion, job) is not traffic's to judge");
@@ -408,18 +424,17 @@ int main() {
         Check(RouteHasRoom(-1, 50), "demand (SR-3): unknown room (no such route here) applies no limit"); }
 
     // KO-2a Handoff: a taken frozen pair is released to the player.
-    {   Check(ReleaseTaken(true, true), "handoff (KO-2a): a frozen pair the player took is released");
-        Check(!ReleaseTaken(true, false), "handoff (KO-2a): a frozen pair nobody took stays held");
-        Check(!ReleaseTaken(false, true), "handoff (KO-2a): a taken pair already released needs nothing"); }
-
-    {   Check(FactoryPose(1.2, 1.6, rules::factoryPoseVertical),
-              "factory siting: position inside its horizontal and vertical bounds");
-        Check(!FactoryPose(1.8, 1.8, 0),
-              "factory siting: radial distance rejects a corner beyond its envelope");
-        Check(!FactoryPose(0, 0, rules::factoryPoseVertical + .1),
-              "factory siting: a different floor is outside its envelope");
-        Check(!FactoryPose(std::nan(""), 0, 0),
-              "factory siting: unknown position cannot establish proof"); }
+    {
+        BirthBudget budget;
+        PopulationRequest path{PopulationAction::FleetPath};
+        Check(ArbitratePopulation(path,&budget).now&&budget.granted==0,
+              "fleet path: an existing pair receives its path in play without a birth window or creation budget");
+        path.worldOwned=true;
+        Check(!ArbitratePopulation(path).now,"fleet path: a player-owned pair cannot be reassigned");
+        path.worldOwned=false;
+        path.sited=false;
+        Check(!ArbitratePopulation(path).now,"fleet path: a real pair needs a committed route before assignment");
+    }
 
     // Relocation hold and re-base (Health)
     { Check(!JudgeFall(true, true, true, true), "relocating: no fall verdict, even when it looks deep, under the floor and descending");

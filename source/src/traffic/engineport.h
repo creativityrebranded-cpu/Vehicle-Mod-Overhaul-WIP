@@ -18,7 +18,13 @@
 // Existing caller guards and the core's native checks remain authoritative.
 namespace engineport {
 enum class Event { Unavailable, Refused, Pending, Suppressed };
-struct Caller {const char* module;std::source_location location;Caller(const char* name,std::source_location where=std::source_location::current()):module(name),location(where){}};
+#ifndef FVO_RELEASE
+struct Caller {const char* module;std::source_location location;Caller(const char* name,std::source_location where=std::source_location::current()):module(name),location(where){}
+    const char* File()const{return location.file_name();}unsigned Line()const{return location.line();}};
+#else
+// Player builds record no source locations: nothing reads them there, and they would put this PC's build paths into the shipped DLL.
+struct Caller {const char* module;Caller(const char* name):module(name){}const char* File()const{return "";}unsigned Line()const{return 0;}};
+#endif
 struct Trace {
     Event event;
     const char* operation;
@@ -40,7 +46,7 @@ inline std::atomic<Observer> observer{nullptr};
 inline std::atomic<std::uint64_t> sequence{0};
 inline const char* Name(Event e) {return e==Event::Suppressed?"suppressed":e==Event::Pending?"pending":e==Event::Refused?"refused":"unavailable";}
 inline void Report(Event event,const char* operation,Caller caller,unsigned vehicle,const char* reason,std::uint64_t request=0) {
-    const Trace trace{event,operation,caller.module,reason,vehicle,request?request:sequence.fetch_add(1,std::memory_order_relaxed)+1,caller.location.file_name(),caller.location.line()};Remember(trace);if(auto sink=observer.load(std::memory_order_relaxed))sink(trace);
+    const Trace trace{event,operation,caller.module,reason,vehicle,request?request:sequence.fetch_add(1,std::memory_order_relaxed)+1,caller.File(),caller.Line()};Remember(trace);if(auto sink=observer.load(std::memory_order_relaxed))sink(trace);
 }
 inline bool Mutation(const char* operation){for(const char* name:{"startTrip","startScripted","startSupply","startPatrol","startArmed","releaseBirth","sendPair","deleteRef","bringDriver","canStartTrip","mayUse"})if(std::strcmp(name,operation)==0)return true;return false;}
 template<class... Args> unsigned Subject(unsigned explicitId,const char* operation,Args&&... args){if(explicitId)return explicitId;if constexpr(sizeof...(Args)>0){auto tuple=std::forward_as_tuple(args...);if constexpr(sizeof...(Args)>1){using Second=std::remove_cvref_t<decltype(std::get<1>(tuple))>;if constexpr(std::is_integral_v<Second>){if(std::strcmp(operation,"startTrip")==0||std::strcmp(operation,"startScripted")==0||std::strcmp(operation,"startArmed")==0||std::strcmp(operation,"mayUse")==0||std::strcmp(operation,"bringDriver")==0)return unsigned(std::get<1>(tuple));}}using First=std::remove_cvref_t<decltype(std::get<0>(tuple))>;if constexpr(std::is_integral_v<First>)return unsigned(std::get<0>(tuple));}return 0;}

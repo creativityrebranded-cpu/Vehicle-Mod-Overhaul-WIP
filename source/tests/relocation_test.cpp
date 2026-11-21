@@ -117,6 +117,83 @@ int main() {
         for (std::uint32_t v = 1; v <= 40; ++v) { auto t = c.Arm(Make(v), 7, why); if (t) c.Refuse(t, "x", 4); }
         Check(c.LastFor(40, got), "the table stays bounded and keeps the newest");
     }
+    // ---- Long and cross-cell moves (2026-11-20) ----
+    {   // hop planning
+        Check(HopCount(0) == 0 && HopCount(6) == 1 && HopCount(20) == 1 && HopCount(20.5) == 2 && HopCount(120) == 6 && HopCount(250) == 13, "hop counts follow the 20 m bound");
+        Check(HopCount(std::nan("")) == 0, "a non-finite distance needs no hops");
+        const Pose from{ 0, 0, -30, 0 }, to{ 90, 120, 2, 0 };   // ~ 150 m
+        Pose at = from; unsigned n = 0; bool last = false;
+        double worst = 0;
+        while (!last && n < 100) { Pose h = NextHop(at, to, last); worst = std::max(worst, Distance(at, h)); at = h; ++n; }
+        Check(last && n == HopCount(Distance(from, to)) && worst <= kMaxHopM + 1e-9, "hops from the measured position reach the target in the planned count, none above 20 m");
+        Check(Distance(at, to) < 1e-9, "the last hop lands exactly on the target");
+        bool l2 = false; const auto h1 = NextHop({ 0, 0, 0, 0 }, { 6, 0, 0.3, 0 }, l2);
+        Check(l2 && Distance(h1, { 6, 0, 0.3, 0 }) < 1e-12, "a short move is one hop to the target (the proven 6 m case is unchanged)");
+        // a hop that came up short is corrected from where the chassis really is, not accumulated
+        bool l3 = false; const auto first = NextHop({ 0, 0, 0, 0 }, { 100, 0, 0, 0 }, l3);
+        const auto second = NextHop({ first.x - 4, 0, 0, 0 }, { 100, 0, 0, 0 }, l3);
+        Check(!l3 && std::fabs(second.x - (first.x - 4 + kMaxHopM)) < 1e-9, "the next hop starts from the measured chassis");
+    }
+    {   // limits
+        const char* why = "";
+        Check(MoveAcceptable(120, why) && MoveAcceptable(250, why) && Is(why, "ok"), "120 m and 250 m are accepted");
+        Check(!MoveAcceptable(250.5, why) && Is(why, "move_above_core_limit"), "above 250 m is refused with its reason");
+        Check(!MoveAcceptable(std::nan(""), why), "a non-finite distance is refused");
+    }
+    {   // hop judgement
+        const char* why = ""; Pose tgt{ 100, 220, 10, 0 };
+        Readback r = Good(); r.chassis = { 100.5, 220.5, 10, 0 }; r.stepAfter = 2;
+        Check(JudgeHop(r, tgt, kHopToleranceM, why) == HopVerdict::Arrived, "a hop that completed a step near its waypoint arrived");
+        Readback w = r; w.stepAfter = 0; Check(JudgeHop(w, tgt, kHopToleranceM, why) == HopVerdict::Wait && Is(why, "no_fresh_step"), "no completed step: wait, no verdict");
+        Readback f = r; f.chassis = { 110, 220, 10, 0 }; Check(JudgeHop(f, tgt, kHopToleranceM, why) == HopVerdict::Failed && Is(why, "hop_not_at_target"), "a hop that missed its waypoint failed");
+        f = r; f.seatedAfter = false; Check(JudgeHop(f, tgt, kHopToleranceM, why) == HopVerdict::Failed && Is(why, "seat_link_lost") && !Recoverable(f), "a lost seat fails the hop and is not recoverable");
+        f = r; f.physicsLive = false; Check(JudgeHop(f, tgt, kHopToleranceM, why) == HopVerdict::Failed && !Recoverable(f), "dead physics fails the hop and is not recoverable");
+        f = r; f.chassis = { 110, 220, 10, 0 }; Check(Recoverable(f), "a live seated pair that only missed the waypoint can be walked back");
+    }
+    {   // multi-hop protocol: one receipt, only after the last hop's read-back; cross-cell flag and hops carried
+        Coordinator c; Log a; c.Subscribe("health", Apply, &a); const char* why = "";
+        Request q = Make(); q.to = { 100, 320, 10, 0 }; q.crossCell = true;   // 120 m
+        auto s = c.Arm(q, 7, why); c.MarkIssued(s, 1000);
+        for (int i = 0; i < 5; ++i) c.HopIssued(s, 1100 + i * 100);
+        Check(c.Hops(s) == 6 && c.Relocating(0xFE001) && a.calls == 0, "six hops issued: still relocating, nobody told");
+        Receipt out; auto rb = Good(); rb.chassis = { 100.3, 319.8, 10, 0 }; rb.stepAfter = 42; rb.refiled = true; rb.driverPoseKnown = false;
+        Check(c.Verify(s, rb, 1700, out) && out.result == Result::Applied && out.crossCell && out.refiled && out.hops == 6 && out.version == kReceiptVersion, "the receipt after the last hop says applied, cross-cell, refiled, six hops");
+        Check(a.calls == 1 && out.displacement > 119 && out.displacement < 121, "one delivery with the full displacement");
+    }
+    {   // the verify window restarts from the last hop
+        Coordinator c; Log a; c.Subscribe("health", Apply, &a); const char* why = "";
+        auto s = c.Arm(Make(), 7, why); c.MarkIssued(s, 1000); c.HopIssued(s, 1000 + kVerifyWindowMs - 100);
+        auto idle = Good(); idle.stepAfter = 40; Receipt out;
+        Check(!c.Verify(s, idle, 1000 + kVerifyWindowMs + 50, out), "a late hop keeps the pair waiting past the first hop's window");
+        Check(c.Verify(s, idle, 1000 + 2 * kVerifyWindowMs, out) && out.result == Result::Failed && Is(out.reason, "no_completed_step"), "then the window ends in failed");
+    }
+    {   // abort and restore: a failed hop is walked back and published once
+        Coordinator c; Log a; c.Subscribe("health", Apply, &a); const char* why = "";
+        Request q = Make(); q.to = { 100, 320, 10, 0 };
+        auto s = c.Arm(q, 7, why); c.MarkIssued(s, 10); c.HopIssued(s, 20);
+        Readback back = Good(); back.chassis = { 100.2, 200.3, 10, 0 }; back.stepAfter = 3;
+        auto r = c.Conclude(s, back, true, "hop_failed_returned_to_origin", 30);
+        Check(r.result == Result::Restored && Is(r.reason, "hop_failed_returned_to_origin") && a.calls == 1 && a.result == Result::Restored && !c.Relocating(0xFE001), "a pair walked back and read back at its origin is published as restored");
+        Check(c.Conclude(s, back, true, "x", 40).result == Result::None && a.calls == 1, "it is published once");
+        auto s2 = c.Arm(Make(0xFE010), 7, why); c.MarkIssued(s2, 50);
+        Readback mid = Good(); mid.chassis = { 100, 260, 10, 0 };
+        auto r2 = c.Conclude(s2, mid, true, "hop_failed_returned_to_origin", 60);
+        Check(r2.result == Result::Failed && Is(r2.reason, "restore_not_proved"), "a walk back that is not at the origin is not called restored");
+        auto s3 = c.Arm(Make(0xFE011), 7, why); c.MarkIssued(s3, 70);
+        Readback gone = Good(); gone.seatedAfter = false;
+        auto r3 = c.Conclude(s3, gone, false, "seat_link_lost", 80);
+        Check(r3.result == Result::Failed && Is(r3.reason, "seat_link_lost"), "an unrecoverable pair is published failed with the last observed reason");
+        auto s4 = c.Arm(Make(0xFE012), 7, why);
+        Check(c.Conclude(s4, back, true, "x", 90).result == Result::None, "a move that never issued cannot be concluded (a refusal is used instead)");
+    }
+    {   // the cross-cell refile that never shows is failed, not applied: a settle timeout is a Conclude, never a Verify
+        Coordinator c; Log a; c.Subscribe("health", Apply, &a); const char* why = "";
+        Request q = Make(); q.crossCell = true;
+        auto s = c.Arm(q, 7, why); c.MarkIssued(s, 10);
+        auto rb = Good(); rb.refiled = false;
+        auto r = c.Conclude(s, rb, false, "refile_not_settled", 10 + kSettleWindowMs + 1);
+        Check(r.result == Result::Failed && Is(r.reason, "refile_not_settled") && r.crossCell && !r.refiled, "no refile: failed with the reason, cross-cell flag kept, refiled false");
+    }
     std::printf("relocation: %d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

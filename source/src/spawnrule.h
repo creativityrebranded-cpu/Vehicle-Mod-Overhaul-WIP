@@ -8,6 +8,15 @@ inline int Presentation(bool loadingCover,bool worldReady,bool panelCover,bool p
 }
 // screen: 3 loading screen, 2 under the local map, 1 play, 0 none. reset: X's fill is running.
 inline bool Open(int screen,bool reset){return screen==3||(screen==2&&reset);}
+// LV-3 (2026-11-20, the user: "we create vehicles like X but this time LIVE ... for a large stretch of whatever road we're in"): the road is
+// also filled during play. Open() above stays the covered rule (loading screen, X); LiveOpen is the play rule. It never replaces the core's own
+// refusal of a pose the player can see; it only says WHEN the Arbiter may ask. Waits for the route clock and for a settle time after any cover
+// (the loading screen's own fill, X, a map) so live births never overlap the covered fill or the world's first frames.
+inline constexpr unsigned long long kLiveSettleMs=8000;
+inline bool LiveOpen(int screen,bool clockPending,unsigned long long sinceCoverMs){return screen==1&&!clockPending&&sinceCoverMs>=kLiveSettleMs;}
+// Live creation (2026-11-20): a car may be made in play wherever the player cannot see it: a line of sight blocked by the world, or
+// outside the camera view (and the camera not about to look there) and at least this far from the player so the hull is clear of them.
+inline constexpr double kUnseenMinM=40.0;
 inline constexpr unsigned long long kResetLimitMs=60000;
 inline constexpr unsigned long long kSettleLimitMs=8000;
 

@@ -17,6 +17,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -565,12 +566,14 @@ namespace loadedarea
 			}
 			g_driverSynced.fetch_add(1, std::memory_order_relaxed);
 		}
-		struct Crossing { std::uint32_t id, driverId; float to[3]; };
+		struct Crossing { std::uint32_t id, driverId; float to[3]; std::uint64_t poseGeneration; bool always = false; };
 		constexpr int kMaxCrossings = 16;
 		Crossing g_crossings[kMaxCrossings];
 		int g_crossingCount = 0;
 		void SyncOne(std::uint32_t id, std::uint32_t driverId, uptr world, ULONGLONG now)
 		{
+			const auto generation=npcvehicles::PoseGeneration(id);
+			if(!generation)return;
 			const uptr component = vehiclediag::ComponentOf(id);
 			if (!component) {logger::Observe("stream.sync",id,0,"driver=%08X reason=no_component",driverId);return;}
 			__try {
@@ -608,7 +611,7 @@ namespace loadedarea
 				// Past its grid cell the position-only setter would leave it listed in the old cell (the 16:07 hang). The service moves
 				// it into the new cell instead (QueueCrossings); nothing is written here.
 				if (WouldLeaveCell(ref, target[0], target[1])) {
-					if (g_crossingCount < kMaxCrossings) g_crossings[g_crossingCount++] = { id, driverId, { target[0], target[1], target[2] } };
+					if (g_crossingCount < kMaxCrossings) g_crossings[g_crossingCount++] = { id, driverId, { target[0], target[1], target[2] }, generation };
 					g_crossHeld.fetch_add(1, std::memory_order_relaxed);
 					return;
 				}
@@ -632,12 +635,12 @@ namespace loadedarea
 		// In the service: the engine's own sequence from FUN_140B52E30. Set the position; if the cell at it exists and is not the listed
 		// one, refile the reference there with FUN_140B48CA0(ref, 0, ws, 0, 1, 1, 1). No cell there: nothing changes. The model and a
 		// seated driver follow by the same amount, as SyncOne does.
-		std::uint64_t Refile(uptr ref, std::uint32_t id, std::uint32_t driverId, float x, float y, float z)
+		std::uint64_t Refile(uptr ref, std::uint32_t id, std::uint32_t driverId, float x, float y, float z, bool always = false)
 		{
 			__try {
 				if (At<std::uint32_t>(ref, kRefFormId) != id) return 0;
 				int cx = 0, cy = 0; uptr ws = 0;
-				if (!ListedGrid(ref, cx, cy, ws) || cellfit::Inside(cx, cy, x, y)) return 0;  // moved already, or off the grid now
+				if (!ListedGrid(ref, cx, cy, ws) || (!always && cellfit::Inside(cx, cy, x, y))) return 0;  // moved already, or off the grid now
 				const uptr cell = reinterpret_cast<uptr (*)(uptr, float, float, uptr, char)>(game::Base() + kCellAt)(0, x, y, ws, 0);
 				// No cell there: FUN_140B52E30 only sets the position, and so does this. Doing nothing left the reference at the edge while its body flew on
 				// (2026-10-31: FF1003EE 147 m, FF1003BB 165 m behind), its driver with it. The cell loads later and the next sync refiles it.
@@ -677,7 +680,11 @@ namespace loadedarea
 					if (!owned) return {};
 					return [=]() -> std::uint64_t {
 						if (!lifecycle::InService()) return 0;
-						return Refile(reinterpret_cast<uptr>(owned.get()), c.id, c.driverId, c.to[0], c.to[1], c.to[2]);
+						if(c.poseGeneration!=npcvehicles::PoseGeneration(c.id)){
+							logger::Observe("stream.sync",c.id,7,"driver=%08X reason=relocation_revoked_refile",c.driverId);
+							return 0;
+						}
+						return Refile(reinterpret_cast<uptr>(owned.get()), c.id, c.driverId, c.to[0], c.to[1], c.to[2], c.always);
 					};
 				});
 			}
@@ -708,7 +715,9 @@ namespace loadedarea
 		}
 		void CheckCells()
 		{
-			static std::unordered_map<std::uint32_t, unsigned long long> told;
+			struct CrossingWatch { unsigned long long key=0; ULONGLONG retryAt=0; bool reported=false; };
+			static std::unordered_map<std::uint32_t, CrossingWatch> watched;
+			const auto now=GetTickCount64();
 			const int n = g_idCount.load(std::memory_order_acquire);
 			for (int i = 0; i < n && i < kMaxIds; ++i) {
 				const std::uint32_t id = g_ids[i].load(std::memory_order_relaxed);
@@ -717,14 +726,21 @@ namespace loadedarea
 				g_outOfCell.fetch_add(1, std::memory_order_relaxed);
 				const unsigned long long key = (unsigned long long)(unsigned(m.cx) & 0xFFFF) << 48 | (unsigned long long)(unsigned(m.cy) & 0xFFFF) << 32 |
 					(unsigned long long)(unsigned(m.px) & 0xFFFF) << 16 | (unsigned long long)(unsigned(m.py) & 0xFFFF);
-				auto it = told.find(id);
-				if (it != told.end() && it->second == key) continue;
-				told[id] = key;
+				auto& watch=watched[id];
+				if(watch.key!=key)watch=CrossingWatch{key};
+				if(now<watch.retryAt)continue;
 				// The deadlock's case is a non-actor (16:07: a cell job moving a non-actor outside its cell). Those go to the right cell; the mover would take a seated actor out of its seat.
 				const uptr ref = g_lookup ? g_lookup(id) : 0;
 				const bool actor = ref && npcvehicles::LooksLikeActor(ref);
-				const bool queued = ref && !actor && g_crossingCount < kMaxCrossings;
-				if (queued) g_crossings[g_crossingCount++] = { id, 0, { m.pos[0], m.pos[1], m.pos[2] } };
+				const auto generation=npcvehicles::PoseGeneration(id);
+				const bool alreadyQueued=std::any_of(g_crossings,g_crossings+g_crossingCount,[=](const Crossing& c){return c.id==id;});
+				const bool queued = ref && !actor && generation && !alreadyQueued && g_crossingCount < kMaxCrossings;
+				if (queued) {
+					g_crossings[g_crossingCount++] = { id, 0, { m.pos[0], m.pos[1], m.pos[2] }, generation };
+					watch.retryAt=now+1000;
+				}
+				if(watch.reported)continue;
+				watch.reported=true;
 				logger::Write("Cell check: %08X is listed in grid cell (%d, %d) but stands in (%d, %d) at (%.0f, %.0f, %.0f); a cell job loading it would deadlock (16:07 hang); actor %d, refile queued %d",
 					id, m.cx, m.cy, m.px, m.py, m.pos[0], m.pos[1], m.pos[2], actor, queued);
 			}
@@ -733,6 +749,7 @@ namespace loadedarea
 
 	bool CarryDriverOf(std::uint32_t vehicleId, float dx, float dy, float dz)
 	{
+		if(!npcvehicles::PoseGeneration(vehicleId))return false;
 		std::uint32_t vehicles[kMaxIds], drivers[kMaxIds];
 		const int jobs = npcvehicles::FlownVehicles(vehicles, drivers, (kMaxIds - 1) / 2);
 		std::uint32_t driverId = 0;
@@ -745,6 +762,70 @@ namespace loadedarea
 			CarryDriver(ref, driverId, dx, dy, dz);
 		} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 		return g_driverSynced.load(std::memory_order_relaxed) != before;
+	}
+
+	// Cross-cell relocation helpers (see loadedarea.h). POD frames only: __try cannot share a frame with objects that have destructors.
+	namespace {
+		bool ReadRelocationCell(std::uint32_t id, float x, float y, RelocationCell& out)
+		{
+			__try {
+				const uptr ref = g_lookup ? g_lookup(id) : 0;
+				int cx = 0, cy = 0; uptr ws = 0;
+				if (!ref || At<std::uint32_t>(ref, kRefFormId) != id || !ListedGrid(ref, cx, cy, ws)) return false;
+				out.known = true; out.fromX = cx; out.fromY = cy; out.toX = cellfit::Grid(x); out.toY = cellfit::Grid(y);
+				out.crossCell = !cellfit::Inside(cx, cy, x, y);
+                const auto cell = reinterpret_cast<uptr (*)(uptr, float, float, uptr, char)>(game::Base() + kCellAt)(0, x, y, ws, 0);
+                out.cellLoaded = cell != 0;
+                const auto state = cell ? At<std::uint8_t>(cell, off::kCellState) : 0;
+                out.cellAttached = state == 9 || state == 10;
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+		bool ReadRelocationSettle(std::uint32_t id, float x, float y, float z, RelocationSettle& out)
+		{
+			__try {
+				const uptr ref = g_lookup ? g_lookup(id) : 0;
+				if (!ref || At<std::uint32_t>(ref, kRefFormId) != id) return false;
+				out.refKnown = true;
+				const float* rp = reinterpret_cast<const float*>(ref + off::kRefPosition);
+				const float dx = rp[0] - x, dy = rp[1] - y, dz = rp[2] - z;
+				out.gap = std::sqrt(dx * dx + dy * dy + dz * dz);
+				out.atTarget = std::isfinite(out.gap) && out.gap <= 2.0f;
+				int cx = 0, cy = 0; uptr ws = 0;
+				out.listedGrid = ListedGrid(ref, cx, cy, ws);
+				out.inDestinationCell = !out.listedGrid || cellfit::Inside(cx, cy, x, y);   // an unlisted (persistent-cell) reference has no grid cell to be wrong in
+				return true;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+		}
+	}
+	bool RelocationDestination(std::uint32_t vehicleId, float x, float y, RelocationCell& out)
+	{
+		out = RelocationCell{};
+		return std::isfinite(x) && std::isfinite(y) && ReadRelocationCell(vehicleId, x, y, out);
+	}
+	bool RefileRelocated(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z)
+	{
+		const auto generation = npcvehicles::PoseGeneration(vehicleId);
+		if (!generation || !g_lookup || !std::isfinite(x + y + z)) return false;   // zero: the relocation doer still owns this pose
+		if (std::any_of(g_crossings, g_crossings + g_crossingCount, [=](const Crossing& c) { return c.id == vehicleId; })) return false;
+		if (g_crossingCount >= kMaxCrossings) return false;
+		g_crossings[g_crossingCount++] = { vehicleId, driverId, { x, y, z }, generation };
+		g_crossHeld.fetch_add(1, std::memory_order_relaxed);
+		return true;   // QueueCrossings (the next SyncHeld) posts it to the service; Refile is the same call SyncOne's crossing uses
+	}
+	bool StepReference(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z)
+	{
+		const auto generation = npcvehicles::PoseGeneration(vehicleId);
+		if (!generation || !g_lookup || !std::isfinite(x + y + z)) return false;
+		if (std::any_of(g_crossings, g_crossings + g_crossingCount, [=](const Crossing& c) { return c.id == vehicleId; })) return false;
+		if (g_crossingCount >= kMaxCrossings) return false;
+		g_crossings[g_crossingCount++] = { vehicleId, driverId, { x, y, z }, generation, true };
+		return true;
+	}
+	bool RelocationSettled(std::uint32_t vehicleId, float x, float y, float z, RelocationSettle& out)
+	{
+		out = RelocationSettle{};
+		return ReadRelocationSettle(vehicleId, x, y, z, out);
 	}
 
 	// Who owns a ray-hit body (trace only; user 2026-11-07: "check the id of anything hit by rays and find out what it belongs to").

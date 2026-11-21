@@ -1,4 +1,5 @@
 #include "trafficprofilestore.h"
+#include "fleetownershipstore.h"
 #include <chrono>
 #include <iostream>
 
@@ -42,6 +43,31 @@ int main() {
         Check(!c.imported && !fs::exists(c.routes / "VehicleGroups.ini"), "another existing playthrough cannot re-import shared setup");
         bool refused = false; try { Open(profiles, 999999); } catch (...) { refused = true; }
         Check(refused && !fs::exists(Folder(profiles, 999999)), "missing saved profile is not silently reset");
+        // A rail car uses the regular durable roster and journey files.
+        // The saved game must see those files from the same snapshot, and
+        // continuing from that save must only mutate its new working copy.
+        const std::string roster = "[City]\npair_route.1=FF002100 FF002101 00123456 0 0\n";
+        const std::string journey = "FVO_JOURNEYS 1\nvehicle path lane and progress\n";
+        Write(a.routes.parent_path() / "trafficpool.ini", roster);
+        Write(a.routes / "journeys.state", journey);
+        const std::vector<unsigned> owned{0xFF002104, 0xFF002108};
+        Write(a.routes / fleetownershipstore::kFileName, fleetownershipstore::Write(owned));
+        const auto saved = Clone(profiles, a.routes, 123);
+        Write(a.routes.parent_path() / "trafficpool.ini", "different live fleet");
+        Write(a.routes / "journeys.state", "different live route assignment");
+        Write(a.routes / fleetownershipstore::kFileName, fleetownershipstore::Write({0xFF002120}));
+        const auto restored = Clone(profiles / "Working", Open(profiles, saved.id), 456);
+        Check(Read(restored.routes.parent_path() / "trafficpool.ini") == roster,
+              "save retains the committed physical fleet");
+        Check(Read(restored.routes / "journeys.state") == journey,
+              "restore uses the matching committed vehicle assignment");
+        std::ifstream ownerFile(restored.routes / fleetownershipstore::kFileName, std::ios::binary);
+        Check(fleetownershipstore::Read(ownerFile) == owned, "restore prevents player-owned cars rejoining traffic");
+        ownerFile.close();
+        Check(!fs::exists(b.routes / fleetownershipstore::kFileName), "ownership is local to the game save");
+        Write(restored.routes / "journeys.state", "new working assignment");
+        Check(Read(Open(profiles, saved.id) / "journeys.state") == journey,
+              "running a restored fleet cannot mutate its saved assignment");
         fs::remove(a.routes.parent_path() / "ready");
         refused = false; try { Open(profiles, a.id); } catch (...) { refused = true; }
         Check(refused, "partial profile cannot be loaded");
@@ -49,7 +75,7 @@ int main() {
         Check(refused, "zero is not a persistent identity");
         // Everything removed is under the unique test-owned directory above.
         fs::remove_all(sandbox);
-        std::cout << "PASS playthrough isolation, reload, legacy migration, collisions, missing/partial profiles\n";
+        std::cout << "PASS fleet roster, assignments, ownership, playthrough isolation, reload, legacy migration, collisions, missing/partial profiles\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << " (test files: " << sandbox << ")\n";

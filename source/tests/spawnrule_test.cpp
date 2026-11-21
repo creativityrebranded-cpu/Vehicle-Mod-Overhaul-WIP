@@ -49,11 +49,12 @@ int main(){int checks=0,fail=0;auto check=[&](bool yes,const char* name){++check
     check(climbing.size()==8&&std::fabs(climbing.front().interval-125)<.01,"station metres include the slope");
     check(!trafficinitial::GapClear(20,970,1000,true,125)&&trafficinitial::GapClear(20,970,1000,false,125),
         "minimum gap crosses the seam only on closed roads");
-    // Test spawn around the player (card TS1): near positions only, spaced, nearest first, capped, still off the route ends.
-    {const auto near=trafficinitial::Near(r,{},{300,0,0},100,30,3);check(near.size()==3,"near: capped at max");
-        bool inside=true,spaced=true,ends=true;for(std::size_t a=0;a<near.size();++a){inside=inside&&std::hypot(near[a].at.x-300,near[a].at.y)<=100;ends=ends&&near[a].at.x<=390.1;
-            for(std::size_t b=0;b<a;++b)spaced=spaced&&std::hypot(near[a].at.x-near[b].at.x,near[a].at.y-near[b].at.y)>=30;}
-        check(inside,"near: within the radius");check(spaced,"near: spaced apart");check(ends,"near: keeps the route-end buffer");
-        check(!near.empty()&&std::hypot(near[0].at.x-300,near[0].at.y)<10,"near: nearest first");
-        check(trafficinitial::Near(r,{},{2000,0,0},100,30,3).empty(),"near: nothing when no route is near");}
+    // LV-2 (2026-11-20): only a real corner blocks births; a bend of a few degrees is a straight road to a car.
+    {trafficdata::Route gentle=r,sharp=r;gentle.closed=sharp.closed=false;gentle.rounding.clear();sharp.rounding.clear();
+        gentle.points={{0,0,0},{100,0,0},{200,8,0},{300,8,0}};sharp.points={{0,0,0},{100,0,0},{100,100,0},{200,100,0}};gentle.road.tiles.assign(4,{});sharp.road.tiles.assign(4,{});
+        check(trafficinitial::TurnAt(gentle.points,1,false)<trafficinitial::rules::cornerTurnRadians&&trafficinitial::TurnAt(sharp.points,1,false)>1.5,"turn angle: a 4.6 degree bend is gentle, a right angle is not");
+        check(trafficinitial::TurnAt(sharp.points,0,false)==0&&trafficinitial::TurnAt(sharp.points,3,false)==0,"turn angle: route ends are never corners");
+        const auto g=trafficroute::Build(gentle),s=trafficroute::Build(sharp);
+        const auto gb=trafficinitial::RoadBlocks(gentle,g,trafficinitial::RoadStations(g),{}),sb=trafficinitial::RoadBlocks(sharp,s,trafficinitial::RoadStations(s),{});
+        check(gb.size()==2&&sb.size()==4,"blocks: only the route ends for gentle bends; ends plus both corners for a right angle");}
     std::printf("spawnrule_test: %d checks, %d failed\n",checks,fail);return fail?1:0;}

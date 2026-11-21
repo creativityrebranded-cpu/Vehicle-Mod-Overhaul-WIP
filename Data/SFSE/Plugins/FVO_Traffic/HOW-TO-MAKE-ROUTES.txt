@@ -117,3 +117,44 @@ places probes along the route your traffic uses, with larger ones at exits and
 places. Switch "Everyday traffic" on for vehicles to use it.
 
 To switch a whole file off, put  enabled = 0  under [file].
+
+
+ROADS AND MIXED DRIVING / FLIGHT
+
+In the selected route's Flow group, Travel -> Change chooses Drive only,
+Hover only, or Both (prefer driving). Existing routes keep their hover default;
+new editor routes start with Both. Lane width is the usable width of each lane.
+The existing width= file setting is the distance between opposite lane centres.
+A one-way route follows its authored centreline.
+
+Ctrl+click adjacent points to select stretches. Selected stretches -> Change
+sets travel only between selected endpoints; gaps keep their previous rules.
+The point panel can change its next stretch. The same controls set stretch
+speed, priority and stop/yield/signal rules. Save keeps these edits.
+Initial point placement still raises onto detected surfaces. Later intentional
+structure intersections remain allowed, with red warnings. Physical collisions
+remain active.
+
+Additive file settings:
+travel = drive, hover, or both
+corridor = 7 (usable metres per lane)
+sections = drive,12,0,2,1,60,30,0 | hover,20,0,0,1,60,30,0 | inherit,0,0,0,1,60,30,0
+
+Sections require one entry per authored point; an open path's final entry is
+reserved. Entries describe outgoing stretches in source order. Fields are:
+travel, speed (0 inherits), priority (-100..100), control (0 none, 1 yield,
+2 stop, 3 signal), stop dwell seconds, signal period seconds, green seconds,
+phase offset seconds. Use | between entries; semicolon starts an INI comment.
+Place authored points at controlled junctions. Existing links define legal turns.
+
+Drive-only stops for blocked or unmeasured roads. Both uses measured support
+and clearance for wheel/flight transitions. It does not fly over a queue or
+ignore right of way. Narrow/impossible routes remain blocked until corrected.
+
+Journey progress is recorded with the individual game save in journeys.state.
+Keep the whole TrafficProfiles folder with saves; do not edit immutable saved
+snapshot folders. Older versions cannot invent journey history they never wrote.
+Old cores remain loadable but do not enforce the new optional road protocol.
+
+Offline tests are separate from actual game acceptance. Verify your authored
+road, mixed-mode transitions, junctions, saved journeys and frame times in game.

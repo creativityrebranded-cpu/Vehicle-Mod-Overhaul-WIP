@@ -27,6 +27,7 @@ namespace vehiclediag
     bool Built(std::uint32_t formId); // the game built its physics vehicle (instance) since the last reset
     void DropBirthHold(std::uint32_t formId); // hidden/replaced/deleted: forget the hold, motion untouched
     bool BirthStageAvailable();
+    std::uint64_t BirthCorrectionGeneration(std::uint32_t id);
     int StagedLoaded(); // staged chassis that have physics (loaded) and still wait for their autopilot
     // B2 (read-only, 2026-11-07): how many physics-world changes the existing hooks have counted so far (vehicle body builds and
     // static/keyframed motion-type sets). Rising means the broadphase was just rebuilt; rays read it and wait briefly.

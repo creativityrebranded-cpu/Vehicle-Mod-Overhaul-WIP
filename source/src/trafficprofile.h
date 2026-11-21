@@ -7,6 +7,9 @@ using Guard = std::lock_guard<std::recursive_mutex>;
 void Allow(bool allowed);
 void SaveReady(bool ready);
 void BeginLoad();
+// The rail retains control while a save briefly pauses its physical writes.
+bool FleetRailAllowed();
+bool FleetRailWritesAllowed();
 void BeforeSave();
 void AfterSave();
 void Report(); // deliver queued error notifications on the main frame thread

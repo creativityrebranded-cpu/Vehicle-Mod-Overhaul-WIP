@@ -14,30 +14,6 @@ static void Check(bool ok, const char* what) { std::printf("%s %s\n", ok ? "PASS
 
 int main() {
     {
-        planinput::GoalAsk ask;
-        ask.goal.radius = 1.5;
-        ask.travel = 1;
-        ask.hoverPossible = false;
-        ask.factoryHold = true;
-        const planinput::FloorPoint floor[]{{0, 0, 0}, {0, -2, 0}, {0, -4, 0}};
-        const planworld::Shape empty[]{{}};
-        auto scene = planinput::GoalScene(ask, empty, 0, floor, 3);
-        const auto hold = planenergy::SolveFactoryGoal({}, {}, scene, 1, {});
-        Check(scene.managerHeld && !scene.lanes && hold.ok && !hold.pulse && std::fabs(hold.first.speed) < .1,
-              "a route-free stock goal holds without a test request");
-        energyplan::TestPulse pulse;
-        pulse.active = true;
-        pulse.speed = -1;
-        const auto clear = planenergy::SolveFactoryGoal({}, {}, scene, 2, pulse);
-        Check(clear.ok && clear.pulse && clear.first.speed < 0,
-              "the existing scorer can admit a reverse pulse on a supported stock goal");
-        scene.solids.push_back({0, -2.0, 0, .6, .22});
-        scene.Index();
-        const auto blocked = planenergy::SolveFactoryGoal({}, {}, scene, 3, pulse);
-        Check(!blocked.pulse && blocked.testRefused && std::fabs(blocked.first.speed) < .1,
-              "route-free qualification refuses a rear obstacle before the pulse");
-    }
-    {
         planscene::Scene scene;
         scene.floor = [](double, double, double& z) { z = 0; return true; };
         scene.laneHalf = 3.8;

@@ -16,6 +16,7 @@
 #include "environment.h"
 #include "inputgate.h"
 #include "playclock.h"
+#include "relocationconsumers.h"  // the relocation receipt: a held vehicle is re-evaluated once per applied serial
 
 #include <Windows.h>
 
@@ -48,7 +49,7 @@ namespace vehiclekeep
 		// A visibility estimate only, not where the game's physics stops.
 		double HoldEdge(unsigned cells) { return cells ? std::max(120.0, std::sqrt(double(cells)) * 50.0 - 60.0) : 0.0; }
 
-		struct Held { bool setLod = false, setPersist = false; ULONGLONG since = 0, seen = 0; double maxDist = 0; bool had3DFar = false; ULONGLONG noCellSince = 0; };  // noCellSince: KW-1
+		struct Held { bool setLod = false, setPersist = false; ULONGLONG since = 0, seen = 0; double maxDist = 0; bool had3DFar = false; ULONGLONG noCellSince = 0; relocrebase::Seen relocSeen; };  // noCellSince: KW-1; relocSeen: the last applied relocation this hold re-based on
 
 		bool g_enabled = true;
 		float g_coneDeg = 60.0f;
@@ -321,6 +322,12 @@ namespace vehiclekeep
 				const bool busy = occupied[id] || npcvehicles::VehicleDriverId(id) != 0 || (wanted && (held || heldFromBirth < g_birthMax));
 				if (held) {
 					Held& h = g_held[id];
+					// Relocation receipt (applied, once per serial): the view, distance and cell facts of the old place no longer hold. The out-of-sight clock, the
+					// no-cell clock and the farthest distance restart from the destination; the release rules below then judge fresh facts. Nothing is released here.
+					if (relocrebase::Take(h.relocSeen, relocconsumers::Poll(id), id)) {
+						h.seen = now; h.noCellSince = 0; h.maxDist = dPlayer; h.had3DFar = false;
+						logger::Write("OBS system=keep.rebased vehicle=%08X event=rebased serial=%llu distance=%.0f reason=relocation_receipt_applied_hold_clocks_restarted", id, static_cast<unsigned long long>(relocconsumers::Peek(id).serial), dPlayer);
+					}
 					// KW-1 (2026-11-07, user: "build it"): past the loaded cells the game can report no parent cell at all (16:11 run: 6 held vehicles
 						// released as "other world" at ~510 m with cell=00000000 while the player's world was FF013B0E). No cell says nothing about the
 						// world: the hold stays, still bound by view, distance and every other release; a real cell in another world still releases.

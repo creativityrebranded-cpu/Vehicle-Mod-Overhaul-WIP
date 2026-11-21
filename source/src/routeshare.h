@@ -35,6 +35,7 @@ struct Candidate {
     int on = 0, want = 0;   // vehicles on the route now (not counting the one asking), its count now
     double dist = 0;        // m from the vehicle to the route
     bool own = false;       // the route the vehicle just flew
+    unsigned priority = 0; // physical fleet: the first observation ring of the join site
 };
 // Index of the route to take, -1 when none is in reach with room.
 inline int Pick(const std::vector<Candidate>& c, double reach)
@@ -45,6 +46,10 @@ inline int Pick(const std::vector<Candidate>& c, double reach)
         if (k.want <= 0 || k.on >= k.want || !(k.dist <= reach)) continue;
         if (best < 0) { best = int(i); continue; }
         const auto& b = c[std::size_t(best)];
+        if(k.priority!=b.priority){
+            if(k.priority<b.priority)best=int(i);
+            continue;
+        }
         // on / want compared without division: k.on * b.want vs b.on * k.want
         const long long lhs = (long long)k.on * b.want, rhs = (long long)b.on * k.want;
         if (lhs < rhs || (lhs == rhs && ((k.own && !b.own) || (k.own == b.own && k.dist < b.dist)))) best = int(i);

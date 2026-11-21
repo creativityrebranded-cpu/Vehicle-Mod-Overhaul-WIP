@@ -13,7 +13,7 @@ public:
         if (lock_) lock_(1);
     }
     ~Guard() { if (lock_) lock_(0); }
-    // Prior v13 cores have no file-lock export; retain their existing behavior.
+    // True when the core is loaded. A core without FVO_TrafficFilesLock still counts: the guard then locks nothing.
     explicit operator bool() const { return core_; }
     Guard(const Guard&) = delete;
     Guard& operator=(const Guard&) = delete;

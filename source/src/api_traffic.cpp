@@ -4,6 +4,7 @@
 // (main_vehicle's tick, reset and paused frames; the map editor's Start / Swap) to the addon's hooks. Without the addon these
 // do nothing.
 #include "trafficpool.h"
+#include "relocation.h"
 #include "handoff.h"
 #include "trafficpair.h"
 #include "modeladmission.h"
@@ -11,7 +12,6 @@
 #include "camera_visibility.h"
 #include "traffic/traffic_api.h"
 #include "traffic/birth_api.h"
-#include "traffic/factorybirth_api.h"
 #include "traffic/roadclearance.h"
 #include "referencebirth.h"
 #include "cellbake.h"
@@ -55,6 +55,8 @@
 #include <set>
 #include <mutex>
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <optional>
 #include <string>
 
@@ -82,17 +84,27 @@ namespace
     double ApiNoticeFar(unsigned base);
     int ApiInCameraView(double x,double y,double z);
     unsigned long long ProofLimitMs(int screen);
-    // May a vehicle be made here in play? Hidden by terrain, or far AND out of view, the standard the pair check's removals use (the user: "far and out of sight").
-    // Terrain alone left open-air lane positions empty for good (2026-10-31: any one of 9 clear lines reads as seen; 32 of 94 stayed empty, site_wait over 1,000 per 5 s).
+    // May a vehicle be made here in play? Hidden by terrain, or OUT OF THE CAMERA VIEW (and the camera not about to look there) and at least
+    // spawnrule::kUnseenMinM from the player. Live creation (2026-11-20, the user: fill the road without frozen X, never a visible pop-in, never an empty
+    // stretch). The old "beyond the notice distance AND out of view" never held inside the ~250 m loaded area, so open road was never filled.
     int BirthHidden(unsigned base,double x,double y,double z,double px,double py){
         const int exposure=ExposureAt(x,y,z);
-        const bool distant=std::hypot(x-px,y-py)>=ApiNoticeFar(base),inCamera=ApiInCameraView(x,y,z)!=0;
+        const bool distant=std::hypot(x-px,y-py)>=spawnrule::kUnseenMinM,inCamera=ApiInCameraView(x,y,z)!=0;
+        (void)base;
         const int hidden=(exposure==2||(distant&&!inCamera))&&
             !vehiclekeep::HoldBirthForLook(x,y,z,unsigned(ProofLimitMs(1)));
         logger::Observe("traffic.fill",0,hidden?2u:distant?1u:0u,"event=hidden_check hidden=%d exposure=%d far=%d in_camera=%d",hidden,exposure,distant,inCamera);
         return hidden;
     }
+    // How far the player may have moved between a birth request and its service. At a standstill 2 m; in play the player can be driving or flying, so the
+    // allowance grows with the time the request waited at up to 60 m/s (a bound, capped at 40 m). The camera look-ahead and the concealment
+    // are asked again at service, so a moved player is judged by them, not by a fixed 2 m.
+    double PlayerMoveLimit(unsigned long long askedAt){
+        const double seconds=double(GetTickCount64()-askedAt)/1000.0;
+        return 2.0+std::min(40.0,60.0*seconds);
+    }
     struct BirthProof {unsigned base=0,vehicle=0;double x=0,y=0,z=0,yaw=0;ULONGLONG at=0;std::string world;bool air=false;} g_birthProof;
+    void NoteBirthRefusal(const FvoTrafficBirthV1& request,const char* stage,const char* reason);  // DW-2: defined with the record below
 
 	uptr Ref(std::uint32_t id)
 	{
@@ -160,35 +172,6 @@ namespace
 		__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 	}
     constexpr runtimeforms::Range kFactoryStock{"FVO_FactoryPlacements.esm",0x800,kFvoFactoryStockCountV1};
-    struct FactoryPlayer {
-        uptr cell=0,world=0;
-        double x=0,y=0,z=0;
-    };
-    struct FactoryCamera {
-        FactoryPlayer player;
-        float origin[3]{};
-        ULONGLONG at=0;
-    };
-    struct FactorySite {
-        FvoRoadSiteV1 draft{};
-        FvoFactorySiteProofV1 proof{};
-        FactoryCamera seenFrom{};
-    };
-#ifndef FVO_RELEASE
-    struct FactoryIdentity {
-        unsigned base=0;
-        uptr ref=0,world=0;
-        FvoRoadSiteV1 origin{};
-        FactoryCamera concealedFrom{};
-        FvoRoadSiteV1 concealedPose{};
-        ULONGLONG concealedAt=0;
-    };
-    std::mutex g_factoryBirthLock;
-    FactorySite g_factorySite;
-    FactoryCamera g_factoryCamera;
-    std::map<unsigned,FactoryIdentity> g_dynamicStock;
-    std::uint64_t g_factoryNonce=0;
-#endif
     uptr StockCell(uptr ref,uptr* world=nullptr){
         __try {
             const auto cell=ref?At<uptr>(ref,off::kRefParentCell):0;
@@ -199,13 +182,6 @@ namespace
     }
     bool FactoryStockId(unsigned id){
         if(!id)return false;
-#ifndef FVO_RELEASE
-        {
-            std::lock_guard lock(g_factoryBirthLock);
-            if(const auto it=g_dynamicStock.find(id);it!=g_dynamicStock.end()&&it->second.ref==VehicleRef(id))
-                return true;
-        }
-#endif
         const auto file=runtimeforms::LoadedPlugin(kFactoryStock.plugin);
         if(!file)return false;
         for(int i=0;i<kFvoFactoryStockCountV1;++i)
@@ -247,6 +223,16 @@ namespace
 		__except (EXCEPTION_EXECUTE_HANDLER) {}
 		return id;
 	}
+    std::uint64_t CreateSeatedActor(const char* source, unsigned base, uptr vehicle, uptr cell, uptr world,
+                                    double x, double y, double z, double heading)
+    {
+        const Birth previous=g_birth;
+        g_birth={vehicle,-99};
+        const unsigned id=Create(source,runtimeforms::Lookup(base),cell,world,x,y,z,heading,kSeatedCreation);
+        const auto seat=g_birth.result;
+        g_birth=previous;
+        return std::uint64_t(id)|(std::uint64_t(std::uint32_t(seat))<<32);
+    }
 	struct EnableEngine {
 		uptr ref;
 		void CancelRequests() { EngineFn<void (*)(uptr)>(addr::kEnableReference)(ref); }
@@ -336,210 +322,6 @@ namespace
             if(radius)*radius=std::hypot(half[0],half[1])+1;if(halfHeight)*halfHeight=half[2]+1;return 1;
         }__except(EXCEPTION_EXECUTE_HANDLER){return 0;}
     }
-#ifndef FVO_RELEASE
-    bool ReadFactoryPlayer(FactoryPlayer& out){
-        FvoTrafficPlayer current{};
-        if(!PlayerCell(out.cell,out.world)||!ApiPlayer(&current))return false;
-        out.x=current.x;out.y=current.y;out.z=current.z;
-        return std::isfinite(out.x)&&std::isfinite(out.y)&&std::isfinite(out.z);
-    }
-    bool SameFactoryPlayer(const FactoryPlayer& a,const FactoryPlayer& b){
-        return a.cell==b.cell&&a.world==b.world&&
-            std::hypot(a.x-b.x,a.y-b.y,a.z-b.z)<=factorybirth::rules::maxPlayerDrift;
-    }
-    bool SameFactorySite(const FvoRoadSiteV1& a,const FvoRoadSiteV1& b){
-        return a.x==b.x&&a.y==b.y&&a.z==b.z&&a.heading==b.heading&&
-            a.radius==b.radius&&a.halfHeight==b.halfHeight;
-    }
-    bool InFactoryCell(const FactoryPlayer& player,const FvoRoadSiteV1& site){
-        __try {
-            const auto exterior=At<uptr>(player.cell,off::kCellExterior);
-            if(!exterior)return false;
-            const double x=At<int>(exterior,0),y=At<int>(exterior,4);
-            const auto in=[](double p,double radius,double cell){
-                return std::floor((p-radius)/off::kCellSize)==cell&&
-                       std::floor((p+radius)/off::kCellSize)==cell;
-            };
-            return in(site.x,site.radius,x)&&in(site.y,site.radius,y);
-        }
-        __except(EXCEPTION_EXECUTE_HANDLER){return false;}
-    }
-    bool RememberFactoryCamera(FactoryCamera& camera){
-        float forward[3]{};
-        if(!ReadFactoryPlayer(camera.player)||!vehiclekeep::ReadCameraPose(camera.origin,forward)||
-           !std::all_of(std::begin(camera.origin),std::end(camera.origin),[](float v){return std::isfinite(v);}))return false;
-        camera.at=GetTickCount64();
-        std::lock_guard lock(g_factoryBirthLock);
-        g_factoryCamera=camera;
-        return true;
-    }
-    bool FactoryCameraForSite(int screen,const FactoryPlayer& player,FactoryCamera& camera){
-        if(!vehicle_probe::RaysLive())return false;
-        if(screen==1)return RememberFactoryCamera(camera)&&SameFactoryPlayer(camera.player,player);
-        if(screen!=2||!trafficarrival::panel.load()||!secretunpause::Active())return false;
-        std::lock_guard lock(g_factoryBirthLock);
-        if(!roadclearance::Fresh(g_factoryCamera.at,GetTickCount64(),factorybirth::rules::coveredProofMs)||
-           !SameFactoryPlayer(g_factoryCamera.player,player))return false;
-        camera=g_factoryCamera;
-        return true;
-    }
-    bool SameFactoryView(const FactoryCamera& a,const FactoryCamera& b){
-        return SameFactoryPlayer(a.player,b.player)&&
-            std::hypot(double(a.origin[0])-b.origin[0],double(a.origin[1])-b.origin[1],double(a.origin[2])-b.origin[2])
-                <=factorybirth::rules::maxPlayerDrift;
-    }
-    FvoFactorySiteStatusV1 FactoryOcclusion(unsigned owner,const FactoryCamera& camera,const FvoRoadSiteV1& site){
-        using Status=FvoFactorySiteStatusV1;
-        bool pending=false;
-        // Conservative whole-envelope samples use the existing camera ray scheduler.
-        for(const double dx:{-site.radius,site.radius})for(const double dy:{-site.radius,site.radius})
-            for(const double dz:{-site.halfHeight,site.halfHeight}){
-                const float end[]{float(site.x+dx),float(site.y+dy),float(site.z+dz)};
-                const double distance=std::hypot(double(end[0])-camera.origin[0],double(end[1])-camera.origin[1],double(end[2])-camera.origin[2]);
-                bool hit=false;double offset=0;
-                const bool answered=environment::CameraRay(owner,camera.origin,end,hit,offset);
-                const auto evidence=cameravisibility::RayEvidence(answered,hit,offset,distance,0);
-                if(evidence==cameravisibility::Evidence::Visible)return Status::Visible;
-                if(evidence!=cameravisibility::Evidence::Occluded)pending=true;
-            }
-        const float centre[]{float(site.x),float(site.y),float(site.z)};
-        bool hit=false;double offset=0;
-        const bool answered=environment::CameraRay(owner,camera.origin,centre,hit,offset);
-        const auto result=cameravisibility::RayEvidence(answered,hit,offset,
-            std::hypot(double(centre[0])-camera.origin[0],double(centre[1])-camera.origin[1],double(centre[2])-camera.origin[2]),0);
-        if(result==cameravisibility::Evidence::Visible)return Status::Visible;
-        return pending||result!=cameravisibility::Evidence::Occluded?Status::Pending:Status::Ready;
-    }
-    FvoFactorySiteStatusV1 QueryFactorySite(unsigned base,const FvoRoadSiteV1& draft,FvoFactorySiteProofV1& out){
-        using Status=FvoFactorySiteStatusV1;
-        if(!std::isfinite(draft.x)||!std::isfinite(draft.y)||!std::isfinite(draft.z)||!std::isfinite(draft.heading)||
-           std::abs(draft.z)>1e6||!vehiclediag::BirthStageAvailable())return Status::Unsafe;
-        FactoryPlayer player{};
-        const int screen=ApiPresentation();
-        if(!screen||!ReadFactoryPlayer(player))return Status::Pending;
-        const auto form=runtimeforms::Lookup(base);
-        double half[3]{},bottom=0,top=0;
-        if(!realvehicles::ReadModelBounds(form,half,bottom,top)||!npcvehicles::BaseHasDriverSeat(form))return Status::Unsafe;
-        FvoRoadSiteV1 site{draft.x,draft.y,draft.z,draft.heading,
-            std::hypot(half[0],half[1])+factorybirth::rules::hullMargin,half[2]+factorybirth::rules::hullMargin};
-        if(!InFactoryCell(player,site))return Status::WrongCell;
-        FactoryCamera camera{};
-        const bool haveCamera=FactoryCameraForSite(screen,player,camera);
-        {
-            std::lock_guard lock(g_factoryBirthLock);
-            const auto& cached=g_factorySite;
-            if(cached.proof.nonce&&cached.proof.base==base&&SameFactorySite(draft,cached.draft)&&
-               SameFactoryPlayer(player,cached.seenFrom.player)&&(screen!=1||(haveCamera&&SameFactoryView(camera,cached.seenFrom)))&&
-               roadclearance::Fresh(cached.proof.at,GetTickCount64(),
-                   screen==1?factorybirth::rules::liveProofMs:factorybirth::rules::coveredProofMs)){
-                out=cached.proof;return Status::Ready;
-            }
-        }
-        realvehicles::RefreshRoadInventory(player.cell,player.world);
-        if(!haveCamera)return Status::Pending;
-        double baked=0;
-        const double ceiling=cellbake::Ground(site.x,site.y,baked)&&std::isfinite(baked)?std::min(site.z,baked):site.z;
-        // A lower-layer factory measurement must not replace the public surface's mapped floor.
-        const auto support=environment::SpawnSite(base,site.x,site.y,
-            ceiling-factorybirth::rules::layerGap-factorybirth::rules::probeTopOffset,site.heading,false);
-        if(support.verdict==environment::Verdict::Pending)return Status::Pending;
-        if(support.verdict==environment::Verdict::Unsafe)return support.supported?Status::Unsafe:Status::NoSupport;
-        if(!support.supported||!std::isfinite(support.z)||support.z+top>=ceiling-factorybirth::rules::layerGap)
-            return Status::NoSupport;
-        site.z=support.z;
-        const auto sight=FactoryOcclusion(base,camera,site);
-        if(sight!=Status::Ready)return sight;
-        std::uint64_t epoch=0;
-        const auto occupied=realvehicles::CheckRoadSite(player.cell,player.world,site,epoch);
-        if(occupied!=FvoRoadClearance::Clear||!epoch)return occupied==FvoRoadClearance::Occupied?Status::Occupied:Status::Pending;
-        if(screen!=1&&!roadclearance::Fresh(camera.at,GetTickCount64(),factorybirth::rules::coveredProofMs))
-            return Status::Pending;
-        std::lock_guard lock(g_factoryBirthLock);
-        const auto at=GetTickCount64();
-        // A proof produced under X is limited by the last real gameplay camera sample.
-        const auto stamped=screen==1?at:camera.at;
-        out.base=base;out.site=site;out.nonce=++g_factoryNonce;out.at=stamped;
-        g_factorySite={draft,out,camera};
-        return Status::Ready;
-    }
-    bool FactoryRefPersistent(uptr ref){
-        __try { return ref&&(At<unsigned>(ref,kFormFlags)&kPersistentFlag)!=0; }
-        __except(EXCEPTION_EXECUTE_HANDLER){return false;}
-    }
-    bool FactoryDriverHidden(unsigned id,const FactoryPlayer& player){
-        const auto ref=VehicleRef(id);
-        FvoTrafficRef live{};
-        if(!ApiRef(id,&live)||!live.usable)return false;
-        std::lock_guard lock(g_factoryBirthLock);
-        const auto it=g_dynamicStock.find(id);
-        if(it==g_dynamicStock.end()||it->second.ref!=ref)return false;
-        const auto& row=it->second;
-        return SameFactoryPlayer(player,row.concealedFrom.player)&&
-            std::hypot(live.x-row.concealedPose.x,live.y-row.concealedPose.y,live.z-row.concealedPose.z)
-                <=factorybirth::rules::maxStockPoseDrift&&
-            roadclearance::Fresh(row.concealedAt,GetTickCount64(),factorybirth::rules::coveredProofMs);
-    }
-    bool DynamicFactoryStock(unsigned id){
-        std::lock_guard lock(g_factoryBirthLock);
-        const auto found=g_dynamicStock.find(id);
-        return found!=g_dynamicStock.end()&&found->second.ref==VehicleRef(id);
-    }
-    const char* FactorySiteRefusal(const FactorySite& site,const FactoryPlayer& current){
-        if(!SameFactoryPlayer(site.seenFrom.player,current))return "factory_site_cell_or_player_changed";
-        if(!roadclearance::Fresh(site.proof.at,GetTickCount64(),factorybirth::rules::coveredProofMs))
-            return "factory_site_proof_expired";
-        if(!InFactoryCell(current,site.proof.site))return "factory_site_outside_cell";
-        std::uint64_t epoch=0;
-        const auto clearance=realvehicles::CheckRoadSite(current.cell,current.world,site.proof.site,epoch);
-        if(clearance==FvoRoadClearance::Occupied)return "factory_site_became_occupied";
-        return clearance==FvoRoadClearance::Clear&&epoch?nullptr:"factory_site_clearance_unknown";
-    }
-    void RememberFactoryStock(unsigned id,const FactorySite& site){
-        const auto ref=VehicleRef(id);
-        if(!ref||(id>>24)!=0xFF)return;
-        std::lock_guard lock(g_factoryBirthLock);
-        const auto& proof=site.proof;
-        g_dynamicStock[id]={proof.base,ref,site.seenFrom.player.world,proof.site,site.seenFrom,proof.site,proof.at};
-    }
-    int BindFactoryStock(unsigned id,unsigned base,const FvoRoadSiteV1& saved){
-        FactoryPlayer player{};FvoTrafficRef vehicle{};
-        const auto ref=VehicleRef(id);
-        if((id>>24)!=0xFF||!base||!ReadFactoryPlayer(player)||!ApiRef(id,&vehicle)||vehicle.isActor||!vehicle.usable||
-           base!=vehicle.baseId||StockCell(ref)!=player.cell||!FactoryRefPersistent(ref)||
-           !spawnflow::FactoryPose(vehicle.x-saved.x,vehicle.y-saved.y,vehicle.z-saved.z)||!std::isfinite(saved.heading))return 0;
-        double half[3]{},bottom=0,top=0;
-        if(!realvehicles::ReadModelBounds(runtimeforms::Lookup(base),half,bottom,top))return 0;
-        auto origin=saved;
-        origin.radius=std::hypot(half[0],half[1])+factorybirth::rules::hullMargin;
-        origin.halfHeight=half[2]+factorybirth::rules::hullMargin;
-        if(!InFactoryCell(player,origin))return 0;
-        FactoryCamera camera{};
-        const int screen=ApiPresentation();
-        const bool haveCamera=FactoryCameraForSite(screen,player,camera);
-        {
-            std::lock_guard lock(g_factoryBirthLock);
-            const auto [it,inserted]=g_dynamicStock.try_emplace(id,FactoryIdentity{base,ref,player.world,origin});
-            auto& row=it->second;
-            if(!inserted&&(row.base!=base||row.ref!=ref||row.world!=player.world||!SameFactorySite(row.origin,origin)))return 0;
-            const auto limit=screen==1?factorybirth::rules::liveProofMs:factorybirth::rules::coveredProofMs;
-            if(SameFactoryPlayer(player,row.concealedFrom.player)&&
-               (screen!=1||(haveCamera&&SameFactoryView(camera,row.concealedFrom)))&&
-               std::hypot(vehicle.x-row.concealedPose.x,vehicle.y-row.concealedPose.y,vehicle.z-row.concealedPose.z)
-                   <=factorybirth::rules::maxStockPoseDrift&&
-               roadclearance::Fresh(row.concealedAt,GetTickCount64(),limit))return 1;
-        }
-        if(!haveCamera)return 0;
-        auto live=origin;live.x=vehicle.x;live.y=vehicle.y;live.z=vehicle.z;
-        if(FactoryOcclusion(id,camera,live)!=FvoFactorySiteStatusV1::Ready)return 0;
-        std::lock_guard lock(g_factoryBirthLock);
-        const auto it=g_dynamicStock.find(id);
-        if(it==g_dynamicStock.end()||it->second.ref!=ref)return 0;
-        it->second.concealedFrom=camera;
-        it->second.concealedPose=live;
-        it->second.concealedAt=screen==1?GetTickCount64():camera.at;
-        return 1;
-    }
-#endif
 	int ReadTrafficVehicles(FvoTrafficVehicle* out, int max, bool includeHeld)
 	{
 		static thread_local world::Snapshot snap;
@@ -587,9 +369,11 @@ namespace
 		switch(request.window){
 		case FvoBirthWindow::Loading:return screen==3;
 		case FvoBirthWindow::Panel:return screen==2&&trafficarrival::panel.load();
-#ifndef FVO_RELEASE
+		// The live road fill (2026-11-20): a fleet birth in play, in every build (the player build must fill the road too). The name is historic.
 		case FvoBirthWindow::Diagnostic:return screen==1&&request.source==FvoBirthSource::Fleet;
-#endif
+        case FvoBirthWindow::FleetShortfall:
+            return screen==1&&request.source==FvoBirthSource::Fleet&&request.slot>=0;
+        case FvoBirthWindow::FactoryConcealed:return false;  // reserved: the factory stock birth path is gone, nothing opens this window
 		default:return false;
 		}
 	}
@@ -600,6 +384,7 @@ namespace
 			const auto source=BirthSourceName(request.source);
 			if(!BirthWindowOpen(request,ApiPresentation())){
 				logger::Write("OBS system=traffic.birth event=refused stage=request reason=window_closed source=%s slot=%d key=%s",source,request.slot,key.c_str());
+				NoteBirthRefusal(request,"request","window_closed");
 				return {};
 			}
 			logger::Write("OBS system=traffic.birth event=accepted source=%s slot=%d base=%08X vehicle=%08X key=%s",
@@ -613,7 +398,8 @@ namespace
 		*state=result?FvoBirthState::Completed:tracked?FvoBirthState::Pending:FvoBirthState::Missing;
 		return result;
 	}
-	int ApiSitedProof(unsigned base,double x,double y,double z,double heading,const char** why,BirthProof* out);
+	int ApiSitedProof(unsigned base,double x,double y,double z,double heading,const char** why,BirthProof* out,
+                      bool requireConcealment=true);
 	const char* RoadRefusal(const FvoRoadProofV1& road,const FvoTrafficBirthV1& request,int screen,uptr cell,uptr ws)
 	{
 		if(!roadclearance::Matches(road,request))return "road_proof_other_site";
@@ -623,11 +409,26 @@ namespace
 		return result==FvoRoadClearance::Clear?nullptr:
 			result==FvoRoadClearance::Occupied?"road_became_occupied":"road_clearance_unknown";
 	}
+	// The core's refusal reasons per birth ticket (DW-2): every refusal line below also lands here, so FVO_TrafficBirthRefusalV1 can hand the add-on the reason.
+	struct BirthRefusalRecord { FvoBirthRefusalV1 row{}; bool used = false; };
+	std::mutex g_refusalLock;
+	std::array<BirthRefusalRecord,32> g_refusals{};
+	std::size_t g_refusalNext=0;
+	void NoteBirthRefusal(const FvoTrafficBirthV1& request,const char* stage,const char* reason)
+	{
+		std::lock_guard lock(g_refusalLock);
+		for(auto& r:g_refusals)if(r.used&&r.row.grant==request.grant&&r.row.slot==request.slot){  // the same ticket polled again: keep the first reason and stage
+			if(request.grant)return;
+		}
+		auto& r=g_refusals[g_refusalNext++%g_refusals.size()];
+		r.used=true;r.row={};r.row.size=sizeof(FvoBirthRefusalV1);r.row.base=request.base;r.row.grant=request.grant;r.row.slot=request.slot;r.row.atMs=GetTickCount64();
+		std::snprintf(r.row.stage,sizeof r.row.stage,"%s",stage?stage:"");std::snprintf(r.row.reason,sizeof r.row.reason,"%s",reason?reason:"");
+	}
 	std::mutex g_uncollectedChassisLock;
     std::set<unsigned> g_uncollectedChassis;
     int (*g_parkedRetirement)(unsigned,const char*,bool)=nullptr;
     unsigned RequestVehicle(const FvoTrafficBirthV1& request, FvoBirthState* state,
-		std::optional<FvoRoadProofV1> road=std::nullopt,std::optional<FactorySite> factory=std::nullopt)
+		std::optional<FvoRoadProofV1> road=std::nullopt)
 	{
 		const auto [source,window,start,grant,slot,baseId,vehicleId,x,y,z,heading]=request;
 			const auto key=BirthKey(MutationKey(source==FvoBirthSource::FactoryStock?"factory_create":"create",baseId,x,y,z,heading),request);
@@ -636,45 +437,37 @@ namespace
 			logger::Write("OBS system=create.vehicle vehicle=00000000 event=request base=%08X pos=%.2f,%.2f,%.2f yaw=%.3f screen=%d key=%s",baseId,x,y,z,heading,screen,key.c_str());
 			BirthProof proof;
 			if(source==FvoBirthSource::Legacy)proof=g_birthProof;
-            else if(source==FvoBirthSource::FactoryStock){
-#ifndef FVO_RELEASE
-                if(!factory||!ApiPlayer(&pl))return {};
-                proof={baseId,0,x,y,z,heading,factory->proof.at,pl.world,true};
-#else
-                return {};
-#endif
-            }else if(!ApiSitedProof(baseId,x,y,z,heading,nullptr,&proof))return {};
+            else if(source==FvoBirthSource::FactoryStock)return {};  // reserved: no producer since the factory stock birth path was removed
+            else{
+                const char* sitedWhy=nullptr;
+                if(!ApiSitedProof(baseId,x,y,z,heading,&sitedWhy,&proof)){  // 2026-11-21: a car made in play must be out of the player's view
+                    NoteBirthRefusal(request,"sited_proof",sitedWhy);return {};
+                }
+            }
 			const unsigned long long proofAge=GetTickCount64()-proof.at;
-            const auto limit=factory?factorybirth::rules::coveredProofMs:ProofLimitMs(screen);
+            const auto limit=ProofLimitMs(screen);
 			const char* why=!screen?"no_presentation":!ApiPlayer(&pl)?"no_player":proof.base!=baseId?"proof_other_base":proof.world!=pl.world?"proof_other_world":
 				proofAge>limit?"proof_expired":
 				(std::fabs(x-proof.x)>0.01||std::fabs(y-proof.y)>0.01||std::fabs(z-proof.z)>0.01||std::fabs(heading-proof.yaw)>0.01)?"proof_other_position":
 				(road&&!PlayerCell(requestCell,requestWorld))?"no_player_cell":
 				(screen<2&&!BirthHidden(baseId,x,y,z,pl.x,pl.y))?"exposed":nullptr;
-			if(why){logger::Write("OBS system=create.vehicle vehicle=00000000 event=refused stage=request reason=%s base=%08X proof_base=%08X proof_age_ms=%llu screen=%d",why,baseId,proof.base,proofAge,screen);return {};}
+			if(why){logger::Write("OBS system=create.vehicle vehicle=00000000 event=refused stage=request reason=%s base=%08X proof_base=%08X proof_age_ms=%llu screen=%d",why,baseId,proof.base,proofAge,screen);NoteBirthRefusal(request,"request",why);return {};}
 			if(source==FvoBirthSource::Legacy)g_birthProof.base=0;
+			const unsigned long long askedAt=GetTickCount64();
 			return [=]()->std::uint64_t {
 				FvoTrafficPlayer current{};uptr cell=0,ws=0;
 				const unsigned long long age=GetTickCount64()-proof.at;
-                const auto liveLimit=factory?factorybirth::rules::coveredProofMs:ProofLimitMs(ApiPresentation());
+                const auto liveLimit=ProofLimitMs(ApiPresentation());
 				const char* late=!lifecycle::InService()?"out_of_service":!BirthWindowOpen(request,ApiPresentation())?"window_closed":!ApiPresentation()?"no_presentation":!ApiPlayer(&current)?"no_player":proof.world!=current.world?"world_changed":
-					(ApiPresentation()<2&&(screen>=2||std::hypot(current.x-pl.x,current.y-pl.y)>2))?"player_moved_or_cover_gone":
+					(ApiPresentation()<2&&(screen>=2||std::hypot(current.x-pl.x,current.y-pl.y)>PlayerMoveLimit(askedAt)))?"player_moved_or_cover_gone":
 					age>liveLimit?"proof_expired":!PlayerCell(cell,ws)?"no_player_cell":
-					(ApiPresentation()==1&&vehiclekeep::HoldBirthForLook(x,y,z,unsigned(ProofLimitMs(1))))?"camera_lookahead":
+					(ApiPresentation()==1&&
+                     vehiclekeep::HoldBirthForLook(x,y,z,unsigned(ProofLimitMs(1))))?"camera_lookahead":
 					!road?nullptr:cell!=requestCell||ws!=requestWorld?"road_cell_changed":RoadRefusal(*road,request,ApiPresentation(),cell,ws);
-                #ifndef FVO_RELEASE
-                if(!late&&factory){
-                    const FactoryPlayer player{cell,ws,current.x,current.y,current.z};
-                    late=FactorySiteRefusal(*factory,player);
-                }
-                #endif
-				if(late){logger::Write("OBS system=create.vehicle vehicle=00000000 event=refused stage=service reason=%s base=%08X proof_age_ms=%llu screen=%d key=%s",late,baseId,age,ApiPresentation(),key.c_str());return 0;}
-				const unsigned id=Create(factory?"traffic_factory_stock":"traffic_vehicle",runtimeforms::Lookup(baseId),cell,ws,x,y,z,heading,proof.air?kStagedCreation:nullptr);
+				if(late){logger::Write("OBS system=create.vehicle vehicle=00000000 event=refused stage=service reason=%s base=%08X proof_age_ms=%llu screen=%d key=%s",late,baseId,age,ApiPresentation(),key.c_str());NoteBirthRefusal(request,"service",late);return 0;}
+				const unsigned id=Create("traffic_vehicle",runtimeforms::Lookup(baseId),cell,ws,x,y,z,heading,proof.air?kStagedCreation:nullptr);
                 if(id){std::lock_guard lock(g_uncollectedChassisLock);g_uncollectedChassis.insert(id);}
-                #ifndef FVO_RELEASE
-                if(id&&factory)RememberFactoryStock(id,*factory);
-                #endif
-				if(!id)logger::Write("OBS system=create.vehicle vehicle=00000000 event=refused stage=engine reason=create_returned_nothing base=%08X",baseId);
+				if(!id){logger::Write("OBS system=create.vehicle vehicle=00000000 event=refused stage=engine reason=create_returned_nothing base=%08X",baseId);NoteBirthRefusal(request,"engine","create_returned_nothing");}
 				return id;
 			};
 		},state);
@@ -700,24 +493,20 @@ namespace
 			const char* why=!owned?"no_vehicle":!ApiPresentation()?"no_presentation":!ApiPlayer(&pl)?"no_player":nullptr;
 			if(!why){
 				const bool birth=g_birthProof.vehicle==vehicleId&&GetTickCount64()-g_birthProof.at<=ProofLimitMs(ApiPresentation());
-				if(!birth&&ApiPresentation()<2&&ApiExposure(x,y,z)!=2)why="exposed";
+				if(!birth&&window!=FvoBirthWindow::FactoryConcealed&&
+                   ApiPresentation()<2&&ApiExposure(x,y,z)!=2)why="exposed";
 			}
-			if(why){logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=request reason=%s base=%08X",vehicleId,why,baseId);return {};}
+			if(why){logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=request reason=%s base=%08X",vehicleId,why,baseId);NoteBirthRefusal(request,"driver_request",why);return {};}
 			const int screen=ApiPresentation();
+			const unsigned long long askedAt=GetTickCount64();
 			return [=]()->std::uint64_t {
 				uptr cell=0,ws=0;FvoTrafficPlayer current{};
 				const char* late=!lifecycle::InService()?"out_of_service":!BirthWindowOpen(request,ApiPresentation())?"window_closed":!ApiPresentation()?"no_presentation":!ApiPlayer(&current)?"no_player":std::strcmp(pl.world,current.world)?"world_changed":
-					(ApiPresentation()<2&&(screen>=2||std::hypot(pl.x-current.x,pl.y-current.y)>2))?"player_moved_or_cover_gone":!PlayerCell(cell,ws)?"no_player_cell":nullptr;
-				if(late){logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=service reason=%s base=%08X key=%s",vehicleId,late,baseId,key.c_str());return 0;}
+					(ApiPresentation()<2&&(screen>=2||std::hypot(pl.x-current.x,pl.y-current.y)>PlayerMoveLimit(askedAt)))?"player_moved_or_cover_gone":!PlayerCell(cell,ws)?"no_player_cell":nullptr;
+				if(late){logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=service reason=%s base=%08X key=%s",vehicleId,late,baseId,key.c_str());NoteBirthRefusal(request,"driver_service",late);return 0;}
 				const uptr vehicle=reinterpret_cast<uptr>(owned.get());
                 if(FactoryStockId(vehicleId)){
-                    bool hidden=false;
-#ifndef FVO_RELEASE
-                    if(DynamicFactoryStock(vehicleId))
-                        hidden=FactoryDriverHidden(vehicleId,{cell,ws,current.x,current.y,current.z});
-                    else
-#endif
-                        hidden=ApiExposure(x,y,z)==2;
+                    const bool hidden=ApiExposure(x,y,z)==2;
                     if(StockCell(vehicle)!=cell||!hidden){
                         logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=service reason=factory_origin_cell_or_visibility_changed",vehicleId);
                         return 0;
@@ -738,10 +527,7 @@ namespace
                     logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=service reason=chassis_left_requested_seat_position",vehicleId);
                     return 0;
                 }
-                const Birth previous=g_birth;g_birth={vehicle,-99};
-				const unsigned id=Create("traffic_driver",runtimeforms::Lookup(baseId),cell,ws,x,y,z,heading,kSeatedCreation);
-				const auto seat=g_birth.result;g_birth=previous;
-				return std::uint64_t(id)|(std::uint64_t(std::uint32_t(seat))<<32);
+                return CreateSeatedActor("traffic_driver",baseId,vehicle,cell,ws,x,y,z,heading);
 			};
 		},state);
 		if(!result)return 0;
@@ -764,8 +550,6 @@ namespace
 	}
 	std::map<unsigned, unsigned> g_guardOthers;  // seat-linked run-time drivers no registry knows (driver -> vehicle), refreshed by the guard
 	std::map<unsigned, float> g_guardHidden;     // drivers the guard has shrunk, with the scale to give back
-	struct AirRescue { double x = 0, y = 0, z = 0; ULONGLONG at = 0; };
-	std::map<unsigned, AirRescue> g_airRescue;   // a stable target per driver: the move request is keyed by its position
 	std::map<unsigned, unsigned> g_madeDrivers;  // driver -> vehicle, for every pair the addon made or reused since the load
     void RememberFactoryDriver(unsigned driver,unsigned vehicle){g_madeDrivers[driver]=vehicle;}
 	unsigned g_lastMadeVehicle = 0;
@@ -943,15 +727,20 @@ namespace
 			++it;
 		}
 	}
-    int ApiMoveTo(unsigned id,double x,double y,double z,double heading)
+    int QueueTrafficMove(unsigned id,double x,double y,double z,double heading,std::uint64_t birthHold)
     {
         // Poll BEFORE fresh preconditions: after a move the original position,
         // visibility and cell may have changed. Its acknowledgement still must
         // be consumed rather than mistaken for another new command.
-        const auto result=lifecycle::Poll(MutationKey("move",id,x,y,z,heading),id,[=]()->lifecycle::Work {
+        const auto key=MutationKey("move",id,x,y,z,heading)+(birthHold?":birth:"+std::to_string(birthHold):"");
+        const auto result=lifecycle::Poll(key,id,[=]()->lifecycle::Work {
             const int screen=ApiPresentation();FvoTrafficPlayer pl{};
             if(!screen||!ApiPlayer(&pl)||!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!std::isfinite(heading))return {};
             const auto owned=lifecycle::Keep(TrafficRef(id),id);if(!owned)return {};
+            const auto driver=g_madeDrivers.find(id);
+            const auto authority=CaptureTrafficAuthority(driver==g_madeDrivers.end()?id:driver->second);
+            const auto poseGeneration=npcvehicles::PoseGeneration(id);
+            if(!poseGeneration)return {};
             const auto sourceRef=reinterpret_cast<uptr>(owned.get());
             const auto source=At<game::Vec3>(sourceRef,off::kRefPosition);
             const uptr loaded=At<uptr>(sourceRef,off::kRefLoadedData);
@@ -962,9 +751,27 @@ namespace
                 uptr cell=0,world=0;FvoTrafficPlayer current{};
                 if(!lifecycle::InService()||!ApiPresentation()||!ApiPlayer(&current)||std::strcmp(pl.world,current.world)||
                    (ApiPresentation()<2&&(screen>=2||std::hypot(pl.x-current.x,pl.y-current.y)>2))||!PlayerCell(cell,world))return 0;
+                if(!TrafficAuthorityCurrent(authority)){
+                    logger::ObserveReference("traffic.move",id,4,"event=refused reason=traffic_authority_revoked");
+                    return 0;
+                }
+                if(poseGeneration!=npcvehicles::PoseGeneration(id)){
+                    logger::ObserveReference("traffic.move",id,3,"event=refused reason=relocation_revoked_pose");
+                    return 0;
+                }
+                if(birthHold&&birthHold!=vehiclediag::BirthCorrectionGeneration(id)){
+                    logger::ObserveReference("traffic.move",id,1,"event=refused reason=stale_birth_hold generation=%llu",
+                        static_cast<unsigned long long>(birthHold));
+                    return 0;
+                }
+                const auto flags=At<unsigned>(ref,kFormFlags);
+                if(flags&kDeletedFlag)return 0;
+                if(!(flags&kDisabledFlag)&&npcvehicles::LooksLikeActor(ref)&&npcvehicles::VehicleOf(ref)){
+                    logger::ObserveReference("traffic.move",id,2,"event=refused reason=actor_linked_to_vehicle");
+                    return 0;
+                }
                 const auto start=At<game::Vec3>(ref,off::kRefPosition);
                 if(std::hypot(std::hypot(start.x-source.x,start.y-source.y),start.z-source.z)>1)return 0;
-                if(At<unsigned>(ref,kFormFlags)&kDeletedFlag)return 0;
                 float pos[]={float(x),float(y),float(z)},rot[]={0.0f,0.0f,float(heading)};
                 std::uint64_t handle=*reinterpret_cast<unsigned*>(game::Base()+addr::kInvalidHandle);
                 EngineFn<void(*)(uptr,std::uint64_t*,uptr,uptr,float*,float*)>(addr::kMoveReference)(ref,&handle,cell,world,pos,rot);
@@ -973,30 +780,10 @@ namespace
         });
         return result?int(*result):0;
     }
+    int ApiMoveTo(unsigned id,double x,double y,double z,double heading){
+        return QueueTrafficMove(id,x,y,z,heading,0);
+    }
 
-	// Not ApiMoveTo: that one refuses within 150 m and whenever the player has moved 2 m, so a stranded driver was never set down (2026-10-31: 7 requests, 0 moves). The caller checks the camera.
-	void RescueDriver(unsigned id, double x, double y, double z)
-	{
-		const uptr r = TrafficRef(id);
-		if (!r) return;
-		lifecycle::Post("rescue:" + std::to_string(id), id, [=]() -> lifecycle::Work {
-			const auto owned = lifecycle::Keep(r, id);
-			if (!owned) return {};
-			return [=]() -> std::uint64_t {
-				uptr cell = 0, world = 0;
-				const uptr ref = reinterpret_cast<uptr>(owned.get());
-				if (!lifecycle::InService() || !PlayerCell(cell, world) || (At<unsigned>(ref, kFormFlags) & (kDeletedFlag | kDisabledFlag))) {
-					logger::Write("OBS system=driver.rescue reference=%08X event=refused flags=%08X", id, At<unsigned>(ref, kFormFlags));
-					return 0;
-				}
-				float pos[] = { float(x), float(y), float(z) }, rot[] = { 0.0f, 0.0f, 0.0f };
-				std::uint64_t handle = *reinterpret_cast<unsigned*>(game::Base() + addr::kInvalidHandle);
-				EngineFn<void (*)(uptr, std::uint64_t*, uptr, uptr, float*, float*)>(addr::kMoveReference)(ref, &handle, cell, world, pos, rot);
-				logger::Write("OBS system=driver.rescue reference=%08X event=set_down pos=%.1f,%.1f,%.1f", id, x, y, z);
-				return 1;
-			};
-		});
-	}
 	unsigned ApiVehicleOf(unsigned actorId)
 	{
 		const uptr d = ActorRef(actorId);
@@ -1140,11 +927,12 @@ namespace
     // field box, model bounds, other vehicles and Health's spot verdict only (no site rays, user 2026-11-06); this records that pose so
     // ApiCreateVehicle reads Siting's output instead of judging the site again. Kept from the old proof: presentation, player, a valid
     // origin, staged creation available, and in play only where the player cannot see. Old callers of birthSite/airSite are unchanged.
-    int ApiSitedProof(unsigned base,double x,double y,double z,double heading,const char** why,BirthProof* out){
+    int ApiSitedProof(unsigned base,double x,double y,double z,double heading,const char** why,BirthProof* out,
+                      bool requireConcealment){
         FvoTrafficPlayer pl{};const int screen=ApiPresentation();
         const char* no=!vehiclediag::BirthStageAvailable()?"staged_birth_unavailable":!screen?"no_presentation":!ApiPlayer(&pl)?"no_player":
             (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||!std::isfinite(heading))?"invalid_pose":!trafficadmission::ValidOrigin(x,y)?"invalid_origin":
-            (screen<2&&!BirthHidden(base,x,y,z,pl.x,pl.y))?"exposed":nullptr;
+            (requireConcealment&&screen<2&&!BirthHidden(base,x,y,z,pl.x,pl.y))?"exposed":nullptr;
         if(why)*why=no?no:"sited_by_spawn_flow";
         if(no){logger::Write("OBS system=create.vehicle vehicle=00000000 event=sited_proof ok=0 base=%08X pos=%.2f,%.2f,%.2f screen=%d reason=%s",base,x,y,z,screen,no);return 0;}
         *out={base,0,x,y,z,heading,GetTickCount64(),pl.world,true};
@@ -1470,19 +1258,6 @@ namespace
 					id, trafficpair::SeenName(seen), lasted / 1000.0, requestRetirement ? ", retirement requested" : "", vehicle, v.baseId, v.x, v.y, v.z, distance, vehicle3D ? "model loaded" : "no model",
 					job ? 1 : 0, made != g_madeDrivers.end() ? 1 : 0, ExposureAt(d.x, d.y, d.z), std::hypot(d.x - pl.x, d.y - pl.y), d.x, d.y, d.z, above, CellStateOf(id), sit);
 			}
-			// A traffic driver with no job and no seat, high up, floats or falls to its death (2026-10-31: 5 in one run, no combat; FF10032E held 75 m up): set down on the ground below,
-			// whenever neither end is in the camera's view.
-			// Not one at its vehicle's side: that vehicle is frozen up there too, and the pair can still be seated (FF100370, 1.4 m from a vehicle 81 m up).
-			if (seen == trafficpair::Seen::Air && made != g_madeDrivers.end() && !job && !d.dead && std::isfinite(above) && !(std::isfinite(distance) && distance <= trafficpair::kSnapReach)) {
-				auto& rescue = g_airRescue[id];
-				if (!rescue.at || now - rescue.at >= 2000) {
-					rescue.at = now;
-					const double groundZ = d.z - above + 0.5;
-					const bool inCamera = ApiInCameraView(d.x, d.y, d.z) || ApiInCameraView(d.x, d.y, groundZ);
-					logger::ObserveReference("driver.rescue", id, inCamera ? 1u : 2u, "event=request vehicle_id=%08X above=%.1f pos=%.1f,%.1f,%.1f in_camera=%d", vehicle, above, d.x, d.y, d.z, inCamera);
-					if (!inCamera) RescueDriver(id, d.x, d.y, groundZ);
-				}
-			}
 			if (requestRetirement && !w.requested && g_retirementReport && (!linked||linked==made->second)) {
 				w.requested=true;++retireRequests;g_retirementReport(made->second,id);
 			}
@@ -1534,14 +1309,45 @@ namespace trafficpool
 		// KO-1: the player in the driver's seat of a vehicle traffic made (not riding as a passenger) has taken it.
 		if (const unsigned in = ApiVehicleOf(0x14); in && (g_madeVehicles.count(in)||FactoryStockId(in)) && passenger::RidingVehicle() != in) NoteTaken(in, "player_in_the_driver_seat");
 		if (g_attached.load() && g_hooks.tick) {
-#ifndef FVO_RELEASE
-            if(ApiPresentation()==1){FactoryCamera camera;RememberFactoryCamera(camera);}
-#endif
             vehiclekeep::UpdateTrafficLook();g_hooks.tick();WatchDrivers();
         }
 		ServiceVisibility();
 	}
 	bool MadeVehicle(std::uint32_t id) { return g_madeVehicles.count(id) != 0; }
+#ifndef FVO_RELEASE
+    std::optional<std::uint64_t> FastSeatBirth(unsigned vehicle, std::uint64_t trial,
+        const trafficpair::SeatPose& offset, std::uint64_t requestedAt)
+    {
+        return lifecycle::Poll("fast-seat:"+std::to_string(trial),vehicle,[=]()->lifecycle::Work {
+            const auto held=lifecycle::Keep(VehicleRef(vehicle),vehicle);
+            if(!held||!TrafficAuthorityCurrent(CaptureTrafficAuthority(vehicle))||MadeVehicle(vehicle)||FactoryStockId(vehicle))return {};
+            const auto authority=CaptureTrafficAuthority(vehicle);
+            return [=]()->std::uint64_t {
+                uptr cell=0,worldspace=0;
+                const auto ref=reinterpret_cast<uptr>(held.get());
+                if(!lifecycle::InService()||ApiPresentation()!=1||!PlayerCell(cell,worldspace)||
+                   StockCell(ref)!=cell||!TrafficAuthorityCurrent(authority)||ApiVehicleOf(0x14)==vehicle||
+                   (At<unsigned>(ref,kFormFlags)&(kDeletedFlag|kDisabledFlag)))return 0;
+                static thread_local world::Snapshot snap;
+                if(!world::Vehicles(snap))return 0;
+                const auto row=std::find_if(snap.v,snap.v+snap.count,[=](const auto& item){return item.formId==vehicle;});
+                if(row==snap.v+snap.count||row->driverId||row->who==world::VehicleInfo::Who::Player||
+                   row->who==world::VehicleInfo::Who::Npc)return 0;
+                const auto position=At<game::Vec3>(ref,off::kRefPosition);
+                const auto heading=At<game::Vec3>(ref,off::kRefRotation).z;
+                float target[3]{};
+                trafficpair::SeatPoint(position.x,position.y,position.z,heading,offset,target);
+                if(!std::isfinite(target[0])||!std::isfinite(target[1])||!std::isfinite(target[2])||!std::isfinite(heading))return 0;
+                const auto before=GetTickCount64();
+                const auto result=CreateSeatedActor("fast_seat_test",kFvoTrafficDriverBase,ref,cell,worldspace,
+                    target[0],target[1],target[2],heading+offset.yaw);
+                logger::Write("OBS system=seat.fast event=created trial=%llu vehicle=%08X driver=%08X callback=%d queued_ms=%llu create_ms=%llu offset=%.2f,%.2f,%.2f",
+                    trial,vehicle,unsigned(result),int(result>>32),before-requestedAt,GetTickCount64()-before,offset.lx,offset.ly,offset.lz);
+                return result;
+            };
+        });
+    }
+#endif
     bool MayHideParked(unsigned id,const char* reason,bool protectedPlacement){
         if(FactoryStockId(id))return false;
         if(!id)return false;
@@ -1551,10 +1357,7 @@ namespace trafficpool
     }
 	void Reset() {
         lifecycle::Reset();
-#ifndef FVO_RELEASE
-        {std::lock_guard lock(g_factoryBirthLock);g_factorySite={};g_factoryCamera={};g_dynamicStock.clear();}
-#endif
-        {std::lock_guard lock(g_uncollectedChassisLock);g_uncollectedChassis.clear();}g_coverScanned=false;g_coverActorCount=0;realvehicles::ResetRoadInventory();g_visibility.clear();g_retireCamera.clear();g_retireAuthority.clear();g_airRescue.clear();{std::lock_guard lock(g_coverHideLock);g_coverHides.clear();}g_unpersisted.clear();g_birthProof={};g_guardOthers.clear();g_guardHidden.clear();trafficarrival::Reset();g_madeVehicles.clear();g_madeDrivers.clear();g_watched.clear();g_pairHealth.clear();g_recoverTimes.clear();{std::lock_guard lk(g_tookLock);g_playerTook.clear();++g_trafficEpoch;++handoff::wheelGeneration;}g_healthLaunch=true;g_lastMadeVehicle=0;g_watchLines=0;if (g_attached.load() && g_hooks.reset) g_hooks.reset();
+        {std::lock_guard lock(g_uncollectedChassisLock);g_uncollectedChassis.clear();}g_coverScanned=false;g_coverActorCount=0;realvehicles::ResetRoadInventory();g_visibility.clear();g_retireCamera.clear();g_retireAuthority.clear();{std::lock_guard lock(g_coverHideLock);g_coverHides.clear();}g_unpersisted.clear();g_birthProof={};g_guardOthers.clear();g_guardHidden.clear();trafficarrival::Reset();g_madeVehicles.clear();g_madeDrivers.clear();g_watched.clear();g_pairHealth.clear();g_recoverTimes.clear();{std::lock_guard lk(g_tookLock);++g_trafficEpoch;++handoff::wheelGeneration;}g_healthLaunch=true;g_lastMadeVehicle=0;g_watchLines=0;if (g_attached.load() && g_hooks.reset) g_hooks.reset();
     }
 	void RushTick() { if (g_attached.load() && g_hooks.housekeeping) g_hooks.housekeeping();ServiceVisibility(); }
 	void Rush(const RushPlace* places, int count)
@@ -1565,10 +1368,10 @@ namespace trafficpool
 	}
 	int PairHealth(unsigned vehicleId) { return ApiPairHealth(vehicleId); }
 	bool WellHiddenFar(unsigned vehicleId, double distance) { FvoTrafficRef v{}; return ApiRef(vehicleId, &v) && distance >= ApiNoticeFar(v.baseId); }
-	bool PutBack(unsigned id, double x, double y, double z)
+	bool PutBack(unsigned id, double x, double y, double z, std::uint64_t generation)
 	{
 		const uptr ref = Ref(id);
-		return ref&&ApiMoveTo(id,x,y,z,At<game::Vec3>(ref,off::kRefRotation).z)!=0;
+		return generation&&ref&&QueueTrafficMove(id,x,y,z,At<game::Vec3>(ref,off::kRefRotation).z,generation)!=0;
 	}
 	int Everyday() { return g_attached.load() && g_hooks.everyday ? g_hooks.everyday() : 0; }
 	bool AddonAttached() { return g_attached.load(); }
@@ -1576,6 +1379,18 @@ namespace trafficpool
     std::uint64_t CaptureWheelHandoff(unsigned vehicle) {
         std::lock_guard lock(g_tookLock);
         return g_playerTook.count(vehicle)?0:handoff::wheelGeneration.load(std::memory_order_relaxed);
+    }
+    std::vector<unsigned> SavePlayerTakeovers() {
+        std::lock_guard lock(g_tookLock);
+        return {g_playerTook.begin(), g_playerTook.end()};
+    }
+    void RestorePlayerTakeovers(const std::vector<unsigned>& vehicles) {
+        std::set<unsigned> owned(vehicles.begin(), vehicles.end());
+        std::lock_guard lock(g_tookLock);
+        if (g_playerTook != owned) {
+            g_playerTook.swap(owned);
+            ++handoff::wheelGeneration;
+        }
     }
     void NotePlayerTook(unsigned vehicle, const char* why) { NoteTaken(vehicle, why); }  // KO-1
 	void ReloadFiles() { if (g_attached.load() && g_hooks.reload) g_hooks.reload(); }
@@ -1606,15 +1421,12 @@ extern "C" __declspec(dllexport) const FvoTrafficApi* FVO_TrafficApi(int version
 }
 
 
-// Additive export (no FvoTrafficApi table change): 1 = the sited pose is the birth proof for the next createVehicle of that base and pose.
+// Additive exports (no FvoTrafficApi table change).
 extern "C" __declspec(dllexport) void FVO_TrafficParkedRetirementV1(int (*arbiter)(unsigned,const char*,bool)){
     g_parkedRetirement=arbiter;
 }
 extern "C" __declspec(dllexport) int FVO_TrafficPanelCoveredV1(){return trafficarrival::panel.load()?1:0;}
 extern "C" __declspec(dllexport) void FVO_TrafficRetirementListenerV1(RetirementReport report){g_retirementReport=report;}
-extern "C" __declspec(dllexport) void FVO_TrafficRetirementShowV1(unsigned id,bool driver){
-    if(id){g_retireCamera[id]=driver;ApiShow(id,0);}
-}
 extern "C" __declspec(dllexport) int FVO_TrafficHandoffReleaseV1(unsigned vehicle,bool player){
     if(!vehicle||player!=(ApiPlayerTook(vehicle)!=0))return 0;
     const bool released=player?vehiclediag::ReleaseBirthToPlayer(vehicle):vehiclediag::ReleaseBirth(vehicle);
@@ -1623,36 +1435,6 @@ extern "C" __declspec(dllexport) int FVO_TrafficHandoffReleaseV1(unsigned vehicl
 #endif
     return released;
 }
-#ifndef FVO_RELEASE
-extern "C" __declspec(dllexport) int FVO_TrafficFactoryLeaseV1(
-    FvoTrafficFactoryLeaseActionV1 action, unsigned vehicle, unsigned driver, std::uint64_t* lease,
-    const FvoTripClaim* claim)
-{
-    using Action = FvoTrafficFactoryLeaseActionV1;
-    if (!lease || !vehicle || !driver) return 0;
-    if (action == Action::Cancel) {
-        if (!npcvehicles::CancelFactoryLease(vehicle, driver, *lease)) return 0;
-        *lease = 0;
-        return 1;
-    }
-    if (!trafficpool::AddonAttached() || ApiPlayerTook(vehicle)) return 0;
-    if (action == Action::Status) return npcvehicles::CheckFactoryLease(vehicle, driver, *lease);
-    if (action == Action::StartStock && !*lease && !claim) {
-        if(!FactoryStockId(vehicle))return 0;
-        *lease=npcvehicles::StartFactoryStockLease(ActorRef(driver),VehicleRef(vehicle));
-        return *lease!=0;
-    }
-    if (action == Action::Start && !*lease && claim && claim->step && claim->user) {
-        *lease = npcvehicles::StartFactoryLease(ActorRef(driver), VehicleRef(vehicle), *claim);
-        return *lease != 0;
-    }
-    if (action == Action::Depart && npcvehicles::DepartFactoryLease(ActorRef(driver), VehicleRef(vehicle), *lease)) {
-        *lease = 0;
-        return 1;
-    }
-    return 0;
-}
-#endif
 extern "C" __declspec(dllexport) void FVO_TrafficHandoffFactsV1(unsigned vehicle,unsigned driver,handoff::Facts* out){
     if(!out)return;
     *out={};
@@ -1671,43 +1453,38 @@ extern "C" __declspec(dllexport) void FVO_TrafficRetirementShowV2(unsigned id,un
     if(camera)g_retireCamera[id]=driver;else g_retireCamera.erase(id);
     ApiShow(id,0);
 }
-extern "C" __declspec(dllexport) int FVO_TrafficPopulationVehiclesV1(FvoTrafficVehicle* out,int max){
-    return out&&max>0?ReadTrafficVehicles(out,max,true):-1;
+// DW-2: the core's reason for the last refusal of one birth ticket (grant + slot of the FvoTrafficBirthV1). 1 and *out filled, or 0 (none recorded: not refused, or an older ticket
+// pushed out of the 32-row ring). Read only; additive (an older add-on never calls it, an older core lacks it and the add-on says so).
+extern "C" __declspec(dllexport) int FVO_TrafficBirthRefusalV1(std::uint64_t grant,int slot,FvoBirthRefusalV1* out){
+    if(!out||out->size<sizeof(FvoBirthRefusalV1)||!grant)return 0;
+    std::lock_guard lock(g_refusalLock);
+    const BirthRefusalRecord* best=nullptr;
+    for(const auto& r:g_refusals)if(r.used&&r.row.grant==grant&&r.row.slot==slot&&(!best||r.row.atMs>best->row.atMs))best=&r;
+    if(!best)return 0;
+    *out=best->row;out->size=sizeof(FvoBirthRefusalV1);
+    return 1;
 }
-#ifndef FVO_RELEASE
-extern "C" __declspec(dllexport) int FVO_TrafficFactoryStockV1(FvoFactoryStockV1* out,int max){
-    if(!out||max<=0)return 0;
-    const auto file=runtimeforms::LoadedPlugin(kFactoryStock.plugin);
-    if(!file)return 0;
-    uptr playerCell=0,world=0;
-    const bool havePlayerCell=PlayerCell(playerCell,world);
-    const int count=std::min(max,kFvoFactoryStockCountV1);
-    for(int i=0;i<count;++i){
-        auto& row=out[i];
-        row={};
-        row.local=kFactoryStock.At(i).local;
-        const auto id=runtimeforms::RuntimeId(file,row.local);
-        FvoTrafficRef found{};
-        if(id&&ApiRef(id,&found)&&!found.isActor){
-            row.vehicle=found.id;row.base=found.baseId;
-            row.usable=found.usable;row.modelLoaded=found.has3D;
-            const auto ref=VehicleRef(id);
-            uptr sourceWorld=0;
-            const auto cell=StockCell(ref,&sourceWorld);
-            row.inPlayerCell=havePlayerCell&&cell==playerCell;
-            row.inPlayerWorld=havePlayerCell&&cell&&sourceWorld==world;
-            row.x=found.x;row.y=found.y;row.z=found.z;
-        }
-    }
-    return count;
-}
-#endif
 extern "C" __declspec(dllexport) int FVO_TrafficRoadVehiclesV1(FvoTrafficVehicle* out,int max){
     uptr cell=0,ws=0;
-    if(!out||max<=0||!PlayerCell(cell,ws))return -1;
+    if(!out||max<=0||!PlayerCell(cell,ws)){
+        logger::Observe("traffic.road_inventory",0,11,"event=road_list_unavailable reason=no_player_cell");
+        return -1;
+    }
     realvehicles::RefreshRoadInventory(cell,ws);
     const int count=ReadTrafficVehicles(out,max,true);
-    return count<0?count:realvehicles::AppendRoadVehicles(out,count,max);
+    if(count<0){
+        logger::Observe("traffic.road_inventory",0,12,"event=road_list_unavailable reason=traffic_vehicle_read_failed");
+        return count;
+    }
+    const int full=realvehicles::AppendRoadVehicles(out,count,max);
+    if(full<0){
+        // 2026-11-21 (live log 00:20-00:25: world_vehicle_list_incomplete 47 times, no live birth for 5 minutes): one stale or busy parked-vehicle source made the whole
+        // list fail and stopped the fill for good. The traffic list is still true; parked vehicles are judged per pose by FVO_TrafficRoadCheckV1, which needs a
+        // consistent inventory epoch of its own and answers Unknown (the birth waits) when it has none. So the fill goes on with the traffic list and says so.
+        logger::Observe("traffic.road_inventory",0,13,"event=road_list_partial reason=parked_sources_not_current traffic_vehicles=%d",count);
+        return count;
+    }
+    return full;
 }
 extern "C" __declspec(dllexport) FvoRoadClearance FVO_TrafficRoadCheckV1(const FvoRoadSiteV1* site,FvoRoadProofV1* proof){
     uptr cell=0,ws=0;
@@ -1715,14 +1492,13 @@ extern "C" __declspec(dllexport) FvoRoadClearance FVO_TrafficRoadCheckV1(const F
     *proof={*site,0,GetTickCount64()};
     return realvehicles::CheckRoadSite(cell,ws,*site,proof->epoch);
 }
-extern "C" __declspec(dllexport) int FVO_TrafficSitedV1(unsigned base,double x,double y,double z,double heading){
-    return ApiSitedProof(base,x,y,z,heading,nullptr,&g_birthProof);
-}
 extern "C" __declspec(dllexport) unsigned FVO_TrafficBirthRequestV1(const FvoTrafficBirthV1* request,FvoBirthState* state){
     if(!state)return 0;
     *state=FvoBirthState::Completed;
     if(!request||!request->base||!request->grant||(request->source!=FvoBirthSource::Fleet&&
        (request->source!=FvoBirthSource::DriverRepair||!request->vehicle)))return 0;
+    // Chassis creation for a live physical shortfall must go through V2 with a road receipt.
+    if(request->window==FvoBirthWindow::FleetShortfall&&request->start&&!request->vehicle)return 0;
     return RequestBirth(*request,nullptr,state);
 }
 extern "C" __declspec(dllexport) unsigned FVO_TrafficBirthRequestV2(const FvoTrafficBirthV1* request,const FvoRoadProofV1* proof,FvoBirthState* state){
@@ -1732,43 +1508,6 @@ extern "C" __declspec(dllexport) unsigned FVO_TrafficBirthRequestV2(const FvoTra
        (request->start&&(!proof||!roadclearance::Matches(*proof,*request))))return 0;
     return RequestVehicle(*request,state,proof?std::optional{*proof}:std::nullopt);
 }
-#ifndef FVO_RELEASE
-extern "C" __declspec(dllexport) FvoFactorySiteStatusV1 FVO_TrafficFactorySiteV1(
-    unsigned base,const FvoRoadSiteV1* draft,FvoFactorySiteProofV1* out)
-{
-    if(!base||!draft||!out||out->size!=sizeof(*out)||out->version!=1)return FvoFactorySiteStatusV1::Unsafe;
-    *out={};
-    const auto result=QueryFactorySite(base,*draft,*out);
-    logger::Observe("traffic.factory_origin",base,unsigned(result),
-        "event=site status=%d draft=%.2f,%.2f,%.2f solved_z=%.2f nonce=%llu",
-        int(result),draft->x,draft->y,draft->z,out->site.z,out->nonce);
-    return result;
-}
-extern "C" __declspec(dllexport) unsigned FVO_TrafficFactoryBirthV1(
-    const FvoTrafficBirthV1* request,const FvoFactorySiteProofV1* proof,FvoBirthState* state)
-{
-    if(!state)return 0;
-    *state=FvoBirthState::Completed;
-    if(!request||!request->base||!request->grant||request->vehicle||request->source!=FvoBirthSource::FactoryStock)return 0;
-    if(!request->start)return RequestVehicle(*request,state);
-    if(!proof||proof->size!=sizeof(*proof)||proof->version!=1||!proof->nonce||proof->base!=request->base||
-       proof->site.x!=request->x||proof->site.y!=request->y||proof->site.z!=request->z||proof->site.heading!=request->heading||
-       (request->window!=FvoBirthWindow::Panel&&request->window!=FvoBirthWindow::Loading)||
-       !BirthWindowOpen(*request,ApiPresentation()))return 0;
-    FactorySite sealed{};
-    {
-        std::lock_guard lock(g_factoryBirthLock);
-        const auto& actual=g_factorySite.proof;
-        if(actual.nonce!=proof->nonce||actual.base!=proof->base||actual.at!=proof->at||!SameFactorySite(actual.site,proof->site))return 0;
-        sealed=g_factorySite;
-        g_factorySite.proof.nonce=0;
-    }
-    return RequestVehicle(*request,state,std::nullopt,sealed);
-}
-extern "C" __declspec(dllexport) int FVO_TrafficFactoryStockBindV1(unsigned vehicle,unsigned base,const FvoRoadSiteV1* origin){
-    return origin?BindFactoryStock(vehicle,base,*origin):0;
-}
-#endif
 extern "C" __declspec(dllexport) int FVO_StoredTrafficModelV1(unsigned base,FvoObservedModelV1* out){
     if(!out||out->size!=sizeof(*out)||out->version!=1||base!=modeladmission::storedBase||
        !modeladmission::Valid(modeladmission::storedShape))return 0;

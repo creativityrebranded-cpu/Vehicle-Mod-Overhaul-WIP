@@ -109,7 +109,7 @@ target_link_libraries(FlyingVehicleOverhaul PRIVATE sp_common Synchronization Dx
 
 # FVO Traffic addon (2026-10-29, was FVO City Placements): all traffic decisions; talks to core through src/traffic/traffic_api.h
 # (API v2) and fvo_addon_api.h. FVO Placements is only FVO_CityPlacements.esm now. See notes/TRAFFIC_ADDON_PROPOSAL_20261029.md.
-add_library(FVO_Traffic SHARED src/traffic/traffic_main.cpp src/traffic/generator.cpp src/traffic/everyday.cpp)
+add_library(FVO_Traffic SHARED src/traffic/traffic_main.cpp src/traffic/generator.cpp)
 sp_options(FVO_Traffic)
 target_link_libraries(FVO_Traffic PRIVATE Shell32 Ole32)
 
@@ -457,6 +457,12 @@ add_executable(route_check tools/route_check.cpp)
 target_include_directories(route_check PRIVATE src)
 target_compile_features(route_check PRIVATE cxx_std_20)
 
+
+
+add_executable(trafficring_test tests/trafficring_test.cpp)
+target_include_directories(trafficring_test PRIVATE src)
+target_compile_features(trafficring_test PRIVATE cxx_std_20)
+
 add_executable(roadedge_test tests/roadedge_test.cpp)
 target_include_directories(roadedge_test PRIVATE src)
 target_compile_features(roadedge_test PRIVATE cxx_std_20)
@@ -465,10 +471,21 @@ add_executable(roadvisual_test tests/roadvisual_test.cpp)
 target_include_directories(roadvisual_test PRIVATE src)
 target_compile_features(roadvisual_test PRIVATE cxx_std_20)
 
-add_executable(factorysite_test tests/factorysite_test.cpp)
-target_include_directories(factorysite_test PRIVATE src)
-target_compile_features(factorysite_test PRIVATE cxx_std_20)
-
 add_executable(relocation_test tests/relocation_test.cpp)
 target_include_directories(relocation_test PRIVATE src)
 target_compile_features(relocation_test PRIVATE cxx_std_20)
+
+add_executable(farrail_test tests/farrail_test.cpp)
+target_include_directories(farrail_test PRIVATE src)
+target_compile_features(farrail_test PRIVATE cxx_std_20)
+
+add_executable(relocationrebase_test tests/relocationrebase_test.cpp)
+target_include_directories(relocationrebase_test PRIVATE src)
+target_compile_features(relocationrebase_test PRIVATE cxx_std_20)
+
+add_executable(stockfloat_test tests/stockfloat_test.cpp)
+target_include_directories(stockfloat_test PRIVATE src)
+target_compile_features(stockfloat_test PRIVATE cxx_std_20)
+
+add_executable(fleetrail_policy_test tests/fleetrail_policy_test.cpp)
+target_include_directories(fleetrail_policy_test PRIVATE src)

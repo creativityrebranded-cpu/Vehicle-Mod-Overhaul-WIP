@@ -4,17 +4,25 @@
 #include "trafficpermanent.h"
 #include "pilotlayout.h"
 #include "fvopaths.h"
+#ifndef FVO_TRAFFICPROFILE_TEST
+#include "fleetrail_api.h"
+#include "fleetownershipstore.h"
+#include "trafficpool.h"
+#endif
 #include "log.h"
 #include "notify.h"
 #include <Windows.h>
 #include <atomic>
 #include <cmath>
+#include <fstream>
 #include <mutex>
 
 namespace trafficprofile {
 namespace {
 std::atomic<bool> g_allowed{false};
 std::atomic<bool> g_saveReady{false};
+std::atomic<bool> g_profileReady{false};
+std::atomic<bool> g_fleetRailSavePause{false};
 std::recursive_mutex g_lock;
 std::uint32_t g_cachedId = 0;
 std::wstring g_cachedRoutes;
@@ -74,6 +82,26 @@ float& SavedValue() {
         throw std::runtime_error("Invalid saved traffic snapshot identity");
     return value;
 }
+#ifndef FVO_TRAFFICPROFILE_TEST
+void SaveFleetOwnership(const std::filesystem::path& routes) {
+    const auto path = routes / fleetownershipstore::kFileName;
+    auto staging = path;
+    staging += L".pending";
+    trafficprofilestore::Write(staging, fleetownershipstore::Write(trafficpool::SavePlayerTakeovers()));
+    if (!MoveFileExW(staging.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        throw std::runtime_error("Could not save traffic vehicle ownership");
+}
+void RestoreFleetOwnership(const std::filesystem::path& routes) {
+    const auto path = routes / fleetownershipstore::kFileName;
+    std::error_code error;
+    const auto bytes = std::filesystem::file_size(path, error);
+    if (error == std::errc::no_such_file_or_directory) return; // older saves have no ownership file
+    if (error || bytes > fleetownershipstore::kMaxRecords * 9 + 32)
+        throw std::runtime_error("Could not open saved traffic vehicle ownership");
+    std::ifstream in(path, std::ios::binary);
+    trafficpool::RestorePlayerTakeovers(fleetownershipstore::Read(in));
+}
+#endif
 std::filesystem::path Defaults() {
 #ifdef FVO_TRAFFICPROFILE_TEST
     return std::filesystem::path(g_testDefaults);
@@ -103,15 +131,36 @@ void Allow(bool allowed) {
 #endif
     g_allowed.store(ready, std::memory_order_release);
 }
+bool FleetRailAllowed() {
+    return g_allowed.load(std::memory_order_acquire) &&
+           g_profileReady.load(std::memory_order_acquire);
+}
+bool FleetRailWritesAllowed() {
+    return FleetRailAllowed() && !g_fleetRailSavePause.load(std::memory_order_acquire);
+}
 void BeginLoad() {
     Allow(false);
+    g_profileReady.store(false, std::memory_order_release);
+    // The engine load has already closed lifecycle work. Release active body
+    // bindings before it can recycle references, even if the frame reset is late.
+#ifndef FVO_TRAFFICPROFILE_TEST
+    FvoFleetRailReset();
+    trafficpool::RestorePlayerTakeovers({});
+#endif
     Guard lock(g_lock);
     // Reloading the same save also discards unsaved route changes and branches anew.
     g_cachedId = 0; g_cachedRoutes.clear(); g_reported = false;
+    g_profileReady.store(false, std::memory_order_release);
 }
 void BeforeSave() {
     Guard lock(g_lock);
     if (g_saveDepth++) return;
+    // Drain a write already inside the rail's lock. The atomic prevents new
+    // pose writes or assignments until the game finishes serializing the save.
+    g_fleetRailSavePause.store(true, std::memory_order_release);
+#ifndef FVO_TRAFFICPROFILE_TEST
+    FvoFleetRailFence();
+#endif
     if (g_cachedRoutes.empty()) return; // traffic was not initialized: existing saved identity stays valid
     try {
         if(routeguidance::beforeSave && !routeguidance::beforeSave()) throw std::runtime_error("Active traffic journeys could not be recorded");
@@ -119,6 +168,9 @@ void BeforeSave() {
         if (static_cast<std::uint32_t>(value) != g_cachedId)
             throw std::runtime_error("Traffic snapshot identity changed before saving");
         const std::filesystem::path working(g_cachedRoutes);
+#ifndef FVO_TRAFFICPROFILE_TEST
+        SaveFleetOwnership(working);
+#endif
         // Flush the Win32 INI writer before cloning the fleet registry.
         for (const auto* name : {L"trafficpool.ini", L"ringroad.ini"})
             WritePrivateProfileStringW(nullptr, nullptr, nullptr, (working.parent_path() / name).c_str());
@@ -132,7 +184,11 @@ void BeforeSave() {
         g_notice = "Traffic snapshot could not be saved. This game save keeps the previous traffic setup; your current edits remain active.";
     }
 }
-void AfterSave() { Guard lock(g_lock); if (g_saveDepth) --g_saveDepth; }
+void AfterSave() {
+    Guard lock(g_lock);
+    if (g_saveDepth && !--g_saveDepth)
+        g_fleetRailSavePause.store(false, std::memory_order_release);
+}
 namespace {
 void WritePermanentCache(const std::filesystem::path& path,const std::string& text){const auto temporary=path.wstring()+L".permanent.tmp";const auto backup=path.wstring()+L".bak";const HANDLE file=CreateFileW(temporary.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);if(file==INVALID_HANDLE_VALUE)throw std::runtime_error("Could not stage permanent traffic cache");DWORD written=0;const bool ok=WriteFile(file,text.data(),DWORD(text.size()),&written,nullptr)&&written==text.size()&&FlushFileBuffers(file);CloseHandle(file);if(!ok){DeleteFileW(temporary.c_str());throw std::runtime_error("Could not flush permanent traffic cache");}if(std::filesystem::exists(path)&&!CopyFileW(path.c_str(),backup.c_str(),FALSE)){DeleteFileW(temporary.c_str());throw std::runtime_error("Could not back up permanent traffic cache");}if(!MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){DeleteFileW(temporary.c_str());throw std::runtime_error("Could not replace permanent traffic cache");}}
 std::filesystem::path PermanentRoot(){return std::filesystem::path(Storage())/L"TrafficProfiles"/L"Permanent"/L"routes";}
@@ -146,7 +202,11 @@ std::wstring Routes() {
     try {
         float& value = SavedValue();
         auto id = static_cast<std::uint32_t>(value);
-        if (id && id == g_cachedId) return g_cachedRoutes;
+        if (id && id == g_cachedId) {
+            g_profileReady.store(true, std::memory_order_release);
+            return g_cachedRoutes;
+        }
+        g_profileReady.store(false, std::memory_order_release);
         if (Storage().empty()) throw std::runtime_error("Could not locate traffic profile storage");
         const std::filesystem::path legacy(Storage()), root = legacy / L"TrafficProfiles";
         std::filesystem::path routes;
@@ -161,9 +221,15 @@ std::wstring Routes() {
         } else routes = trafficprofilestore::Open(root, id);
         const auto working = trafficprofilestore::Clone(root / L"Working", routes, Seed());
         trafficpermanent::Sync(PermanentRoot(),working.routes,WritePermanentCache);
+#ifndef FVO_TRAFFICPROFILE_TEST
+        RestoreFleetOwnership(working.routes);
+#endif
         g_cachedId = id; g_cachedRoutes = working.routes.wstring(); g_reported = false;
+        if (!g_allowed.load(std::memory_order_acquire)) return {};
+        g_profileReady.store(true, std::memory_order_release);
         return g_cachedRoutes;
     } catch (const std::exception& error) {
+        g_profileReady.store(false, std::memory_order_release);
         if (!g_reported) {
             g_reported = true;
             logger::Important("Traffic profile: %s; traffic remains paused", error.what());
@@ -180,7 +246,7 @@ std::wstring File(const wchar_t* name) {
 namespace testing {
 void Configure(const std::wstring& storage, const std::wstring& defaults, float* saved, bool established) {
     Guard lock(g_lock);
-    g_allowed = false; g_saveReady = false; g_cachedId = 0; g_cachedRoutes.clear(); g_saveDepth = 0;
+    g_allowed = false; g_saveReady = false; g_profileReady = false; g_fleetRailSavePause = false; g_cachedId = 0; g_cachedRoutes.clear(); g_saveDepth = 0;
     g_reported = false; g_notice = nullptr;
     g_testStorage = storage; g_testDefaults = defaults; g_testSaved = saved; g_testEstablished = established;
 }

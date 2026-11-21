@@ -62,6 +62,7 @@ namespace drive
 	{
 		double now = 0;                 // s (monotonic)
 		double x = 0, y = 0, z = 0, heading = 0, vx = 0, vy = 0;
+		double vz = 0;                  // vertical speed (0 on the game's own wheels: no flight velocity is known there)
 		double groundUnder = 0;         // world height of the ground under the vehicle
 		bool groundOk = false;
 		double above = 0;               // m over that ground

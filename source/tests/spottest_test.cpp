@@ -166,18 +166,58 @@ int main() {
         Check(!step(5100 + rules::factoryPlanWaitMs).active && !evidence.proof.completed,
               "a worker that never accepts cannot hold an attempt indefinitely");
     }
-    Check(FactorySupported(true, -80.0, 1.0, -81.0), "current measurement supports a below-world body at its base");
-    Check(!FactorySupported(true, -80.0, 1.0, 0.0), "street level does not support a below-world factory");
-    Check(!FactorySupported(false, -80.0, 1.0, -81.0), "stale floor cannot start route-free qualification");
-    FactoryWheelContact wheel{1000, 12, 7, 3, -81.0, .95};
-    Check(FactoryWheelSupported(wheel, 7, 1100), "fresh same-body beneath-world native contact");
-    Check(!FactoryWheelSupported(wheel, 8, 1100), "replacement chassis cannot inherit the wheel observation");
-    Check(!FactoryWheelSupported(wheel, 7, 1300), "stale native contact cannot prove support");
-    wheel.touching = 0;
-    Check(!FactoryWheelSupported(wheel, 7, 1100), "wheel mode without actual touching cannot qualify");
-    wheel.touching = 3;
-    wheel.up = -.8;
-    Check(!FactoryWheelSupported(wheel, 7, 1100), "an underside contact cannot qualify as wheel support");
+    {   // Lab stock in flight (stockfloat.h): the same FactoryTest, answered by the hover's own command instead of the wheeled planner. The test
+        // never needs wheels or a floor: eligibility is the caller's (float held, seated, concealed); the pulse is the reverse ask; "accepted" is
+        // "the hover applied last frame's pulse", and the answer is displacement against the nose.
+        FactoryTest test;
+        MotionEvidence evidence;
+        Input in;
+        in.eligible = true; in.covered = true;
+        in.builtAt = 10; in.steps = 100; in.speed = 0;
+        const double heading = 1.5707963267948966;   // facing +x
+        std::uint64_t issuedSerial = 0; bool applied = false;
+        const auto frame = [&](std::uint64_t at) {
+            const auto ask = test.Step(21, in, 33, at, applied ? issuedSerial : 0, applied, false, heading, evidence);
+            applied = ask.active; if (ask.active) issuedSerial = ask.serial;   // the hover applies what is asked this frame; the test sees it next frame
+            return ask;
+        };
+        const auto first = frame(1000);
+        Check(first.active && first.reverse && first.factory && first.serial, "flight: the first frame asks for the reverse pulse");
+        ++in.steps;
+        Check(frame(1016).active && !evidence.proof.completed, "flight: the pulse is applied; no proof before the car moves");
+        ++in.steps; in.x -= .002;
+        Check(frame(1032).active && !evidence.proof.completed, "flight: 2 mm backwards is below the answer threshold");
+        ++in.steps; in.x -= .004;
+        Check(!frame(1048).active && evidence.proof.completed == 1048 && evidence.proof.direction == Dir::Back && evidence.proof.moved >= rules::answer,
+              "flight: backwards motion along the nose after a completed step proves it and retires the pulse");
+        Check(!frame(1500).active && evidence.proof.completed == 1048, "flight: the proof stays after the pulse");
+    }
+    {   // A drifting hover (forward, or sideways) is not the commanded answer.
+        FactoryTest test; MotionEvidence evidence; Input in;
+        in.eligible = true; in.covered = true; in.builtAt = 10; in.steps = 100;
+        const double heading = 0.0;   // facing +y
+        std::uint64_t serial = 0; bool applied = false;
+        const auto frame = [&](std::uint64_t at) {
+            const auto ask = test.Step(22, in, 34, at, applied ? serial : 0, applied, false, heading, evidence);
+            applied = ask.active; if (ask.active) serial = ask.serial; return ask; };
+        frame(1000); ++in.steps; frame(1016);
+        ++in.steps; in.y += .05;
+        frame(1032);
+        Check(!evidence.proof.completed, "flight: drifting forward is not a reverse answer");
+        ++in.steps; in.x += .05;
+        frame(1048);
+        Check(!evidence.proof.completed, "flight: sideways drift is not a reverse answer");
+        // The pulse is bounded: after factoryPulseMs without an answer it ends and paces its retry.
+        const auto expired = frame(1048 + rules::factoryPulseMs + 20);
+        Check(!expired.active && !evidence.proof.completed, "flight: an unanswered pulse is bounded in time");
+        Check(!frame(1048 + rules::factoryPulseMs + 100).active, "flight: the retry is paced (no pulse train)");
+    }
+    {   // No float, no eligibility: nothing is asked and no proof can start.
+        FactoryTest test; MotionEvidence evidence; Input in;
+        in.eligible = false; in.covered = true; in.builtAt = 10; in.steps = 100;
+        Check(!test.Step(23, in, 35, 1000, 0, false, false, 0.0, evidence).active && !evidence.serial,
+              "flight: a float that is not held asks for nothing");
+    }
     std::printf("spottest_test: %s\n", failed ? "FAILED" : "ALL PASS");
     return failed ? 1 : 0;
 }

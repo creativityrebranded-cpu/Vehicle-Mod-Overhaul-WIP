@@ -42,11 +42,6 @@ constexpr std::uint64_t factoryPlanWaitMs = 2000;  // includes the shared worker
 constexpr std::uint64_t factoryPulseMs = 500;      // maximum after Plan first accepts this attempt
 constexpr std::uint64_t factoryRetryMs = 3000;    // give a resting chassis the ordinary wake gap
 constexpr std::uint64_t factoryPulseSteps = 12;   // bounded movement after the accepted command
-constexpr double factoryFloorTolerance = .5;    // measured support must be at the body base
-constexpr double factorySupportNormal = .7;
-constexpr int factorySupportWheels = 3;          // same native traction minimum as corner forces
-constexpr std::uint64_t factorySupportMs = 250;
-constexpr double factorySupportRayShift = .25;
 }
 // Cover facts are trafficarrival's (T-1): the caller passes `covered`.
 
@@ -65,6 +60,7 @@ struct Input {
     double laneOffset = 0, laneHalfWidth = 1e9, upZ = 1;  // ST-A3: across its lane line (m), the lane's half width, body up-vector z
     bool refused = false;         // T-2: the last pulse was not run (its branch was infeasible): skip that direction
     bool requested = false;       // CH-4: Health asked for a test (the pair is doubtful); any number of times, never more often than retestSuspect
+    std::uint64_t relocation = 0; // serial of this car's latest APPLIED relocation receipt (0 none): displacement across it is not motion
 };
 struct Event { const char* what = ""; const char* why = ""; Dir dir = Dir::Count; double moved = 0; int steps = 0; };
 struct State {
@@ -74,6 +70,7 @@ struct State {
     bool checked = false, haveFirst = false; std::uint64_t firstSteps = 0;  // the spawn check ran for this car; its first hidden steps
     unsigned long long builtSeen = 0;  // Z-1: the body build this car was last checked for
     double ineligibleSince = -1; int refusedDirs = 0;
+    std::uint64_t relocSeen = 0;  // the last relocation serial the pulse baseline re-based on
 };
 
 // Separate evidence for factory Health. The legacy verdict also accepts
@@ -93,9 +90,13 @@ struct MotionEvidence {
     Dir direction = Dir::Count;
     bool accepted = false;
     double x = 0, y = 0, heading = 0;
+    std::uint64_t relocSeen = 0;
 
     void Observe(const Input& in, std::uint32_t boundBody, std::uint64_t now,
                  std::uint64_t acceptedPulse, double headingNow, Ask& ask) {
+        // A relocation receipt (applied, newer than the last seen): the car jumped between two samples. The baseline moves with it, so the jump is
+        // not the commanded pulse's answer. A stale or repeated serial changes nothing.
+        if (in.relocation > relocSeen) { relocSeen = in.relocation; if (accepted) { x = in.x; y = in.y; heading = headingNow; } }
         if (proof.body != boundBody || proof.builtAt != in.builtAt) proof = {};
         const bool eligible = in.eligible && (in.covered || in.unseen) && boundBody && in.builtAt;
         if (eligible && !in.refused && serial && body == boundBody && builtAt == in.builtAt &&
@@ -139,26 +140,6 @@ inline Ask AskFor(Dir d) {
     a.lateral = d == Dir::Left ? -rules::pulseLateral : d == Dir::Right ? rules::pulseLateral : 0; return a;
 }
 
-inline bool FactorySupported(bool groundCurrent, double referenceZ, double originAbove, double groundZ) {
-    return groundCurrent && std::isfinite(referenceZ) && std::isfinite(originAbove) &&
-        std::isfinite(groundZ) && originAbove >= 0 &&
-        std::fabs(referenceZ - originAbove - groundZ) <= rules::factoryFloorTolerance;
-}
-
-struct FactoryWheelContact {
-    std::uint64_t at = 0, step = 0;
-    std::uint32_t body = 0;
-    int touching = 0;
-    double z = 0, up = 0;
-};
-
-inline bool FactoryWheelSupported(const FactoryWheelContact& contact, std::uint32_t body, std::uint64_t now) {
-    return body && contact.body == body && contact.step && contact.at &&
-        now >= contact.at && now - contact.at <= rules::factorySupportMs &&
-        contact.touching >= rules::factorySupportWheels && std::isfinite(contact.z) &&
-        std::isfinite(contact.up) && contact.up >= rules::factorySupportNormal;
-}
-
 struct FactoryTest {
     std::uint64_t lease = 0, acceptedAt = 0, retryAt = 0;
 
@@ -194,8 +175,8 @@ struct FactoryTest {
         if (evidence.proof.completed || (!evidence.serial &&
             (now < retryAt || in.speed >= rules::settledSpeed))) return {};
 
-        // A private lane is held. The same Plan scorer can admit an allowed
-        // reverse pulse without crossing the forward stop line.
+        // A private pair is held (a lane lease: the planner scores a reverse pulse; a lab stock pair: the hover applies it in flight, stockfloat.h).
+        // Either way the ask is the same reverse pulse, so nothing crosses a forward stop line, and `planAccepted` means "the actuator applied it".
         auto ask = AskFor(Dir::Back);
         ask.factory = true;
         evidence.Observe(sample, body, now, same && planAccepted ? planSerial : 0, heading, ask);
@@ -219,6 +200,9 @@ inline void Fail(State& s, const Input& in, Event& ev) {
 // One update. The ask is active only while a pulse runs; ev says what happened (empty: nothing to log).
 inline Ask Step(State& s, const Input& in, Event& ev) {
     ev = Event{};
+    // A relocation receipt (applied, newer than the last seen): the car jumped between two samples. A running pulse measures from here, so the jump is
+    // never read as the car answering; a stale or repeated serial changes nothing.
+    if (in.relocation > s.relocSeen) { s.relocSeen = in.relocation; s.x0 = in.x; s.y0 = in.y; }
     if (s.lastStepAt < 0 || in.steps != s.lastSteps) { s.lastSteps = in.steps; s.lastStepAt = in.now; }
     if (!s.running) {
         if (s.result == Result::Failed && in.speed >= rules::movedOnItsOwn) { s.result = Result::Passed; s.fails = 0; s.lastTestAt = in.now; ev.what = "passed"; ev.why = "moved_on_its_own"; return {}; }

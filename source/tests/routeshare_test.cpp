@@ -42,6 +42,12 @@ int main()
         check(Pick({ { 1, 4, 300, false }, { 1, 4, 50, false } }, 600) == 1, "a tie otherwise takes the nearer");
         check(Pick({ { 2, 4, 10, true }, { 1, 4, 500, false } }, 600) == 1, "a less filled route wins over its own");
     }
+    {
+        check(Pick({{0,8,300,false,2},{4,8,400,false,0}},600)==1,
+              "fleet route demand is ordered by the observation ring before coverage");
+        check(Pick({{0,8,300,false,2},{8,8,400,false,0}},600)==0,
+              "a lower-priority route still gets a car when its own assignment is eligible");
+    }
     {   // Cruise
         using O = CruiseOption;
         check(PickCruise({}, 600, 5) == -1, "no routes: nowhere to cruise");

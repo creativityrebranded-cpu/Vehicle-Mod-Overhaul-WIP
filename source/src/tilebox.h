@@ -72,7 +72,12 @@ inline bool TileBox(const trafficdata::Route& r, const trafficroute::Line& l, in
     roadplan::FieldBox b;
     if (!StoredBox(r, tile, b)) return false;
     const double u0 = l.ToLine(double(tile)), u1 = l.ToLine(double(tile + 1));
-    const auto a = RouteAt(l, u0), c = RouteAt(l, u1), m = RouteAt(l, .5 * (u0 + u1));
+    // LV-1 (2026-11-20, live road fill; found with the real lc_ring_road): the box CENTRE is the middle of the two end points, not the route line
+    // at the middle line INDEX. A rounded corner crowds many line samples into the end of a tile, so the index middle sat up to 35 m from the
+    // chord middle: the box (length = the chord) then covered the far end only and the first 35 m of the tile had no field at all
+    // (spawn refusal lane_point_outside_its_tile). Straight tiles are unchanged (their index middle is the chord middle).
+    const auto a = RouteAt(l, u0), c = RouteAt(l, u1);
+    const trafficdata::Vec m{ .5 * (a.x + c.x), .5 * (a.y + c.y), .5 * (a.z + c.z) };
     const double run = std::hypot(c.x - a.x, c.y - a.y), len = std::hypot(run, c.z - a.z);
     if (!(len > .2) || !std::isfinite(len)) return false;
     // FW-1 (2026-11-12, 14:57 run: lc_ring_road edited to a 15.1 m road kept 11 m boxes, so its lanes ran at and past the box sides; the

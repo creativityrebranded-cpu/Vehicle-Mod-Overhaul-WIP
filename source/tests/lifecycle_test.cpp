@@ -82,7 +82,9 @@ int main() {
         requests.Close();commands[0]->Run();commands.clear();
         check(ran==0,"work queued before a load never runs against the world being read");
         check(!requests.Poll("during",5,counted,submit)&&built==1&&commands.empty(),"nothing is built or queued during a load");
-        check(!requests.Poll("posted",5,counted,submit,true)&&built==1&&commands.empty(),"a post during a load is not refused as table-full");
+        bool accepted=true;
+        check(!requests.Poll("posted",5,counted,submit,true,true,&accepted)&&!accepted&&built==1&&commands.empty(),
+              "a closed table cannot acknowledge a post");
         check(requests.Pending(5)&&requests.Pending(5,"anything"),"during a load an unanswered request reads as pending, not failed");
         check(requests.Refused()==refusedBefore,"a closed table is not a full one");
         requests.Open();
@@ -100,6 +102,15 @@ int main() {
         check(!small.Poll("a",1,one,take,true)&&small.Refused()==1,"a repeat of a queued post is not a refusal");
         for(auto& t:queued)t->Run();
         check(!small.Poll("b",2,one,take,true),"finished posts free the table");
+        Requests posts(4);
+        bool accepted=true;
+        auto refuse=[](const Ticket&){return false;};
+        posts.Poll("submit_failure",2,one,refuse,true,true,&accepted);
+        check(!accepted,"a rejected native submission leaves the post eligible for retry");
+        posts.Poll("empty_work",3,[] {return Work{};},take,true,true,&accepted);
+        check(!accepted,"unavailable work is not an accepted post");
+        posts.Poll("submit_failure",2,one,take,true,true,&accepted);
+        check(accepted,"a previously refused post can submit successfully");
         for(auto& t:queued)t->Run();
     }
     // A result its caller stopped asking for (an abandoned move key) is evicted once the table is full and it is 10 s old,

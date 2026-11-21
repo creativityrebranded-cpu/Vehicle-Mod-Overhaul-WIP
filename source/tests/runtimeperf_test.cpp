@@ -27,6 +27,10 @@
 #include <string>
 #include <vector>
 
+// vehicleworld.cpp polls relocation receipts through the core export; this test links no doer, so it reports no receipt.
+#include "relocationapi.h"
+extern "C" int FVO_TrafficRelocationV1(unsigned, FvoRelocationStatusV1*) { return 0; }
+
 // This suite measures read-only discovery/cache work. Native mutation adapters
 // must not run against its synthetic executable; the dispatcher/transport have
 // their own asynchronous ownership tests.

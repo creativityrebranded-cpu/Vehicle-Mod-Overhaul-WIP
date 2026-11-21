@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 #include "traffic_api.h"
+#include "../fleetrail_api.h"
 #include "birth_api.h"
-#include "factorybirth_api.h"
 #include "../trafficcensusapi.h"
 #include "../relocationapi.h"
 #include "../traffichealthapi.h"
@@ -18,14 +18,6 @@ namespace generator
 {
 	void Attach(const FvoTrafficApi* api, FvoLog_t log);
     void SetStorage(const wchar_t* registry); // bind a stable playthrough path before starting a frame
-    // Optional save-profile prototype. The private and road phases share the same Route cookie.
-    struct FactoryBay { std::string key; unsigned vehicle=0; FvoPoolSpot at{}, arrival{}; bool driverOriginReady=true; };
-    enum class FactoryTripAction { Test, Dispatch, Rollback, Complete };
-    using FactoryTrip=int (*)(FactoryTripAction action,unsigned vehicle,double x,double y,double z,FvoTripClaim* claim);
-    void SetFactoryBay(const FactoryBay* bay,FactoryTrip trip,FvoSpotMotionProofQueryV1 proof,FvoTrafficFactoryLeaseFnV1 lease);
-    void SetFactoryStockQuery(FvoFactoryStockQueryV1 query);
-    void SetFactoryBirth(FvoFactorySiteFnV1 site, FvoFactoryBirthFnV1 birth, FvoFactoryStockBindFnV1 bind);
-    void SetFactoryAnchors(std::vector<FvoPoolSpot> anchors);
 	// Authored ground origins for stable fleet names, then parking places with parking[i] = 1.
 	void SetSpots(const char* world, const FvoPoolSpot* spots, int count, const int* parking, const char* const* names, FvoPoolTrip trip);
     // Pure mod-owned gate consumes the hull dimensions already measured by admission.
@@ -41,13 +33,8 @@ namespace generator
     void SetSiteGate(SiteGate gate,RoadSpacingGate spacing);
     // Census copy for core readers (trafficcensusapi.h): optional; null when the core has no such export.
     void SetCensusPublisher(FvoTrafficCensusPublishV1 publish,FvoTrafficCensusForgetV1 forget);
-    // Siting's pose as the core's birth proof (core export FVO_TrafficSitedV1, change card C1). Null with an older core: births are
-    // refused with reason core_has_no_sited_proof (traced), never sited by rays.
-    using SitedProof=int (*)(unsigned base,double x,double y,double z,double heading);
-    void SetSitedProof(SitedProof proof);
     void SetBirthListener(FvoTrafficBirthFnV1 listener);
     void SetHandoffListeners(handoff::ReadFacts facts,handoff::Release release,handoff::RetireShow retire);
-    void SetPopulationVehicles(int (*read)(FvoTrafficVehicle*,int));
     void SetRoadClearance(int (*read)(FvoTrafficVehicle*,int), FvoRoadCheckFnV1 check, FvoTrafficBirthFnV2 birth);
     void ReportDriverRetirement(unsigned vehicle,unsigned driver);
     int DecideParkedRetirement(unsigned vehicle,const char* reason,bool protectedIdentity);
@@ -57,21 +44,24 @@ namespace generator
     int OutOfTraffic(unsigned* vehicles, int max);
     void SetHealthSources(int (*sample)(unsigned,FvoPairHealthSampleV1*),void (*spot)(unsigned));  // CH-1/CH-4: core exports, optional
     void SetPlayClock(unsigned (*fn)());  // W1: core FVO_PlayClockV1, optional
-    void SetCameraAhead(int (*fn)(double x,double y,double z,double seconds,double* turnDegPerS));  // CP-1: core FVO_CameraAheadV1 (null: older core)
+    using FleetPath = bool (*)(unsigned vehicle, const FvoTrafficRef&, std::vector<FvoFleetRailPoint>&, double& speed);
+    void SetPhysicalFleet(FvoFleetRailAssignV1Fn assign, FvoFleetRailReleaseV1Fn release,
+                          FvoFleetRailStateV1Fn state, FleetPath path);
+    bool PhysicalFleetActive();
+    unsigned FleetPriority(double distance);
+    void SetCameraAhead(int (*fn)(double x,double y,double z,double seconds,double* turnDegPerS));  // CP-1: core FVO_CameraAheadV1
     void SetCameraEnvelopeAhead(int (*fn)(double x,double y,double z,double seconds,double radius));  // optional, for deep falls
-    void SetCameraEvidence(cameravisibility::Reader reader,cameravisibility::ForecastReader forecast,void (*retireShow)(unsigned,bool));
+    void SetCameraEvidence(cameravisibility::Reader reader,cameravisibility::ForecastReader forecast);
+    void SetBirthRefusal(FvoBirthRefusalFnV1 refusal);  // core FVO_TrafficBirthRefusalV1: the core's own reason for a refused birth
     void SetRemovalPrediction(bool on);  // CP-1: settings.ini [traffic] removeByCameraPrediction (Retirement also removes by camera prediction)
     void SetSpotTest(int (*fn)(unsigned vehicle));  // ST-B: the core's FVO_SpotTestV1 (null: an older core, no spot-test fact)
     void SetRelocation(FvoRelocationStatusFn fn);   // the core's FVO_TrafficRelocationV1 (null: an older core, no relocation receipts)
-    void SetTestNearPlayer(bool on);  // card TS1: test spawn around the player (settings.ini [diagnostics] spawnNearPlayer)
     bool HealthModel(unsigned model, FvoTrafficHealthModelV1& out);  // card FR1: Health's published record (any thread)
     void HealthAllow(unsigned model, bool allow);                    // card FR1: your call, applied by Health on its next tick (any thread)
     bool HealthReason(unsigned model, char* out, int n);             // card RI-4: the last fail reason of this model (any thread)
     bool HealthSpot(const char* route, int index, FvoTrafficHealthSpotV1& out);  // card RI-4: the index-th rejected spot of a route (any thread)
     void SetModelRules(const std::vector<std::vector<unsigned>>& skip); // per position (as SetSpots): models it may not hold (vehicle rules)
-    void SetLandingSpots(const FvoPoolSpot* spots,const char* const* names,int count); // the world's landing spots: in play, new pairs come only from these
     void SetInitialScene(const FvoPoolSpot* spots,int count); // active, distributed lane positions; covered initialization only
-    void SetInitialCoverage(std::vector<unsigned> coverage);
     void SetInitialRoads(const std::vector<bool>& roads); // same covered admission, existing grounded birthSite adapter
     void SetInitialAlternatives(int slot,const FvoPoolSpot* spots,int count);
     void WaitForInitialClock(bool pending);

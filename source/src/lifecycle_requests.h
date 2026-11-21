@@ -90,6 +90,7 @@ public:
         ticket->state.store(Request::Queued,std::memory_order_release);
         if(!ticket->work || ticket->generation!=epoch_->value.load() || !submit(ticket)) {
             ticket->work={};ticket->state.store(Request::Done,std::memory_order_release);
+            if(forget&&tracked)*tracked=false;
             // Leave a completed failure for the next poll; never create twice
             // because the submitter happened to finish synchronously.
         }

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import xml.etree.ElementTree as ET
 import zipfile
 import re
-from package_fomod import masters, DLL, PILOTS, PATCH, CITY, CITY_DLL, ROUTE_GUIDE, RETIRED, PROFILE, ALWAYS_ON, ROUTES, ROUTE_FILES, TRAFFIC_DIR, COLD_START_ONLY
+from package_fomod import masters, DLL, PILOTS, PATCH, CITY, CITY_DLL, ROUTE_GUIDE, RETIRED, PROFILE, ALWAYS_ON, FIXED_FEATURES, ROUTES, ROUTE_FILES, TRAFFIC_DIR, COLD_START_ONLY
 
 
 def dependencies_match(node, states):
@@ -105,10 +105,10 @@ def verify(path, schema=None):
                       ('fvo_scheduledtraffic.esm', 'fvo_roadtrafficpool.esm', 'galactichighwaynetwork.esm', 'vehicles - real.esm')
                       + tuple(r.casefold() for r in RETIRED)), 'Removed content not reintroduced')
         features=json.loads(archive.read('fomod/features.json'))
-        check(len(features)==18 and len({f['id'] for f in features})==18,'Complete runtime profile has 18 distinct keys')
+        check(len(features)==19 and len({f['id'] for f in features})==19,'Complete runtime profile has 19 distinct keys')
         check(len([f for f in features if f['configurable']])==6,'Only the 6 menu switches are configurable')
         hidden=[f for f in features if not f['configurable']]
-        check({f['id'] for f in hidden}=={'Placement','PlacementMode','DebugLog','PhysicalAi',*ALWAYS_ON},'Removed, development, merged and always-on switches are excluded')
+        check({f['id'] for f in hidden}=={'Placement','PlacementMode','DebugLog','PhysicalAi','Radar',*ALWAYS_ON},'Removed, development, merged and always-on switches are excluded')
         steps=root.findall('installSteps/installStep')
         check([p.get('name') for p in steps]==['Core and feature setup','Flight and Navigation','NPCs and Combat','City traffic routes','Traffic options','Route beacons'],
               'Installer pages (0.9.0)')
@@ -170,7 +170,7 @@ def verify(path, schema=None):
         shown={g.get('name') for p in pages for g in p.findall('optionalFileGroups/group')}
         check('Placement mode' not in shown and 'Detailed log' not in shown,'Removed option labels are not shown')
         for f in hidden:
-            on=f['id'] in ALWAYS_ON
+            on=FIXED_FEATURES[f['id']]  # the packager's fixed value (always-on switches and Radar: on)
             check(f"40 Features/{f['id']}/{'Off' if on else 'On'}.ini" not in names,'A fixed switch ships only its fixed value')
             ini=configparser.ConfigParser();ini.read_string(archive.read(f"40 Features/{f['id']}/{'On' if on else 'Off'}.ini").decode('ascii'))
             check(ini['feature']['value']==('1' if on else '0'),'Fixed switch written at its fixed value in configured profiles')

@@ -48,6 +48,7 @@ namespace vehicleflight
     PhysicsStatus HandoffPhysics(std::uint32_t vehicle);
 #ifndef FVO_RELEASE
     bool FactoryMotionProved(int pilot, unsigned vehicle, std::uint64_t lease);
+    void RebaseFactoryMotionAfterTransfer(int pilot,unsigned vehicle,std::uint64_t lease);
 #endif
 	const char* PilotEndReason(int pilot);  // why the pilot last stopped ("arrived", "stuck", ...)
 	void PilotStop(int pilot, const char* why);
@@ -164,10 +165,31 @@ namespace vehicleflight
 			std::uint64_t actionCalls = 0;
 		};
 		struct Chassis { bool bodyValid = false, live = false; double pos[3]{}; std::uint64_t completedSteps = 0; };
-		const char* Arm(std::uint32_t vehicleId, double dx, double dy, double dz, std::uint64_t serial);  // nullptr = armed, else why not
+		const char* Arm(std::uint32_t vehicleId,double dx,double dy,double dz,std::uint64_t serial,
+            std::uint64_t authority=0);  // nullptr = armed, else why not
 		bool Take(std::uint64_t serial, Facts& out);   // true once the physics thread has issued (or refused)
 		bool Read(std::uint64_t serial, Chassis& out); // the chassis where the body record says it is now, and completed steps since issue
 		void Disarm(std::uint64_t serial);
+
+		// Far tier test (2026-11-21, notes/FAR_TIER_TEST_20261121.md; diagnostic builds only). Beyond the loaded cells nothing collides, so the test
+		// can hold a chassis on a kinematic "rail": every physics step the doer places it along a straight path at a set speed, its height from a
+		// terrain profile the main thread fills (farrail.h) plus a ride height. Exclusive with the hop doer above (one writer of the pose).
+		struct RailFacts {
+			bool active = false, terrainKnown = false;
+			std::uint64_t steps = 0, faults = 0, holds = 0, missed = 0;
+			double s = 0, x = 0, y = 0, z = 0, target = 0;
+			const char* fault = "";
+		};
+		// nullptr = started. x0,y0 and dirX,dirY: the path (dir is a unit vector); s0: path length where the chassis is now; z0: its height.
+		const char* RailStart(std::uint32_t vehicleId, double x0, double y0, double dirX, double dirY, double s0, double z0, double speed, double ride);
+		void RailStop();
+		bool RailRead(RailFacts& out);
+		void RailSetTerrain(int index, double z);   // profile sample at path length index * 8 m (main thread)
+		void RailClearTerrain();
+		int RailTerrainKnown();
+		// The chassis' body now, wherever it is (main thread read of the body record, as the hop read-back does): false when the pilot has no bound physics instance.
+		struct ChassisNow { bool bound = false, bodyValid = false; double pos[3]{}, vel[3]{}; };
+		bool ReadChassisNow(std::uint32_t vehicleId, ChassisNow& out);
 	}
 #endif
 }

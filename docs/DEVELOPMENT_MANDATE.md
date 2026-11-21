@@ -4,6 +4,6 @@ Explicit user instruction, 2026-11-01: all future updates must remain backwards 
 
 Traffic configuration must be restored from the individual game save's immutable snapshot, with a separate editable working copy. Continue reading/migrating older profile formats; do not claim historical snapshots exist where an older version did not record them. Retain supported API consumers and read-only integrations.
 
-Intentional routes inside or through structures are allowed. Building intersections produce red clearance warnings, not route-editing or saving refusals. Proposed clearance adjustments remain optional. Keep separate validation for invalid coordinates and proven terrain violations.
+Intentional routes inside or through structures are allowed. Building intersections produce red clearance warnings, not route-editing or saving refusals. Retain automatic route-point raising during initial placement, including existing surface/roof and initial ground-probe behavior (explicit user clarification). Subsequent intentional edits through structures remain allowed; proposed clearance adjustments remain optional. Keep separate validation for invalid coordinates and proven terrain violations.
 
 Validate prior-version data, old/new save branching and supported integrations before release. Offline checks are not in-game proof. Release player DLLs with FVO_RELEASE=ON and retained crash reporting; keep diagnostic test DLLs FVO_RELEASE=OFF.

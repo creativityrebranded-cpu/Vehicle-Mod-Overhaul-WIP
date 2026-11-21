@@ -9,6 +9,10 @@
 namespace trafficinitial {
 namespace rules {
 inline constexpr double fallbackStep = 6.0, maxFallback = 18.0, fallbackFraction = .10;
+// LV-2 (2026-11-20): a vertex is a corner for births only when the road turns at least this much there. A bend of a few degrees (the ring road's
+// ramps and long sweeps have vertices every 20-40 m) is a straight road to a car; blocking +-16 m round each of them left 16 of 61 ring slots
+// with no place (refusal kilometre_slot_no_field_room). Real corners (road_hybrid_test: 90 degrees) keep the whole buffer.
+inline constexpr double cornerTurnRadians = 3.141592653589793 / 12;  // 15 degrees
 inline constexpr double gapFraction = 1 - 2 * fallbackFraction;
 }
 struct Backup {trafficroute::Vec at;double heading=0,u=0;};
@@ -53,8 +57,18 @@ inline bool GapClear(double a,double b,double length,bool closed,double interval
     return StationGap(a,b,length,closed)+1e-6>=MinimumGap(interval);
 }
 using Blocks = std::vector<std::pair<double,double>>;
+// How far the road turns at authored point i (radians, 0 = straight on); 0 for an end or a degenerate vertex.
+inline double TurnAt(const std::vector<trafficdata::Vec>& pts,std::size_t i,bool closed) {
+    if(pts.size()<3||i>=pts.size()||(!closed&&(i==0||i+1==pts.size())))return 0;
+    const auto a=pts[(i+pts.size()-1)%pts.size()],b=pts[i],c=pts[(i+1)%pts.size()];
+    const double first=std::hypot(a.x-b.x,a.y-b.y),second=std::hypot(c.x-b.x,c.y-b.y);
+    if(first<.1||second<.1)return 0;
+    const double interior=std::acos(std::clamp(((a.x-b.x)*(c.x-b.x)+(a.y-b.y)*(c.y-b.y))/(first*second),-1.0,1.0));
+    return 3.141592653589793-interior;
+}
+// laneOut / distanceOut (optional): the lane the point is nearest to and its 3D distance from that lane's line (the dot simulation needs both).
 inline bool ProjectRoadStation(const trafficdata::Route& route,const trafficroute::Line& line,
-    const std::vector<double>& arc,trafficroute::Vec point,double& metres) {
+    const std::vector<double>& arc,trafficroute::Vec point,double& metres,int* laneOut=nullptr,double* distanceOut=nullptr) {
     const int tiles=tilebox::TileCount(route);
     if(tiles<=0)return false;
     double best=std::numeric_limits<double>::infinity();
@@ -68,7 +82,7 @@ inline bool ProjectRoadStation(const trafficdata::Route& route,const trafficrout
         FvoFieldBoxV1 field;fieldbox::Box box;
         if(!tilebox::TileBox(route,line,tile,field)||!fieldboxapi::ToBox(field,box)||
            !fieldbox::Contains(box,{point.x,point.y,point.z}))continue;
-        best=distance;metres=StationAt(arc,u);
+        best=distance;metres=StationAt(arc,u);if(laneOut)*laneOut=lane;if(distanceOut)*distanceOut=distance;
     }
     return std::isfinite(best);
 }
@@ -85,7 +99,7 @@ inline Blocks RoadBlocks(const trafficdata::Route& r,const trafficroute::Line& l
     };
     if(!line.closed){block(0,buffer);block(arc.back(),buffer);}
     for(std::size_t i=0;i<r.points.size();++i){
-        const double corner=routecurve::CornerLimit(r.points,i,r.closed);
+        const double corner=TurnAt(r.points,i,r.closed)>=rules::cornerTurnRadians?routecurve::CornerLimit(r.points,i,r.closed):0;
         if(corner>0)block(StationAt(arc,line.ToLine(double(i))),buffer+std::min(r.corridor,corner));
     }
     for(auto [u,radius]:junctions)block(StationAt(arc,line.ToLine(u)),std::max(buffer,radius));
@@ -206,18 +220,6 @@ inline std::vector<Slot> Route(const trafficdata::Route& r,int count,const std::
         const auto a=trafficroute::At(line,lane,u),b=trafficroute::At(line,lane,u+trafficroute::Direction(line,lane)*0.001);
         out.push_back({a,std::atan2(b.x-a.x,b.y-a.y),r.name,lane,u});
     }
-    return out;
-}
-// Test spawn around the player (card TS1): the route's own eligible positions (Route's corner, junction and end buffers, densely sampled),
-// those within `radius` of `focus`, nearest first, each at least `spacing` from the ones already taken, at most `max`.
-inline std::vector<Slot> Near(const trafficdata::Route& r,const std::vector<std::pair<double,double>>& junctions,trafficroute::Vec focus,double radius,double spacing,int max){
-    std::vector<Slot> all=Route(r,fvolimits::kVehicles,junctions),out;
-    auto far_=[&](const Slot& s){return std::hypot(s.at.x-focus.x,s.at.y-focus.y,s.at.z-focus.z);};
-    all.erase(std::remove_if(all.begin(),all.end(),[&](const Slot& s){return !(far_(s)<=radius);}),all.end());
-    std::stable_sort(all.begin(),all.end(),[&](const Slot& a,const Slot& b){return far_(a)<far_(b);});
-    for(const auto& s:all){if(int(out.size())>=max)break;
-        if(std::any_of(out.begin(),out.end(),[&](const Slot& t){return std::hypot(s.at.x-t.at.x,s.at.y-t.at.y,s.at.z-t.at.z)<spacing;}))continue;
-        out.push_back(s);}
     return out;
 }
 inline std::vector<Slot> Interleave(const std::vector<std::vector<Slot>>& routes,int limit=fvolimits::kVehicles){

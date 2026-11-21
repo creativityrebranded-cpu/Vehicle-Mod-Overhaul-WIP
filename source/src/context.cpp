@@ -236,8 +236,9 @@ namespace context
 			}
 
 			// Everyday traffic (2026-10-27; moved into FVO_Traffic.dll 2026-10-29, stage 2 of notes/TRAFFIC_ADDON_PROPOSAL_20261029.md):
-			// on the same cadence and behind the same gates, the addon picks a free parked vehicle and a calm person near it
-			// (traffic/everyday.cpp) from the candidates core reports (EverydayVehicles / EverydayPeople) and starts the trip.
+			// on the same cadence and behind the same gates, an add-on that fills the everyday hook picks a free parked vehicle and a
+			// calm person near it from the candidates core reports (EverydayVehicles / EverydayPeople) and starts the trip. The current
+			// add-on leaves that hook null (traffic/everyday.cpp was removed 2026-11-21); older add-ons (0.3, 0.3.1) still use it.
 			if (features::On(features::Id::Traffic) && now - g_trafficAt >= kTrafficEveryMs) {
 				g_trafficAt = now;
 				g_everydayActors = &actors;

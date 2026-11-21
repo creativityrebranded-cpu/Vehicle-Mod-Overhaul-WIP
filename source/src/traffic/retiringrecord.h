@@ -45,6 +45,39 @@ namespace retiringrecord
     // driver id only if it is an actor with the stored base (0 stored: not checked beyond being an actor).
     inline bool VehicleStillOurs(bool exists, bool isActor, unsigned baseNow, unsigned baseSaved) { return exists && !isActor && baseSaved && baseNow == baseSaved; }
     inline bool DriverStillOurs(bool exists, bool isActor, unsigned baseNow, unsigned baseSaved) { return exists && isActor && (!baseSaved || baseNow == baseSaved); }
+    // Rows older versions wrote for retired systems (removed 2026-11-21): factory bay slots "factory_v1_<key>", runtime stock
+    // "factory_v2_runtime_<key>" (both start "vehicle driver base staged surplus" like a pair row) and landing spots
+    // "landing_<key>" ("vehicle base"). RetiredRowKind: 0 = not such a row, 1 = factory or stock, 2 = landing.
+    inline int RetiredRowKind(const wchar_t* key) {
+        if (!key) return 0;
+        if (!std::wcsncmp(key, L"factory_v1_", 11) || !std::wcsncmp(key, L"factory_v2_runtime_", 19)) return 1;
+        return std::wcsncmp(key, L"landing_", 8) ? 0 : 2;
+    }
+    inline PairRow ParseRetiredRow(int kind, const wchar_t* value) {
+        if (kind == 1) return value ? ParsePair(value) : PairRow{};
+        PairRow row; unsigned vehicle = 0, base = 0;
+        if (kind == 2 && value && std::swscanf(value, L"%x %x", &vehicle, &base) == 2) { row.vehicle = vehicle; row.base = base; }
+        return row;
+    }
+    // The one load-time decision for such a row. NotLoadedKeep: the row stays, so a later load can still check the car.
+    enum class RetiredOutcome { Unreadable, PublicOwner, NotLoadedKeep, Gone, JourneyRecovery, Retire };
+    inline RetiredOutcome DecideRetiredRow(unsigned vehicle, bool publicOwner, bool loaded, bool stillOurs, bool savedJourney) {
+        if (!vehicle) return RetiredOutcome::Unreadable;
+        if (publicOwner) return RetiredOutcome::PublicOwner;
+        if (!loaded) return RetiredOutcome::NotLoadedKeep;
+        if (!stillOurs) return RetiredOutcome::Gone;
+        return savedJourney ? RetiredOutcome::JourneyRecovery : RetiredOutcome::Retire;
+    }
+    inline const char* RetiredOutcomeName(RetiredOutcome o) {
+        switch (o) {
+            case RetiredOutcome::Unreadable: return "row_unreadable";
+            case RetiredOutcome::PublicOwner: return "public_fleet_owns_it";
+            case RetiredOutcome::NotLoadedKeep: return "not_loaded_row_kept";
+            case RetiredOutcome::Gone: return "id_reused_or_gone";
+            case RetiredOutcome::JourneyRecovery: return "saved_journey_left_for_fleet_recovery";
+            default: return "retired";
+        }
+    }
     // Clear one id from the record; drop entries with nothing left. Returns true when something changed.
     inline bool Clear(std::vector<Entry>& list, unsigned id) {
         if (!id) return false; bool changed = false;

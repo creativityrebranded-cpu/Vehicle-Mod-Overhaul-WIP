@@ -1,7 +1,9 @@
+#include "fleetrail_api.h"
 #include "traffic/traffic_api.h"
 #include "traffic/trafficprofileclient.h"
 #include "sfse/PluginAPI.h"
 #include <cstdio>
+#include <cwchar>
 
 namespace {
 SFSEMessagingInterface::EventCallback listener = nullptr;
@@ -13,9 +15,20 @@ PluginHandle Handle() { return 1; }
 const PluginInfo* Info(const char*) { return nullptr; }
 }
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 3) return 2;
+    if (argc != 3 && (argc != 4 || std::wcscmp(argv[3], L"--fleet") != 0)) return 2;
     HMODULE core = LoadLibraryW(argv[1]);
     if (!core) { std::printf("FAIL core load %lu\n", GetLastError()); return 1; }
+    if (argc == 4) {
+        const auto assign = reinterpret_cast<FvoFleetRailAssignV1Fn>(GetProcAddress(core, "FVO_FleetRailAssignV1"));
+        const auto release = reinterpret_cast<FvoFleetRailReleaseV1Fn>(GetProcAddress(core, "FVO_FleetRailReleaseV1"));
+        const auto state = reinterpret_cast<FvoFleetRailStateV1Fn>(GetProcAddress(core, "FVO_FleetRailStateV1"));
+        if (!assign || !release || !state || assign(nullptr) || state(0) != 0) {
+            std::puts("FAIL fleet rail V1 ABI or unassigned state");
+            return 1;
+        }
+        release(0);
+        std::puts("PASS fleet rail V1 ABI and empty-state reset");
+    }
     {
         trafficprofileclient::Guard files;
         if (!files) { std::printf("FAIL file guard fallback\n"); return 1; }

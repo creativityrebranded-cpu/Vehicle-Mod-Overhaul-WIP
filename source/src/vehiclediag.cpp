@@ -365,7 +365,7 @@ namespace vehiclediag
 		// sunk before), its driver left at the lane. What in the game does it is not found. It is put back, with room between tries, and a refused try (no player cell, in a load) uses
 		// none of them. Measured in the 11:21 run with tries 100 ms apart: 6 stayed, 5 went down again, 9 unclear. If it will not stay, the driver goes to the vehicle.
 		// Only logged reading of the reference: it shows the move just after the build returns.
-		struct BuildWatch { std::uint32_t id; float before[3]; ULONGLONG at; ULONGLONG triedAt; int tries; };
+		struct BuildWatch { std::uint32_t id; float before[3]; ULONGLONG at; ULONGLONG triedAt; int tries; std::uint64_t generation; };
 		std::vector<BuildWatch> g_buildWatch;
         void ApplyBirthStage(std::uint32_t id);
 		void WatchBuild(std::uint32_t id, const float before[3]);
@@ -510,8 +510,8 @@ namespace vehiclediag
 		// at the build was already low and nothing was put back. Straight down only: a spare relocated since has other x, y and keeps the position at the build.
 		std::unordered_map<std::uint32_t, std::array<float, 3>> g_birthAt;
 		void WatchBuild(std::uint32_t id, const float before[3]) {
-			const bool held = g_birthHolds.Get(id).has_value();
-			if (!held) return;
+			const auto held = g_birthHolds.Get(id);
+			if (!held || held->releasing) return;
 			std::lock_guard lock(g_builtLock);
 			std::array<float, 3> from{ before[0], before[1], before[2] };
 			const auto born = g_birthAt.find(id);
@@ -520,7 +520,7 @@ namespace vehiclediag
 				from = born->second;
 				logger::Write("OBS system=chassis.drop vehicle=%08X event=low_before_build birth_z=%.1f z=%.1f", id, born->second[2], before[2]);
 			}
-			g_buildWatch.push_back({ id, { from[0], from[1], from[2] }, GetTickCount64(), 0, 0 });
+			g_buildWatch.push_back({ id, { from[0], from[1], from[2] }, GetTickCount64(), 0, 0, held->generation });
 		}
         void ApplyBirthStage(std::uint32_t id){
             if(!lifecycle::InService()){
@@ -883,6 +883,10 @@ namespace vehiclediag
 	}
 
     bool BirthStageAvailable(){return g_setMotion&&g_builder;}
+    std::uint64_t BirthCorrectionGeneration(std::uint32_t id){
+        const auto held=g_birthHolds.Get(id);
+        return held&&!held->releasing?held->generation:0;
+    }
     int StagedLoaded(){int n=0;for(const auto& entry:g_birthHolds.All())if(entry.object)++n;return n;}
     void StageBirth(std::uint32_t id){
         if(!id)return;g_birthHolds.Add(id);
@@ -1002,15 +1006,15 @@ namespace vehiclediag
 		std::vector<BuildWatch> keep;
 		for (auto& w : watched) {
 			float at[3] = {};
-			const bool held = g_birthHolds.Get(w.id).has_value();
-			if (!held || !RefPosOf(w.id, at)) continue;  // hidden, released or gone
+			const auto generation = BirthCorrectionGeneration(w.id);
+			if (generation != w.generation || !RefPosOf(w.id, at)) continue;  // hold released, replaced or gone
 			if (now - w.at >= trafficpair::kPutBackWatchMs) {
 				if (w.tries) logger::Write("Vehicle build: %08X after %d put-back(s): z %.1f, wanted %.1f: %s", w.id, w.tries, at[2], w.before[2], w.before[2] - at[2] < 2.0f ? "it stayed" : "it did not stay");
 				continue;
 			}
 			if (now - w.triedAt >= trafficpair::kPutBackEveryMs && trafficpair::PutBackAfterBuild(w.before[2], at[2], w.tries)) {
 				w.triedAt = now;
-				if (trafficpool::PutBack(w.id, w.before[0], w.before[1], w.before[2])) {
+				if (trafficpool::PutBack(w.id, w.before[0], w.before[1], w.before[2], generation)) {
 					if (!w.tries) logger::Write("Vehicle build: %08X went down %.1f m around its build (%.0f, %.0f, z %.1f to %.1f), %.0f m from the player: putting it back", w.id, w.before[2] - at[2], w.before[0], w.before[1], w.before[2], at[2], PlayerDistance(at));
 					++w.tries;
 				}

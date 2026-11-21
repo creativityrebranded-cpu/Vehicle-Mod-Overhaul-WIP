@@ -9,6 +9,8 @@
 #include "fieldboxapi.h"
 #include "planowner.h"
 #include "spottest.h"
+#include "stockfloat.h"
+#include "relocationconsumers.h"
 #include "selfreport.h"
 #include "worldtrust.h"
 #include "trafficcensusapi.h"
@@ -26,6 +28,7 @@
 #include "planprobe.h"
 #include "vehicle_probe.h"
 #include <string>
+#include <string_view>
 #include "planrays.h"
 #include "planview.h"
 #include "hoverthrust.h"
@@ -76,6 +79,9 @@
 #include "bodyattitude.h"
 #include "freeroll.h"
 #include "physicsstep.h"
+#include "farrail.h"
+#include "fleetrail_policy.h"
+#include "trafficprofile.h"
 #include "vtolphysics.h"
 #include "vtolai.h"
 #include "flightgear.h"
@@ -617,6 +623,10 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         spottest::FactoryTest g_factoryTest[1 + prefetch::kSlotPilotCount];
         std::unordered_map<std::uint32_t, spottest::MotionProof> g_spotProof;  // under g_spotLock
         std::uint64_t g_stockPulseOwner = 0, g_stockPulseAt = 0;  // one live private goal-test request
+        // Lab stock in flight (stockfloat.h): the commanded ABSOLUTE float height per pilot (main thread; EnergyStep writes, Fly reads), and the
+        // spot test's last pulse command (serial, ms) so the next frame can tell the test that its pulse was applied.
+        stockfloat::Hold g_stockFloat[1 + prefetch::kSlotPilotCount];
+        struct StockPulseIssued { std::uint64_t serial = 0, at = 0; } g_stockPulseIssued[1 + prefetch::kSlotPilotCount];
 #endif
         std::mutex g_spotLock; std::unordered_map<std::uint32_t, int> g_spotResult; std::unordered_map<std::uint32_t, selfreport::Record> g_selfReport; std::unordered_map<std::uint32_t, FvoPairHealthSampleV1> g_healthSample;  // CH-1 under g_spotLock
         std::unordered_map<std::uint32_t, ULONGLONG> g_spotRequest;  // CH-4: Health asked for a spot test at (ms), under g_spotLock  // PF-1 under g_spotLock     // ST-B: the exported fact by vehicle; cleared on load
@@ -797,11 +807,6 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             ULONGLONG handoffStepAt = 0;
             std::uintptr_t handoffStepInstance = 0;
             std::uint32_t handoffStepBody = 0;
-#ifndef FVO_RELEASE
-            ULONGLONG factoryWheelRequestedAt = 0;
-            std::uintptr_t factoryWheelRequestedRef = 0;
-            spottest::FactoryWheelContact factoryWheelContact{};
-#endif
 			std::atomic<std::uint64_t> testSteps{0};  // ST-A: physics steps of any kind, never reset (the spot test counts its pulses in these)
 			ULONGLONG lastStepAt = 0;
 			std::uintptr_t lastStepInstance = 0;
@@ -1216,19 +1221,6 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			}
 			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 		}
-#ifndef FVO_RELEASE
-        // Called with the slot lock held after the game's existing step.
-        void NoteFactoryWheelContact(Shared& slot, std::uintptr_t instance, std::uint32_t body, ULONGLONG now)
-        {
-            if (!slot.factoryWheelRequestedAt || now < slot.factoryWheelRequestedAt ||
-                now - slot.factoryWheelRequestedAt > spottest::rules::factorySupportMs ||
-                slot.vehicle.load() != slot.factoryWheelRequestedRef) return;
-            WheelRead wheels;
-            slot.factoryWheelContact = ReadWheels(instance, wheels)
-                ? spottest::FactoryWheelContact{now, slot.handoffSteps, body, wheels.touching, wheels.z, wheels.up}
-                : spottest::FactoryWheelContact{};
-        }
-#endif
 		double ProbeSpeed(std::uintptr_t motion)
 		{
 			__try { const float* v = reinterpret_cast<const float*>(motion + 0x60); return std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1]); }
@@ -1813,16 +1805,176 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				blk.tyres.friction[0] * want.front, blk.tyres.friction[std::min(2, std::max(0, blk.tyres.wheels - 1))] * want.rear, inv[0], inv[1], inv[2]);
 			blk.appliedFront = want.front; blk.appliedRear = want.rear; blk.appliedWeight = want.weight; blk.appliedOwner = dec.owner;
 		}
+        // Applies a rail target inside the same native chassis callback for both traffic and the test.
+        // POD frame: SEH protects the body handles, which can disappear when cells change.
+        const char* WriteRailPose(std::uintptr_t vehicle, std::uint32_t bodyId,
+                                  const FvoFleetRailPoint& position, const FvoFleetRailPoint& velocity)
+        {
+            __try {
+                const Body body = FindBody(vehicle, 0, 0, 0, true);
+                if (!body.body || !body.motion || body.id != bodyId ||
+                    At<std::uint32_t>(body.body, 0x50) != body.id) return "body_changed";
+                if (At<std::uint32_t>(body.motion, 0x48) != body.id) return "motion_owner_changed";
+                auto* centre = reinterpret_cast<double*>(body.motion + 0x10);
+                auto* pose = reinterpret_cast<float*>(body.body + 0x30);
+                auto* speed = reinterpret_cast<float*>(body.motion + 0x60);
+                if (!std::isfinite(centre[0]) || !std::isfinite(centre[1]) || !std::isfinite(centre[2]) ||
+                    !std::isfinite(pose[0]) || !std::isfinite(pose[1]) || !std::isfinite(pose[2])) return "non_finite_pose";
+                if (!(std::hypot(centre[0] - pose[0], centre[1] - pose[1], centre[2] - pose[2]) <= 20.0))
+                    return "motion_body_separated";
+                const double dx = position.x - pose[0], dy = position.y - pose[1], dz = position.z - pose[2];
+                if (!(std::hypot(dx, dy, dz) <= 25.0)) return "step_over_25m";
+                centre[0] += dx; centre[1] += dy; centre[2] += dz;
+                pose[0] += float(dx); pose[1] += float(dy); pose[2] += float(dz);
+                speed[0] = float(velocity.x); speed[1] = float(velocity.y); speed[2] = float(velocity.z);
+                return nullptr;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return "fault_while_writing"; }
+        }
+
+        struct FleetRail {
+            unsigned driver = 0, body = 0;
+            std::uintptr_t instance = 0;
+            fleetrail::Path path;
+            fleetrail::Mode mode = fleetrail::Mode::Awaiting;
+            bool railOwner = false, seeded = false;
+            double station = 0.0, speed = 0.0;
+            FvoFleetRailPoint position{};
+            std::uint64_t lastStep = 0;
+            const char* fault = "";
+            // Soft switching (fleetrail::rules): the rail's own speed, the entry blend and when the mode last changed.
+            double railSpeed = 0.0, blendT = 0.0;
+            bool blendReady = false;
+            FvoFleetRailPoint offset{};
+            std::uint64_t modeSince = 0;
+            // Reference mode: last reference move and how many were queued.
+            std::uint64_t refStepAt = 0;
+            unsigned refSteps = 0;
+        };
+        std::mutex g_fleetRailLock;
+        std::unordered_map<unsigned, FleetRail> g_fleetRails;
+        std::atomic<unsigned> g_fleetRailCount{0};
+
+        // Exit ramp: after the rail hands a car to autopilot, autopilot may only speed up gradually from the rail's speed.
+        struct FleetHandoff { std::uint64_t at = 0; double speed = 0.0; };
+        std::mutex g_fleetHandoffLock;
+        std::unordered_map<unsigned, FleetHandoff> g_fleetHandoffs;
+        void NoteFleetHandoff(unsigned vehicle, double speed, std::uint64_t now)
+        {
+            std::lock_guard lk(g_fleetHandoffLock);
+            g_fleetHandoffs[vehicle] = {now, std::isfinite(speed) ? std::max(0.0, speed) : 0.0};
+        }
+        double FleetHandoffCap(unsigned vehicle, std::uint64_t now)
+        {
+            std::lock_guard lk(g_fleetHandoffLock);
+            if (g_fleetHandoffs.empty()) return std::numeric_limits<double>::infinity();
+            const auto it = g_fleetHandoffs.find(vehicle);
+            if (it == g_fleetHandoffs.end()) return std::numeric_limits<double>::infinity();
+            const double cap = fleetrail::RampCap(it->second.speed, now >= it->second.at ? now - it->second.at : 0);
+            if (!std::isfinite(cap)) g_fleetHandoffs.erase(it);
+            return cap;
+        }
+        // Reads the body the rail is about to drive: where it is and how fast it moves (for the entry blend).
+        bool ReadRailBody(std::uintptr_t vehicle, std::uint32_t bodyId, FvoFleetRailPoint& pose, FvoFleetRailPoint& velocity)
+        {
+            __try {
+                const Body body = FindBody(vehicle, 0, 0, 0, true);
+                if (!body.body || !body.motion || body.id != bodyId || At<std::uint32_t>(body.body, 0x50) != body.id ||
+                    At<std::uint32_t>(body.motion, 0x48) != body.id) return false;
+                const auto* p = reinterpret_cast<const float*>(body.body + 0x30);
+                const auto* v = reinterpret_cast<const float*>(body.motion + 0x60);
+                pose = {p[0], p[1], p[2]};
+                velocity = {v[0], v[1], v[2]};
+                return std::isfinite(pose.x) && std::isfinite(pose.y) && std::isfinite(pose.z) &&
+                    std::isfinite(velocity.x) && std::isfinite(velocity.y) && std::isfinite(velocity.z);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        }
+
+        bool FleetRailOwns(unsigned vehicle)
+        {
+            if (!g_fleetRailCount.load(std::memory_order_acquire) || !trafficprofile::FleetRailAllowed()) return false;
+            std::lock_guard lk(g_fleetRailLock);
+            const auto it = g_fleetRails.find(vehicle);
+            return it != g_fleetRails.end() && it->second.railOwner;
+        }
+
+        bool FleetRailStep(std::uintptr_t vehicle, std::uint32_t body, float seconds)
+        {
+            if (!g_fleetRailCount.load(std::memory_order_acquire) || !trafficprofile::FleetRailAllowed()) return false;
+            std::lock_guard lk(g_fleetRailLock);
+            if (!trafficprofile::FleetRailWritesAllowed()) {
+                for (const auto& [id, car] : g_fleetRails)
+                    if (car.railOwner && car.instance == vehicle && car.body == body) return true;
+                return false;
+            }
+            for (auto& [id, car] : g_fleetRails) {
+                if (!car.railOwner || car.instance != vehicle || car.body != body) continue;
+                if (g_manualDriverId.load(std::memory_order_relaxed) == id) return false;
+                const double dt = physicsstep::ModelSeconds(seconds);
+                if (dt <= 0.0) return true;
+                if (!car.blendReady) {
+                    // Entry blend: start from where the car actually is and how fast it actually moves.
+                    FvoFleetRailPoint pose{}, moving{};
+                    const auto onPath = car.path.At(car.station);
+                    if (ReadRailBody(vehicle, body, pose, moving)) {
+                        car.offset = {pose.x - onPath.x, pose.y - onPath.y, pose.z - onPath.z};
+                        if (!(std::hypot(car.offset.x, car.offset.y, car.offset.z) <= fleetrail::rules::kMaxBlendOffset)) car.offset = {};
+                        car.railSpeed = std::clamp(std::hypot(moving.x, moving.y, moving.z), 0.0, 150.0);
+                    } else {
+                        car.offset = {};
+                        car.railSpeed = car.speed;
+                    }
+                    car.blendT = 0.0;
+                    car.blendReady = true;
+                    logger::Write("OBS system=traffic.fleet_rail event=entry_blend vehicle=%08X offset_m=%.2f speed=%.1f target_speed=%.1f",
+                        id, std::hypot(car.offset.x, car.offset.y, car.offset.z), car.railSpeed, car.speed);
+                }
+                const double want = std::min(car.speed, car.path.CornerSpeed(car.station));
+                const double railSpeed = fleetrail::Approach(car.railSpeed, want, dt);
+                const double station = car.path.Advance(car.station, railSpeed * dt);
+                const double w0 = fleetrail::BlendWeight(car.blendT), w1 = fleetrail::BlendWeight(car.blendT + dt);
+                const auto Shifted = [&](FvoFleetRailPoint p, double w) {
+                    return FvoFleetRailPoint{p.x + car.offset.x * w, p.y + car.offset.y * w, p.z + car.offset.z * w};
+                };
+                const auto target = Shifted(car.path.At(station), w1);
+                const auto previous = Shifted(car.path.At(car.station), w0);
+                const FvoFleetRailPoint velocity{(target.x - previous.x) / dt,
+                    (target.y - previous.y) / dt, (target.z - previous.z) / dt};
+                if (const char* fault = WriteRailPose(vehicle, body, target, velocity)) {
+                    if (car.fault != fault)
+                        logger::Write("OBS system=traffic.fleet_rail event=engine_result vehicle=%08X mode=awaiting reason=%s", id, fault);
+                    car.fault = fault;
+                    if (car.mode != fleetrail::Mode::Awaiting) car.modeSince = GetTickCount64();
+                    car.mode = fleetrail::Mode::Awaiting;
+                    return true;
+                }
+                car.fault = "";
+                if (car.mode != fleetrail::Mode::Rail) car.modeSince = GetTickCount64();
+                car.mode = fleetrail::Mode::Rail;
+                car.station = station;
+                car.railSpeed = railSpeed;
+                car.blendT += dt;
+                car.position = target;
+                car.lastStep = GetTickCount64();
+                return true;
+            }
+            return false;
+        }
+
 #ifndef FVO_RELEASE
 		// Relocation doer, physics-thread half (diagnostic builds). One armed request; issued at the armed chassis's next action call, which
 		// runs inside the world step before it integrates. The substitution adds the displacement to the motion's centre of mass (double X/Y at
 		// +0x10/+0x18, Z at +0x20: the integrator's own store site) and to the body position (+0x30), so the step integrates from the new pose
 		// and the engine's own publisher carries it to the body, bounds and listeners. Nothing here decides; it only writes once and records facts.
 		namespace reloc {
+			bool RailOnStep(std::uintptr_t vehicle, float seconds);
+            bool RailOwns(std::uint32_t vehicle);
 			struct State {
 				std::mutex lock;
 				std::atomic<bool> armed{ false }, ready{ false };
 				std::uint64_t serial = 0;
+				std::uint64_t authority = 0;
 				std::uint32_t vehicleId = 0, bodyId = 0;
 				std::uintptr_t instance = 0;
 				double dx = 0, dy = 0, dz = 0;
@@ -1830,6 +1982,12 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				ULONGLONG lastActionAt = 0;
 			};
 			State g_state;
+            bool HopOwns(std::uintptr_t vehicle)
+            {
+                if (!g_state.armed.load(std::memory_order_acquire) && !g_state.ready.load(std::memory_order_acquire)) return false;
+                std::lock_guard lk(g_state.lock);
+                return g_state.instance == vehicle && (g_state.armed.load() || g_state.ready.load());
+            }
 			// POD only: __try cannot share a frame with objects that have destructors.
 			bool Write(State& st, std::uintptr_t vehicle)
 			{
@@ -1848,6 +2006,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					for (int i = 0; i < 3; ++i) { f.comBefore[i] = com[i]; f.bodyBefore[i] = bp[i]; }
 					if (!f.ringFirstOk) { f.refusal = "motion_ring_not_this_body"; return false; }
 					if (!f.comNearBody) { f.refusal = "motion_position_not_at_body"; return false; }
+					if (!handoff::WheelGrantCurrent(st.authority)) { f.refusal = "relocation_authority_revoked"; return false; }
 					com[0] += st.dx; com[1] += st.dy; com[2] += st.dz;
 					bp[0] += float(st.dx); bp[1] += float(st.dy); bp[2] += float(st.dz);
 					for (int i = 0; i < 3; ++i) { f.comAfter[i] = com[i]; f.bodyAfter[i] = bp[i]; }
@@ -1884,6 +2043,68 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				}
 				__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 			}
+			// Position and linear velocity (far tier test read-back).
+			bool ReadBodyV(std::uintptr_t vehicle, std::uint32_t bodyId, double* pos, double* vel)
+			{
+				__try {
+					const Body b = FindBody(vehicle, 0, 0, 0, true);
+					if (!b.body || !b.motion || b.id != bodyId || At<std::uint32_t>(b.body, 0x50) != b.id) return false;
+					const float* bp = reinterpret_cast<const float*>(b.body + 0x30);
+					const float* mv = reinterpret_cast<const float*>(b.motion + 0x60);
+					for (int i = 0; i < 3; ++i) { pos[i] = bp[i]; vel[i] = mv[i]; }
+					return true;
+				}
+				__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+			}
+
+			// ---- Far tier rail (diagnostic): one kinematic pose substitution per physics step for one chassis, before the world integrates ----
+			// The step adds the move (target pose minus the body's pose) to the motion's centre of mass and to the body position, exactly like the hop
+			// write above, and sets the linear velocity to the path's own so the integrator adds nothing. Height: farrail::Profile (terrain + ride).
+			struct Rail {
+				std::mutex lock;
+				std::atomic<bool> active{ false };
+				std::uint32_t vehicleId = 0, bodyId = 0;
+				std::uintptr_t instance = 0;
+				farrail::RailParams p;
+				farrail::RailState st;
+				farrail::Profile profile;
+				vehicleflight::relocate::RailFacts facts;
+			};
+			Rail g_rail;
+			bool RailWrite(Rail& r, std::uintptr_t vehicle, double dt)
+            {
+                auto& facts = r.facts;
+                double ground = 0;
+                const bool known = r.profile.Get(r.st.s + r.p.speed * dt, ground);
+                const auto step = farrail::Step(r.st, r.p, dt, known, ground);
+                if (const char* fault = WriteRailPose(vehicle, r.bodyId, {step.x, step.y, step.z},
+                                                     {step.vx, step.vy, step.vz})) {
+                    facts.fault = fault;
+                    ++facts.faults;
+                    if (fault != std::string_view{"body_changed"}) r.active.store(false, std::memory_order_release);
+                    return false;
+                }
+                facts.steps = r.st.steps; facts.holds = r.st.holds; facts.s = r.st.s;
+                facts.x = step.x; facts.y = step.y; facts.z = step.z;
+                facts.target = step.target; facts.terrainKnown = step.terrainKnown;
+                return true;
+            }
+            bool RailOwns(std::uint32_t vehicle)
+            {
+                auto& r = g_rail;
+                std::lock_guard lk(r.lock);
+                return r.active.load(std::memory_order_acquire) && vehicle == r.vehicleId;
+            }
+            bool RailOnStep(std::uintptr_t vehicle, float seconds)
+            {
+                auto& r = g_rail;
+                if (!r.active.load(std::memory_order_acquire)) return false;
+                std::lock_guard lk(r.lock);
+                if (!r.active.load(std::memory_order_acquire) || vehicle != r.instance) return false;
+                const double dt = physicsstep::ModelSeconds(seconds);
+                if (dt > 0.0) RailWrite(r, vehicle, dt);
+                return true;
+            }
 		}
 #endif
 		std::uint64_t StepDetour(std::uintptr_t vehicle, std::uintptr_t world, float seconds)
@@ -1897,6 +2118,21 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			vehiclediag::NoteStep(vehicle);
 			const auto body=PhysicsBodyId(vehicle);const auto now=GetTickCount64();
             ObserveChassisMass(vehicle,now,massEpoch);
+#ifdef FVO_RELEASE
+            const bool railOwnsStep = FleetRailStep(vehicle, body, seconds);
+#else
+            const bool railOwnsStep = reloc::RailOnStep(vehicle, seconds) ||
+                (!reloc::HopOwns(vehicle) && FleetRailStep(vehicle, body, seconds));
+#endif
+            if (railOwnsStep) {
+                // The native step publishes the body. Stale FVO force/wheel controllers do not run in rail mode.
+                for (auto& binding : g_shs)
+                    if (binding.physInstance.load() == vehicle) PhysicalRelease(binding);
+                timing.BeginNative();
+                const auto result = g_original(vehicle, world, seconds);
+                timing.EndNative();
+                return result;
+            }
 			bodybinding::Binding bindings[kPilots];
             int wheelObserver=-1;
             bool ambiguousWheelObserver=false;
@@ -1953,9 +2189,6 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         bodybinding::Contains({wheel.sceneBodies,wheel.sceneCount},body)){
                         ++wheel.handoffSteps;wheel.handoffStepAt=now;
                         wheel.handoffStepInstance=vehicle;wheel.handoffStepBody=body;
-#ifndef FVO_RELEASE
-                        NoteFactoryWheelContact(wheel, vehicle, body, now);
-#endif
                     }
                 }
                 return result;
@@ -1969,9 +2202,6 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
              if(owner>0&&s->instance.load()==vehicle&&bodybinding::Matches(body,s->bodyId.load())&&
                 physicsstep::ModelSeconds(seconds)>0.0){
                 ++s->handoffSteps;s->handoffStepAt=now;s->handoffStepInstance=vehicle;s->handoffStepBody=body;
-#ifndef FVO_RELEASE
-                NoteFactoryWheelContact(*s, vehicle, body, now);
-#endif
              }
              if(!s->active) {
                 const auto passiveBody=FindBody(vehicle,0,0,0,true);
@@ -2872,7 +3102,9 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				{   // PS-1 (2026-11-12, ramp queue 13:10:44: FF101109 rocked for 40 s, its still clock kept resetting, the car behind waited): passable
 					// means not getting anywhere. A car the core drives is judged by its own plan: under a route hold it is a queue; in recovery or
 					// flagged not moving it is stuck. Any other vehicle: net movement over progressWindow under progressNet.
-					auto& pc = g_worldProgress[w.formId]; pc.Step(now, w.pos[0], w.pos[1]);
+					auto& pc = g_worldProgress[w.formId];
+					if (pc.Rebase(now, w.pos[0], w.pos[1], relocconsumers::Poll(w.formId), w.formId)) g_worldStill[w.formId].Rebase();  // a relocation jump is not progress or a stall
+					else pc.Step(now, w.pos[0], w.pos[1]);
 					const char* why = nullptr;
 					const auto it = g_planPilot.find(w.formId);
 					const bool queued = it != g_planPilot.end() && it->second >= 0 && it->second < 257 && routeguidance::frames[it->second].lane.held;
@@ -3631,9 +3863,6 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				g_sh.instance.store(0);g_sh.matched=false;
 				g_sh.stepSerial=0;g_sh.lastStepAt=0;g_sh.lastStepInstance=0;
                 g_sh.handoffStepAt=0;g_sh.handoffStepInstance=0;
-#ifndef FVO_RELEASE
-                g_sh.factoryWheelRequestedAt=0;g_sh.factoryWheelContact={};
-#endif
 				g_sh.gEst = std::clamp(g_sh.gEst, 3.0, 20.0);  // a drained estimate would start a flight with no lift
 				g_sh.holding = false;
 				g_sh.haveLast = false;
@@ -4792,47 +5021,17 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 		// goal plan (D13) and step 7 (the plan's newest result writes the controls; none fresh: stand). Lane cars are planned and driven in
 		// AutodriveDecide's lane branch.
 #ifndef FVO_RELEASE
-        bool StockLocalFloor(int idx, unsigned self, std::uint64_t lease, std::uint32_t body,
-                             const drive::Input& in, ULONGLONG now, double& floor)
-        {
-            if (!routesurvey::OnMainThread()) return false;
-            struct Sample {
-                std::uint64_t lease = 0;
-                ULONGLONG at = 0;
-                std::uint32_t body = 0;
-                double x = 0, y = 0, base = 0, floor = 0;
-                bool hit = false;
-            };
-            static Sample samples[kPilots]{};
-            auto& sample = samples[idx];
-            const double base = in.z - in.shape.originAbove;
-            if (!std::isfinite(base) || !std::isfinite(in.x) || !std::isfinite(in.y)) return false;
-            const bool current = sample.lease == lease && sample.body == body && sample.at && now >= sample.at &&
-                now - sample.at < spottest::rules::factorySupportMs &&
-                std::hypot(sample.x - in.x, sample.y - in.y) <= spottest::rules::factorySupportRayShift &&
-                std::fabs(sample.base - base) <= spottest::rules::factorySupportRayShift;
-            if (!current) {
-                sample = {lease, now, body, in.x, in.y, base};
-                constexpr float reach = float(spottest::rules::factoryFloorTolerance);
-                const float from[3]{float(in.x), float(in.y), float(base) + reach};
-                const float to[3]{float(in.x), float(in.y), float(base) - reach};
-                prefetch::RayHit hit{};
-                sample.hit = vehicle_probe::CastNow(from, to, 0x22806, hit) == 1 &&
-                    hit.hit && hit.normalOk && hit.nz >= spottest::rules::factorySupportNormal &&
-                    hit.bodyId != body && hit.formId != self &&
-                    loadedarea::HitBodyOwner(hit.bodyId) != self && !InVehicleSpace(self, hit.x, hit.y, hit.z, true);
-                if (sample.hit) sample.floor = hit.z;
-            }
-            if (!spottest::FactorySupported(sample.hit, in.z, in.shape.originAbove, sample.floor)) return false;
-            floor = sample.floor;
-            return true;
-        }
-
-        spottest::Ask StockSpotTest(int idx, unsigned self, std::uint64_t lease, const drive::Input& in,
-                                   const planenergy::Result& previous, double& floor)
+        // Lab stock in FLIGHT (user decision 2026-11-20: the lab spot check must not need driving, wheels or a floor under the road; the below-road
+        // floor may not exist). Mode for a private lab pair is flight at one commanded absolute height (stockfloat.h, held by the hover in Fly with
+        // no ground reference). The spot test is the same FactoryTest / MotionEvidence as before (Health and Handoff read the same g_spotProof): a
+        // bounded reverse pulse measured along the heading. Only who answers the ask changed: this frame's hover command, not the wheeled planner.
+        // Eligibility keeps: released lease, driver seated, concealment (covered or unseen), steps advancing, one pulse at a time, no player
+        // handoff. It no longer needs onWheels or any floor; it needs the float to be held instead.
+        spottest::Ask StockFlightTest(int idx, unsigned self, std::uint64_t lease, const drive::Input& in)
         {
             auto& motion = g_spotMotion[idx];
             auto& test = g_factoryTest[idx];
+            auto& hold = g_stockFloat[idx];
             if (g_spotVehicle[idx] != self) {
                 std::lock_guard lock(g_spotLock);
                 g_spotProof.erase(g_spotVehicle[idx]);
@@ -4841,55 +5040,77 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 g_spotVehicle[idx] = self;
                 motion.Reset();
                 test = {};
+                g_stockPulseIssued[idx] = {};
             }
             const auto now = GetTickCount64();
+            const auto receipt = relocconsumers::Poll(self);
+            // The commanded height: captured from the car's own, followed through a seated move, re-based on its receipt.
+            stockfloat::Sample fs;
+            fs.vehicle = self; fs.lease = lease; fs.now = now; fs.z = in.z; fs.onWheels = in.onWheels;
+            fs.relocating = (npcvehicles::RelocationMark(self) & 1u) != 0;
+            fs.relocEpoch = receipt.epoch; fs.relocSerial = receipt.serial;
+            if (receipt.valid()) fs.relocToZ = receipt.to[2];
+            const auto floatEvent = stockfloat::Update(hold, fs);
+            if (floatEvent != stockfloat::Event::None)
+                logger::Write("OBS system=stock.float vehicle=%08X pilot=%d event=%s lease=%llu z=%.2f commanded_z=%.2f on_wheels=%d ground_ok=%d ground_z=%.2f reloc_serial=%llu reloc_to_z=%.2f reason=%s",
+                    self, idx, stockfloat::Name(floatEvent), static_cast<unsigned long long>(lease), in.z, hold.z, int(in.onWheels), int(in.groundOk),
+                    in.groundOk ? in.groundUnder : 0.0, static_cast<unsigned long long>(receipt.serial), receipt.valid() ? receipt.to[2] : 0.0,
+                    floatEvent == stockfloat::Event::Captured ? "lab_lease_float_at_own_height_no_ground_reference" :
+                    floatEvent == stockfloat::Event::Following ? "seated_move_in_progress_height_follows_the_car" : "applied_receipt_destination_height");
+            const bool held = stockfloat::Held(hold, now, in.z, in.vz, in.onWheels);
+            static bool wasHeld[1 + prefetch::kSlotPilotCount] = {};
+            if (held != wasHeld[idx]) {
+                wasHeld[idx] = held;
+                logger::Write("OBS system=stock.float vehicle=%08X pilot=%d event=%s lease=%llu z=%.2f commanded_z=%.2f vz=%.2f engaged_ms=%llu reason=%s",
+                    self, idx, held ? "held" : "released_hold", static_cast<unsigned long long>(lease), in.z, hold.z, in.vz,
+                    static_cast<unsigned long long>(hold.engagedAt && now >= hold.engagedAt ? now - hold.engagedAt : 0),
+                    held ? "flight_at_commanded_height_spot_pulse_allowed" : "flight_height_or_mode_not_held");
+            }
+
             const bool released = npcvehicles::FactoryStockLeaseOf(idx, self, true) == lease;
             const bool anotherPulse = g_stockPulseOwner && g_stockPulseOwner != lease &&
                 now >= g_stockPulseAt && now - g_stockPulseAt < spottest::rules::factoryPulseMs;
             spottest::Input sample;
             sample.x = in.x; sample.y = in.y; sample.now = in.now;
+            sample.relocation = receipt.serial;  // the jump of a relocation is not motion
             sample.speed = std::hypot(in.vx, in.vy);
             sample.builtAt = vehiclediag::BuiltAt(self);
             sample.covered = trafficarrival::Hidden();
             sample.unseen = !vehiclekeep::InCameraView(in.x, in.y, in.z);
-            sample.eligible = released && in.onWheels && in.driverSeated && !in.paused &&
-                (sample.covered || sample.unseen) && !anotherPulse && !trafficpool::PlayerOwnsHandoff(self);
+            const bool concealed = sample.covered || sample.unseen;
+            sample.eligible = released && held && in.driverSeated && !in.paused && concealed && !anotherPulse &&
+                !trafficpool::PlayerOwnsHandoff(self);
             auto& binding = g_shs[idx];
             unsigned body = 0;
-            spottest::FactoryWheelContact wheel;
             {
                 std::lock_guard lock(binding.lock);
                 const auto instance = binding.instance.load();
                 body = instance ? binding.bodyId.load() : binding.handoffStepBody;
                 if (!bodybinding::Contains({binding.sceneBodies, binding.sceneCount}, body)) body = 0;
                 sample.steps = binding.handoffSteps;
-                wheel = binding.factoryWheelContact;
-                const bool proved = motion.proof.completed && motion.proof.body == body &&
-                    motion.proof.builtAt == sample.builtAt && test.lease == lease;
-                if (sample.eligible && body && !proved) {
-                    binding.factoryWheelRequestedAt = now;
-                    binding.factoryWheelRequestedRef = binding.vehicle.load();
-                }
             }
-            const bool wheelContact = spottest::FactoryWheelSupported(wheel, body, now);
-            const bool wheelFloor = wheelContact &&
-                spottest::FactorySupported(true, in.z, in.shape.originAbove, wheel.z) &&
-                !InVehicleSpace(self, in.x, in.y, wheel.z, true);
-            if (wheelFloor) floor = wheel.z;
-            const bool rayFloor = !wheelFloor && sample.eligible && body && !motion.proof.completed &&
-                StockLocalFloor(idx, self, lease, body, in, now, floor);
-            const bool supported = wheelFloor || (rayFloor && wheelContact &&
-                std::fabs(wheel.z - floor) <= spottest::rules::factoryFloorTolerance);
-            sample.eligible &= supported;
-            const bool fresh = previous.at && now >= previous.at && now - previous.at <= 500 &&
-                previous.vehicle == self && previous.goal;
-            const bool accepted = fresh && previous.ok && previous.factorySpotPulse && !previous.hover && previous.speed < 0;
+            // The pulse the hover applied last frame is the test's "accepted" answer (the planner no longer answers for stock).
+            const auto& issued = g_stockPulseIssued[idx];
+            const bool applied = issued.serial && now >= issued.at && now - issued.at <= 150 && held;
             const auto before = motion.proof.completed;
-            const auto ask = test.Step(lease, sample, body, now, fresh ? previous.spotPulseSerial : 0,
-                accepted, fresh && previous.testRefused, in.heading, motion);
+            const auto ask = test.Step(lease, sample, body, now, applied ? issued.serial : 0, applied, false, in.heading, motion);
             if (ask.active) {
                 g_stockPulseOwner = lease;
                 g_stockPulseAt = now;
+                // One short backwards thrust in flight (float travel, gentlest gear), renewed every frame the test asks; it lapses by itself.
+                Command c;
+                c.set = Command::kScripted | Command::kTravel | Command::kThrottle | Command::kGear;
+                c.travel = 1;
+                c.throttle = ask.reverse ? -stockfloat::rules::pulseThrottle : stockfloat::rules::pulseThrottle;
+                c.gear = stockfloat::rules::pulseGear;
+                c.holdMs = stockfloat::rules::pulseHoldMs;
+                g_cmds[idx].c = c;
+                g_cmds[idx].until = now + c.holdMs;
+                if (issued.serial != ask.serial)
+                    logger::Write("OBS system=stock.pulse vehicle=%08X pilot=%d event=issued serial=%llu dir=%s throttle=%.2f gear=%d hold_ms=%u steps=%llu reason=flight_pulse_on_the_hover_actuator_not_the_wheeled_planner",
+                        self, idx, static_cast<unsigned long long>(ask.serial), spottest::Name(ask.dir), c.throttle, c.gear, c.holdMs,
+                        static_cast<unsigned long long>(sample.steps));
+                g_stockPulseIssued[idx] = {ask.serial, now};
             } else if (g_stockPulseOwner == lease) g_stockPulseOwner = 0;
             if (motion.proof.completed != before) {
                 const auto& proof = motion.proof;
@@ -4899,22 +5120,21 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     else g_spotProof.erase(self);
                 }
                 if (proof.completed) logger::Write(
-                    "OBS system=spot.motion vehicle=%08X body=%08X event=pulse_response mode=stationary_goal built_at=%llu start=%llu completed=%llu dir=%s moved_m=%.4f steps=%llu",
+                    "OBS system=spot.motion vehicle=%08X body=%08X event=pulse_response mode=flight_pulse built_at=%llu start=%llu completed=%llu dir=%s moved_m=%.4f steps=%llu commanded_z=%.2f z=%.2f",
                     self, proof.body, proof.builtAt, proof.started, proof.completed, spottest::Name(proof.direction),
-                    proof.moved, proof.steps);
+                    proof.moved, proof.steps, hold.z, in.z);
             }
-            const char* why = !released ? "await_handoff" : motion.proof.completed ? "proved" :
-                !in.onWheels ? "await_wheels" : !sample.covered && !sample.unseen ? "await_concealment" :
-                !wheelContact ? "await_native_wheel_contact" : !supported ? "await_measured_floor" :
-                !sample.eligible ? "await_eligible_owner" :
-                ask.active ? "pending_plan_pulse" : "await_retry";
-            logger::Observe("factory.stock-test", self, unsigned(released) | (unsigned(supported) << 1) |
-                (unsigned(sample.eligible) << 2) | (unsigned(ask.active) << 3) | (unsigned(motion.proof.completed != 0) << 4) |
-                (unsigned(sample.covered || sample.unseen) << 5) | (unsigned(wheelContact) << 6) |
-                (unsigned(rayFloor) << 7),
-                "pilot=%d token=%llu reason=%s body=%08X floor_source=%s floor=%.2f wheels=%d wheel_z=%.2f wheel_up=%.2f origin=%.2f z=%.2f",
-                idx, lease, why, body, wheelFloor ? "wheels" : rayFloor ? "local_ray" : "unknown", floor,
-                wheel.touching, wheel.z, wheel.up, in.shape.originAbove, in.z);
+            const bool proved = motion.proof.completed != 0;
+            const char* why = !released ? "await_handoff" : proved ? "proved" :
+                !stockfloat::Active(hold, now) ? "await_float_capture" : in.onWheels ? "await_flight_mode" :
+                !held ? "await_float_height" : !concealed ? "await_concealment" :
+                !sample.eligible ? "await_eligible_owner" : ask.active ? "pending_flight_pulse" : "await_retry";
+            logger::Observe("factory.stock-test", self, unsigned(released) | (unsigned(held) << 1) |
+                (unsigned(sample.eligible) << 2) | (unsigned(ask.active) << 3) | (unsigned(proved) << 4) |
+                (unsigned(concealed) << 5),
+                "pilot=%d token=%llu mode=flight reason=%s body=%08X on_wheels=%d float_held=%d commanded_z=%.2f z=%.2f vz=%.2f steps=%llu",
+                idx, static_cast<unsigned long long>(lease), why, body, int(in.onWheels), int(held), hold.z, in.z, in.vz,
+                static_cast<unsigned long long>(sample.steps));
             return ask;
         }
 #endif
@@ -4926,57 +5146,57 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			const double now = ain.now;
 			const bool lane = now - g_shadowLaneAt[idx] < .5;
 			const bool ordinaryGoal = !lane && owner && std::strcmp(owner, "energy_plan_goal") == 0;
-            spottest::Ask stockTest;
             bool stockGoal = false;
-            double stockFloor = std::numeric_limits<double>::quiet_NaN();
 #ifndef FVO_RELEASE
             if (const auto stockLease = npcvehicles::FactoryStockLeaseOf(idx, self, false)) {
                 stockGoal = true;
-                stockTest = StockSpotTest(idx, self, stockLease, ain, planenergy::Latest(idx), stockFloor);
+                (void)StockFlightTest(idx, self, stockLease, ain);  // the float and its spot pulse (a hover command), no planner, no floor
             }
 #endif
             const double estimatedBase = ain.z - ain.shape.originAbove;
             const double normalBase = ain.groundOk ? ain.groundUnder + (ain.onWheels ? 0.0 : std::max(0.0, ain.above)) : estimatedBase;
-            const double base = stockGoal ? (std::isfinite(stockFloor) ? stockFloor : estimatedBase) : normalBase;
+            const double base = stockGoal ? estimatedBase : normalBase;
             // World radar and the Goal scene use the same local base.
             RadarStep(idx, self, ain.x, ain.y, base, ain.heading, ain.vx * std::sin(ain.heading) + ain.vy * std::cos(ain.heading),
                 ain.shape.halfWidth, ain.shape.halfLength, ain.now, floorProofLane);
-            const bool goalCar = ordinaryGoal || stockGoal;
+            const bool goalCar = ordinaryGoal;
 			if (goalCar && planenergy::budget::MaySubmit(now, d.submitAt, planenergy::g_plansInFlight.load(std::memory_order_relaxed))) {
 				static thread_local std::vector<planworld::Shape> shapes; static thread_local std::vector<planinput::FloorPoint> floor;
 				planinput::GoalAsk ask; ask.now = now; ask.carX = ain.x; ask.carY = ain.y; ask.carBase = base; ask.halfLength = ain.shape.halfLength;
 				ask.goal.x = ain.hold ? ain.x : ain.gx; ask.goal.y = ain.hold ? ain.y : ain.gy; ask.goal.radius = std::max(1.5, ain.stop); ask.goal.stop = !ain.keepGoing;
 				ask.travel = ain.permit == drive::Permit::DriveOnly ? 1 : ain.permit == drive::Permit::HoverOnly ? 2 : ain.preferAir ? 0 : 1; ask.hoverPossible = ain.hoverPossible;  // Both with the ground preferred: priced as drive-only (hover only where wheels cannot go), the autopilot's own "preference, not a limit"
-                ask.factoryHold = stockGoal;
-                if (stockGoal) {
-                    ask.goal.x = ain.x; ask.goal.y = ain.y; ask.goal.stop = true;
-                    ask.travel = 1; ask.hoverPossible = false;
-                }
-                const double lookX = stockGoal ? ain.x - 4 * std::sin(ain.heading) : ask.goal.x;
-                const double lookY = stockGoal ? ain.y - 4 * std::cos(ain.heading) : ask.goal.y;
-                GoalWorld(self, ain.x, ain.y, base, lookX, lookY, now, shapes, floor);
+                GoalWorld(self, ain.x, ain.y, base, ask.goal.x, ask.goal.y, now, shapes, floor);
 				RadarAppend(idx, shapes, now);  // radar boxes: measured solids with their real size
 				bicycle::Spec spec; spec.halfWidth = ain.shape.halfWidth; spec.halfLength = ain.shape.halfLength; spec.height = std::max(1.0, ain.shape.height);
 				if (ain.shape.steerLock > 0 && ain.shape.wheelbase > 0) spec.car = { ain.shape.steerLock, ain.shape.wheelbase, ain.shape.slopePoint, ain.shape.initialSlope, ain.shape.fullSteerSpeed };
 				else spec.car = carmodel::Fallback(ain.shape.halfLength);  // not measured yet
-				const double want = stockGoal ? 0 : ain.cruise && ain.cruiseSpeed > 0 ? ain.cruiseSpeed : ain.speedLimit > 0 ? ain.speedLimit : 12.0;
+				const double want = ain.cruise && ain.cruiseSpeed > 0 ? ain.cruiseSpeed : ain.speedLimit > 0 ? ain.speedLimit : 12.0;
 				FlightSpec(spec, idx, self); NoteFlightPlan(idx, want, nullptr);  // FC-1: the gear row's hover turn and top; FG-1's wanted speed
 				bicycle::State st; st.x = ain.x; st.y = ain.y; st.heading = ain.heading; st.speed = ain.vx * std::sin(ain.heading) + ain.vy * std::cos(ain.heading);
 				st.input = g_shs[idx].carInput.load(std::memory_order_relaxed); st.z = base; st.mode = ain.onWheels ? 0 : 1;
-				planenergy::SubmitGoal(idx, self, ask, shapes, floor, st, spec, want, now, stockTest);
+				planenergy::SubmitGoal(idx, self, ask, shapes, floor, st, spec, want, now);
 			}
+			// Lab stock (user decision 2026-11-20): held in FLIGHT at its commanded absolute height, standing (no speed, brake on, nose kept). The hover
+			// in Fly holds that height with no ground reference (stockfloat.h); the spot pulse is StockFlightTest's command. When the lease ends (the
+			// pair is promoted to a route) this branch stops: the ordinary goal plan / lane decides hover or wheels for the route as for any traffic car.
+#ifndef FVO_RELEASE
+			if (stockGoal) {
+				auto& out = g_gs[idx].adOut; g_energyOwnsAt[idx] = GetTickCount64();
+				out.mode = drive::Mode::Hover; out.phase = drive::Phase::Arrived; out.bearing = ain.heading;
+				out.speed = 0; out.brake = true; out.reverse = false; out.boost = false; out.why = "factory float hold";
+				if (now - g_energyAuthLogAt[idx] >= 2.0 || now < g_energyAuthLogAt[idx]) { g_energyAuthLogAt[idx] = now;
+					logger::Write("OBS system=plan.authority vehicle=%08X pilot=%d event=decides scene=stock_float mode=%s speed=0.00 reverse=0 brake=1 commanded_z=%.2f z=%.2f pos=%.1f,%.1f reason=lab_stock_flight_hold_no_wheels_no_floor",
+						self, idx, drive::Name(out.mode), g_stockFloat[idx].z, ain.z, ain.x, ain.y); }
+				return;
+			}
+#endif
 			// Step 7 (one authority): a car with no lane is driven by its goal plan (D13). Wheels: the path follower's bearing and the plan's speed into
 			// the actuators' channels; hover: the hover follower. Not ready: stand.
 			if (goalCar) {
 				const auto ge = planenergy::Latest(idx); const ULONGLONG gage = ge.at ? GetTickCount64() - ge.at : ~0ull;
 				auto& out = g_gs[idx].adOut; g_energyOwnsAt[idx] = GetTickCount64(); const char* gwhy = "";
 				const double gspd = std::hypot(ain.vx, ain.vy);
-                const bool currentPulse = stockGoal && stockTest.active && stockTest.serial &&
-                    ge.factorySpotPulse && stockTest.serial == ge.spotPulseSerial;
-                const bool eligibleResult = stockGoal
-                    ? currentPulse || (!ge.factorySpotPulse && !ge.hover && std::fabs(ge.speed) < .1)
-                    : !ge.factorySpotPulse;
-				if (ge.at && ge.vehicle == self && ge.goal && gage <= 500 && ge.ok && eligibleResult) {
+				if (ge.at && ge.vehicle == self && ge.goal && gage <= 500 && ge.ok) {
 					if (ge.hover) {
 						hoverfollow::Car hc; hc.x = ain.x; hc.y = ain.y; hc.z = ain.z - ain.shape.originAbove; hc.heading = ain.heading; hc.speed = gspd; hc.originAbove = ain.shape.originAbove;
 						const auto ho = hoverfollow::Follow(ge.hoverPath, hc, gage / 1000.0);
@@ -4994,7 +5214,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 						if (pf.ok) out.bearing = pf.bearing; out.phase = ge.reverse ? drive::Phase::Reverse : drive::Phase::Travel; gwhy = "wheels";
 					}
 					out.why = ge.why;
-				} else { if (stockGoal) out.mode = drive::Mode::Drive; out.speed = 0; out.brake = true; out.reverse = false; out.boost = false; out.why = stockGoal ? "factory private hold" : "energy plan not ready"; gwhy = !ge.at ? "no_result_yet" : ge.vehicle != self ? "result_for_another_car" : !ge.goal ? "lane_scene_result" : gage > 500 ? "result_stale" : !eligibleResult ? "factory_hold_or_expired_pulse" : "no_finite_candidate"; }
+				} else { out.speed = 0; out.brake = true; out.reverse = false; out.boost = false; out.why = "energy plan not ready"; gwhy = !ge.at ? "no_result_yet" : ge.vehicle != self ? "result_for_another_car" : !ge.goal ? "lane_scene_result" : gage > 500 ? "result_stale" : "no_finite_candidate"; }
 				if (now - g_energyAuthLogAt[idx] >= 2.0 || now < g_energyAuthLogAt[idx]) { g_energyAuthLogAt[idx] = now;
 					logger::Write("OBS system=plan.authority vehicle=%08X pilot=%d event=decides scene=goal mode=%s speed=%.2f reverse=%d brake=%d age_ms=%llu candidate=\"%s\" state=%s pos=%.1f,%.1f reason=one_authority_energy_plan",
 						self, idx, drive::Name(out.mode), out.speed, int(out.reverse), int(out.brake), static_cast<unsigned long long>(ge.at ? gage : 0), ge.why ? ge.why : "", gwhy, ain.x, ain.y); }
@@ -5012,7 +5232,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			in.now = double(nowMs) / 1000.0;
 			in.x = pos.x; in.y = pos.y; in.z = pos.z; in.heading = heading;
 			if (g.drive) { in.vx = std::sin(heading) * g.drvSp; in.vy = std::cos(heading) * g.drvSp; }
-			else { in.vx = v[0]; in.vy = v[1]; }
+			else { in.vx = v[0]; in.vy = v[1]; in.vz = v[2]; }
 			if (const auto selfId = vehicle ? At<std::uint32_t>(vehicle, off::kFormId) : 0u) world::NoteFlownVelocity(selfId, v);  // VL-1: the body's velocity for the Vehicle List
 			in.groundUnder = groundZ; in.groundOk = groundOk; in.above = above;
 			in.gx = goal.x; in.gy = goal.y; in.gz = goal.z; in.stop = std::max(goal.stop, 1.0);
@@ -5335,7 +5555,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 #endif
                                 g_spot[idx]={};g_spotVehicle[idx]=self;
                             }
-                            spottest::Input si;si.now=in.now;si.x=in.x;si.y=in.y;si.speed=spd;si.steps=g_shs[idx].testSteps.load(std::memory_order_relaxed);
+                            spottest::Input si;si.now=in.now;si.x=in.x;si.y=in.y;si.speed=spd;si.relocation=relocconsumers::Poll(self).serial;si.steps=g_shs[idx].testSteps.load(std::memory_order_relaxed);
                             si.eligible=idx>=1&&in.driverSeated&&!in.paused&&in.onWheels&&!planFlies;
                             si.covered=trafficarrival::Hidden();
                             const bool inCameraView=vehiclekeep::InCameraView(in.x,in.y,in.z);
@@ -5768,6 +5988,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                             const int castNeed=fieldslice::CastsPerRefresh(slice.start,slice.end,fullRefresh);
                             {static fieldslice::Memory memories[1+prefetch::kSlotPilotCount];static unsigned memoryFor[1+prefetch::kSlotPilotCount]={};  // OA-1: object memory, world space, kept through turns and full refreshes
                              if(memoryFor[idx]!=self){memories[idx]={};memoryFor[idx]=self;}  // another car in this slot: its memory is not this car's
+                             {static std::uint64_t memoryMark[1+prefetch::kSlotPilotCount]={};const auto mark=npcvehicles::RelocationMark(self);
+                              if(mark!=memoryMark[idx]){memories[idx]={};memoryMark[idx]=mark;logger::Observe("plan.memory",self,0x30u+(mark&1u),"event=flushed reason=pose_relocated mark=%llu",(unsigned long long)mark);}}  // the old surroundings are not where the car is now
                              slice.memory=&memories[idx];}
                             if(fresh)slice=cached.slice;
                             else if(main&&!gateOpen&&canReuse&&slice.end>slice.start+1){
@@ -6088,6 +6310,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                                 bearingBy="energy plan (path follower)";ewhy="wheels";
                             }
                             g.adOut.why=er.why;capBy="energy plan";laneSpeed=g.adOut.speed;
+                            // Exit ramp after a rail handoff: speeding up is gradual, braking is never limited.
+                            if(const double rampCap=FleetHandoffCap(self,GetTickCount64());rampCap<g.adOut.speed){g.adOut.speed=rampCap;laneSpeed=rampCap;capBy="rail handoff ramp";}
                         } else {
                             g.adOut.speed=0;g.adOut.brake=true;g.adOut.reverse=false;g.adOut.boost=false;g.adOut.why="energy plan not ready";capBy="energy plan not ready";laneSpeed=0;
                             ewhy=!currentPulse?"factory_pulse_ended":!er.at?"no_result_yet":er.vehicle!=self?"result_for_another_car":er.goal?"goal_scene_result":eage>500?"result_stale":"no_finite_candidate";
@@ -6168,6 +6392,12 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			const bool scripted = (g_cmds[idx].c.set & Command::kScripted) && GetTickCount64() < g_cmds[idx].until;
 			// Passenger control (kManual, 2026-11-17, ported 2026-11-18): the player's own hands on this NPC-driven vehicle; see vehicleflight.h Command.
 			const bool manual = (g_cmds[idx].c.set & Command::kManual) && GetTickCount64() < g_cmds[idx].until;
+#ifndef FVO_RELEASE
+			// Lab stock float (stockfloat.h): the hover holds one commanded absolute height, with no ground reference, while a lab lease renews it.
+			const bool stockFloat = idx >= 1 && idx < int(sizeof g_stockFloat / sizeof g_stockFloat[0]) && stockfloat::Active(g_stockFloat[idx], GetTickCount64());
+#else
+			constexpr bool stockFloat = false;
+#endif
             const auto* trafficPolicy=routeguidance::Policy(idx);
             const bool respondStatic=!g.autopilot||!trafficPolicy||trafficPolicy->obstacles!=2;
             const bool respondPeople=!g.autopilot||!trafficPolicy||trafficPolicy->people!=2;
@@ -6649,7 +6879,21 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				if (g.drive) {
 					// Speed from position differences (no physics step in this mode); the steer sign is checked against the
 					// heading change it causes.
-					if (g.drvT && tNow > g.drvT) {
+					// A relocation moved this car's pose on purpose (relocation.h): the jump is not speed. 2026-11-20 19:40 run: a 6 m move read as
+					// 24 m/s here (position difference over a short sample), which the plan then answered (moving_without_counted_steps, phase=reverse).
+					// While the move is in progress and once at its end the baseline is re-taken and the speed already known is kept.
+					bool relocationJump = false;
+					{
+						static std::uint64_t relocMark[kPilots] = {};
+						const std::uint64_t mark = npcvehicles::RelocationMark(At<std::uint32_t>(vehicle, off::kFormId));
+						if (mark != relocMark[idx] || (mark & 1u)) {
+							relocationJump = true;
+							logger::Observe("autopilot.speed", At<std::uint32_t>(vehicle, off::kFormId), 0x20u + (mark & 1u), "pilot=%d event=baseline_retaken mark=%llu in_progress=%d speed_kept=%.2f reason=relocation_jump_is_not_speed", idx, (unsigned long long)mark, int(mark & 1u), g.drvSp);
+							relocMark[idx] = mark;
+						}
+					}
+					if (relocationJump && g.drvT) { g.drvX = pos.x; g.drvY = pos.y; g.drvT = tNow; g.drvHead = heading; }
+					else if (g.drvT && tNow > g.drvT) {
 						const double dd = (tNow - g.drvT) / 1000.0;
 						if (dd >= 0.02) {
 							const double inst = std::hypot(pos.x - g.drvX, pos.y - g.drvY) / dd;
@@ -6961,9 +7205,14 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			else if (!level) {
 				g.holding = false;
 			}
+#ifndef FVO_RELEASE
+			if (stockFloat) {  // the commanded absolute height replaces every ground-relative rule above
+				g.hold = g_stockFloat[idx].z - refGround; g.holding = true; g.liftoff = false;
+			}
+#endif
 
-			// Settling onto the ground ends the hover.
-			if (groundOk && !g.liftoff && above < kLandHeight && v[2] <= 0.1 && !thrust) {  // never while climbing out
+			// Settling onto the ground ends the hover (never a lab float: its height is commanded, not the ground's).
+			if (groundOk && !g.liftoff && !stockFloat && above < kLandHeight && v[2] <= 0.1 && !thrust) {  // never while climbing out
 				if (!g.landedSince) g.landedSince = GetTickCount64();
 				if (GetTickCount64() - g.landedSince >= kLandMs) {
 					Stop(idx, "landed");
@@ -7123,7 +7372,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				if (g.ceilValid) {
 					// Never up into a ceiling: the hold (metres over refGround) stays under it; the climb-outs give way to it too.
 					const double maxHold = g.ceilZ - kCeilClear - kVehicleTop - refGround;
-					if (g.hold > maxHold) {
+					if (g.hold > maxHold && !stockFloat) {
 						g.hold = std::max(0.8, maxHold);
 						const ULONGLONG cNow = GetTickCount64();
 						if (logger::Verbose() && cNow - g.ceilLogAt >= 2000) {
@@ -7135,7 +7384,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				g_sh.hold = g.hold;
 				g_sh.refGround = refGround;
 				g_sh.groundUnder = floorOn ? std::max(g.ground, g.floorZ - 0.5) : g.ground;
-				g_sh.groundOk = groundOk;
+				g_sh.groundOk = groundOk && !stockFloat;  // a lab float has no ground reference: no floor-clearance push under the commanded height
 				g_sh.airborne = groundOk && above > 1.5;
 				g_sh.cap = g.cap;
 				attitudeActive=physical&&!g_sh.physicalFault;  // the autopilot too (2026-10-30, the user: everything of manual VTOL, the camera included)
@@ -8261,6 +8510,165 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			return r;
 		}
 
+        void RefreshFleetRails()
+        {
+            if (!g_fleetRailCount.load(std::memory_order_acquire) || !trafficprofile::FleetRailWritesAllowed()) return;
+            static std::uint64_t lastRefresh = 0;
+            const auto now = GetTickCount64();
+            if (now - lastRefresh < 100) return;
+            lastRefresh = now;
+            std::array<unsigned, fvolimits::kVehicles> vehicles{};
+            std::size_t count = 0;
+            {
+                std::lock_guard lk(g_fleetRailLock);
+                for (const auto& entry : g_fleetRails) vehicles[count++] = entry.first;
+            }
+            for (std::size_t i = 0; i < count; ++i) {
+                const auto id = vehicles[i];
+                const auto ref = RefById(id);
+                unsigned driver = 0;
+                bool seeded = false;
+                FvoFleetRailPoint position{}, ahead{}, enter{};
+                {
+                    std::lock_guard lk(g_fleetRailLock);
+                    const auto it = g_fleetRails.find(id);
+                    if (it == g_fleetRails.end()) continue;
+                    const auto& car = it->second;
+                    driver = car.driver;
+                    seeded = car.seeded;
+                    position = car.position;
+                }
+                if (ref && (!seeded || !FleetRailOwns(id))) {
+                    const auto p = At<game::Vec3>(ref, off::kRefPosition);
+                    position = {p.x, p.y, p.z};
+                }
+                if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) continue;
+                int pilot = 0;
+                for (int slot = 1; slot < kPilots; ++slot)
+                    if (g_jobs[slot].vehicleId == id && g_gs[slot].active && g_gs[slot].autopilot) { pilot = slot; break; }
+                std::uintptr_t instance = 0;
+                unsigned body = 0;
+                std::uint64_t driveStep = 0;
+                if (pilot) {
+                    auto& binding = g_shs[pilot];
+                    std::lock_guard lk(binding.lock);
+                    instance = binding.instance.load();
+                    body = binding.bodyId.load();
+                    if (!instance && binding.handoffStepAt && now - binding.handoffStepAt < 1500) {
+                        instance = binding.handoffStepInstance;
+                        body = binding.handoffStepBody;
+                    }
+                    if (binding.handoffStepInstance == instance && binding.handoffStepBody == body)
+                        driveStep = binding.handoffStepAt;
+                }
+                const bool playerTook = PlayerDriving(id);
+                const auto currentDriver = ref && !playerTook ? npcvehicles::VehicleDriverId(id) : 0;
+                double station = 0.0;
+                {
+                    std::lock_guard lk(g_fleetRailLock);
+                    const auto it = g_fleetRails.find(id);
+                    if (it == g_fleetRails.end()) continue;
+                    const auto& car = it->second;
+                    station = car.railOwner && car.seeded ? car.station : car.path.Project(position.x, position.y, position.z);
+                    const double look = fleetrail::ExitAhead(std::max(car.speed, car.railSpeed));
+                    ahead = car.path.At(car.path.Advance(station, look));
+                    enter = car.path.At(car.path.Advance(station, look + fleetrail::rules::kEnterAheadExtra));
+                }
+                loadedarea::RelocationCell here{}, next{}, further{};
+                const bool hereKnown = ref && loadedarea::RelocationDestination(id, float(position.x), float(position.y), here);
+                const bool nextKnown = ref && loadedarea::RelocationDestination(id, float(ahead.x), float(ahead.y), next);
+                const bool furtherKnown = ref && loadedarea::RelocationDestination(id, float(enter.x), float(enter.y), further);
+                std::lock_guard lk(g_fleetRailLock);
+                const auto it = g_fleetRails.find(id);
+                if (it == g_fleetRails.end() || !trafficprofile::FleetRailWritesAllowed()) continue;
+                auto& car = it->second;
+                const auto oldMode = car.mode;
+                const bool sameBody = instance && body && instance == car.instance && body == car.body;
+                const bool railFresh = sameBody && car.lastStep && now - car.lastStep < 1500;
+                const bool driveFresh = driveStep && now - driveStep < 1500;
+                const bool chassisReady = ref && pilot && instance && body && currentDriver == driver &&
+                    (railFresh || driveFresh) && !*car.fault;
+                const bool autopilotReady = pilot && (railFresh || driveFresh);
+                if (playerTook || (currentDriver && currentDriver != driver)) {
+                    car.railOwner = false;
+                    car.mode = fleetrail::Mode::Awaiting;
+                } else if (ref && hereKnown && !(here.cellAttached && !here.crossCell) && !railFresh && !driveFresh) {
+                    // Outside the attached cells the engine has dropped the body: move the reference along the path instead.
+                    if (car.mode != fleetrail::Mode::Reference) {
+                        if (!car.railOwner || !car.seeded) {
+                            car.station = station;
+                            car.position = position;
+                            car.seeded = true;
+                        }
+                        if (!(car.railSpeed > 0.0)) car.railSpeed = car.speed;
+                        car.refStepAt = now;
+                        car.blendReady = false;
+                        logger::Write("OBS system=traffic.fleet_rail event=reference_start vehicle=%08X driver=%08X station=%.1f speed=%.1f pos=%.1f,%.1f,%.1f",
+                            id, driver, car.station, car.railSpeed, car.position.x, car.position.y, car.position.z);
+                    }
+                    car.railOwner = true;
+                    car.mode = fleetrail::Mode::Reference;
+                    if (now - car.refStepAt >= fleetrail::rules::kReferenceStepMs) {
+                        const double dt = std::min(1.0, double(now - car.refStepAt) / 1000.0);
+                        const double want = std::min(car.speed, car.path.CornerSpeed(car.station));
+                        const double v = fleetrail::Approach(car.railSpeed, want, dt);
+                        const double s = car.path.Advance(car.station, v * dt);
+                        const auto target = car.path.At(s);
+                        if (loadedarea::StepReference(id, driver, float(target.x), float(target.y), float(target.z))) {
+                            car.station = s;
+                            car.railSpeed = v;
+                            car.position = target;
+                            car.refStepAt = now;
+                            if (++car.refSteps % 20 == 1)
+                                logger::Write("OBS system=traffic.fleet_rail event=reference_step vehicle=%08X steps=%u station=%.1f of %.1f speed=%.1f pos=%.1f,%.1f,%.1f",
+                                    id, car.refSteps, s, car.path.End(), v, target.x, target.y, target.z);
+                        }
+                    }
+                } else if (!hereKnown || !nextKnown) {
+                    if (!car.railOwner || !chassisReady) car.mode = fleetrail::Mode::Awaiting;
+                } else {
+                    const auto prior = car.railOwner ? fleetrail::Mode::Rail : car.mode;
+                    fleetrail::Facts facts;
+                    facts.attachedNow = here.cellAttached && !here.crossCell;
+                    facts.exitAheadAttached = next.cellAttached;
+                    facts.enterAheadAttached = furtherKnown && further.cellAttached;
+                    facts.chassisReady = chassisReady;
+                    facts.autopilotReady = autopilotReady;
+                    car.mode = fleetrail::Choose(prior == fleetrail::Mode::Reference ? fleetrail::Mode::Rail : prior, facts,
+                        car.modeSince && now >= car.modeSince ? now - car.modeSince : ~0ull);
+                    if (car.mode == fleetrail::Mode::Auto) {
+                        if (car.railOwner) {
+                            NoteFleetHandoff(id, car.railSpeed, now);
+                            logger::Write("OBS system=traffic.fleet_rail event=exit_ramp vehicle=%08X rail_speed=%.1f ramp_ms=%llu",
+                                id, car.railSpeed, fleetrail::rules::kRampMs);
+                        }
+                        car.railOwner = false;
+                        car.seeded = false;
+                    } else if (car.mode == fleetrail::Mode::Rail) {
+                        if (!car.railOwner || !car.seeded) {
+                            car.station = station;
+                            car.position = position;
+                            car.seeded = true;
+                            car.blendReady = false;  // the next rail step starts the entry blend from the car's actual pose
+                        }
+                        car.railOwner = true;
+                    }
+                }
+                if (car.railOwner && currentDriver == driver && instance && body) {
+                    if (!sameBody) { car.lastStep = 0; car.fault = ""; }
+                    car.instance = instance;
+                    car.body = body;
+                } else if (car.railOwner && (!ref || currentDriver != driver || !instance || !body)) {
+                    car.instance = 0;
+                    car.body = 0;
+                }
+                if (oldMode != car.mode) car.modeSince = now;
+                if (oldMode != car.mode)
+                    logger::Write("OBS system=traffic.fleet_rail event=mode vehicle=%08X driver=%08X mode=%d current_attached=%d ahead_attached=%d chassis_ready=%d",
+                        id, driver, int(car.mode), hereKnown && here.cellAttached, nextKnown && next.cellAttached, chassisReady);
+            }
+        }
+
 		// Descend before the drop. A stop for an autopilot-flown vehicle (every NPC pilot; the player's own vehicle while Auto, follow
 		// or a call flies it, never the player's manual flight) that is more than kDropMaxAbove over known ground is held: the
 		// vehicle hovers straight down over where it is, and the stop happens once it is down (or after kSettleMaxMs). Reasons that
@@ -8372,7 +8780,12 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			}
 			for (int idx = 1; idx < kPilots; ++idx) {
 				if (!g_gs[idx].active) { flownAt[idx] = unboundSince[idx] = seenAt[idx] = dangerAt[idx] = 0; g_straight[idx] = g_farHold[idx] = wasRelaxed[idx] = false; continue; }
-				const auto vehicle = RefById(g_jobs[idx].vehicleId);
+				const auto id = g_jobs[idx].vehicleId;
+                if (FleetRailOwns(id)) { flownAt[idx] = 0; continue; }
+#ifndef FVO_RELEASE
+                if (reloc::RailOwns(id)) { flownAt[idx] = 0; continue; }
+#endif
+				const auto vehicle = RefById(id);
 				const auto loaded = vehicle ? At<std::uintptr_t>(vehicle, off::kRefLoadedData) : 0;
 				if (!vehicle || vehicle != g_shs[idx].vehicle.load()) Stop(idx, "vehicle lost");
 				else if (vehicle == driven) Stop(idx, "the player took the vehicle");
@@ -8562,16 +8975,19 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 
 #ifndef FVO_RELEASE
     namespace relocate {
-        const char* Arm(std::uint32_t vehicleId, double dx, double dy, double dz, std::uint64_t serial)
+        const char* Arm(std::uint32_t vehicleId,double dx,double dy,double dz,std::uint64_t serial,std::uint64_t authority)
         {
-            if (!vehicleId || !serial || !std::isfinite(dx + dy + dz) || std::fabs(dx) > 30 || std::fabs(dy) > 30 || std::fabs(dz) > 30) return "bad_request";
+            // One write is one bounded hop (relocation.h kMaxHopM = 20 m; 25 m allows the measured-position correction). Longer moves are several
+            // hops, each read back before the next: the Coordinator in npcvehicles.cpp plans them.
+            if (!vehicleId || !serial || !std::isfinite(dx + dy + dz) || std::sqrt(dx * dx + dy * dy + dz * dz) > 25.0) return "bad_request";
+            if (FleetRailOwns(vehicleId) || reloc::RailOwns(vehicleId)) return "rail_owns_chassis";
             for (int i = 1; i < kPilots; ++i) if (g_jobs[i].vehicleId == vehicleId) {
                 auto& s = g_shs[i];
                 const auto instance = s.instance.load(); const auto body = s.bodyId.load();
                 if (!instance || !body) return "no_physics_instance";
                 auto& st = reloc::g_state; std::lock_guard lock(st.lock);
                 if (st.armed.load() || st.ready.load()) return "busy";
-                st.serial = serial; st.vehicleId = vehicleId; st.bodyId = body; st.instance = instance; st.dx = dx; st.dy = dy; st.dz = dz;
+                st.serial = serial; st.authority=authority; st.vehicleId = vehicleId; st.bodyId = body; st.instance = instance; st.dx = dx; st.dy = dy; st.dz = dz;
                 st.facts = Facts{}; st.lastActionAt = 0;
                 st.armed.store(true, std::memory_order_release);
                 return nullptr;
@@ -8600,6 +9016,58 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             if (serial != st.serial) return;
             st.armed.store(false); st.ready.store(false); st.serial = 0; st.instance = 0; st.bodyId = 0; st.vehicleId = 0;
         }
+
+        // ---- Far tier rail (diagnostic) ----
+        const char* RailStart(std::uint32_t vehicleId, double x0, double y0, double dirX, double dirY, double s0, double z0, double speed, double ride)
+        {
+            if (!vehicleId || !std::isfinite(x0 + y0 + dirX + dirY + s0 + z0 + speed + ride) || !(speed >= 0.0) || speed > 60.0) return "bad_request";
+            if (FleetRailOwns(vehicleId)) return "fleet_rail_owns_chassis";
+            const double len = std::hypot(dirX, dirY);
+            if (len < 0.5) return "bad_direction";
+            for (int i = 1; i < kPilots; ++i) if (g_jobs[i].vehicleId == vehicleId) {
+                auto& s = g_shs[i];
+                const auto instance = s.instance.load(); const auto body = s.bodyId.load();
+                if (!instance || !body) return "no_physics_instance";
+                auto& hop = reloc::g_state;
+                if (hop.armed.load() || hop.ready.load()) return "busy_hop_doer";
+                auto& r = reloc::g_rail; std::lock_guard lock(r.lock);
+                if (r.active.load()) return "rail_already_active";
+                r.vehicleId = vehicleId; r.bodyId = body; r.instance = instance;
+                r.p = farrail::RailParams{}; r.p.x0 = x0; r.p.y0 = y0; r.p.dirX = dirX / len; r.p.dirY = dirY / len; r.p.speed = speed; r.p.ride = ride;
+                r.st = farrail::RailState{}; r.st.s = s0; r.st.z = z0;
+                r.facts = RailFacts{}; r.facts.active = true; r.facts.s = s0; r.facts.z = z0;
+                r.active.store(true, std::memory_order_release);
+                return nullptr;
+            }
+            return "no_pilot_slot";
+        }
+        void RailStop()
+        {
+            auto& r = reloc::g_rail; std::lock_guard lock(r.lock);
+            r.active.store(false, std::memory_order_release); r.instance = 0; r.bodyId = 0; r.vehicleId = 0; r.facts.active = false;
+        }
+        bool RailRead(RailFacts& out)
+        {
+            auto& r = reloc::g_rail; std::lock_guard lock(r.lock);
+            out = r.facts; out.active = r.active.load(std::memory_order_acquire);
+            return r.vehicleId != 0 || out.steps != 0 || out.faults != 0;
+        }
+        void RailSetTerrain(int index, double z) { reloc::g_rail.profile.Set(index, z); }
+        void RailClearTerrain() { reloc::g_rail.profile.Clear(); }
+        int RailTerrainKnown() { return reloc::g_rail.profile.KnownCount(); }
+        bool ReadChassisNow(std::uint32_t vehicleId, ChassisNow& out)
+        {
+            out = ChassisNow{};
+            for (int i = 1; i < kPilots; ++i) if (g_jobs[i].vehicleId == vehicleId) {
+                auto& s = g_shs[i];
+                const auto instance = s.instance.load(); const auto body = s.bodyId.load();
+                if (!instance || !body) return false;
+                out.bound = true;
+                out.bodyValid = reloc::ReadBodyV(instance, body, out.pos, out.vel);
+                return out.bodyValid;
+            }
+            return false;
+        }
     }
 
     bool FactoryMotionProved(int pilot, unsigned vehicle, std::uint64_t lease)
@@ -8615,11 +9083,44 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         return stock && binding.handoffStepBody == proof.body &&
             bodybinding::Contains({binding.sceneBodies, binding.sceneCount}, proof.body);
     }
+
+    void RebaseFactoryMotionAfterTransfer(int pilot,unsigned vehicle,std::uint64_t lease)
+    {
+        if(pilot<1||pilot>=kPilots||g_jobs[pilot].vehicleId!=vehicle||!lease||
+           npcvehicles::FactoryStockLeaseOf(pilot,vehicle,false)!=lease)return;
+        if(g_spotVehicle[pilot]==vehicle){
+            g_spot[pilot]={};
+            g_spotMotion[pilot].Reset();
+            g_factoryTest[pilot]={};
+            g_testActive[pilot]=false;
+            if(g_stockPulseOwner==lease)g_stockPulseOwner=g_stockPulseAt=0;
+        }
+        {
+            std::lock_guard lock(g_spotLock);
+            g_spotProof.erase(vehicle);g_spotResult.erase(vehicle);g_spotRequest.erase(vehicle);
+            g_healthSample.erase(vehicle);g_selfReport.erase(vehicle);
+        }
+        g_probeRecent[pilot]={};
+        // The car leaves the lab float here: from now on the ordinary hover-or-drive rules of its route choose hover or wheels (no second decider).
+        if(pilot<int(sizeof g_stockFloat/sizeof g_stockFloat[0])){
+            logger::Write("OBS system=stock.float vehicle=%08X pilot=%d event=released_at_transfer lease=%llu commanded_z=%.2f reason=route_mode_by_the_ordinary_hover_or_drive_rules",
+                vehicle,pilot,static_cast<unsigned long long>(lease),g_stockFloat[pilot].z);
+            g_stockFloat[pilot]={};g_stockPulseIssued[pilot]={};
+            g_gs[pilot].liftoff=true;  // an ordinary take-off at the road if its route flies (never the ground-settle stop of a car that was floating)
+        }
+        logger::Write("OBS system=factory.transfer vehicle=%08X event=motion_rebased pilot=%d lease=%llu",
+            vehicle,pilot,static_cast<unsigned long long>(lease));
+    }
 #endif
 
     bool DriveFor(std::uint32_t vehicleFormId, DriveInput& out)
 	{
 		if (!vehicleFormId) return false;
+        // The native wheel-input provider still receives a neutral command while the rail owns the body.
+#ifndef FVO_RELEASE
+        if (reloc::RailOwns(vehicleFormId)) { out = {}; return true; }
+#endif
+        if (FleetRailOwns(vehicleFormId)) { out = {}; return true; }
 		for (int i = 0; i < kPilots; ++i) {
 			DriveInput frame;
             std::uint64_t authority=0;
@@ -9060,6 +9561,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			PlayerAirTick(player);
 		}
 		PlayerTick();
+        RefreshFleetRails();
 		PilotsTick();
 		for(auto&s:g_shs){std::lock_guard lk(s.lock);if(const auto ref=s.vehicle.load())BindBody(s,ref);}
 		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
@@ -9074,8 +9576,53 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 		if (boundPilots) *boundPilots = bound;
 		return total;
 	}
+    int FleetRailAssign(const FvoFleetRailRequest* request)
+    {
+        if (!trafficprofile::FleetRailWritesAllowed() || !request || !request->vehicle || !request->driver ||
+            !std::isfinite(request->speed) || request->speed < 0.0 || request->speed > 150.0 ||
+            PlayerDriving(request->vehicle)) return 0;
+        fleetrail::Path path;
+        if (!path.Set(request->points, request->count)) return 0;
+        std::lock_guard lk(g_fleetRailLock);
+        if (!trafficprofile::FleetRailWritesAllowed()) return 0;
+        const auto it = g_fleetRails.find(request->vehicle);
+        if (it == g_fleetRails.end() && g_fleetRails.size() >= fvolimits::kVehicles) return 0;
+        auto& car = g_fleetRails[request->vehicle];
+        if (car.driver && car.driver != request->driver) car = {};
+        car.driver = request->driver;
+        car.speed = request->speed;
+        if (!car.path.Same(path)) {
+            if (car.seeded) car.station = path.Project(car.position.x, car.position.y, car.position.z);
+            car.path = std::move(path);
+        }
+        g_fleetRailCount.store(unsigned(g_fleetRails.size()), std::memory_order_release);
+        return int(car.mode);
+    }
+
+    void FleetRailRelease(unsigned vehicle)
+    {
+        std::lock_guard lk(g_fleetRailLock);
+        if (vehicle) g_fleetRails.erase(vehicle);
+        else g_fleetRails.clear();
+        {
+            std::lock_guard handoffLock(g_fleetHandoffLock);
+            if (vehicle) g_fleetHandoffs.erase(vehicle);
+            else g_fleetHandoffs.clear();
+        }
+        g_fleetRailCount.store(unsigned(g_fleetRails.size()), std::memory_order_release);
+    }
+
+    int FleetRailState(unsigned vehicle)
+    {
+        std::lock_guard lk(g_fleetRailLock);
+        const auto it = g_fleetRails.find(vehicle);
+        if (it == g_fleetRails.end()) return 0;
+        return it->second.mode == fleetrail::Mode::Reference ? int(fleetrail::Mode::Rail) : int(it->second.mode);
+    }
+
 	void LoadReset()
 	{
+        FleetRailRelease(0);
         { std::lock_guard lock(g_floorProofLock); g_floorProofs = {}; g_nextFloorProof = 0; }
         (void)planenergy::TakeFloorProbe();
         for(int i=0;i<257;++i)routeguidance::Clear(i);
@@ -9086,6 +9633,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         for(auto& motion:g_spotMotion)motion.Reset();
         for(auto& test:g_factoryTest)test={};
         g_stockPulseOwner=0;g_stockPulseAt=0;
+        for(auto& f:g_stockFloat)f={};for(auto& i:g_stockPulseIssued)i={};
 #endif
         }for(auto& sp:g_spot)sp=spottest::State{};for(auto& v:g_spotVehicle)v=0;  // ST-B: ids are reused across saves
         for(int i=0;i<kPilots;++i)g_door.Clear(i);g_contacts.Reset();for(auto& f:g_planFlies)f=false;  // nothing carried into the next save
@@ -9111,9 +9659,6 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				g_shs[i].steps = 0;
 				g_shs[i].stepSerial=0;g_shs[i].lastStepAt=0;g_shs[i].lastStepInstance=0;
                 g_shs[i].handoffStepAt=0;g_shs[i].handoffStepInstance=0;
-#ifndef FVO_RELEASE
-                g_shs[i].factoryWheelRequestedAt=0;g_shs[i].factoryWheelContact={};
-#endif
 				g_shs[i].guardVehicle = 0;
 				g_shs[i].autopilot = false;
 			}
@@ -9139,6 +9684,29 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 		g_targetSession={};g_guard=false;g_cf=CoverFight{};
 		logger::Write("Rover flight: load reset discarded prior rover motion and body identity");
 	}
+}
+
+void FvoFleetRailFence()
+{
+    std::lock_guard lk(vehicleflight::g_fleetRailLock);
+}
+
+void FvoFleetRailReset()
+{
+    vehicleflight::FleetRailRelease(0);
+}
+
+extern "C" __declspec(dllexport) int FVO_FleetRailAssignV1(const FvoFleetRailRequest* request)
+{
+    return vehicleflight::FleetRailAssign(request);
+}
+extern "C" __declspec(dllexport) void FVO_FleetRailReleaseV1(unsigned vehicle)
+{
+    vehicleflight::FleetRailRelease(vehicle);
+}
+extern "C" __declspec(dllexport) int FVO_FleetRailStateV1(unsigned vehicle)
+{
+    return vehicleflight::FleetRailState(vehicle);
 }
 
 extern "C" __declspec(dllexport) int FVO_RegisterCruisePlanner(FvoCruisePlanner planner)
@@ -9208,11 +9776,6 @@ bool PlanLedgerLine(std::uint32_t v, char* out, int n){
     return true;
 }
 }
-// Field boxes from the traffic addon (fieldboxapi.h, step 3): optional both ways; without it the road reads as before.
-extern "C" __declspec(dllexport) int FVO_RegisterFieldBoxV1(FvoFieldBoxProviderV1 provider){
-    if(fieldboxapi::provider&&fieldboxapi::provider!=provider)return 0;
-    fieldboxapi::provider=provider;logger::Write("OBS system=plan.field event=provider registered=%d reason=addon_offers_field_boxes",int(provider!=nullptr));return 1;
-}
 // Spawn Census -> Owner Record (trafficcensusapi.h). The Census is the traffic part of this one record, never a second registry:
 // it claims Owner::Traffic (a stronger owner keeps the car: answer 2) and writes the traffic metadata. Optional both ways.
 namespace { std::unordered_map<std::uint32_t,std::string> g_censusWhy; }  // reasons must outlive the record (node-based: c_str stays put); under g_ownersLock
@@ -9253,30 +9816,8 @@ extern "C" __declspec(dllexport) int FVO_RegisterLanePermitV1(lanecoord::PermitP
     if(fieldgate::lanePermitProvider&&fieldgate::lanePermitProvider!=provider)return 0;
     fieldgate::lanePermitProvider=provider;return 1;
 }
-// PF-1: the pair self-report bits (selfreport::Bits) for the addon's Health. Optional export: an older addon never calls it.
-extern "C" __declspec(dllexport) unsigned FVO_PairSelfReportV1(std::uint32_t vehicle){
-    std::lock_guard sl(vehicleflight::g_spotLock);const auto it=vehicleflight::g_selfReport.find(vehicle);return it==vehicleflight::g_selfReport.end()?0u:selfreport::Facts(it->second,GetTickCount64());}
 extern "C" __declspec(dllexport) int FVO_SpotTestV1(std::uint32_t vehicle){
     std::lock_guard sl(vehicleflight::g_spotLock);const auto it=vehicleflight::g_spotResult.find(vehicle);return it==vehicleflight::g_spotResult.end()?0:it->second;}
-#ifndef FVO_RELEASE
-extern "C" __declspec(dllexport) int FVO_SpotMotionProofV1(
-    std::uint32_t vehicle, unsigned long long after, struct FvoSpotMotionProofV1* out)
-{
-    if (!vehicle || !out || out->size != sizeof(*out) || out->version != 1) return 0;
-    std::lock_guard lock(vehicleflight::g_spotLock);
-    const auto it = vehicleflight::g_spotProof.find(vehicle);
-    if (it == vehicleflight::g_spotProof.end() || it->second.started <= after) return 0;
-    const auto& proof = it->second;
-    out->body = proof.body;
-    out->direction = int(proof.direction);
-    out->started = proof.started;
-    out->completed = proof.completed;
-    out->builtAt = proof.builtAt;
-    out->steps = proof.steps;
-    out->moved = proof.moved;
-    return 1;
-}
-#endif
 extern "C" __declspec(dllexport) int FVO_TrafficCensusPublishV1(const FvoTrafficCensusV1* c){
     using vehicleflight::g_owners;using vehicleflight::g_ownersLock;
     if(!c||c->size<sizeof(FvoTrafficCensusV1)||c->version!=1||!c->vehicle)return 0;

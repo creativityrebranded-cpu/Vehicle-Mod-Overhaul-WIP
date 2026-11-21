@@ -779,12 +779,5 @@ namespace navmesh
 	}
 }
 
-// Core exports for FVO_Traffic.dll (optional, read with GetProcAddress): see navmesh::Deck and navmesh::Want.
+// Core export for FVO_Traffic.dll (optional, read with GetProcAddress): see navmesh::Want.
 extern "C" __declspec(dllexport) void FVO_NavWantV1(double x, double y) { navmesh::Want(x, y, "spawn_spot"); }
-extern "C" __declspec(dllexport) int FVO_NavDeckV1(double x, double y, double z, double* deck)
-{
-	double found = 0;
-	const int r = navmesh::Deck(x, y, z, found);
-	if (r > 0 && deck) *deck = found;
-	return r;
-}
