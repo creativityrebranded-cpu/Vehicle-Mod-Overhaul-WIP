@@ -3270,7 +3270,15 @@ namespace generator
                 if(site==1&&g_roadCheck){
                     const FvoRoadSiteV1 envelope{pose.x,pose.y,pose.z,pose.heading,p.radius,p.halfHeight};
                     const auto result=g_roadCheck(&envelope,&clearance);
-                    if(result==FvoRoadClearance::Unknown||(result==FvoRoadClearance::Clear&&!clearance.epoch)){
+                    if((result==FvoRoadClearance::Unknown||(result==FvoRoadClearance::Clear&&!clearance.epoch))&&window.cover){
+                        // Under cover (loading screen / X panel) the core's road check often cannot answer yet (its inventory is still being
+                        // copied, or the spot's cell is not attached): the spacing check above, against every vehicle the add-on can see, is
+                        // the occupancy answer and nothing is visible (user, 2026-11-21: "Yes, do that"). The birth goes without road proof.
+                        clearance={};
+                        observations::Record(g_logFn,now,"traffic.birth",0,4u,
+                            "event=road_check_skipped speaker=arbiter reason=covered_road_clearance_unknown slot=%d at=%.2f,%.2f,%.2f",i,pose.x,pose.y,pose.z);
+                    }
+                    else if(result==FvoRoadClearance::Unknown||(result==FvoRoadClearance::Clear&&!clearance.epoch)){
                         ++fillSiteWait;p.at=now+250;
                         g_clearanceWaiting.insert(i);
                         if(alternatives!=g_initialAlternatives.end()&&!alternatives->second.empty())
