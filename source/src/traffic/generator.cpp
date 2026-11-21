@@ -399,6 +399,10 @@ namespace generator
 		// and the driver on the vehicle (under 1 m) is in the seat.
 		bool SeatedPair(bool v3D,bool d3D,bool aboard,int sit,double separation){
 			return trafficpair::ReadyAt(v3D,d3D,aboard,sit,separation);}  // sitting (sit state 3), not merely linked
+		// AP-1 (2026-11-21): in the air only when the ground there is known and the car is well above it. Unknown ground (off the
+		// road, no navmesh) is not proof of air: 17:36 run, FF100060 stood on the ground 40 m off its lane, was frozen as "in the air",
+		// and its driver ended 92.7 m from it.
+		bool KnownAirborne(const Pos& vp){double nav=0,baked=0;const int known=engineport::Forward<&FvoTrafficApi::ground>(g_api,"ground","generator",0u,vp.x,vp.y,vp.z,&nav,&baked);if(!known)return false;const double g=known&2?baked:nav;return std::isfinite(g)&&vp.z-g>2.5;}
 		bool Grounded(const Pos& vp){double nav=0,baked=0;const int known=engineport::Forward<&FvoTrafficApi::ground>(g_api,"ground","generator",0u,vp.x,vp.y,vp.z,&nav,&baked);return known&&std::isfinite(known&2?baked:nav)&&std::fabs(vp.z-(known&2?baked:nav))<2.5;}
 
 		// Bound at the start of a frame, so a concurrent load cannot redirect an old frame's writes.
@@ -2459,7 +2463,7 @@ namespace generator
                 if(g_api->pilotHolds&&g_api->holdBirth&&now-p.fallCheckAt>=500&&!p.staged){
                     p.fallCheckAt=now;
                     FvoTrafficRef v{};
-                    if(Info(p.vehicle,v)&&v.has3D&&!engineport::Forward<&FvoTrafficApi::pilotHolds>(g_api,"pilotHolds","generator",0u,p.vehicle)&&!Grounded({v.x,v.y,v.z})){
+                    if(Info(p.vehicle,v)&&v.has3D&&!engineport::Forward<&FvoTrafficApi::pilotHolds>(g_api,"pilotHolds","generator",0u,p.vehicle)&&KnownAirborne({v.x,v.y,v.z})){
                         engineport::Forward<&FvoTrafficApi::holdBirth>(g_api,"holdBirth","generator",0u,p.vehicle);p.staged=true;SaveIds(i,p);p.frozenAt=now;
                         Log("OBS system=traffic.cleanup vehicle=%08X event=held_until_retired slot=%d pos=%.0f,%.0f,%.0f reason=no_pilot_holds_it_in_the_air",p.vehicle,i,v.x,v.y,v.z);
                     }
@@ -2481,7 +2485,8 @@ namespace generator
 				const bool aboard = Aboard(p.driver, p.vehicle);
 				// A driver aboard gets a new trip wherever the vehicle stopped (the journey goes on). M1: one who got out is no longer seated
 				// again here; that is Health's fact (driver_out) and Retirement replaces the pair once unseen.
-				if (!aboard || p.restarts >= kRestarts) return;
+				// AP-1: a frozen (staged) pair waits for Retirement; a new trip on a car that cannot move pulled the driver away (FF100060).
+				if (!aboard || p.restarts >= kRestarts || p.staged) return;
 				if (!p.idleSince) { p.idleSince = now; return; }
 				if (now - p.idleSince < kIdleMs) return;
 				p.idleSince = 0;

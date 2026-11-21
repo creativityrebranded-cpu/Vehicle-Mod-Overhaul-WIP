@@ -437,16 +437,17 @@ int main() {
         auto blockedBack = memory;
         auto held = memory;
         auto r = energyplan::Plan(current, spec, 6, scene, memory, 11.2);
-        Check(r.ok && r.first.speed < -.1 && std::strcmp(r.step, "retrace") == 0 && r.traj[energyplan::kSteps].y < -2,
-              "route recovery reverses along travelled geometry toward the checkpoint");
+        Check(r.ok && r.first.speed < -.1 && std::strcmp(r.step, "back_up") == 0 && std::strcmp(r.why, "recover: back up") == 0 &&
+              r.traj[energyplan::kSteps].y < -2, "AP-1: in traffic the routine's back-up step is the one plan (retrace is off)");
         scene.solids.push_back({0, -3.0, 0, 1.5, .25});
         scene.Index();
         r = energyplan::Plan(current, spec, 6, scene, blockedBack, 11.2);
-        Check(r.ok && std::strcmp(r.step, "retrace") != 0, "an alternative outranks retrace when an obstacle blocks the old trail");
+        Check(r.ok && blockedBack.recStepBlocked && std::strcmp(r.why, "recover: back up") != 0,
+              "AP-1: a blocked back-up step is told to the routine; the candidates choose this tick");
         scene.managerHeld = true;
         scene.stopStation = 0;
         r = energyplan::Plan(current, spec, 0, scene, held, 11.2);
-        Check(std::strcmp(r.step, "retrace") != 0, "Traffic hold takes priority over retrace");
+        Check(std::strcmp(r.step, "back_up") != 0 && std::strcmp(r.step, "retrace") != 0, "Traffic hold takes priority over the routine");
     }
     {
         Check(energyplan::WeightedEnergy(2, 1.e100) < energyplan::WeightedEnergy(3, -1.e100) &&

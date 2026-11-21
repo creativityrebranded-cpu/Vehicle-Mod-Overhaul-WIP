@@ -93,7 +93,7 @@ struct Sim {
         if (c.mode == Mode::Recover && c.step == Step::BackUp && c.steer != 0.0) backUpSteerZero = false;
         if (v < 0.0 && prevWant >= 0.0) ++reverseSwaps;
         prevWant = v;
-        h += steer * 0.8 * kDt;
+        h += steer * 0.8 * kDt * (v < 0.0 ? -1.0 : 1.0);  // AP-1: reversing, the same wheel turns the nose the other way
         double ds = v * std::cos(h) * kDt;
         if (wallOn && !lift && s <= wall && s + ds > wall) {
             ds = std::max(0.0, wall - s);
@@ -208,13 +208,13 @@ int main() {
         std::printf("     wall hit %.1f s, Recover %.1f s (%s), %.1f s later\n", w.wallHitAt, w.firstRecoverAt, w.firstRecoverWhy, wait);
         Check(wait >= 5.0 && wait <= 6.3 && std::string(w.firstRecoverWhy) == "no_progress_6s",
               "wall: Recover after ~6 s without progress, why no_progress_6s");
-        Check(w.last.step == Step::BackUp && w.last.wantSpeed < 0.0 && w.last.steer == 0.0 && w.st.tries == 1,
-              "wall: first step BackUp, reverse at 1.5 m/s, steer 0, try 1");
+        Check(w.last.step == Step::BackUp && w.last.wantSpeed < 0.0 && w.last.steer > 0.0 && w.st.tries == 1,
+              "wall: first step BackUp, reverse at 1.5 m/s steering the nose toward the lane, try 1");
         w.RunUntil(10.0, [](const Command& c) { return c.step == Step::TurnToLane; });
         std::printf("     backed %.2f m, heading drift %.3f rad, why %s\n", w.maxBackedPath, w.backUpHeadingDrift, w.last.why);
-        Check(w.maxBackedPath >= 2.9 && w.maxBackedPath <= 3.3 && w.backUpSteerZero && w.backUpHeadingDrift < 1e-9 &&
-              std::string(w.last.why) == "backed_up_3m",
-              "wall: backed up ~3 m straight, then TurnToLane (backed_up_3m)");
+        Check(w.maxBackedPath >= 4.9 && w.maxBackedPath <= 5.3 && !w.backUpSteerZero && w.backUpHeadingDrift > 0.3 &&
+              std::string(w.last.why) == "backed_up",
+              "wall: backed up ~5 m turning toward the lane (AP-1), then TurnToLane (backed_up)");
         Check(w.last.steer < 0.0 && w.last.wantSpeed > 0.0, "wall: TurnToLane steers toward the lane, rolling forward");
         w.RunUntil(10.0, [](const Command& c) { return c.step == Step::Retry; });
         Check(std::fabs(w.h) < w.rules.turnDone && std::string(w.last.why) == "facing_the_lane",
@@ -269,6 +269,22 @@ int main() {
         w.forceBlocked = false;
         w.RunFor(10.0);
         Check(w.firstRecoverAt < 0.0 && w.last.mode == Mode::Follow, "stop line: drives on after release");
+    }
+
+    {   // AP-1: a managed car nose-on with a clear way back reverses at once; a blocked turn backs up again (multi-point turn)
+        State st; Input in; in.now = 1.0; in.continuous = true; in.forwardBlocked = true; in.reverseFeasible = true; in.headingErrToLane = 0.6;
+        auto c = Update(st, in);
+        Check(c.mode == Mode::Recover && c.step == Step::BackUp && std::string(c.why) == "forward_blocked_reverse_clear" && c.steer > 0.0,
+              "AP-1: forward blocked, reverse clear: BackUp at once, steering toward the lane");
+        in.forwardBlocked = false; in.stepBlocked = true; in.now = 1.1; c = Update(st, in);
+        Check(c.step == Step::TurnToLane && std::string(c.why) == "reverse_blocked", "AP-1: a blocked back-up step ends: TurnToLane");
+        Check(c.steer <= -1.0 + 1e-9, "AP-1: TurnToLane at 0.6 rad is full lock");
+        std::string seq;
+        for (int i = 0; i < 6; ++i) { in.now += .1; c = Update(st, in); seq += c.step == Step::BackUp ? 'B' : c.step == Step::TurnToLane ? 'T' : c.step == Step::Retry ? 'R' : '?'; if (c.step == Step::Retry) break; }
+        Check(seq == "BTBTR" && std::string(c.why) == "turn_blocked", "AP-1: blocked turn: back up again twice, then Retry (turn_blocked)");
+        std::printf("     cycles %s\n", seq.c_str());
+        State q; Input j; j.now = 1.0; j.continuous = false; j.forwardBlocked = true; j.reverseFeasible = true;
+        Check(Update(q, j).mode == Mode::Follow, "AP-1: an unmanaged car (player autopilot) keeps the 6 s no-progress rule");
     }
 
     {   // nothing feasible for 2 s -> Recover

@@ -214,7 +214,9 @@ struct Memory { bool have = false; Candidate best; bicycle::State traj[kSteps + 
                 int relWorse = 0, relClose = 0, relSolid = 0, relYield = 0, relTimer = 0, keptN = 0; double relSince = -1;
                 // RV-1: the mode state machine, when the plan last ran (2 s apart: a fresh start), where the car stood then (progress)
                 Trail trail;
-                recovery::State rec; double recSeen = -1, progX = 0, progY = 0; };  // HC-3: switches per rule, per second
+                recovery::State rec; double recSeen = -1, progX = 0, progY = 0;
+                bool recStepBlocked = false;  // AP-1: the routine's held step was not clear (fed to the next tick)
+                double queuedSince = -1; };   // AP-1: since when the lane centre is blocked by a road user (queued in traffic)  // HC-3: switches per rule, per second
 
 
 inline bicycle::Control Command(const Segment& g, const bicycle::Spec& k, const Weights& wt) {
@@ -755,7 +757,10 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
                     mem.trail.Note(s, 0, false, now);
             }
             if (mem.trail.target < 0) mem.trail.target = mem.trail.FindTarget(s);
-            if (mem.trail.target >= 0)
+            // AP-1 (2026-11-21): retrace is off. It backed straight down the way the car came, so the car pointed at the same
+            // obstacle again (17:36 run: ~430 retrace picks, cars rocking a metre back and forth). The held routine reverses instead.
+            constexpr bool kRetrace = false;
+            if (kRetrace && mem.trail.target >= 0)
                 addPrimitive("recover: retrace travelled path", 0., -1.2, true);
         } else {
             mem.trail.target = -1;
@@ -794,7 +799,7 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
     // nothing. REPLACES the SL-1 ladder weights, RH-1 ladder timers and the LD-1 layer flag.
     recovery::Command cmd;
     {
-        bool anyCentre = false, anyFeasible = false, anyMoving = false, reverseFeasible = false; int full = -1; unsigned options = 0;
+        bool anyCentre = false, anyFeasible = false, anyMoving = false, reverseFeasible = false, anyForwardClear = false; int full = -1; unsigned options = 0;
         for (int i = 0; i < n; ++i) {
             if (!weighted && cands[i].count && cands[i].seg[0].retrace) {
                 energies[i] = kInf; rejects[i] = "retrace_rebuild";
@@ -802,6 +807,7 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
             }
             const bool ok = std::isfinite(energies[i]) && (!weighted || clearanceTiers[i] == 0);
             if (ok) anyFeasible = true; if (ok && cands[i].count && cands[i].seg[0].speed < -.05) reverseFeasible = true;
+            if (ok && cands[i].count && cands[i].seg[0].speed > .1) anyForwardClear = true;
             if (ok && cands[i].count && std::fabs(cands[i].seg[0].speed) > .1) {
                 anyMoving = true;
                 const auto& g = cands[i].seg[0];
@@ -818,7 +824,9 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
             Terms traceTerms; double traceClearance;
             Score(cands[full], s, k, want, w, wt, &mem, now, traceTerms, nullptr, traceClearance, hint, field, &r.centreBlock, weighted);
         }
-        const bool waitingForUser = full >= 0 && !std::isfinite(energies[full]) && rejects[full] && std::strstr(rejects[full], "road_user");  // queued behind traffic: waiting, not stuck
+        // AP-1: in weighted mode a road user does not reject the plan, it raises its tier to 30..49 (only movers use those tiers).
+        const bool waitingForUser = full >= 0 && ((!std::isfinite(energies[full]) && rejects[full] && std::strstr(rejects[full], "road_user")) ||
+                                                  (weighted && std::isfinite(energies[full]) && clearanceTiers[full] >= 30));  // queued behind traffic: waiting, not stuck
         double st = std::numeric_limits<double>::quiet_NaN(), lat = 0, half = 0; if (lane) w.Route(s.x, s.y, st, lat, half, hint);
         // Progress since the last plan, both positions in this snapshot (route stations restart with every snapshot: LR-1); a plan not run
         // for 2 s (Cruise off and on) starts the mode afresh.
@@ -839,7 +847,7 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
             if (w.Floor(s.x, s.y, gz0) && w.Floor(s.x + std::sin(s.heading) * ahead, s.y + std::cos(s.heading) * ahead, gz1)) in.roadGrade = (gz1 - gz0) / ahead; }
         in.speed = s.speed; in.headingErrToLane = std::remainder(s.heading - laneHeading, 2 * 3.14159265358979323846); in.hoverAllowed = hoverOK;
         in.meantToStand = want < .5 || (std::isfinite(w.stopStation) && std::isfinite(st) && w.stopStation - st < 10.0) || waitingForUser;
-        bool managed = false, trafficHold = false, swept = false;
+        bool managed = false, trafficHold = false, swept = false, queuedWait = false;
         if constexpr (requires { w.continuousRecovery; w.managerHeld; w.checkedPath; }) {
             managed = w.continuousRecovery;
             trafficHold = w.managerHeld || (std::isfinite(w.stopStation) && std::isfinite(st) &&
@@ -857,9 +865,15 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
             else mem.trail.Note(s, options, swept, now);
             if (trafficHold) mem.trail.target = -1;
             in.continuous = true;
-            in.meantToStand = trafficHold;
+            // AP-1: queued behind a road user is waiting, not stuck (17:36 run: followers of a stuck car started recovering and
+            // made the jam worse). After kQueuePatience s the queue counts as stuck, so a car behind a dead one can still get round.
+            constexpr double kQueuePatience = 20.0;
+            if (waitingForUser && !trafficHold) { if (mem.queuedSince < 0 || now < mem.queuedSince) mem.queuedSince = now; } else mem.queuedSince = -1;
+            queuedWait = waitingForUser && !trafficHold && now - mem.queuedSince <= kQueuePatience;
+            in.meantToStand = trafficHold || queuedWait;
             in.anyFeasible = anyMoving;
         }
+        in.forwardBlocked = !anyForwardClear; in.stepBlocked = mem.recStepBlocked; mem.recStepBlocked = false;
         cmd = recovery::Update(mem.rec, in);
         r.layer = cmd.mode == recovery::Mode::Follow ? "follow" : cmd.mode == recovery::Mode::Avoid ? "avoid" : cmd.mode == recovery::Mode::Recover ? "recover" : "stand";
         r.step = cmd.step == recovery::Command::Step::BackUp ? "back_up" : cmd.step == recovery::Command::Step::TurnToLane ? "turn_to_lane" : cmd.step == recovery::Command::Step::Retry ? "retry" : cmd.step == recovery::Command::Step::Hover ? "hover" : "none";
@@ -867,8 +881,27 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
         auto only = [&](auto keep, const char* why) { for (int i = 0; i < n; ++i) if (!keep(i) && std::isfinite(energies[i])) { energies[i] = kInf; rejects[i] = why; } };
         if (weighted && !trafficHold) {
             preferRecovery = cmd.mode == recovery::Mode::Recover || !anyMoving;
-            for (int i = 0; i < n; ++i) {
-                if (cands[i].count && std::fabs(cands[i].seg[0].speed) <= .1 && !std::isfinite(w.stopStation)) {
+            // AP-1: the routine's held step (back up / turn to the lane) is the one plan while it is clear; a blocked step is told to
+            // the routine (next tick it moves on) and this tick the candidates compete as before.
+            bool heldStep = false;
+            if (cmd.mode == recovery::Mode::Recover && (cmd.step == recovery::Command::Step::BackUp || cmd.step == recovery::Command::Step::TurnToLane) &&
+                std::isfinite(cmd.wantSpeed) && n < kMaxCandidates) {
+                Candidate c; c.count = 1; c.seg[0].input = std::isfinite(cmd.steer) ? cmd.steer : 0.0; c.seg[0].speed = cmd.wantSpeed; c.seg[0].seconds = kSteps * kDt;
+                c.kind = cmd.step == recovery::Command::Step::BackUp ? "recover: back up" : "recover: turn to the lane";
+                Terms t; double cl; const double e = Score(c, s, k, want, w, wt, &mem, now, t, nullptr, cl, hint, field, nullptr, true, true);
+                if (std::isfinite(e) && t.clearanceTier == 0) {
+                    cands[n] = c; energies[n] = e; clearanceTiers[n] = 0; rejects[n] = nullptr; ++n; r.candidates = n;
+                    only([&](int i) { return i == n - 1; }, "recover_step_only");
+                    heldStep = true;
+                } else mem.recStepBlocked = true;
+            }
+            for (int i = 0; i < n && !heldStep; ++i) {
+                if (!std::isfinite(energies[i])) continue;
+                if (cands[i].count && cands[i].seg[0].speed < -.05 && queuedWait) {
+                    // AP-1: no reversing in a queue (a car behind a stopped car waits)
+                    energies[i] = kInf;
+                    rejects[i] = "queued_behind_traffic";
+                } else if (cands[i].count && std::fabs(cands[i].seg[0].speed) <= .1 && !std::isfinite(w.stopStation) && !queuedWait) {
                     energies[i] = kInf;
                     rejects[i] = "stationary_without_stop_order";
                 } else {
