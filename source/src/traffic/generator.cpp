@@ -191,6 +191,7 @@ namespace generator
             std::string spotKey; bool bothLoadedOnce = false, brokenEvidenceJudged = false, bodyJudged = false, releaseAttempted = false, releaseJudged = false, driveJudged = false; double relX = 0, relY = 0;
             double radius=8,halfHeight=6;
             bool vehiclePending=false,driverPending=false; int relocating=0;
+            ULONGLONG flowStuckSince=0;  // flow: since when this real car sits outside the loaded area without moving (Awaiting / no model)
             bool vehicleIssued=false,driverIssued=false;
             std::uint64_t birthGrant=0;
             FvoBirthSource driverSource=FvoBirthSource::Fleet;
@@ -252,6 +253,7 @@ namespace generator
         // past kFlowReturnM (moved by the core's far model meanwhile) is retired out of sight and its position goes on simulated.
         generator::FlowPose g_flowPose=nullptr;std::vector<FvoPoolSpot> g_slotPose;std::vector<char> g_slotPoseOk;
         constexpr double kFlowEdgeMinM=120.0,kFlowReturnM=900.0;
+        constexpr ULONGLONG kFlowStepMs=250,kFlowStuckMs=4000;  // flow step period; how long a car may sit unmoving outside the loaded area
         ULONGLONG g_flowToldAt=0;
         const FvoPoolSpot& SlotPose(int i){return g_flowPose&&i>=0&&i<int(g_slotPose.size())&&g_slotPoseOk[std::size_t(i)]?g_slotPose[std::size_t(i)]:g_initialScene[std::size_t(i)];}
         std::vector<bool> g_initialRoads;
@@ -3202,7 +3204,8 @@ namespace generator
                 const auto distance=std::hypot(slotAt.x-pp.x,slotAt.y-pp.y);
                 // In play only replace a real shortfall within the existing native
                 // service envelope. Ring order does not reject any candidate.
-                if(live&&(distance>spawnflow::rules::liveRadius||(g_flowPose&&distance<kFlowEdgeMinM)))continue;  // flow: in play a car appears only at the loaded edge
+                if(live&&(distance>spawnflow::rules::liveRadius||(g_flowPose&&distance<kFlowEdgeMinM)))continue;
+                if(g_flowPose&&!live&&distance>spawnflow::rules::liveRadius)continue;  // flow, covered: only where the game loads the car (17:36 run: 23 made beyond it never got a model)  // flow: in play a car appears only at the loaded edge
                 order.push_back({i,distance,FleetRing(distance,reach)});
             }
         }
@@ -3529,7 +3532,9 @@ namespace generator
         const Snap* occupancy=&snap;
         if(g_roadVehicles&&spawnflow::MayCreate(window,budget.granted,0))
             occupancy=ReadVehicles(held,true)?&held:nullptr;
-        if(g_flowPose){
+        static ULONGLONG flowStepAt=0;
+        if(g_flowPose&&(now-flowStepAt>=kFlowStepMs||g_slotPose.size()!=std::size_t(std::min(int(g_initialScene.size()),int(g_pairs.size()))))){
+            flowStepAt=now;
             const int slots=std::min(int(g_initialScene.size()),int(g_pairs.size()));
             g_slotPose.resize(std::size_t(slots));g_slotPoseOk.resize(std::size_t(slots));
             int real=0,simulated=0,returned=0;
@@ -3540,12 +3545,17 @@ namespace generator
                 g_slotPoseOk[std::size_t(i)]=g_flowPose(i,haveCar?&car:nullptr,g_slotPose[std::size_t(i)])?1:0;
                 if(haveCar)++real;else ++simulated;
                 // Far past the loaded area: the car goes back to the flow (retired out of sight; its position keeps moving simulated).
-                if(presentation==1&&haveCar&&!p.proving&&!p.staged&&!p.handoffPending&&Driving(p)&&
-                   std::hypot(v.x-pp.x,v.y-pp.y)>kFlowReturnM){
+                const double away=haveCar?std::hypot(v.x-pp.x,v.y-pp.y):0;
+                const int fleetMode=haveCar&&g_fleetState?g_fleetState(p.vehicle):0;
+                const bool stuck=haveCar&&away>spawnflow::rules::liveRadius&&(fleetMode==3||(p.proving&&!v.has3D));
+                if(!stuck)p.flowStuckSince=0;else if(!p.flowStuckSince)p.flowStuckSince=now;
+                const bool stuckLong=stuck&&now-p.flowStuckSince>=kFlowStuckMs;
+                if(presentation==1&&haveCar&&((!p.proving&&!p.staged&&!p.handoffPending&&Driving(p)&&away>kFlowReturnM)||stuckLong)){
                     const auto order=DecideRetirement(p,p.driver,"returned_to_flow");
                     if(order.decision.now){
                         if(g_fleetRelease)g_fleetRelease(p.vehicle);
-                        Log("OBS system=traffic.flow vehicle=%08X driver=%08X event=returned_to_flow slot=%d distance=%.0f rule=%s",p.vehicle,p.driver,i,std::hypot(v.x-pp.x,v.y-pp.y),order.rule);
+                        Log("OBS system=traffic.flow vehicle=%08X driver=%08X event=returned_to_flow slot=%d distance=%.0f reason=%s fleet_mode=%d rule=%s",p.vehicle,p.driver,i,away,
+                            stuckLong?(p.proving?"no_model_outside_loaded_area":"not_moving_outside_loaded_area"):"beyond_return_distance",fleetMode,order.rule);
                         SetLife(i,p,spawnflow::Life::Retiring,"returned_to_flow");ApplyRetirement(order);
                         p=Pair{};p.st=St::Empty;SaveIds(i,p);++returned;
                     }
