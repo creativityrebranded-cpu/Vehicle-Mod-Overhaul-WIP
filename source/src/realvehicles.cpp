@@ -243,8 +243,14 @@ namespace realvehicles
 
 		// The data handler's per-type form lists: {lock 8, uint32 size, uint32 capacity, form** data} each 0x18 bytes,
 		// starting at +0x70 in CommonLibSF's 1.14 layout; the start is checked by finding the player vehicle's base.
+		// Read once from the data handler's form lists (static after data load). Called by Tick (full simulation) and, since 2026-11-21,
+		// by RefreshRoadInventory on first use, so the road inventory is ready when the world is ready behind the loading screen
+		// (before, the list was empty until full simulation started, ~2 s before the screen closed: 0 of 61 arrival births). The lock
+		// makes a second caller wait for the finished list instead of reading it half-built.
+		std::mutex g_discoverLock;
 		void DiscoverVehicles()
 		{
+			std::lock_guard discoverLock(g_discoverLock);
 			if (g.haveVehicles) return;
 			g.haveVehicles = true;
 			const uptr dh = Ptr(addr::kDataHandlerPtr);
@@ -1054,8 +1060,9 @@ namespace realvehicles
         }
     }
 
-    void RefreshRoadInventory(uptr playerCell, uptr world)
+    void RefreshRoadInventory(uptr playerCell, uptr world, bool covered)
     {
+        if (world && playerCell) DiscoverVehicles();  // the vehicle type list the inventory needs; at once, not at the first full update
         std::unique_lock lock(g_roadInventoryLock, std::try_to_lock);
         if (!lock) return;
         if (world != g_roadWorld) SetRoadWorld(playerCell, world);
@@ -1107,7 +1114,9 @@ namespace realvehicles
             else ++it;
         }
         const auto now = GetTickCount64();
-        unsigned budget = roadclearance::scanRefs;
+        // Covered (loading screen / X panel): the frame is held and the arrival window is short, so the inventory may take far more per call.
+        unsigned budget = covered ? roadclearance::scanRefs * 16 : roadclearance::scanRefs;
+        const double timeCap = covered ? .008 : .0005;
         LARGE_INTEGER began{}, frequency{}; QueryPerformanceCounter(&began); QueryPerformanceFrequency(&frequency);
         for (std::size_t visited = 0; visited < cells.size() && budget; ++visited) {
             const auto cell = cells[g_roadCursor++ % cells.size()];
@@ -1115,7 +1124,7 @@ namespace realvehicles
             if (!source.next.entries.size() && roadclearance::Fresh(source.seen.at, now, roadclearance::refreshMs)) continue;
             uptr* refs = nullptr;
             if (!RoadView(cell, source, refs)) { source.seen = {}; source.next = {}; continue; }
-            const unsigned slice = std::min(budget, source.persistent ? 512u : 256u);
+            const unsigned slice = std::min(budget, covered ? budget : source.persistent ? 512u : 256u);
             for (unsigned n = 0; n < slice && source.next.entries.size() < source.count; ++n, --budget) {
                 uptr ref = 0; bool vehicle = false;
                 if (!RoadEntry(refs, unsigned(source.next.entries.size()), ref, vehicle)) {
@@ -1133,7 +1142,7 @@ namespace realvehicles
                 source.next.at = 0; source.next.entries.clear(); source.next.vehicles.clear();
             }
             LARGE_INTEGER at{}; QueryPerformanceCounter(&at);
-            if (double(at.QuadPart - began.QuadPart) > double(frequency.QuadPart) * .0005) break;
+            if (double(at.QuadPart - began.QuadPart) > double(frequency.QuadPart) * timeCap) break;
         }
     }
 

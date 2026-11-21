@@ -15,7 +15,7 @@ struct FvoTrafficVehicle;
 namespace realvehicles
 {
     bool ReadModelBounds(std::uintptr_t base, double (&half)[3], double& bottom, double& top);
-    void RefreshRoadInventory(std::uintptr_t playerCell, std::uintptr_t world);
+    void RefreshRoadInventory(std::uintptr_t playerCell, std::uintptr_t world, bool covered = false);  // covered: the loading screen or X panel holds the frame (larger scan budget)
     void ResetRoadInventory();
     int AppendRoadVehicles(FvoTrafficVehicle* out, int count, int max);
     FvoRoadClearance CheckRoadSite(std::uintptr_t playerCell, std::uintptr_t world,

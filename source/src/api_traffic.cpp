@@ -479,7 +479,7 @@ namespace
                 out=cached.proof;return Status::Ready;
             }
         }
-        realvehicles::RefreshRoadInventory(player.cell,player.world);
+        realvehicles::RefreshRoadInventory(player.cell,player.world,ApiPresentation()>=2);
         if(!haveCamera)return Status::Pending;
         double baked=0;
         const double ceiling=cellbake::Ground(site.x,site.y,baked)&&std::isfinite(baked)?std::min(site.z,baked):site.z;
@@ -1859,7 +1859,7 @@ extern "C" __declspec(dllexport) int FVO_TrafficRoadVehiclesV1(FvoTrafficVehicle
         logger::Observe("traffic.road_inventory",0,11,"event=road_list_unavailable reason=no_player_cell");
         return -1;
     }
-    realvehicles::RefreshRoadInventory(cell,ws);
+    realvehicles::RefreshRoadInventory(cell,ws,ApiPresentation()>=2);
     const int count=ReadTrafficVehicles(out,max,true);
     if(count<0){
         logger::Observe("traffic.road_inventory",0,12,"event=road_list_unavailable reason=traffic_vehicle_read_failed");
@@ -1970,7 +1970,7 @@ extern "C" __declspec(dllexport) FvoStockTransferResultV1 FVO_TrafficStockTransf
     const auto sight=FactoryOcclusion(r.vehicle,camera,target);
     if(sight==Sight::Visible)return answer(Result::Refused,18,"destination_visible");
     if(sight!=Sight::Ready)return answer(Result::Pending,19,"await_destination_concealment");
-    realvehicles::RefreshRoadInventory(player.cell,player.world);
+    realvehicles::RefreshRoadInventory(player.cell,player.world,ApiPresentation()>=2);
     std::uint64_t roadEpoch=0;
     const auto clearance=realvehicles::CheckRoadSite(player.cell,player.world,target,roadEpoch);
     if(clearance==FvoRoadClearance::Occupied)return answer(Result::Refused,20,"destination_occupied");
