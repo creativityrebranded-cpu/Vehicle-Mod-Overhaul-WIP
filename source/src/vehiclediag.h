@@ -26,6 +26,7 @@ namespace vehiclediag
     bool ReleaseBirthToPlayer(std::uint32_t formId); // KO-2: a vehicle the player took; true when released or never held
     bool Built(std::uint32_t formId); // the game built its physics vehicle (instance) since the last reset
     void DropBirthHold(std::uint32_t formId); // hidden/replaced/deleted: forget the hold, motion untouched
+    bool BirthHeld(std::uint32_t formId); // AC-4 (read-only): the vehicle is under its birth hold (not yet released to its pilot)
     bool BirthStageAvailable();
     std::uint64_t BirthCorrectionGeneration(std::uint32_t id);
     int StagedLoaded(); // staged chassis that have physics (loaded) and still wait for their autopilot

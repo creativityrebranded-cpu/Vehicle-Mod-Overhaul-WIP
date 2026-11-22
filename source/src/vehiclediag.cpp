@@ -897,6 +897,7 @@ namespace vehiclediag
     // A hidden, replaced or deleted traffic vehicle leaves the hold list at once, motion untouched (its physics object can be
     // freed and reused by something else).
     void DropBirthHold(std::uint32_t id){g_birthHolds.Remove(id);std::lock_guard lock(g_builtLock);g_birthAt.erase(id);}
+    bool BirthHeld(std::uint32_t id){return id&&g_birthHolds.Get(id).has_value();}
     static bool HasInstance(uptr component){if(!component)return false;__try{return At<uptr>(component,0x10)!=0;}__except(EXCEPTION_EXECUTE_HANDLER){return false;}}
     // Built since the last reset, or (after a reset, for a vehicle that is not built again) its live component has an instance.
     bool Built(std::uint32_t id){

@@ -5539,7 +5539,6 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 // has no model, or the engine does not step it and it is beyond the game's physics radius (less kSwapBandM); a car inside the
                 // radius whose physics has not started waits (never moved without physics where it can be seen). Same autopilot either way:
                 // lane speed, the lane's holds and stop lines, the gap behind the car ahead.
-                constexpr double kSwapBandM = 20.0;
                 static const char* actuatorWas[1 + prefetch::kSlotPilotCount] = {};
                 const bool hasModel = FarHas3D(vehicle), stepping = hasModel && StepsRecent(idx, GetTickCount64());
                 const double physicsR = PhysicsRadius();
@@ -5548,15 +5547,17 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 // stepping: wait) and never writes positions onto a live body (advised virtual, physics stepping: stay physical).
                 Actuator advised = Actuator::Waiting; double advisedDistance = 0;
                 const bool haveAdvice = idx >= 1 && AdviceOf(self, advised, advisedDistance);
-                // AC-3: a fleet car never waits: physical the moment the engine steps it, the rail path carries it otherwise.
-                const bool moveVirtual = idx >= 1 && (haveAdvice ? (!hasModel || !stepping)
-                    : (!hasModel || (!stepping && physicsR > 0 && toPlayerM > physicsR - kSwapBandM)));  // not a fleet car: the same rule here
-                const char* gateWhy = !haveAdvice ? "own_rule_not_a_fleet_car" : advised == Actuator::Virtual && stepping ? "physics_live_takes_over_at_once" :
+                // AC-3/AC-4: no car waits, fleet or not: physical the moment the engine steps it, carried virtually otherwise (the rail path
+                // for a fleet car, its lane for any other). A car under its birth hold is not the autopilot's yet: no actuator moves it.
+                const bool birthHeld = vehiclediag::BirthHeld(self);
+                const bool moveVirtual = idx >= 1 && !birthHeld && (!hasModel || !stepping);
+                const char* gateWhy = birthHeld ? "birth_hold_not_released" : !haveAdvice ? (moveVirtual ? "not_a_fleet_car_lane_carries_it" : "not_a_fleet_car_physical") :
+                    advised == Actuator::Virtual && stepping ? "physics_live_takes_over_at_once" :
                     advised == Actuator::Physical && moveVirtual ? "physics_not_ready_keeps_going_on_rail" : "as_advised";
                 // AC-2/AC-3: the arbiter's owner for this car this update (MB-4 one decider): the rail path carries it, or the physical actuator.
                 if (idx >= 1 && moveVirtual) driverOwner = "plan_virtual";
                 if (idx >= 1 && idx < int(sizeof actuatorWas / sizeof actuatorWas[0])) {
-                    const char* now = moveVirtual ? "virtual" : stepping ? "physical" : "physical_not_stepping";
+                    const char* now = moveVirtual ? "virtual" : birthHeld ? "birth_hold" : stepping ? "physical" : "physical_not_stepping";
                     if (actuatorWas[idx] != now) { actuatorWas[idx] = now;
                         logger::Write("OBS system=traffic.actuator vehicle=%08X pilot=%d event=swap to=%s advice=%s gate=%s distance=%.0f physics_radius=%.0f physics_live=%d model=%d",
                             self, idx, now, haveAdvice ? ActuatorName(advised) : "none", gateWhy, toPlayerM, physicsR, int(stepping), int(hasModel)); }
