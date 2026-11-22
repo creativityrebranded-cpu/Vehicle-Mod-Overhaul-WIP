@@ -1833,6 +1833,9 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             __except (EXCEPTION_EXECUTE_HANDLER) { return "fault_while_writing"; }
         }
 
+        // AC-2: the traffic manager's advice per fleet car (which actuator the autopilot should drive it through).
+        enum class Actuator : int { Physical = 0, Virtual = 1, Waiting = 2 };
+        inline const char* ActuatorName(Actuator a) { return a == Actuator::Physical ? "physical" : a == Actuator::Virtual ? "virtual" : "waiting"; }
         struct FleetRail {
             unsigned driver = 0, body = 0;
             std::uintptr_t instance = 0;
@@ -1851,6 +1854,9 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             // Reference mode: last reference move and how many were queued.
             std::uint64_t refStepAt = 0;
             unsigned refSteps = 0;
+            Actuator advice = Actuator::Waiting;  // AC-2: the manager's advice
+            std::uint64_t adviceAt = 0;
+            double toPlayer = 0.0;
         };
         std::mutex g_fleetRailLock;
         std::unordered_map<unsigned, FleetRail> g_fleetRails;
@@ -1892,6 +1898,43 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
         }
 
+        // AC-1 (2026-11-21): the fleet rail no longer drives cars (it took a car away from the autopilot and pushed it along its own path
+        // with no avoidance: 19:27 run, FF105ACC glided beside the player). It only reports a mode to the add-on: Auto (1) while the engine
+        // steps the car, Rail (2) while the autopilot moves it virtually (the core owns its motion, as published add-ons read it), else
+        // Awaiting (3).
+        constexpr bool kFleetRailDrives = false;
+        std::unordered_map<unsigned, ULONGLONG> g_virtualAt;  // vehicle -> when the autopilot last moved it virtually (under g_fleetRailLock)
+        // The game's physics radius (havok cell extents x 50 m, game::ReadLimits), read every 5 s; 0 = unknown.
+        double PhysicsRadius() {
+            static double radius = 0; static ULONGLONG at = 0; const auto now = GetTickCount64();
+            if (!at || now - at >= 5000) { at = now; const double r = double(game::ReadLimits().physicsMetres); radius = std::isfinite(r) && r > 50.0 ? r : 0.0; }
+            return radius;
+        }
+        unsigned FleetDriverOf(unsigned vehicle) {
+            std::lock_guard lk(g_fleetRailLock); const auto it = g_fleetRails.find(vehicle); return it == g_fleetRails.end() ? 0u : it->second.driver;
+        }
+        void NoteVirtual(unsigned vehicle, ULONGLONG now) { std::lock_guard lk(g_fleetRailLock); g_virtualAt[vehicle] = now; }
+        // AC-2: the manager's advice for this car (false: not a fleet car, or no fresh advice).
+        bool AdviceOf(unsigned vehicle, Actuator& out, double& toPlayer) {
+            std::lock_guard lk(g_fleetRailLock); const auto it = g_fleetRails.find(vehicle);
+            if (it == g_fleetRails.end() || !it->second.adviceAt || GetTickCount64() - it->second.adviceAt > 1000) return false;
+            out = it->second.advice; toPlayer = it->second.toPlayer; return true;
+        }
+        // AC-2 virtual actuator: the fleet rail's path carries the car at the autopilot's wanted speed (capped by the path's corner speed);
+        // returns the next pose (the path gives the height and heading). False: no rail path for this car.
+        bool RailVirtualStep(unsigned vehicle, double x, double y, double z, double want, double dt, double& ox, double& oy, double& oz, double& yaw, double& used) {
+            std::lock_guard lk(g_fleetRailLock); const auto it = g_fleetRails.find(vehicle);
+            if (it == g_fleetRails.end() || !(it->second.path.End() > 1.0)) return false;
+            auto& car = it->second;
+            if (!car.seeded) { car.station = car.path.Project(x, y, z); car.seeded = true; car.railSpeed = 0; }
+            const double v = fleetrail::Approach(car.railSpeed, std::min(want, car.path.CornerSpeed(car.station)), dt);
+            const double st = car.path.Advance(car.station, std::max(0.0, v) * dt);
+            const auto pt = car.path.At(st), q = car.path.At(car.path.Advance(st, 1.0));
+            if (!std::isfinite(pt.x + pt.y + pt.z)) return false;
+            car.station = st; car.railSpeed = v; car.position = pt;
+            ox = pt.x; oy = pt.y; oz = pt.z; yaw = std::atan2(q.x - pt.x, q.y - pt.y); used = v; return true;
+        }
+        bool FarYaw(std::uintptr_t vehicle, double yaw) { __try { reinterpret_cast<float*>(vehicle + off::kRefRotation)[2] = float(yaw); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
         bool FleetRailOwns(unsigned vehicle)
         {
             if (!g_fleetRailCount.load(std::memory_order_acquire) || !trafficprofile::FleetRailAllowed()) return false;
@@ -5492,9 +5535,35 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 g.adOut={};g.adOut.bearing=in.heading;g.adOut.mode=in.onWheels||driveOnly?drive::Mode::Drive:drive::Mode::Hover;  // NH-1: never a hover start on drive onlyg.adOut.phase=drive::Phase::Travel;  // removal step 1: the lane driver no longer decides; the energy plan writes the controls below
                 laneWhy=nullptr;laneSpeed=0;
                 if(idx>=0&&railCar)g_railLaneAt[idx]=GetTickCount64();  // traffic and the player's Cruise, wherever the selector gives Rail
-                if(idx>=1&&g_driveRail&&lane->count>=2&&!FarHas3D(vehicle)){
+                // AC-1 actuator (2026-11-21): physical while the engine steps this car; virtual (moved along the lane with its driver) when it
+                // has no model, or the engine does not step it and it is beyond the game's physics radius (less kSwapBandM); a car inside the
+                // radius whose physics has not started waits (never moved without physics where it can be seen). Same autopilot either way:
+                // lane speed, the lane's holds and stop lines, the gap behind the car ahead.
+                constexpr double kSwapBandM = 20.0;
+                static const char* actuatorWas[1 + prefetch::kSlotPilotCount] = {};
+                const bool hasModel = FarHas3D(vehicle), stepping = hasModel && StepsRecent(idx, GetTickCount64());
+                const double physicsR = PhysicsRadius();
+                double toPlayerM = 0; if (const auto pl = Ptr(addr::kPlayerCharacterPtr)) { const auto pp = At<game::Vec3>(pl, off::kRefPosition); toPlayerM = std::hypot(double(pp.x) - in.x, double(pp.y) - in.y); }
+                // AC-2 gate (the one arbiter): the manager advises; the gate never drives without collision (advised physical, physics not
+                // stepping: wait) and never writes positions onto a live body (advised virtual, physics stepping: stay physical).
+                Actuator advised = Actuator::Waiting; double advisedDistance = 0;
+                const bool haveAdvice = idx >= 1 && AdviceOf(self, advised, advisedDistance);
+                const bool moveVirtual = idx >= 1 && (haveAdvice ? (advised == Actuator::Virtual ? !stepping : !hasModel)
+                    : (!hasModel || (!stepping && physicsR > 0 && toPlayerM > physicsR - kSwapBandM)));  // not a fleet car: the same rule here
+                const char* gateWhy = !haveAdvice ? "own_rule_not_a_fleet_car" : advised == Actuator::Virtual && stepping ? "advised_virtual_but_physics_live" :
+                    advised == Actuator::Physical && !stepping && hasModel ? "advised_physical_waiting_for_physics" : "as_advised";
+                // AC-2: the arbiter's owner for this car this update (MB-4 one decider): the rail path carries it, or it waits for physics.
+                if (idx >= 1 && moveVirtual) driverOwner = "plan_virtual";
+                else if (idx >= 1 && haveAdvice && advised == Actuator::Physical && !stepping && hasModel) driverOwner = "physics_wait";
+                if (idx >= 1 && idx < int(sizeof actuatorWas / sizeof actuatorWas[0])) {
+                    const char* now = moveVirtual ? "virtual" : stepping ? "physical" : "waiting_for_physics";
+                    if (actuatorWas[idx] != now) { actuatorWas[idx] = now;
+                        logger::Write("OBS system=traffic.actuator vehicle=%08X pilot=%d event=swap to=%s advice=%s gate=%s distance=%.0f physics_radius=%.0f physics_live=%d model=%d",
+                            self, idx, now, haveAdvice ? ActuatorName(advised) : "none", gateWhy, toPlayerM, physicsR, int(stepping), int(hasModel)); }
+                }
+                if(idx>=1&&g_driveRail&&lane->count>=2&&moveVirtual){
                     const bool live=!trafficarrival::Covered()&&inputgate::GameplayAllowed();
-                    const double dt=g_farAt[idx]>0?std::clamp(in.now-g_farAt[idx],0.0,0.25):0.0;g_farAt[idx]=in.now;
+                    const double dt=g_farAt[idx]>0?std::clamp(in.now-g_farAt[idx],0.0,1.0):0.0;g_farAt[idx]=in.now;  // AC-1: far cars plan at 2-5 Hz
                     const auto here=laneline::Project(*lane,in.x,in.y,in.z);
                     double want=lane->held?0.0:std::min(double(lane->speed),in.limits.driveTop);
                     if(lane->stopDistance>=0)want=std::min(want,std::sqrt(2*4.0*std::max(0.0,lane->stopDistance-3.0)));
@@ -5502,11 +5571,21 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     for(int k=0;k<in.otherCount&&in.others;++k){const auto& o=in.others[k];const double dx=o.x-in.x,dy=o.y-in.y,ahead=dx*fx+dy*fy,side=std::fabs(-dx*fy+dy*fx);
                         if(ahead>0&&ahead<14&&side<3)want=0;}
                     if(live&&dt>0&&want>0){
-                        const double s=here.along+want*dt;const auto p=laneWindow.At(s),q=laneWindow.At(s+1.0);
+                        const double s=here.along+want*dt;auto p=laneWindow.At(s);const auto q=laneWindow.At(s+1.0);
                         double z=p.z+in.shape.originAbove;double fz=0;
                         if(surfaceOwner&&fieldgate::surfaceProvider(surfaceOwner,p.x,p.y,&fz)==1)z=fz+in.shape.originAbove;
-                        const double yaw=std::atan2(q.x-p.x,q.y-p.y);
-                        const bool ok=FarWrite(vehicle,p.x,p.y,z,yaw);
+                        double railYaw=0,railUsed=0,rx=0,ry=0,rz=0;
+                        const bool onRail=RailVirtualStep(self,in.x,in.y,in.z,want,dt,rx,ry,rz,railYaw,railUsed);  // AC-2: the rail path is the virtual actuator
+                        if(onRail){p.x=rx;p.y=ry;z=rz;}
+                        {const auto m=navmap::At(p.x,p.y,z+2.0);if(m.haveGround&&std::isfinite(m.ground)&&double(m.ground)+in.shape.originAbove>z&&double(m.ground)-z<4.0)z=double(m.ground)+in.shape.originAbove;}  // AC-1: never under the real ground at the swap
+                        const double yaw=onRail?railYaw:std::atan2(q.x-p.x,q.y-p.y);
+                        // AC-1: the car and its seated driver move together (StepReference, as the rail's reference mode did); the heading is written here.
+                        const unsigned farDriver=FleetDriverOf(self);
+                        bool ok=false;
+                        if(farDriver&&hasModel){ok=loadedarea::StepReference(self,farDriver,float(p.x),float(p.y),float(z));
+                            if(ok)FarYaw(vehicle,yaw);}
+                        else ok=FarWrite(vehicle,p.x,p.y,z,yaw);
+                        if(ok)NoteVirtual(self,GetTickCount64());
                         if(GetTickCount64()-g_farLogAt[idx]>=5000){g_farLogAt[idx]=GetTickCount64();
                             logger::Write("OBS system=traffic.far vehicle=%08X pilot=%d event=move speed=%.1f along=%.1f pos=%.1f,%.1f,%.1f ok=%d reason=no_model_loaded",self,idx,want,s,p.x,p.y,z,int(ok));}
                     } else if(GetTickCount64()-g_farLogAt[idx]>=5000){g_farLogAt[idx]=GetTickCount64();
@@ -6373,11 +6452,11 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     self,idx,driverOwner,g_driverOwner[idx]?g_driverOwner[idx]:"-",int(jobLine),g_jobLineWhy[idx]?g_jobLineWhy[idx]:"-",int(in.onWheels));
                 g_driverOwner[idx]=driverOwner;g_driverOwnerAt[idx]=in.now;
                 if(g_ownerSummaryAt<0||in.now-g_ownerSummaryAt>=30||in.now<g_ownerSummaryAt){g_ownerSummaryAt=in.now;
-                    static const char* const kOwners[]={"plan_rail","plan_flies","energy_plan_goal","coordinator_hold"};
+                    static const char* const kOwners[]={"plan_rail","plan_flies","energy_plan_goal","coordinator_hold","plan_virtual","physics_wait"};
                     int n[sizeof kOwners/sizeof kOwners[0]]={};
                     for(int k=0;k<int(sizeof g_driverOwner/sizeof g_driverOwner[0]);++k){if(!g_driverOwner[k]||in.now-g_driverOwnerAt[k]>2.0||g_driverOwnerAt[k]>in.now)continue;
                         for(int o=0;o<int(sizeof kOwners/sizeof kOwners[0]);++o)if(!std::strcmp(g_driverOwner[k],kOwners[o])){++n[o];break;}}
-                    logger::Write("OBS system=plan.ownermap event=census plan_rail=%d plan_flies=%d energy_plan_goal=%d coordinator_hold=%d reason=removal_20261114_one_decider",n[0],n[1],n[2],n[3]);}
+                    logger::Write("OBS system=plan.ownermap event=census plan_rail=%d plan_flies=%d energy_plan_goal=%d coordinator_hold=%d plan_virtual=%d physics_wait=%d reason=removal_20261114_one_decider",n[0],n[1],n[2],n[3],n[4],n[5]);}
             }
             EnergyStep(idx,self,in,driverOwner,floorProofLane);  // radar tick; a car with no lane: its goal plan and step 7
             const auto& o = g.adOut;
@@ -8536,6 +8615,11 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             const auto now = GetTickCount64();
             if (now - lastRefresh < 100) return;
             lastRefresh = now;
+            // AC-2 traffic manager: the player and the physics radius once per refresh.
+            game::Vec3 managerPlayer{}; bool managerHavePlayer = false;
+            if (const auto pl = Ptr(addr::kPlayerCharacterPtr)) { managerPlayer = At<game::Vec3>(pl, off::kRefPosition); managerHavePlayer = true; }
+            const double managerRadius = PhysicsRadius();
+            constexpr double kManagerBandM = 20.0;  // inside radius - band: physical; beyond the radius: virtual; between: as it was
             std::array<unsigned, fvolimits::kVehicles> vehicles{};
             std::size_t count = 0;
             {
@@ -8608,7 +8692,31 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 const bool chassisReady = ref && pilot && instance && body && currentDriver == driver &&
                     (railFresh || driveFresh) && !*car.fault;
                 const bool autopilotReady = pilot && (railFresh || driveFresh);
-                if (playerTook || (currentDriver && currentDriver != driver)) {
+                if (!kFleetRailDrives) {  // AC-1: report only; the autopilot drives (physical or virtual)
+                    const auto v = g_virtualAt.find(id);
+                    const bool movedVirtually = v != g_virtualAt.end() && now - v->second < 1500;
+                    if (car.railOwner) NoteFleetHandoff(id, car.railSpeed, now);
+                    car.railOwner = false;
+                    // AC-2 advice: no model -> virtual; within the physics radius (less the band) -> physical; beyond it -> virtual;
+                    // in the band it stays as it was (no flapping at the edge). Unknown radius: physical with a model.
+                    {   const bool modelLoaded = ref && FarHas3D(ref);
+                        const double d = managerHavePlayer && ref ? std::hypot(double(position.x) - managerPlayer.x, double(position.y) - managerPlayer.y) : 0.0;
+                        const auto was = car.advice;
+                        Actuator next = was;
+                        if (!modelLoaded) next = Actuator::Virtual;
+                        else if (!(managerRadius > 0)) next = Actuator::Physical;
+                        else if (d < managerRadius - kManagerBandM) next = Actuator::Physical;
+                        else if (d > managerRadius) next = Actuator::Virtual;
+                        else if (!car.adviceAt) next = Actuator::Physical;
+                        if (next != Actuator::Virtual) car.seeded = false;  // the rail path restarts from wherever the car is next time
+                        car.advice = next; car.adviceAt = now; car.toPlayer = d;
+                        if (next != was || !car.modeSince)
+                            logger::Write("OBS system=traffic.manager vehicle=%08X driver=%08X event=advice to=%s from=%s distance=%.0f physics_radius=%.0f model=%d",
+                                id, driver, ActuatorName(next), ActuatorName(was), d, managerRadius, int(modelLoaded));
+                    }
+                    car.mode = playerTook || (currentDriver && currentDriver != driver) ? fleetrail::Mode::Awaiting :
+                        chassisReady ? fleetrail::Mode::Auto : movedVirtually ? fleetrail::Mode::Rail : fleetrail::Mode::Awaiting;
+                } else if (playerTook || (currentDriver && currentDriver != driver)) {
                     car.railOwner = false;
                     car.mode = fleetrail::Mode::Awaiting;
                 } else if (ref && hereKnown && !(here.cellAttached && !here.crossCell) && !railFresh && !driveFresh) {
