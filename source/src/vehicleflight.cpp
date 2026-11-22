@@ -5548,15 +5548,15 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 // stepping: wait) and never writes positions onto a live body (advised virtual, physics stepping: stay physical).
                 Actuator advised = Actuator::Waiting; double advisedDistance = 0;
                 const bool haveAdvice = idx >= 1 && AdviceOf(self, advised, advisedDistance);
-                const bool moveVirtual = idx >= 1 && (haveAdvice ? (advised == Actuator::Virtual ? !stepping : !hasModel)
+                // AC-3: a fleet car never waits: physical the moment the engine steps it, the rail path carries it otherwise.
+                const bool moveVirtual = idx >= 1 && (haveAdvice ? (!hasModel || !stepping)
                     : (!hasModel || (!stepping && physicsR > 0 && toPlayerM > physicsR - kSwapBandM)));  // not a fleet car: the same rule here
-                const char* gateWhy = !haveAdvice ? "own_rule_not_a_fleet_car" : advised == Actuator::Virtual && stepping ? "advised_virtual_but_physics_live" :
-                    advised == Actuator::Physical && !stepping && hasModel ? "advised_physical_waiting_for_physics" : "as_advised";
-                // AC-2: the arbiter's owner for this car this update (MB-4 one decider): the rail path carries it, or it waits for physics.
+                const char* gateWhy = !haveAdvice ? "own_rule_not_a_fleet_car" : advised == Actuator::Virtual && stepping ? "physics_live_takes_over_at_once" :
+                    advised == Actuator::Physical && moveVirtual ? "physics_not_ready_keeps_going_on_rail" : "as_advised";
+                // AC-2/AC-3: the arbiter's owner for this car this update (MB-4 one decider): the rail path carries it, or the physical actuator.
                 if (idx >= 1 && moveVirtual) driverOwner = "plan_virtual";
-                else if (idx >= 1 && haveAdvice && advised == Actuator::Physical && !stepping && hasModel) driverOwner = "physics_wait";
                 if (idx >= 1 && idx < int(sizeof actuatorWas / sizeof actuatorWas[0])) {
-                    const char* now = moveVirtual ? "virtual" : stepping ? "physical" : "waiting_for_physics";
+                    const char* now = moveVirtual ? "virtual" : stepping ? "physical" : "physical_not_stepping";
                     if (actuatorWas[idx] != now) { actuatorWas[idx] = now;
                         logger::Write("OBS system=traffic.actuator vehicle=%08X pilot=%d event=swap to=%s advice=%s gate=%s distance=%.0f physics_radius=%.0f physics_live=%d model=%d",
                             self, idx, now, haveAdvice ? ActuatorName(advised) : "none", gateWhy, toPlayerM, physicsR, int(stepping), int(hasModel)); }
@@ -6452,11 +6452,11 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     self,idx,driverOwner,g_driverOwner[idx]?g_driverOwner[idx]:"-",int(jobLine),g_jobLineWhy[idx]?g_jobLineWhy[idx]:"-",int(in.onWheels));
                 g_driverOwner[idx]=driverOwner;g_driverOwnerAt[idx]=in.now;
                 if(g_ownerSummaryAt<0||in.now-g_ownerSummaryAt>=30||in.now<g_ownerSummaryAt){g_ownerSummaryAt=in.now;
-                    static const char* const kOwners[]={"plan_rail","plan_flies","energy_plan_goal","coordinator_hold","plan_virtual","physics_wait"};
+                    static const char* const kOwners[]={"plan_rail","plan_flies","energy_plan_goal","coordinator_hold","plan_virtual"};
                     int n[sizeof kOwners/sizeof kOwners[0]]={};
                     for(int k=0;k<int(sizeof g_driverOwner/sizeof g_driverOwner[0]);++k){if(!g_driverOwner[k]||in.now-g_driverOwnerAt[k]>2.0||g_driverOwnerAt[k]>in.now)continue;
                         for(int o=0;o<int(sizeof kOwners/sizeof kOwners[0]);++o)if(!std::strcmp(g_driverOwner[k],kOwners[o])){++n[o];break;}}
-                    logger::Write("OBS system=plan.ownermap event=census plan_rail=%d plan_flies=%d energy_plan_goal=%d coordinator_hold=%d plan_virtual=%d physics_wait=%d reason=removal_20261114_one_decider",n[0],n[1],n[2],n[3],n[4],n[5]);}
+                    logger::Write("OBS system=plan.ownermap event=census plan_rail=%d plan_flies=%d energy_plan_goal=%d coordinator_hold=%d plan_virtual=%d reason=removal_20261114_one_decider",n[0],n[1],n[2],n[3],n[4]);}
             }
             EnergyStep(idx,self,in,driverOwner,floorProofLane);  // radar tick; a car with no lane: its goal plan and step 7
             const auto& o = g.adOut;
