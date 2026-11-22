@@ -253,7 +253,10 @@ namespace generator
         // past kFlowReturnM (moved by the core's far model meanwhile) is retired out of sight and its position goes on simulated.
         generator::FlowPose g_flowPose=nullptr;std::vector<FvoPoolSpot> g_slotPose;std::vector<char> g_slotPoseOk;
         constexpr double kFlowEdgeMinM=120.0,kFlowReturnM=900.0;
-        constexpr ULONGLONG kFlowStepMs=250,kFlowStuckMs=4000;  // flow step period; how long a car may sit unmoving outside the loaded area
+        constexpr ULONGLONG kFlowStepMs=250,kFlowStuckMs=4000;
+        // PF-2 (2026-11-21, 18:31 run: the live fill averaged up to 29.9 ms a tick, worst 127 ms, as refused flow positions retried
+        // their alternatives every 100 ms): in play the fill stops for this tick after kLiveFillMs; under cover it is not capped.
+        constexpr double kLiveFillMs=3.0;constexpr ULONGLONG kLiveRetryMs=500;  // flow step period; how long a car may sit unmoving outside the loaded area
         ULONGLONG g_flowToldAt=0;
         const FvoPoolSpot& SlotPose(int i){return g_flowPose&&i>=0&&i<int(g_slotPose.size())&&g_slotPoseOk[std::size_t(i)]?g_slotPose[std::size_t(i)]:g_initialScene[std::size_t(i)];}
         std::vector<bool> g_initialRoads;
@@ -3215,7 +3218,9 @@ namespace generator
             }
         }
         spawnflow::Order(order);
-        for(int k=0,looked=0;k<int(order.size())&&looked<maxLook&&spawnflow::MayCreate(window,budget.granted,waiting,budget.limit);++k){const int i=order[std::size_t(k)].slot;auto& p=g_pairs[i];
+        LARGE_INTEGER fillFrom{},fillHz{};QueryPerformanceFrequency(&fillHz);QueryPerformanceCounter(&fillFrom);  // PF-2: the live fill's time cap
+        for(int k=0,looked=0;k<int(order.size())&&looked<maxLook&&spawnflow::MayCreate(window,budget.granted,waiting,budget.limit)&&
+            (window.cover||[&]{LARGE_INTEGER t{};QueryPerformanceCounter(&t);return 1000.0*double(t.QuadPart-fillFrom.QuadPart)/double(fillHz.QuadPart);}()<kLiveFillMs);++k){const int i=order[std::size_t(k)].slot;auto& p=g_pairs[i];
             g_initialRejected.erase(i);
             ++looked;g_initialCursor=(i+1)%total;
             const int attempt=g_initialAttempt[i];const auto alternatives=g_initialAlternatives.find(i);
@@ -3314,7 +3319,7 @@ namespace generator
                 ++fillRefused;g_tally.Refuse(why);
                 Log("OBS system=traffic.spawn vehicle=00000000 event=refused slot=%d model=%08X at=%.2f,%.2f,%.2f attempt=%d reason=%s",i,base,at.x,at.y,at.z,attempt,why);
                 if(gap>=0)Log("OBS system=traffic.spawn event=road_gap_refused slot=%d station_m=%.1f conflict_gap_m=%.1f nominal_interval_m=%.1f",i,road.station,gap,road.interval);
-                if(alternatives!=g_initialAlternatives.end()&&attempt<int(alternatives->second.size())){++g_initialAttempt[i];p.at=now+100;}
+                if(alternatives!=g_initialAlternatives.end()&&attempt<int(alternatives->second.size())){++g_initialAttempt[i];p.at=now+(window.cover?100:kLiveRetryMs);}
                 else if(g_clearanceWaiting.count(i)){g_initialAttempt[i]=0;p.at=now+250;}
                 else {g_initialAttempt[i]=0;if(window.cover)g_passRefused.insert(i);g_initialRejected.insert(i);p.at=now+(window.cover?5000:10000);}  // LV-3: a covered window asks again at its next opening; play asks again in 10 s (a car that blocked the spot will have moved)
                 continue;

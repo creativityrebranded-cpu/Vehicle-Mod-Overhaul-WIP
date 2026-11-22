@@ -798,6 +798,7 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
     // Avoid: every candidate. Recover: the routine's held step (back up straight, turn to the lane, retry) or hover where allowed. Stand:
     // nothing. REPLACES the SL-1 ladder weights, RH-1 ladder timers and the LD-1 layer flag.
     recovery::Command cmd;
+    bool heldStepChosen = false;  // PF-2: the routine's held step is this tick's plan
     {
         bool anyCentre = false, anyFeasible = false, anyMoving = false, reverseFeasible = false, anyForwardClear = false; int full = -1; unsigned options = 0;
         for (int i = 0; i < n; ++i) {
@@ -889,10 +890,12 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
                 Candidate c; c.count = 1; c.seg[0].input = std::isfinite(cmd.steer) ? cmd.steer : 0.0; c.seg[0].speed = cmd.wantSpeed; c.seg[0].seconds = kSteps * kDt;
                 c.kind = cmd.step == recovery::Command::Step::BackUp ? "recover: back up" : "recover: turn to the lane";
                 Terms t; double cl; const double e = Score(c, s, k, want, w, wt, &mem, now, t, nullptr, cl, hint, field, nullptr, true, true);
-                if (std::isfinite(e) && t.clearanceTier == 0) {
-                    cands[n] = c; energies[n] = e; clearanceTiers[n] = 0; rejects[n] = nullptr; ++n; r.candidates = n;
+                // PF-2 (18:31 run: 387 back-ups ended at once as "reverse_blocked"): soft tiers (grade, stopping distance, wheel vote,
+                // 1..9) are costs, not blocks; the step is blocked only by a solid or a road user (tier 10 and up).
+                if (std::isfinite(e) && t.clearanceTier < 10) {
+                    cands[n] = c; energies[n] = e; clearanceTiers[n] = t.clearanceTier; rejects[n] = nullptr; ++n; r.candidates = n;
                     only([&](int i) { return i == n - 1; }, "recover_step_only");
-                    heldStep = true;
+                    heldStep = true; heldStepChosen = true;
                 } else mem.recStepBlocked = true;
             }
             for (int i = 0; i < n && !heldStep; ++i) {
@@ -1019,6 +1022,10 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
                 else { best = keptIdx; r.energy = ek; r.kept = true; r.switchWhy = !wins ? (dirChange ? "direction_near_tie_kept" : "near_tie_committed_plan_kept") : "challenger_not_yet_long_enough"; }
             }
         } else if (keptIdx >= 0 && best == keptIdx) { r.kept = true; mem.challengeSince = -1; }
+        // PF-2: the same recovery step carrying on is the committed plan, not a switch (its steering follows the heading error each tick;
+        // counting it as a switch logged a plan.switch line per tick and reset the hold timers).
+        if (heldStepChosen && !r.kept && mem.have && mem.best.count && mem.best.kind && std::strcmp(mem.best.kind, cands[best].kind) == 0) {
+            r.kept = true; r.switchWhy = "recovery_step_continues"; }
         if (!r.kept) { mem.switchedAt = now; mem.challengeSince = -1; }
         // HC-1: the release baseline is the kept plan's smallest gap to the best since it was chosen (0 when chosen: it was the best).
         if (!r.kept) mem.keptGap = 0;
