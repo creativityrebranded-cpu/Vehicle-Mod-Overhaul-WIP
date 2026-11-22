@@ -152,6 +152,7 @@
 #include "routeedit.h"
 #include "playclock.h"
 #include "traffichealthapi.h"
+#include "costparts.h"
 
 namespace vehicleflight
 {
@@ -414,8 +415,8 @@ namespace vehicleflight
 		// within kCrowdM, giving way, its path blocked or uncertain, a bump within kBumpRecentMs; and only on traffic lanes.
 		// A vehicle counts as near within kCrowdM plus kCrowdLeadS of both speeds (two at 30 m/s: 130 m). The check runs every tick; the
 		// moment it fails the pilot plans at once, and it stays at its normal rate kDangerHoldMs after the last failure.
-		constexpr double kViewHalf = 1.0472, kViewLeadS = 0.5, kViewLeadMax = 1.2, kCrowdM = 40.0, kCrowdLeadS = 1.5;
-		constexpr ULONGLONG kViewKeepMs = 3000, kBumpRecentMs = 5000, kDangerHoldMs = 2000, kOutMidMs = 250, kOutFarMs = 500;
+		constexpr double kViewHalf = 1.0472, kViewLeadS = 0.5, kViewLeadMax = 1.2, kCrowdM = 40.0, kCrowdLeadS = 1.5, kNearKeepM = 60.0;
+		constexpr ULONGLONG kViewKeepMs = 3000, kBumpRecentMs = 5000, kDangerHoldMs = 2000, kOutMidMs = 250, kOutFarMs = 500, kNearOutMs = 100;
 		bool g_straight[1 + prefetch::kSlotPilotCount] = {};
         // What World keeps per lane car (removal 2026-11-14; the old lane driver's state is gone): the road's lanes at the car (asked every
         // gather, for the energy plan's frame and the corridor rays) and the hover follower's wanted height (the height hold reads it).
@@ -2285,7 +2286,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					g_sh.probeWrote = o.tipped ? g_sh.probeMeasured : std::hypot(o.v.x, o.v.y); g_sh.probeNz = U[2]; g_sh.probeSlip = o.slip; g_sh.probeGrounded = o.grounded; g_sh.probeTipped = o.tipped;
 					g_sh.probeRailSteps.fetch_add(1);
 					{ WheelRead wr; if (ReadWheels(g_sh.instance.load(), wr)) { g_sh.probeWheels = wr.count; g_sh.probeWheelsTouching = wr.touching; g_sh.probeWheelZ = wr.z; g_sh.probeWheelUp = wr.up; } else g_sh.probeWheels = -1; }
-					if (GetTickCount64() - g_sh.probeAt >= 250) {
+					if (GetTickCount64() - g_sh.probeAt >= 1000) {  // PF-1: every 1 s (was 250 ms; 11% of the log)
 						g_sh.probeAt = GetTickCount64();
 						const unsigned ns = g_sh.probeNativeSteps.exchange(0), dc = g_sh.probeDampCalls.exchange(0), cc = g_sh.probeClampCalls.exchange(0), rsN = g_sh.probeRailSteps.exchange(0), gcl = g_sh.probeGuardClears.exchange(0);
 						const double nd = g_sh.probeNativeDrop.exchange(0) / 1000.0, dd = g_sh.probeDampDrop.exchange(0) / 1000.0, cd = g_sh.probeClampDrop.exchange(0) / 1000.0;
@@ -4688,7 +4689,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				}
 			}
 			static double sweepLog[1 + prefetch::kSlotPilotCount]{};
-			if (idx < int(sizeof sweepLog / sizeof sweepLog[0]) && (now - sweepLog[idx] >= 1.0 || now < sweepLog[idx] || (bodies > 0 && now - sweepLog[idx] >= .25))) { sweepLog[idx] = now;
+			if (idx < int(sizeof sweepLog / sizeof sweepLog[0]) && (now - sweepLog[idx] >= 5.0 || now < sweepLog[idx] || (bodies > 0 && now - sweepLog[idx] >= 1.0))) { sweepLog[idx] = now;
 				logger::Write("OBS system=world.radar vehicle=%08X pilot=%d event=path_sweep along=%s pieces=%d side=%.1f reach=%.1f speed=%.1f contacts=%d floor=%d floor_noted=%d bodies=%d worst_us=%u first=%.1f,%.1f->%.1f,%.1f last_end=%.1f,%.1f reason=own_hull_swept_along_the_path_every_contact_looked_up",
 					self, idx, along, ns, sideOff, reach, speed, found, floorN, floorNoted, bodies, worst, seg[0].x0, seg[0].y0, seg[0].x1, seg[0].y1, seg[ns - 1].x1, seg[ns - 1].y1); }
 		}
@@ -4881,7 +4882,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				else shapes.push_back(tmp[i]);
 			}
 			static double logAt[1 + prefetch::kSlotPilotCount] = {};
-			if (now - logAt[idx] >= 1.0 || now < logAt[idx]) {
+			if (now - logAt[idx] >= 5.0 || now < logAt[idx]) {  // PF-1: every 5 s (was 1 s)
 				logAt[idx] = now;
 				logger::Write("OBS system=world.radar pilot=%d event=shapes solids=%d dropped_below=%d reason=point_local_floor", idx, n - dropped, dropped);
 #ifndef FVO_RELEASE
@@ -5539,7 +5540,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         const double spd=std::hypot(in.vx,in.vy),carBase=in.z-in.shape.originAbove;
                         auto lineAt=[&](double d){const auto p=laneWindow.At(hereP.along+d),q=laneWindow.At(hereP.along+d+1.0);return planrun::LinePoint{p.x,p.y,p.z,std::atan2(q.x-p.x,q.y-p.y)};};
                         const auto tPlanCar0=std::chrono::steady_clock::now();
-                        double pcSurfaceUs=0,pcWorldUs=0,pcProbeUs=0,pcBuildUs=0,pcCollideUs=0,pcSpeedUs=0,pcScoreWallUs=0,pcArbUs=0,pcBodyUs=0;
+                        double pcProvUs=0,pcBoxUs=0,pcReachUs=0;double pcSurfaceUs=0,pcWorldUs=0,pcProbeUs=0,pcBuildUs=0,pcCollideUs=0,pcSpeedUs=0,pcScoreWallUs=0,pcArbUs=0,pcBodyUs=0;
                         const double stNow=g_planOdo[idx].Step(in.x,in.y,lineAt(0).yaw);
                         const auto plRef=Ptr(addr::kPlayerCharacterPtr);const auto plPos=plRef?At<game::Vec3>(plRef,off::kRefPosition):game::Vec3{};
                         const double toPlayer=plRef?std::hypot(double(plPos.x)-in.x,double(plPos.y)-in.y):0.0;
@@ -5613,18 +5614,30 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         // The wanted surface along the line: the addon's road where it answers near the car's level, else the car's own level
                         // carried along the lane's rise. An open-air tile wants nothing touched. (Derived intent: older addons work the same.)
                         double wantZ[kSamples];bool wantHave[kSamples];double fieldEnd=-1,arriveHeading=std::numeric_limits<double>::quiet_NaN();const double roadZ0=carBase-onA.z;
+                        // PF-1 (2026-11-21): the add-on's road answers and field boxes are reused while the car has hardly moved (under 0.3 m and
+                        // 0.05 rad, 0.2 m in height, within 1 s): queued and slow cars asked the same questions every pass. On wheels only.
+                        struct SurfCache{bool ok=false;std::uint32_t self=0;void* owner=nullptr;double x=0,y=0,heading=0,base=0,at=-1;int answer[kSamples]{};double fz[kSamples]{};int got=-1;FvoFieldBoxV1 raw[12];};
+                        static SurfCache s_surf[planenergy::kSlots];auto& sc=s_surf[idx];
+                        const bool reuseSurf=!flightLine&&sc.ok&&sc.self==self&&sc.owner==surfaceOwner&&in.now>=sc.at&&in.now-sc.at<1.0&&
+                            std::hypot(in.x-sc.x,in.y-sc.y)<0.3&&std::fabs(std::remainder(in.heading-sc.heading,6.283185307179586))<0.05&&std::fabs(carBase-sc.base)<0.2;
+                        if(reuseSurf)++costparts::g_surfaceReused;
+                        else{sc.ok=!flightLine;sc.self=self;sc.owner=surfaceOwner;sc.x=in.x;sc.y=in.y;sc.heading=in.heading;sc.base=carBase;sc.at=in.now;sc.got=-1;}
                         for(int i=0;i<kSamples;++i){const auto p=lineAt(i*kStep);const double expected=flightLine?p.z:p.z+roadZ0;double fz=0;
-                            const int answer=surfaceOwner?fieldgate::surfaceProvider(surfaceOwner,p.x,p.y,&fz):0;
+                            int answer=0;
+                            if(reuseSurf){answer=sc.answer[i];fz=sc.fz[i];}
+                            else{answer=surfaceOwner?fieldgate::surfaceProvider(surfaceOwner,p.x,p.y,&fz):0;sc.answer[i]=answer;sc.fz[i]=fz;}
                             wantHave[i]=answer!=2;wantZ[i]=answer==1&&std::fabs(fz-expected)<4.0?fz:expected;
                             // planHover: the line is 3D. A surface is wanted only where one really is near the line (the addon's road, or measured
                             // ground); a line in the air over a road far below wants nothing touched there.
                             if(flightLine&&!(answer==1&&std::fabs(fz-expected)<4.0)){const auto m=navmap::At(p.x,p.y,p.z+2.0);
                                 wantHave[i]=answer!=2&&m.haveGround&&std::fabs(m.ground-p.z)<4.0;wantZ[i]=wantHave[i]?double(m.ground):p.z;}}
+                        const auto tProv1=std::chrono::steady_clock::now();
                         // Field boxes (step 3, fieldboxapi.h): the addon's boxes round the car. A Touch bottom picks the level among stacked decks;
                         // the measured or authored road near it gives the exact height (authored floors sit up to 1.4 m off the deck). No Touch
                         // face: nothing to touch (open air). No answer: the road reads exactly as before (older addons, D11 shapes).
                         fieldbox::Box fbox[12];int nbox=0;  // FB-1 (2026-11-12): up to 12 tiles ahead (short hairpin tiles); older addons send 3
-                        if(fieldboxapi::provider&&surfaceOwner){FvoFieldBoxV1 raw[12];const int got=std::clamp(fieldboxapi::provider(surfaceOwner,in.x,in.y,carBase,raw,12),0,12);
+                        if(fieldboxapi::provider&&surfaceOwner){FvoFieldBoxV1 raw[12];int got=0;if(reuseSurf&&sc.got>=0){got=sc.got;std::copy(sc.raw,sc.raw+got,raw);}
+                            else{got=std::clamp(fieldboxapi::provider(surfaceOwner,in.x,in.y,carBase,raw,12),0,12);if(sc.ok){sc.got=got;std::copy(raw,raw+got,sc.raw);}}
                             int lineEnd=0;double endX=0,endY=0,endZ=0;arriveHeading=std::numeric_limits<double>::quiet_NaN();
                             for(int k=0;k<got;++k)if(fieldboxapi::ToBox(raw[k],fbox[nbox])){++nbox;if(raw[k].lineEnd>lineEnd){lineEnd=raw[k].lineEnd;endX=raw[k].endX;endY=raw[k].endY;endZ=raw[k].endZ;if(lineEnd==2&&std::isfinite(raw[k].arriveHeading))arriveHeading=raw[k].arriveHeading;}}
                             int bottomUsed=0,airUsed=0;
@@ -5643,6 +5656,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         // measured floor in that level: the route survey's down rays first, then live floor hits (facing up) near the line. Authored
                         // heights are a straight line between route points and sit up to 1.4 m off the deck, so at a ramp's foot or crest the real
                         // floor bent away from them and its edge read as a 0.4 m face (23:40 / 23:59 runs). Unmeasured samples keep the old value.
+                        const auto tBox1=std::chrono::steady_clock::now();
                         bool wantMeasured[kSamples]={};
                         // C1 (2026-11-07, source priority: contact, then rays, then the sweep, then the coarse map): on its wheels the car's own
                         // floor is the newest, closest measurement. 11:38 run: the addon floor sat 1.1 m under the wheels with 6 samples
@@ -5674,6 +5688,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                             if(in.now-g_surfaceLogAt[idx]>=5||in.now<g_surfaceLogAt[idx]){g_surfaceLogAt[idx]=in.now;
                                 logger::Write("OBS system=plan.surface vehicle=%08X pilot=%d from_map=%d unmeasured=%d reachable_levels=%d reach_ms=%.2f largest_correction_m=%.2f contact_offset_m=%.2f reason=reachable_map_floor_gives_height",
                                     self,idx,fromMap,unmeasured,reachLevels,reachMs,most,contactOffset);}}
+                        const auto tReach1=std::chrono::steady_clock::now();
                         fieldbox::Body body;body.centre={in.x,in.y,carBase+in.shape.height*.5};body.heading=in.heading;body.halfWidth=in.shape.halfWidth;body.halfLength=in.shape.halfLength;body.halfHeight=in.shape.height*.5;
                         fieldbox::JoinAtBends(fbox,nbox);  // D13: for containment; the surfaces above read the boxes as drawn
                         const double fieldShareNow=nbox>0?fieldbox::ShareFlat(fbox,nbox,body):-1.0;  // CH-1: also the health sample
@@ -5687,6 +5702,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         auto survey=routesurvey::ReadSweep();
                         const auto tWorld0=std::chrono::steady_clock::now();
                         pcSurfaceUs=std::chrono::duration<double,std::micro>(tWorld0-tSurf0).count();
+                        pcProvUs=std::chrono::duration<double,std::micro>(tProv1-tSurf0).count();pcBoxUs=std::chrono::duration<double,std::micro>(tBox1-tProv1).count();
+                        pcReachUs=std::chrono::duration<double,std::micro>(tReach1-tBox1).count();
                         static thread_local std::vector<Shape> shapes;shapes.clear();constexpr std::size_t kMaxShapes=128;int sweptOverBand=0,wholeBoxes=0,wholeTooBig=0,bandCells=0,sweepKnown=0,sweepShapes=0;  // WB-1 counts
                         const double span=std::max(double(lane->halfWidth),6.0);
                         auto tProbe0=tWorld0;
@@ -6256,6 +6273,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                             if(idx>=0&&idx<256)g_planCost.activeMask[idx>>6]|=(1ull<<(idx&63));
                             g_planCost.frameCurUs+=carUs;g_planCost.totalUs+=carUs;g_planCost.carMaxUs=std::max(g_planCost.carMaxUs,carUs);
                             g_planCost.surfaceUs+=pcSurfaceUs;g_planCost.worldUs+=pcWorldUs;g_planCost.probeUs+=pcProbeUs;
+                            costparts::Add(costparts::g_gatherMs,carUs/1000.0);costparts::Add(costparts::g_surfaceMs,pcSurfaceUs/1000.0);++costparts::g_gathers;
+                            costparts::Add(costparts::g_surfProvMs,pcProvUs/1000.0);costparts::Add(costparts::g_surfBoxMs,pcBoxUs/1000.0);costparts::Add(costparts::g_surfReachMs,pcReachUs/1000.0);
                             g_planCost.buildUs+=pcBuildUs;g_planCost.collideUs+=pcCollideUs;g_planCost.speedUs+=pcSpeedUs;g_planCost.scoreWallUs+=pcScoreWallUs;
                             g_planCost.arbiterUs+=pcArbUs;g_planCost.bodyUs+=pcBodyUs;
                             if(in.now-g_planCost.logAt>=5.0||in.now<g_planCost.logAt){
@@ -6711,7 +6730,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				const auto pick = flightgear::Target(fa);
 				gearReason = pick.reason;
 				const int was = g.flightShift.gear;
-				if (flightgear::Update(g.flightShift, pick, double(GetTickCount64()) / 1000.0))
+				if (flightgear::Update(g.flightShift, pick, double(GetTickCount64()) / 1000.0) && !g.drive)  // PF-1: on wheels the gear restarts every pass (64k lines a run)
 					logger::Write("OBS system=vehicle.gear vehicle=%08X pilot=%d event=flight_shift from=%d to=%d target=%d want=%.1f plan_speed=%.1f speed=%.1f peak_turn=%.3f need_lateral=%.2f gear_lateral=%.2f floor_gap=%.1f to_arrival=%.0f obstacle=%.0f on_wheels=%d reason=%s",
 						At<std::uint32_t>(vehicle, off::kFormId), idx, was, g.flightShift.gear, pick.gear, fa.want, fa.planSpeed, sp, fa.peakTurn, pick.need,
 						fa.lateral[g.flightShift.gear], fa.floorGap, fa.toArrival, fa.obstacle, int(g.drive), g.flightShift.reason);
@@ -8813,8 +8832,10 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 						if (in) seenAt[idx] = now;
 						viewed = seenAt[idx] && now - seenAt[idx] < kViewKeepMs;
 					}
-					bool relaxed = false;
-					if (!viewed && !unbound && !g_farHold[idx] && d >= kNearM && lane) {
+					bool relaxed = false, nearOut = false;
+					// PF-1 (2026-11-21): a near car (kNearKeepM..kNearM) out of view and safe plans at 10 Hz, not 20 (17:36 run: 78% of the
+					// passes were near cars at 20 Hz); in view, within kNearKeepM, or crowded it stays at 20 Hz.
+					if (!viewed && !unbound && !g_farHold[idx] && d >= kNearKeepM && lane) {
 						const auto& o = g.adOut;
 						bool safe = !g.liftoff && !g.landing && o.phase == drive::Phase::Travel && now - g_bumps[idx].ev >= kBumpRecentMs;
 						for (unsigned k = 0; safe && g_vsnapOk && k < g_vsnap.count && k < world::kMaxVehicles; ++k) {
@@ -8824,13 +8845,16 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 							if (std::hypot(double(w.pos[0]) - vp.x, double(w.pos[1]) - vp.y) < reach && std::fabs(double(w.pos[2]) - vp.z) < 15.0) safe = false;
 						}
 						if (!safe) dangerAt[idx] = now;
-						relaxed = safe && now - dangerAt[idx] >= kDangerHoldMs;
+						const bool calm = safe && now - dangerAt[idx] >= kDangerHoldMs;
+						relaxed = calm && d >= kNearM;
+						nearOut = calm && d < kNearM && tierEvery[idx] <= 50;
 					}
-					if (wasRelaxed[idx] && !relaxed) flownAt[idx] = 0;  // a failed check or coming into view: plan this tick, not at the end of the slow interval
-					wasRelaxed[idx] = relaxed;
+					if (wasRelaxed[idx] && !(relaxed || nearOut)) flownAt[idx] = 0;  // a failed check or coming into view: plan this tick, not at the end of the slow interval
+					wasRelaxed[idx] = relaxed || nearOut;
 					g_straight[idx] = relaxed && d >= kMidM;  // only safe, unseen traffic flies straight (past kHoldM a traffic pilot is held)
 					ULONGLONG every = unbound ? 333 : g_farHold[idx] ? (sp > 2.0 ? 200 : 1000) : tierEvery[idx] ? tierEvery[idx] : 50;
 					if (relaxed) every = std::max(every, d < kMidM ? kOutMidMs : kOutFarMs);
+					else if (nearOut) every = std::max(every, kNearOutMs);
 					g_ageScale[idx] = unsigned(std::max<ULONGLONG>(every, 50) / 50);  // probe age limit follows the interval actually used
 					if (HandsOn(idx) && !g.settle) {  // your hands: every frame, through the player's own hover model
 						flownAt[idx] = now;
@@ -8842,7 +8866,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					}
 					if (flownAt[idx] && now - flownAt[idx] < every) continue;
 					flownAt[idx] = now;
-					if (unbound) ++slowed; else { ++flown; ++tierCount[every <= 50 ? 0 : every <= 100 ? 1 : 2]; }
+					if (unbound) ++slowed; else { ++flown; ++tierCount[every <= 50 ? 0 : every <= 100 ? 1 : 2];
+						++costparts::g_pass[every <= 50 ? 0 : every <= 100 ? 1 : 2]; if (nearOut) ++costparts::g_passNearOut; if (relaxed) ++costparts::g_passFarOut; }
 					if (g_farHold[idx]) ++held; else if (relaxed) ++outOfView;
 					if (g_straight[idx]) ++straightCount;
 					if (g.settle) { SettleTick(idx, vehicle); continue; }
@@ -9554,19 +9579,21 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 	void Tick()
 	{
         ReportStepCost();
-		g_vsnapOk = world::Vehicles(g_vsnap);
-		EnvTick();
-		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
-			TrailTick(player);
-			PlayerAirTick(player);
-		}
-		PlayerTick();
-        RefreshFleetRails();
-		PilotsTick();
-		for(auto&s:g_shs){std::lock_guard lk(s.lock);if(const auto ref=s.vehicle.load())BindBody(s,ref);}
-		if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
-			if (!DrivenBy(player)) WatchFlip(Rover(), "Rover");  // never while the player drives it
-		}
+		{costparts::Scope c(costparts::FlightSnapshot);g_vsnapOk = world::Vehicles(g_vsnap);}
+		{costparts::Scope c(costparts::FlightEnv);EnvTick();}
+		{costparts::Scope c(costparts::FlightPlayer);
+			if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
+				TrailTick(player);
+				PlayerAirTick(player);
+			}
+			PlayerTick();}
+        {costparts::Scope c(costparts::FlightRails);RefreshFleetRails();}
+		{costparts::Scope c(costparts::FlightPilots);PilotsTick();}
+		{costparts::Scope c(costparts::FlightBind);
+			for(auto&s:g_shs){std::lock_guard lk(s.lock);if(const auto ref=s.vehicle.load())BindBody(s,ref);}
+			if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
+				if (!DrivenBy(player)) WatchFlip(Rover(), "Rover");  // never while the player drives it
+			}}
 	}
 
 	std::uint64_t TotalPhysicsSteps(int* boundPilots)

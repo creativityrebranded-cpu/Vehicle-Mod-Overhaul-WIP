@@ -62,6 +62,7 @@
 #include <cstdio>
 #include <optional>
 #include <string>
+#include "costparts.h"
 
 namespace
 {
@@ -1617,9 +1618,11 @@ namespace trafficpool
 #ifndef FVO_RELEASE
             if(ApiPresentation()==1){FactoryCamera camera;RememberFactoryCamera(camera);}
 #endif
-            vehiclekeep::UpdateTrafficLook();g_hooks.tick();WatchDrivers();
+            {costparts::Scope c(costparts::PoolLook);vehiclekeep::UpdateTrafficLook();}
+            {costparts::Scope c(costparts::PoolAddon);g_hooks.tick();}
+            {costparts::Scope c(costparts::PoolWatch);WatchDrivers();}
         }
-		ServiceVisibility();
+		{costparts::Scope c(costparts::PoolVisibility);ServiceVisibility();}
 	}
 	bool MadeVehicle(std::uint32_t id) { return g_madeVehicles.count(id) != 0; }
 #ifndef FVO_RELEASE

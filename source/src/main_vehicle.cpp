@@ -65,6 +65,7 @@
 #include <cstring>
 #include <algorithm>
 #include <Windows.h>
+#include "costparts.h"
 
 namespace plugininfo
 {
@@ -302,10 +303,34 @@ namespace
 
     struct FrameCost {
         double sum[8]{},max[8]{};unsigned count=0;ULONGLONG began=0;
+        // PF-1 (2026-11-21): updates over 8 / 12 / 20 ms, the flight and traffic pool parts, and the energy plan's gathering per update.
+        unsigned over8=0,over12=0,over20=0;double partSum[costparts::kParts]{},partMax[costparts::kParts]{},gatherSum=0,gatherMax=0,poolSum=0,poolMax=0;
         void Finish(const double sample[8]) {
             const auto now=GetTickCount64();if(!began)began=now;++count;
             for(int i=0;i<8;++i){sum[i]+=sample[i];max[i]=std::max(max[i],sample[i]);}
+            if(sample[7]>8.0)++over8;if(sample[7]>12.0)++over12;if(sample[7]>20.0)++over20;
+            double pool=0;for(int p=0;p<costparts::kParts;++p){partSum[p]+=costparts::g_frame[p];partMax[p]=std::max(partMax[p],costparts::g_frame[p]);if(p>=costparts::PoolLook)pool+=costparts::g_frame[p];}
+            poolSum+=pool;poolMax=std::max(poolMax,pool);
+            const double gather=costparts::g_gatherMs.exchange(0.0);gatherSum+=gather;gatherMax=std::max(gatherMax,gather);
             if(now-began<60000)return;
+            {   using namespace costparts;
+                const double c=double(count),secs=double(now-began)/1000.0,surf=std::max(1e-9,g_surfaceMs.load());
+                auto avg=[&](int p){return partSum[p]/c;};
+                logger::Important("Performance: %u updates in %.0f s (%.1f a second); mod %.2f ms avg / %.1f worst; over 8 ms %u, over 12 ms %u, over 20 ms %u; "
+                    "flight %.2f / %.1f [pilots %.2f / %.1f, of which world gathering %.2f / %.1f (%u gathers, %u reused road answers; surface %.0f%% of it: road answers %.0f%%, field boxes %.0f%%, floor map %.0f%%); "
+                    "fleet rails %.2f / %.1f, snapshot %.2f, environment %.2f, player %.2f, body bind %.2f]; "
+                    "traffic pool %.2f / %.1f [add-on tick %.2f / %.1f, visibility %.2f / %.1f, traffic look %.2f, driver watch %.2f]; "
+                    "NPC decisions %.2f / %.1f; map+navigation %.2f / %.1f; identity+world %.2f; "
+                    "planning passes 20 Hz %u, 10 Hz %u (near but out of view %u), 5 Hz or slower %u (far out of view %u)",
+                    count,secs,c/std::max(1.0,secs),sum[7]/c,max[7],over8,over12,over20,
+                    sum[5]/c,max[5],avg(FlightPilots),partMax[FlightPilots],gatherSum/c,gatherMax,g_gathers.load(),g_surfaceReused.load(),
+                    100.0*surf/std::max(1e-9,gatherSum),100.0*g_surfProvMs.load()/surf,100.0*g_surfBoxMs.load()/surf,100.0*g_surfReachMs.load()/surf,
+                    avg(FlightRails),partMax[FlightRails],avg(FlightSnapshot),avg(FlightEnv),avg(FlightPlayer),avg(FlightBind),
+                    poolSum/c,poolMax,avg(PoolAddon),partMax[PoolAddon],avg(PoolVisibility),partMax[PoolVisibility],avg(PoolLook),avg(PoolWatch),
+                    sum[4]/c,max[4],sum[2]/c,max[2],sum[0]/c,
+                    g_pass[0],g_pass[1],g_passNearOut,g_pass[2],g_passFarOut);
+                ResetMinute();
+            }
             logger::Write("Vehicle update cost: total %.3f ms avg / %.3f worst; identity+world %.3f / %.1f, hits %.3f / %.1f, map+navigation %.3f / %.1f, context+profiles %.3f / %.1f, NPC decisions+squads+rams %.3f / %.1f, flight %.3f / %.1f, other (vehicle registry, placement, scanner, traffic) %.3f / %.1f (avg / worst ms)",
                 sum[7]/count,max[7],sum[0]/count,max[0],sum[1]/count,max[1],sum[2]/count,max[2],sum[3]/count,max[3],sum[4]/count,max[4],sum[5]/count,max[5],sum[6]/count,max[6]);
             *this={};began=now;
@@ -316,6 +341,7 @@ namespace
     {
         LARGE_INTEGER frequency,start,previous,stamp;QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&start);previous=start;
         double cost[8]{};auto mark=[&](int i){QueryPerformanceCounter(&stamp);cost[i]=1000.0*double(stamp.QuadPart-previous.QuadPart)/frequency.QuadPart;previous=stamp;};
+        costparts::BeginFrame();
         modscene::NewFrame();
         features::Tick();bindings::Tick();
         vehicleflight::BeginFrame(); // decision owners must renew their commands in this frame
