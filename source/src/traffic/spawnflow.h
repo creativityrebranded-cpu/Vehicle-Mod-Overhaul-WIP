@@ -194,7 +194,8 @@ inline Site Place(bool haveBox, const FvoFieldBoxV1& raw, Pose lane, const Shape
     if (!haveBox) { r.why = "no_field_box"; return r; }                 // D11 shapes, unreadable boxes, no tile: no birth there
     fieldbox::Box b; if (!fieldboxapi::ToBox(raw, b)) { r.why = "field_box_malformed"; return r; }
     r.defaultBox = fieldboxapi::IsDefault(raw);
-    if (b.faces[fieldbox::Bottom] != fieldbox::State::Touch) { r.why = "no_floor_hover_tile"; return r; }  // hover-only tiles stay out for now
+    // 2026-11-22 (user): all routes are the same to birth. A hover tile's box bottom sits on the route line, so the bottom plane is its floor too;
+    // the autopilot decides drive or hover after birth.
     if (!FloorAt(b, lane.x, lane.y, r.floor)) { r.why = "no_floor_plane"; return r; }
     const auto l = fieldbox::Local(b, { lane.x, lane.y, r.floor });
     if (std::fabs(l.y) > b.halfLength + .01) { r.why = "lane_point_outside_its_tile"; return r; }

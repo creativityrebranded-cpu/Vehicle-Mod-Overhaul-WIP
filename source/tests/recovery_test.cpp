@@ -276,15 +276,57 @@ int main() {
         auto c = Update(st, in);
         Check(c.mode == Mode::Recover && c.step == Step::BackUp && std::string(c.why) == "forward_blocked_reverse_clear" && c.steer > 0.0,
               "AP-1: forward blocked, reverse clear: BackUp at once, steering toward the lane");
-        in.forwardBlocked = false; in.stepBlocked = true; in.now = 1.1; c = Update(st, in);
+        in.forwardBlocked = false; in.legReverseClear = false; in.now = 1.1; c = Update(st, in);
         Check(c.step == Step::TurnToLane && std::string(c.why) == "reverse_blocked", "AP-1: a blocked back-up step ends: TurnToLane");
         Check(c.steer <= -1.0 + 1e-9, "AP-1: TurnToLane at 0.6 rad is full lock");
         std::string seq;
-        for (int i = 0; i < 6; ++i) { in.now += .1; c = Update(st, in); seq += c.step == Step::BackUp ? 'B' : c.step == Step::TurnToLane ? 'T' : c.step == Step::Retry ? 'R' : '?'; if (c.step == Step::Retry) break; }
-        Check(seq == "BTBTR" && std::string(c.why) == "turn_blocked", "AP-1: blocked turn: back up again twice, then Retry (turn_blocked)");
+        for (int i = 0; i < recovery::Rules{}.maxCycles; ++i) {
+            in.legForwardClear = false; in.legReverseClear = true; in.now += .1;
+            c = Update(st, in); seq += c.step == Step::BackUp ? 'B' : '?';
+            in.legForwardClear = true; in.legReverseClear = false; in.now += .1;
+            c = Update(st, in); seq += c.step == Step::TurnToLane ? 'T' : '?';
+        }
+        in.legForwardClear = false; in.legReverseClear = true; in.now += .1;
+        c = Update(st, in);
+        Check(seq == "BTBTBTBT" && c.step == Step::Retry && std::string(c.why) == "turn_blocked",
+              "AP-2: blocked turn: back up again four times, then Retry");
         std::printf("     cycles %s\n", seq.c_str());
         State q; Input j; j.now = 1.0; j.continuous = false; j.forwardBlocked = true; j.reverseFeasible = true;
         Check(Update(q, j).mode == Mode::Follow, "AP-1: an unmanaged car (player autopilot) keeps the 6 s no-progress rule");
+    }
+
+    {
+        State state;
+        Input in;
+        in.centreAtWantedSpeedBlocked = true;
+        in.headingErrToLane = 2.9;
+        in.legForwardFaces = true;
+        auto command = Update(state, in);
+        Check(command.step == Step::TurnToLane && std::string(command.why) == "off_heading_kturn" && command.steer < 0,
+              "AP-2: a blocked high-angle start uses a clear forward leg that can face the lane");
+        in.now = .1;
+        in.headingErrToLane = -3.1;
+        in.speed = -1.5;
+        in.progress = 3.0;
+        command = Update(state, in);
+        Check(command.steer < 0 && state.turnSign == 1, "AP-2: a heading wrap does not reverse the chosen turn");
+        Check(state.tries == 1 && state.progressSum == 0, "AP-2: reversing toward the goal does not reset recovery tries");
+    }
+
+    {
+        for (const double side : {-1.0, 1.0}) {
+            Input in;
+            in.headingErrToLane = side * 1.0471975511965976;  // 60 degrees
+            State stationary;
+            auto command = Update(stationary, in);
+            Check(command.step == Step::BackUp && command.steer * side > 0,
+                  "AP-2: stationary high-angle car recovers even when the lane-centre score is feasible");
+            State moving;
+            in.speed = 3.0;
+            command = Update(moving, in);
+            Check(command.mode == Mode::Follow,
+                  "AP-2: moving high-angle car does not leave a feasible lane-centre plan");
+        }
     }
 
     {   // nothing feasible for 2 s -> Recover

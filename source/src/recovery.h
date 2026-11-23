@@ -30,6 +30,7 @@
 // on the Command; a Recover command carries its own signed speed and steer.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -53,7 +54,10 @@ struct Input {
     bool continuous = false;               // a managed lane keeps searching instead of entering a timed Stand
     bool floorRetry = false;                // a verified point left the scene and the full centre candidate is feasible
     double roadGrade = 0.0;                 // SP-1: rise over run of the road just ahead along the travel (World's lane floor)
-    bool stepBlocked = false;               // AP-1: the held step's own plan was not clear last tick
+    bool wheels = true;
+    bool legForwardClear = true;
+    bool legForwardFaces = false;
+    bool legReverseClear = true;
     bool forwardBlocked = false;            // AP-1: no forward plan is clear
 };
 
@@ -79,9 +83,15 @@ struct Rules {
     double backUpSteerGain = 3.0;    // AP-1: reverse steer per rad of heading error (toward the lane; full lock from 0.33 rad)
     double turnSpeed = 1.5;          // m/s forward while turning to the lane
     double turnDone = 0.17;          // rad heading error that ends TurnToLane (AP-1: 10 deg; 20 deg left cars pointing at the kerb)
-    double turnMax = 6.0;            // s
+    double turnMax = 10.0;           // s
     double turnSteerGain = 4.0;      // AP-1: forward steer per rad (full lock from 0.25 rad; was 2)
-    int maxCycles = 2;               // AP-1: extra back-up/turn cycles in one try when the turn is blocked
+    double kturnFrom = 1.04;         // rad, approximately 60 degrees
+    double kturnBackMetres = 2.7;    // m before a high-angle reverse leg must switch
+    double kturnRestSpeed = .15;    // m/s below which lane-centre cost cannot suppress recovery
+    // Longest first. The planner still needs room to stop at the end of any prefix.
+    std::array<double, 10> kturnPrefixes = {5.0, 3.6, 2.7, 2.1, 1.6, 1.2, .9, .6, .35, .15};
+    double minBackForTurn = .8;      // m before switching early from reverse to a clear forward turn
+    int maxCycles = 4;               // extra back-up/turn cycles in one try
     int maxTries = 3;
     double standRetry = 5.0;         // s in Stand before Avoid is tried again
     double nothingFeasibleFor = 2.0; // s with no feasible plan before Recover
@@ -100,8 +110,33 @@ struct State {
     double progressSum = 0.0;  // metres since the anchor
     double backed = 0.0;       // metres reversed in the current BackUp step
     int tries = 0;             // Recover entries since the last progress
-    int cycles = 0;            // AP-1: back-up/turn cycles in the current try
+    int cycles = 0;            // back-up/turn cycles in the current try
+    int turnSign = 0;
+    double startErr = 0.0;
 };
+
+inline double LegError(const State& s, double err) {
+    constexpr double pi = 3.14159265358979323846;
+    if (std::fabs(err) > pi / 2 && s.turnSign * err < 0)
+        return err + s.turnSign * 2 * pi;
+    return err;
+}
+
+inline double LegSteer(const State& s, double err, Command::Step step, const Rules& r = {}) {
+    if (!std::isfinite(err)) return 0;
+    const double gain = step == Command::Step::BackUp ? r.backUpSteerGain : -r.turnSteerGain;
+    return std::clamp(LegError(s, err) * gain, -1.0, 1.0);
+}
+
+inline bool HighAngleTurn(const State& s, double err, const Rules& r) {
+    return std::fabs(err) >= r.kturnFrom ||
+        (s.mode == Mode::Recover && std::fabs(s.startErr) >= r.kturnFrom);
+}
+
+inline double BackUpMetres(const State& s, double err, const Rules& r) {
+    const double start = s.mode == Mode::Recover ? s.startErr : err;
+    return std::fabs(start) >= r.kturnFrom ? r.kturnBackMetres : r.backUpMetres;
+}
 
 inline Command Update(State& s, const Input& in, const Rules& r = {}) {
     using Step = Command::Step;
@@ -124,7 +159,8 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
     else s.noneSince = nan;
 
     // Progress anchor: progressMin metres net since the anchor resets the clock and the tries.
-    if (std::isfinite(in.progress)) s.progressSum += in.progress;
+    if (std::isfinite(in.progress) && !(in.speed < -.05 && in.progress > 0))
+        s.progressSum += in.progress;
     bool madeProgress = false;
     if (s.progressSum >= r.progressMin) {
         madeProgress = true;
@@ -137,6 +173,7 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
         if (m != s.mode) s.modeSince = now;
         if (m != s.mode || st != s.step) s.stepSince = now;
         s.mode = m;
+        if (m != Mode::Recover) s.turnSign = 0;
         s.step = st;
         s.why = why;
     };
@@ -144,11 +181,12 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
         if (centreClear) enter(Mode::Follow, Step::None, followWhy);
         else enter(Mode::Avoid, Step::None, avoidWhy);
     };
+    const bool offHeading = in.haveLane && std::fabs(in.headingErrToLane) >= r.turnDone;
     auto startRecover = [&](const char* why) {
         s.progressSince = now;
         s.backed = 0.0;
         s.cycles = 0;
-        if (!in.anyFeasible && !in.reverseFeasible) {
+        if (!in.anyFeasible && !in.reverseFeasible && !(offHeading && in.legForwardClear)) {
             if (in.continuous) enter(Mode::Avoid, Step::None, "stalled_no_feasible_maneuver");
             else enter(Mode::Stand, Step::None, "nothing_safe");
             return;
@@ -160,7 +198,16 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
             return;
         }
         ++s.tries;
-        enter(Mode::Recover, in.reverseFeasible ? Step::BackUp : Step::TurnToLane, why);
+        s.turnSign = (in.headingErrToLane > 0) - (in.headingErrToLane < 0);
+        s.startErr = in.headingErrToLane;
+        if (offHeading && in.legForwardClear && in.legForwardFaces)
+            enter(Mode::Recover, Step::TurnToLane, why);
+        else if (in.reverseFeasible && in.legReverseClear)
+            enter(Mode::Recover, Step::BackUp, why);
+        else if (offHeading && in.legForwardClear)
+            enter(Mode::Recover, Step::TurnToLane, why);
+        else
+            enter(Mode::Recover, Step::Retry, "no_clear_leg");
     };
     // SP-1 (2026-11-19): slowness the road explains is not "no progress". On a measured climb, with the centre clear and the car still
     // moving forward, the no-progress clock holds (13:20 run: the rover climbed at 0.3 m/s and recovery backed it down the ramp).
@@ -170,6 +217,9 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
     // AP-1: a managed car nose-on to something with a clear way back reverses now, as one held step (17:36 run: FF1000DE swapped
     // between forward and reverse plans every 0.3-0.7 s for 15 s and never gained room).
     const bool forwardStuck = in.continuous && in.forwardBlocked && in.reverseFeasible && s.tries < r.maxTries;
+
+    const bool turnRound = in.wheels && in.haveLane && std::fabs(in.headingErrToLane) >= r.kturnFrom &&
+        (!centreClear || std::fabs(in.speed) < r.kturnRestSpeed) && s.tries < r.maxTries;
 
     if (in.meantToStand) {
         // Rule 1: never recovers while it is supposed to wait.
@@ -186,6 +236,7 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
         switch (s.mode) {
         case Mode::Follow:
             if (forwardStuck) startRecover("forward_blocked_reverse_clear");
+            else if (turnRound) startRecover("off_heading_kturn");
             else if (!in.haveLane) enter(Mode::Avoid, Step::None, "no_lane");
             else if (in.centreAtWantedSpeedBlocked) enter(Mode::Avoid, Step::None, "centre_blocked");
             else if (!in.centreFeasible) enter(Mode::Avoid, Step::None, "centre_infeasible");
@@ -193,6 +244,7 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
             break;
         case Mode::Avoid:
             if (forwardStuck) startRecover("forward_blocked_reverse_clear");
+            else if (turnRound) startRecover("off_heading_kturn");
             else if (!std::isnan(s.clearSince) && now - s.clearSince >= r.avoidHold)
                 enter(Mode::Follow, Step::None, "centre_clear_long_enough");
             else if (noProgressLong) startRecover("no_progress_6s");
@@ -201,19 +253,30 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
         case Mode::Recover:
             switch (s.step) {
             case Step::BackUp:
-                s.backed += std::fabs(in.speed) * dt;
-                if (s.backed >= r.backUpMetres) enter(Mode::Recover, Step::TurnToLane, "backed_up");
-                else if (now - s.stepSince >= r.backUpMax) enter(Mode::Recover, Step::TurnToLane, "back_up_time_up");
-                else if (!in.reverseFeasible || in.stepBlocked) enter(Mode::Recover, Step::TurnToLane, "reverse_blocked");
+                s.backed += std::max(0.0, -in.speed) * dt;
+                if (in.haveLane && std::fabs(s.startErr) >= r.kturnFrom && !offHeading)
+                    enter(Mode::Recover, Step::Retry, "faced_while_backing");
+                else if (offHeading && in.legForwardClear && in.legForwardFaces && s.backed >= r.minBackForTurn)
+                    enter(Mode::Recover, Step::TurnToLane, "forward_turn_fits");
+                else if (s.backed >= BackUpMetres(s, in.headingErrToLane, r))
+                    enter(Mode::Recover, Step::TurnToLane, "backed_up");
+                else if (now - s.stepSince >= r.backUpMax)
+                    enter(Mode::Recover, Step::TurnToLane, "back_up_time_up");
+                else if (!in.reverseFeasible || !in.legReverseClear) {
+                    if (in.legForwardClear || !offHeading)
+                        enter(Mode::Recover, Step::TurnToLane, "reverse_blocked");
+                    else
+                        enter(Mode::Recover, Step::Retry, "both_legs_blocked");
+                }
                 break;
             case Step::TurnToLane:
                 if (!in.haveLane) enter(Mode::Recover, Step::Retry, "no_lane_to_face");
-                else if (std::fabs(in.headingErrToLane) < r.turnDone) enter(Mode::Recover, Step::Retry, "facing_the_lane");
-                else if (in.stepBlocked && s.cycles < r.maxCycles && in.reverseFeasible) {
+                else if (!offHeading) enter(Mode::Recover, Step::Retry, "facing_the_lane");
+                else if (!in.legForwardClear && s.cycles < r.maxCycles && in.legReverseClear) {
                     ++s.cycles; s.backed = 0.0;
                     enter(Mode::Recover, Step::BackUp, "turn_blocked_back_up_again");
                 }
-                else if (in.stepBlocked) enter(Mode::Recover, Step::Retry, "turn_blocked");
+                else if (!in.legForwardClear) enter(Mode::Recover, Step::Retry, "turn_blocked");
                 else if (now - s.stepSince >= r.turnMax) enter(Mode::Recover, Step::Retry, "turn_time_up");
                 break;
             case Step::Retry:
@@ -255,11 +318,11 @@ inline Command Update(State& s, const Input& in, const Rules& r = {}) {
         switch (s.step) {
         case Step::BackUp:  // AP-1: reversing, the wheel turns the nose the other way: +error steers it back toward the lane
             c.wantSpeed = -r.backUpSpeed;
-            c.steer = std::isfinite(in.headingErrToLane) ? std::clamp(in.headingErrToLane * r.backUpSteerGain, -1.0, 1.0) : 0.0;
+            c.steer = LegSteer(s, in.headingErrToLane, s.step, r);
             break;
         case Step::TurnToLane:
             c.wantSpeed = r.turnSpeed;
-            c.steer = std::isfinite(in.headingErrToLane) ? std::clamp(-in.headingErrToLane * r.turnSteerGain, -1.0, 1.0) : 0.0;
+            c.steer = LegSteer(s, in.headingErrToLane, s.step, r);
             break;
         case Step::Retry: c.wantSpeed = r.turnSpeed; c.steer = 0.0; break;  // keep rolling through the hand-over tick
         case Step::Hover: c.wantSpeed = r.turnSpeed; c.steer = 0.0; break;

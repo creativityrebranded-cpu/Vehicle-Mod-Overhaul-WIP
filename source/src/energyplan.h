@@ -19,12 +19,14 @@
 #include "bicycle.h"
 #include "carcap.h"
 #include "planlattice.h"
+#include "planspeed.h"
 #include "recovery.h"
 #include "wheelguard.h"
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -34,65 +36,36 @@ namespace energyplan {
 constexpr int kSteps = 30;            // rollout steps
 constexpr double kDt = .2;            // s per step (6 s ahead)
 constexpr int kMaxSegments = 3;
-constexpr int kMaxCandidates = 700;  // step 3: the full library + drive-then-stop + hover families (546 + 56 + 7 at most)
+constexpr int kMaxCandidates = 800;  // step 3: the full library + drive-then-stop + hover families (546 + 56 + 7 at most)
 constexpr double kInf = std::numeric_limits<double>::infinity();
 constexpr double kNoGoRise = .05;       // m: leaving a band: the body's centre may be this much deeper in it than it was before the step is refused
 constexpr double kNoGoTolerance = .03;  // m: a body this far into known no-go space (route edge band / median) still counts as clear
 constexpr double kBandTierStep = .25;   // m: a clearance tier is this deep when the only thing the body is in is a known band (a solid: 5 cm)
 constexpr double kBandSoft = .12;       // m: a body this far into a known band alone is a cost, not a clearance tier (beyond it: a tier)
 
+// ST-B: the numbers the margins come from, all from the car or the controller (nothing chosen here).
+inline double CreepSpeed(const bicycle::Spec& k) { return k.brake * kDt; }               // m/s: the lowest rung; time to creep out of an intrusion = excess / this
+// m: the distance covered in one controller reaction, at the speed (never below the creep speed: a speed under it is "a stop", so a stand
+// cannot be placed better than creep x that time).
+inline double Margin(double speed, const bicycle::Spec& k) { return std::max(std::fabs(speed), CreepSpeed(k)) * wheelguard::reaction; }
+// s: the time a take-off plus a landing takes; hovering is preferred over wheels by one such switch per horizon (the plan sees H ahead).
+inline double ModeSwitchTime(const bicycle::Spec& k) { return k.hoverClear / k.climbRate + k.hoverClear / k.descendRate; }
+inline double StopGap(const bicycle::Spec& k) { return .5 * k.halfLength; }              // m: a half body length kept short of a stop station
+inline double EdgeSpeed(const bicycle::Spec& k) { return std::sqrt(2 * 9.81 * k.climb); } // m/s: the speed that lifts a wheel over the highest edge it rolls over
+// ST-A (2026-11-22, notes/GENERATED_COSTS_DESIGN_20261122.md): every cost is in SECONDS. Speed shortfall dt*(1 - v/v_w); route / cost-to-go metres divided
+// by the wanted speed; a mode switch costs the take-off + landing time; a gear change the time to stop and pull away; the facing the time to turn the nose.
 struct Weights {
-    double progress = 1.0;      // per metre along the route (subtracted)
-    double lateral = .6;        // per second at the lane's half width
-    // O1 / O2 (2026-11-14, design section 9's arbiter; replaces RH-1's flip cost): the committed plan stays unless a challenger is cheaper by
-    // switchBase (MP-1: fixed) for challengeFor s of plans, not within holdAfter s of the last switch. Forward <-> reverse is such a
-    // switch too (a clear win, held as long), never a timed hold (12:28 run: a forward plan 35 cheaper waited 2.5 s). The committed plan entering a
-    // solid (infinite) bypasses all of it.
-    // MP-1 (2026-11-14 19:44 run): the margin is a fixed switchBase. A share of |energy| (was 1%) grew it to 1.6 on a lane (the total is about
-    // -133 from road past the goal, the same for every plan) while the whole speed term is 0.1-0.5, so every speed was a near tie.
-    double switchBase = .3, challengeFor = .4, holdAfter = .6;
-    // HC-1 (2026-11-14 19:14 run: 475 of 477 switches skipped the hold): "got worse" is judged against the challenger, never against the kept plan's
-    // own past (every plan's energy moves when the lane goal moves ahead). It releases at once when the gap (kept minus best) grew past its
-    // smallest since the plan was chosen by jumpWorse margins (steepWorse for a direction change); a smaller lead waits for the challenge timer.
-    double jumpWorse = 3.0, steepWorse = 5.0;
-    double roomBetter = .05;    // HC-1: a kept plan within the margin of a solid gives way only to a plan with the margin, or more room by this (each release gains room: no flapping back)
-    double endCurveMax = .5;    // HC-2: 1/m, the sharpest end curvature the stopping rule continues (the car's tightest turn is about this)
-    double laneEdge = 6.0;      // LK-1 (2026-11-13 09:56 run): per second x (m of the body past its own lane's edge)^2. The lane is the plan;
-                                // leaving it is finite (a blocked lane can still be driven round) but never cheaper than a few metres of way
-    double speed = .4;          // per second at the wanted speed's square, scaled
-    double collision = 6.0;     // per second at zero clearance (rises inside the margin)
-    double margin = .5;         // m clearance below which collision cost starts
-    double lowEdge = .4;        // per wheel-climbable point under the body, per second
-    double slope = 4.0;         // per second, (grade - comfortGrade)^2 scaled
-    double comfortGrade = .55;  // rise over run: free up to comfort; wheels cannot past carcap MaxGrade(grip) (D2 2026-11-19: was a separate 1.0 here)
-    double field = 4.0;         // per second per square metre outside the field
-    double gear = 5.0;          // per gear change
-    double commit = .6;         // per square metre of mean distance from the previous best (first 2 s)
-    double steer = .25;         // per unit of input change between segments
+    // ST-B (2026-11-22): margins and constraints in seconds. No weight is left but the gear's grip: a body inside the margin m(v) = v * t_r (the
+    // distance covered in one controller reaction) pays the time to creep out of it, excess / v_creep (v_creep = brake * kDt, the lowest rung);
+    // contact stays infinite (a clearance tier). The lane, the field, a road user's box, a predicted solid, a low edge and a steep grade are priced
+    // the same way (see Score). Replaces collision / margin / mover / moverMargin / moverHit / soft / lateral / laneEdge / field / slope /
+    // comfortGrade / lowEdge / stopGap / endCurveMax / offLaneEase.
     double grip = 1.0;          // the gear's tyre grip multiplier: speed in a turn is capped by carcap PlanLat(grip) and the grade by carcap
                                 // MaxGrade(grip), inside the rollout (D2 2026-11-19, the one car record: was latAccel 3.0 x grip here)
-    double endReach = 25.0;     // m checked straight past the rollout's end for the stopping rule
-    double togo = 3.0;          // per metre-equivalent of the cost to go (planlattice) at the rollout's end; replaces progress when known
-    // D4 moving users (one-authority step 1): their predicted boxes at each rollout time. Driving INTO one is out; one coming into us
-    // (we are not closing on it) costs moverHit per second instead, so a follower behind can never freeze the car.
-    double mover = 6.0, moverMargin = 1.0, moverHit = 8.0;  // moverHit: once per rollout whose predicted contact is a follower's (step 2)
-    double stopGap = 1.0;       // D5: m kept between the car's front and the stop station
-    double soft = 2.0;          // ED-1: per predicted solid near the body, per second (a prediction shapes the path, never blocks)
-    // Step 2 finding: a trimmed library (110 or 230 shapes + refinement) changed decisions scene by scene (the 19:51 recorded hairpin stood
-    // still; then the rock scene failed). The full library passes every scene, so it stays the default; speed comes from doing the same
-    // work faster (exact early-outs, one-pass checks, local route search), never from evaluating less. The trimmed set stays switchable.
+    // Step 2 finding: a trimmed library changed decisions scene by scene; the full library passes every scene, so it stays the default.
     bool fullSet = true;        // the full library (default) / the trimmed coarse set (diagnostic)
-    int refineRounds = 0;       // refinement after the trimmed set (diagnostic; the full library needs none)       // step 2: coarse-to-fine refinement rounds (diagnostic switch for plan_sim comparisons)
-    bool windowEdgeRule = true; // step 2 (ED-2): progress past the field window counts against the last inside cost to go (false: togoCap, as before)
-    double togoCap = 400.0;     // a rollout ending where no way on is known pays this (not infinite: it may still be the best there is)
-    // D6/D7 (one-authority step 3): rail or flight as part of the plan, and facing.
-    double hover = 1.5;         // per second hovering (the energy it uses; driving is preferred where both work)
-    double modeSwitch = 6.0;    // per change between wheels and hover (taking off, landing)
-    double facing = 8.0;        // at the end, x (1 - cos) of the nose against the wanted facing
-    // JL-1 (2026-11-18, the user approved "looser lane-keeping while joining and leaving a route"; the laps of 0.9/1.0 followed a point 70 m
-    // ahead with 25 m reach): a plan that starts off its own lane (joining it, or leaving it at an exit) prices the lane's lateral and edge
-    // terms at this share until the car is back inside its half width.
-    double offLaneEase = .25;
+    int refineRounds = 0;       // refinement after the trimmed set (diagnostic; the full library needs none)
+    bool windowEdgeRule = true; // step 2 (ED-2): progress past the field window counts against the last inside cost to go (false: the horizon time, as before)
 };
 
 // mode (step 3): 0 on the wheels (input = steering), 1 hovering (input = turn rate share, strafe = travel angle off the nose).
@@ -102,7 +75,7 @@ struct Segment { double input = 0, speed = 0, seconds = 0; int mode = 0; double 
 struct Candidate { std::array<Segment, kMaxSegments> seg{}; int count = 0; const char* kind = ""; };
 
 struct GradeFit { double grade = 0, raw = 0; int points = 0, setAside = 0; bool ok = false; };  // GR-2
-struct Terms { double hover = 0, modes = 0, facing = 0, movers = 0, soft = 0, togo = 0, progress = 0, lateral = 0, speed = 0, collision = 0, lowEdge = 0, slope = 0, field = 0, gear = 0, commit = 0, steer = 0;
+struct Terms { double hover = 0, modes = 0, facing = 0, movers = 0, soft = 0, togo = 0, progress = 0, lateral = 0, speed = 0, collision = 0, lowEdge = 0, slope = 0, field = 0, gear = 0;
                int clearanceTier = 0;
                double wheelSpeed = kInf;
                const char* wheelReason = "clear";
@@ -124,6 +97,9 @@ struct BlockTrace {
 };
 struct Result {
     BlockTrace centreBlock;
+    double laneErr = 0;
+    bool legF = false, legFaces = false, legR = false;
+    int recTries = 0, recCycles = 0, turnSign = 0;
     bool ok = false;                       // some candidate has finite energy
     // O1 / O4 (Ledger): kept = the committed plan stayed; the challenger it held off (or the plan it replaced) and the energy gap; why it switched.
     bool kept = false; const char* rival = ""; double rivalGap = 0; const char* switchWhy = ""; double offset = 0, speedAhead = 0;
@@ -215,7 +191,6 @@ struct Memory { bool have = false; Candidate best; bicycle::State traj[kSteps + 
                 // RV-1: the mode state machine, when the plan last ran (2 s apart: a fresh start), where the car stood then (progress)
                 Trail trail;
                 recovery::State rec; double recSeen = -1, progX = 0, progY = 0;
-                bool recStepBlocked = false;  // AP-1: the routine's held step was not clear (fed to the next tick)
                 double queuedSince = -1; };   // AP-1: since when the lane centre is blocked by a road user (queued in traffic)  // HC-3: switches per rule, per second
 
 
@@ -357,7 +332,6 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
     };
     if (bandSlack(clear0, s, bandFloor(s, z0))) clear0 = 0;
     double st0, lat0, half0; int rseg = -1; w.Route(s.x, s.y, st0, lat0, half0, hint, nullptr, nullptr, &rseg);
-    const double laneScale = w.lanes && std::isfinite(lat0) && std::isfinite(half0) && std::fabs(lat0) > half0 ? wt.offLaneEase : 1.0;  // JL-1: joining / leaving
     // Step 2: route projections follow the rollout from the last segment (RouteLocal) instead of scanning the station window each step.
     auto routeAt = [&](double x, double y, double& st, double& lat, double& half) { if (rseg >= 0) rseg = w.RouteLocal(x, y, rseg, st, lat, half); else w.Route(x, y, st, lat, half, st0); };
     // Known no-go (route edge bands, medians): walls in the scene (planscene BuildKnownBandSolids), refused by the same collision rule below as any
@@ -370,21 +344,29 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
     if (inBand) { double yaw0 = s.heading, a0, b0, h0; w.Route(s.x, s.y, a0, b0, h0, st0, &yaw0); bandPrevC = w.NoGoDepth(lat0, 0, k); }
     int seg = 0; double segLeft = c.count ? c.seg[0].seconds : 0;
     double lastDir = start.speed > .3 ? 1 : start.speed < -.3 ? -1 : 0; int gears = 0;
-    for (int i = 1; i < c.count; ++i) terms.steer += wt.steer * std::fabs(c.seg[i].input - c.seg[i - 1].input);
-    const int shift = mem && mem->have ? std::clamp(int(std::lround((now - mem->at) / kDt)), 0, kSteps) : 0;
-    double commitSum = 0; int commitN = 0;
+    const double vw = std::max(1.0, want);  // ST-A: the wanted speed turns metres into seconds
+    const double vCreep = CreepSpeed(k);
+    // ST-B: each constraint pays once per rollout the time to creep out of its worst intrusion (the deepest step), never a rate per second.
+    double inCollision = 0, inMover = 0, inSoft = 0, inLane = 0, inField = 0, inEdge = 0, inGrade = 0;
+    const double laneOut0 = w.lanes && std::isfinite(lat0) && std::isfinite(half0) ? std::max(0.0, std::fabs(lat0) + k.halfWidth - half0) : 0.0;  // joining: priced from where the plan starts
     double lastIn = kInf, lastInStation = 0;  // ED-2 (step 2): the cost to go at the last rollout state inside the field window, and its station
     bool contactExcused = false;  // D4: this rollout's predicted contact began as a follower coming from behind; the rest of it stays theirs
     double endTurn = start.heading; struct { double x, y; } endFrom = { start.x, start.y };  // HC-2: heading and position one step before the end
+    double prevSpeed = start.speed, prevClear = clear0;  // prevClear: the clearance at the step before (the midpoint bound below)
+    bool outsideLane = false;  // this step's body is past its lane's edge by more than the plan started with
+    double prevStation = st0;  // ST-A: the speed that counts is the way gained along the route (closing on the goal), not speed in any direction
+    const bool onRoute = (w.lanes && std::isfinite(st0)) || w.goal.have;
     double lastGrade = 0;  // SG-1: the floor's signed grade along the nose at the last step (0 until measured, or off the floor)
     for (int step = 1; step <= kSteps; ++step) {
         while (seg < c.count - 1 && segLeft <= 1e-9) { ++seg; segLeft = c.seg[seg].seconds; }
         const Segment& g = c.seg[std::min(seg, c.count - 1)]; segLeft -= kDt;
         const double dir = g.speed > .05 ? 1 : g.speed < -.05 ? -1 : 0;
-        if (dir != 0 && lastDir != 0 && dir != lastDir) ++gears;
+        if (dir != 0 && lastDir != 0 && dir != lastDir) {  // ST-A: replace the command (stop), brake, replace it again (go), pull away the other way at the gear's acceleration
+            ++gears; terms.gear += 2 * wheelguard::reaction + std::fabs(s.speed) / k.brake + std::min(std::fabs(g.speed), g.speed < 0 ? k.maxReverse : g.mode == 1 ? k.hoverTop : k.maxSpeed) / (g.mode == 1 ? k.hoverAccel : k.accel); }
         if (dir != 0) lastDir = dir;
         // Step 3: a hover segment flies (HoverStep toward the height it holds); a wheels segment drives (grip: the speed in a turn is what
         // the tyres hold), and a car still in the air first comes down at the descent rate, landing inside the plan.
+        const bicycle::State pre = s;
         const int modeBefore = s.mode; endTurn = s.heading; endFrom = { s.x, s.y };  // HC-2: the last step's start, for the end curvature
         if (g.mode == 1) {
             if (!w.hoverPossible) { terms.reject = "hover_not_possible"; return kInf; }
@@ -406,18 +388,19 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
         double z = z0; const bool haveFloor = w.Floor(s.x, s.y, z);
         if (s.mode == 0 && haveFloor) s.z = z;
         if (out) out[step] = s;
-        if (s.mode != modeBefore) terms.modes += wt.modeSwitch;
+        if (s.mode != modeBefore) terms.modes += s.mode == 1 ? k.hoverClear / k.climbRate : k.hoverClear / k.descendRate;  // the time the change takes: climbing to the height it holds / coming down from it  // ST-A: take-off + landing time
         if (s.mode == 0 && w.travel == 2) { terms.reject = "wheels_on_a_flight_only_stretch"; return kInf; }               // a flight-only stretch: no wheels
         if (s.mode == 1) {
             if (haveFloor && z > s.z + .05) {
                 if (!weightedClearance) { terms.reject = "ground_rises_into_the_hover"; return kInf; }
                 terms.clearanceTier = std::max(terms.clearanceTier, ClearanceTier(10, 29, z - s.z));
             }
-            terms.hover += wt.hover * kDt;  // NH-1: on drive only this is the descent of a car already in the air (hover segments are rejected above)
         }
+        if (s.mode == 1) terms.hover += ModeSwitchTime(k) / (kSteps * kDt) * kDt;  // ST-A: wheels preferred where both do the job: one switch's time per horizon of flight
+        outsideLane = false;
         const double band = bandFloor(s, z);
         // Collision: entering a solid is infinite. A car already touching may move without going deeper (it can always get out).
-        const auto probe = w.Contact(s.x, s.y, s.heading, band, k, .3, s.mode == 0);  // step 2: clearance, low edges and predictions in one pass (RP-1: tilted on wheels)
+        const auto probe = w.Contact(s.x, s.y, s.heading, band, k, Margin(s.speed, k), s.mode == 0);  // step 2: clearance, low edges and predictions in one pass (RP-1: tilted on wheels)
         double clear = probe.clear;
         if (probe.nearest && probe.nearest->band && bandSlack(clear, s, band)) clear = 0;  // within the tolerance of a known band alone: clear
         bool leavingBand = false;
@@ -428,14 +411,26 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
         }
         if (clear >= 0) inBand = false;  // out: from here the whole body is judged as for any wall
         if (!leavingBand) minClear = std::min(minClear, clear);
-        if (clear < 0 && !leavingBand && !(clear0 < 0 && clear >= clear0 - .02)) {
+        // ST-B: the rollout sees the body once per step, so between two samples the body has moved up to half a step's travel from the nearest one
+        // (a turning body's far corner moves faster than its centre by 1 + halfLength / radius). A sampled clearance under that may hide a contact:
+        // it counts as one. (The hairpin grazed a wall by 10 cm at 4 m/s once the old 0.5 m cost was gone: its samples were 0.8 m apart.)
+        // The pose half a step back is looked at too (the body at the midpoint of the step), so what is left unseen is a quarter step.
+        const double sweep = .25 * kDt * std::max(std::fabs(s.speed), std::fabs(prevSpeed)) * (s.mode == 0 ? 1 + k.halfLength / k.MinRadius() : 1.0);
+        prevSpeed = s.speed;
+        double clearC = clear;  // the clearance the contact test uses: the least of the sample and the midpoint
+        if (sweep > 0 && clear >= sweep && std::min(prevClear, clear) < 3 * sweep && std::hypot(s.x - pre.x, s.y - pre.y) > .05) {  // HV-3: exact early-out. Clearance moves at most as fast as the body, and the midpoint is half a step (2 sweeps of edge travel) from either sample, so when both samples clear 3 sweeps the midpoint clears one and is not looked at
+            const double mh = pre.heading + .5 * std::remainder(s.heading - pre.heading, 2 * 3.14159265358979323846);
+            clearC = std::min(clear, w.Clearance(.5 * (s.x + pre.x), .5 * (s.y + pre.y), mh, band, k, s.mode == 0));
+        }
+        prevClear = clear;
+        if (clearC < sweep && !leavingBand && !(clear0 < sweep && clear >= clear0 - .02)) {
             if constexpr (requires { probe.nearest; }) {
                 if (trace && !trace->valid && probe.nearest)
                     *trace = {true, haveFloor, c.seg[0].speed, step * kDt, s.x, s.y, s.z, s.heading, s.speed,
-                              band, clear, clear0, *probe.nearest};
+                              band, clearC - sweep, clear0, *probe.nearest};  // the trace reports the clearance of the swept body: below 0 is the rejection
             }
             if (!weightedClearance) { terms.reject = probe.nearest && probe.nearest->band ? "enters_a_known_band" : "enters_a_solid"; return kInf; }
-            double deeper = -clear + std::min(0.0, clear0);
+            double deeper = sweep - clearC + std::min(0.0, clear0);
             // A known band alone is a line the road's edge draws, not a wall the body hits: how deep into it is graded in kBandTierStep metres, not
             // 5 cm, so a body wavering a few centimetres at its edge does not change tier (and plan) every tick (08:00-08:03 stall: 465 tier switches).
             const bool bandOnly = probe.nearest && probe.nearest->band && s.mode == 0 && w.Clearance(s.x, s.y, s.heading, band, k, true, true) >= 0;
@@ -444,9 +439,9 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
             // step of 100 in the energy, so a body hugging the band edge flipped between plans at the tolerance line (the 4.4 switches a second).
             if (!(bandOnly && -clear <= kBandSoft)) terms.clearanceTier = std::max(terms.clearanceTier, ClearanceTier(10, 29, deeper));
         }
-        if (clear < wt.margin) { const double p = (wt.margin - clear) / wt.margin; terms.collision += wt.collision * p * p * kDt; }
-        if (s.mode == 0) terms.lowEdge += wt.lowEdge * probe.low * kDt;
-        terms.soft += wt.soft * probe.soft * kDt;
+        { const double m = Margin(s.speed, k); if (clear < m) inCollision = std::max(inCollision, m - clear);
+          if (s.mode == 0 && probe.low > 0) inEdge = std::max(inEdge, (std::fabs(s.speed) - EdgeSpeed(k)) / k.brake);  // time to slow to the speed that lifts a wheel over the edge
+          if (probe.soft > 0) inSoft = std::max(inSoft, m); }  // a predicted solid within the margin: the whole margin is the intrusion (its distance is not known)
         if (haveFloor && s.mode == 0) {
             lastGrade = Grade(w, s, k); const double grade = std::fabs(lastGrade);  // SG-1: signed, for the next step's acceleration
             const double maxGrade = carcap::kCar.MaxGrade(wt.grip);
@@ -456,19 +451,20 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
                 if (!weightedClearance) { terms.reject = "too_steep_for_wheels"; return kInf; }
                 terms.clearanceTier = std::max(terms.clearanceTier, ClearanceTier(0, 9, grade - maxGrade));
             }
-            if (grade > wt.comfortGrade) { const double e = (grade - wt.comfortGrade) / (maxGrade - wt.comfortGrade); terms.slope += wt.slope * e * e * kDt; }
+            inGrade = std::max(inGrade, (std::fabs(s.speed) - planspeed::SlopeLimit(s.speed > 0 ? k.maxSpeed : k.maxReverse, grade, maxGrade)) / k.brake);  // the speed the grade forces: time to slow to it
         }
         double station, lateral, half; routeAt(s.x, s.y, station, lateral, half);
         // FC-1: on the road = inside a field box OR inside the lane. The frame carries only the boxes near the car (three, ending 17 m on at
         // the 13:56 crest), and past them the route line itself read as 1-7 m outside the field, so the road ahead looked forbidden.
         {   double outside = w.FieldOutside(s.x, s.y);
             if (w.lanes && outside > 0) outside = std::min(outside, std::max(0.0, std::fabs(lateral) - half));
-            terms.field += wt.field * outside * outside * kDt; }
-        if (field && field->ready) { const double fc = s.mode == 1 ? field->AtAnyHeading(s.x, s.y) : field->At(s.x, s.y, s.heading, s.speed); if (std::isfinite(fc)) { lastIn = fc; lastInStation = station; } }  // LK-1: hovering turns in place
+            inField = std::max(inField, outside); }
+        double fcNow = kInf;
+        if (field && field->ready) { const double fc = s.mode == 1 ? field->AtAnyHeading(s.x, s.y) : field->At(s.x, s.y, s.heading, s.speed); fcNow = fc; if (std::isfinite(fc)) { lastIn = fc; lastInStation = station; } }  // LK-1: hovering turns in place
         // D5: a route hold, stop line or the line's end is a wall across the road for forward motion: the front stays stopGap short of it,
         // and the speed always lets the car stop there (stopping energy).
         if (std::isfinite(w.stopStation) && s.speed > .05) {
-            const double room = w.stopStation - (station + k.halfLength) - wt.stopGap;
+            const double room = w.stopStation - (station + k.halfLength) - StopGap(k);
             if (room < 0 || s.speed * s.speed > 2 * k.brake * room + 1e-6) { terms.reject = "cannot_stop_before_the_line_end"; return kInf; }
         }
         // D4: moving road users where they will be at this step's time.
@@ -486,55 +482,60 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
                     !w.MoverReaches(which, start.x, start.y, start.heading, bandFloor(start, z0), k, start.mode == 0));
                 if (ours && !weightedClearance) { terms.reject = closing ? "closing_on_a_road_user" : "meets_a_road_user"; return kInf; }
                 if (ours) terms.clearanceTier = std::max(terms.clearanceTier, ClearanceTier(30, 49, -mc));
-                if (!contactExcused) terms.movers += wt.moverHit;
                 if (!ours) contactExcused = true;
             }
-            else if (mc < wt.moverMargin) { const double p = (wt.moverMargin - mc) / wt.moverMargin; terms.movers += wt.mover * p * p * kDt; }
+            { const double m = Margin(s.speed, k); if (mc < m) inMover = std::max(inMover, m - mc); }
         }
-        if (w.lanes) { const double l = lateral / std::max(.5, half); terms.lateral += laneScale * wt.lateral * l * l * kDt;  // D13: no lane, no lateral
-            const double out = std::fabs(lateral) + k.halfWidth - half; if (out > 0 && !w.LaneEdgeFree(station)) terms.lateral += laneScale * wt.laneEdge * out * out * kDt; }  // JL-1: laneScale  // LK-1: past the lane's edge (D1: free beside a static block in the lane)
-        const double v = s.speed, e = (want - v) / std::max(1.0, want); terms.speed += wt.speed * e * e * kDt;
-        if (mem && mem->have && step * kDt <= 2.0 + 1e-9) {  // commitment: stay near what was planned (time-shifted), first 2 s
-            const int j = std::min(kSteps, shift + step);
-            commitSum += (s.x - mem->traj[j].x) * (s.x - mem->traj[j].x) + (s.y - mem->traj[j].y) * (s.y - mem->traj[j].y); ++commitN;
-        }
+        if (w.lanes) { const double out = std::fabs(lateral) + k.halfWidth - half;  // D13: no lane, no lateral. The body inside its lane is free; only what is past the edge is priced
+            if (out > 0 && !w.LaneEdgeFree(station)) {
+                inLane = std::max(inLane, out);  // what is outside is paid as the time to creep back in
+                if (out > laneOut0 + kNoGoTolerance) outsideLane = true; } }  // and the way gained outside it is not credited (below): time outside the lane is lost time  // JL-1: a car starting off its lane pays only for going further out  // LK-1: past the lane's edge (D1: free beside a static block in the lane)
+        const double gained = onRoute && std::isfinite(station) ? (outsideLane ? 0.0 : station - prevStation) / kDt : (outsideLane ? 0.0 : s.speed); prevStation = std::isfinite(station) ? station : prevStation;
+        if (!(fcNow < 1e-6)) terms.speed += kDt * std::max(0.0, 1.0 - gained / vw);  // only while there is way left to go: standing in the goal loses no time  // ST-A: the time lost to going slower than wanted (planspeed's `lost`)
     }
     double st1, lat1, half1; routeAt(s.x, s.y, st1, lat1, half1);
+    terms.collision = inCollision / vCreep; terms.movers = inMover / vCreep; terms.soft = inSoft / vCreep; terms.lateral = inLane / vCreep;
+    terms.field = inField / vCreep;
+    if (w.lanes && std::isfinite(lat1)) terms.lateral += std::fabs(lat1) / vCreep;  // the route is the plan: the time to creep back onto it from where the rollout ends
+ terms.lowEdge = std::max(0.0, inEdge); terms.slope = std::max(0.0, inGrade);
     // The way on past the horizon: the cost to go under this car's turning, where the field covers it; else plain route progress.
     // ED-2 (step 2; 20:15 run: the car crawled at 2.5-3 m/s everywhere): a fast rollout runs past the field's window, and an end outside it
     // paid togoCap, so only slow rollouts could win. Past the window, the road covered beyond the last state inside counts one for one
     // against that state's cost to go; togoCap only where no state of the rollout was inside.
     if (field && field->ready) {
         const double fc = s.mode == 1 ? field->AtAnyHeading(s.x, s.y) : field->At(s.x, s.y, s.heading, s.speed);  // LK-1: a hovering end turns in place
-        terms.togo = wt.togo * (std::isfinite(fc) ? fc : wt.windowEdgeRule && std::isfinite(lastIn) ? std::max(0.0, lastIn - std::max(0.0, st1 - lastInStation)) : wt.togoCap);
+        terms.togo = (std::isfinite(fc) ? fc : wt.windowEdgeRule && std::isfinite(lastIn) ? std::max(0.0, lastIn - std::max(0.0, st1 - lastInStation)) : vw * kSteps * kDt) / vw;  // ST-A: seconds; no way on known pays the horizon time
         // LF-1: in a lane scene, way past the goal band's start always counts (every speed reached the band, so following the lane held 5.5-6
         // m/s where 11 was wanted). Ending in the band (cost 0): minus the way past its start. Ending past the window: the window-edge rule
         // without its floor at 0, from the last state inside (in the band: from the band's start). The field itself is unchanged (seeding it
         // bent it across a hairpin's barrier).
         if (w.lanes && std::isfinite(field->goalStation)) {
             const double past = std::max(0.0, st1 - field->goalStation);
-            if (std::isfinite(fc)) { if (fc < 1e-6) terms.togo = -wt.togo * past; }
-            else if (wt.windowEdgeRule && std::isfinite(lastIn)) terms.togo = wt.togo * (lastIn < 1e-6 ? -past : lastIn - std::max(0.0, st1 - lastInStation));
+            if (std::isfinite(fc)) { if (fc < 1e-6) terms.togo = -past / vw; }
+            else if (wt.windowEdgeRule && std::isfinite(lastIn)) terms.togo = (lastIn < 1e-6 ? -past : lastIn - std::max(0.0, st1 - lastInStation)) / vw;
         }
     }
-    else terms.progress = -wt.progress * (st1 - st0);
-    terms.gear = wt.gear * gears;
+    else terms.progress = -(st1 - st0) / vw;
     // Stopping energy at the end: the car can stop inside the free distance from where the rollout ends.
     // HC-2 (2026-11-14 19:14 run: 3 m/s on a winding road lined by rocks): the free distance follows the curve the car is on at the end (braking
     // with the wheel held keeps that curvature), not straight on; straight on meets the verge of any bend within a few metres.
     if (std::fabs(s.speed) > .3) {
         const double dir = s.speed > 0 ? 1 : -1; double free = 0;
         const double moved = std::hypot(s.x - endFrom.x, s.y - endFrom.y);
-        const double curve = moved > .05 ? std::clamp(std::remainder(s.heading - endTurn, 2 * 3.14159265358979323846) / moved, -wt.endCurveMax, wt.endCurveMax) : 0.0;
+        const double curve = moved > .05 ? std::clamp(std::remainder(s.heading - endTurn, 2 * 3.14159265358979323846) / moved, -1.0 / k.MinRadius(), 1.0 / k.MinRadius()) : 0.0;
         double x = s.x, y = s.y, h = s.heading, along = 0;
         // Step 2: stepped by the clearance found (a body this far from every solid can move that far without touching one), at least 0.5 m;
         // the arc is walked in 0.5 m pieces so a long step still bends with the road.
-        for (double d = .5; d <= wt.endReach;) {
+        // HV-2 (2026-11-22): the look-ahead is what the stopping rule needs, derived from this rollout's own end speed: the braking distance v^2 / 2b
+        // plus the distance covered in the controller's reaction. It was a fixed 25 m (endReach), which capped every plan at sqrt(2 b 25) = 17 m/s on
+        // an empty road, air or land (offline probe: 22 and 18 m/s rejected "cannot stop in the free distance" with the road clear to 700 m).
+        const double reach = s.speed * s.speed / (2 * k.brake) + std::fabs(s.speed) * wheelguard::reaction + 1.0;
+        for (double d = .5; d <= reach;) {
             while (along + 1e-9 < d) { const double piece = std::min(.5, d - along); h += curve * piece * .5; x += dir * piece * std::sin(h); y += dir * piece * std::cos(h); h += curve * piece * .5; along += piece; }
             double z; if (!w.Floor(x, y, z)) z = z0;
             const double cl = w.Clearance(x, y, h, s.mode == 0 ? z : bandFloor(s, z), k, s.mode == 0, inBand);  // a car still leaving a band is not stopped by it
             if (cl < 0) break;
-            free = d; d += std::max(.5, cl);
+            free = std::max(d, std::min(reach, d + cl) - StopGap(k)); d += std::max(.5, cl);  // HV-2: the clearance at d proves the body can move that far on, less the gap D5 keeps (the walk ends at reach, not before it)
         }
         terms.endFree = free;
         if (s.speed * s.speed > 2 * k.brake * free + 1e-6) {
@@ -542,8 +543,9 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
             terms.clearanceTier = std::max(terms.clearanceTier, ClearanceTier(0, 9, s.speed * s.speed / (2 * k.brake) - free));
         }
     }
-    terms.commit = commitN ? wt.commit * commitSum / commitN : 0;
-    if (std::isfinite(w.facing)) terms.facing = wt.facing * w.facingScale * (1 - std::cos(s.heading - w.facing));  // D7: the nose against the wanted facing (D13: scaled near the goal)
+    if (std::isfinite(w.facing)) {  // ST-A: the time to turn the nose: angle / yaw rate (hover: the gear row's turn at this speed; wheels: speed / smallest turn radius, at least a creep)
+        const double yaw = s.mode == 1 ? k.HoverYawAt(std::fabs(s.speed)) : std::max(std::fabs(s.speed), k.brake * kDt) / k.MinRadius();
+        terms.facing = w.facingScale * std::fabs(std::remainder(s.heading - w.facing, 2 * 3.14159265358979323846)) / yaw; }  // D7: the nose against the wanted facing (D13: scaled near the goal)
     if constexpr (std::is_same_v<W, planscene::Scene>) {
         if (wheelVote && start.mode == 0 && c.seg[0].mode == 0 && std::fabs(c.seg[0].speed) > .1) {
             const auto first = FirstControl(c, start, k, w, wt, mem, hint);
@@ -563,13 +565,32 @@ inline double Score(const Candidate& c, const bicycle::State& start, const bicyc
                     const int tier = vote.speed < .1 ? 10 : ClearanceTier(0, 9, deficit);
                     terms.clearanceTier = std::max(terms.clearanceTier, tier);
                 }
-                terms.collision += 12.0 * deficit / demand;
+                terms.collision += deficit / k.brake;  // the time to slow by what the guard would not allow
             }
         }
     }
-    return terms.hover + terms.modes + terms.facing + terms.movers + terms.soft + terms.togo + terms.progress + terms.lateral + terms.speed + terms.collision + terms.lowEdge + terms.slope + terms.field + terms.gear + terms.commit + terms.steer;
+    return terms.hover + terms.modes + terms.facing + terms.movers + terms.soft + terms.togo + terms.progress + terms.lateral + terms.speed + terms.collision + terms.lowEdge + terms.slope + terms.field + terms.gear;
 }
 
+// HV-2 (2026-11-22, user: values come from a general scheme, not hand-tuning): the forward speeds every family offers, generated from the car's own
+// physics instead of fixed fractions and constants. The top rung is the wanted speed capped by what the car can do in this mode. The rungs step
+// down by what the car comfortably gains in one settle second (accel x kSettle), so neighbours are as far apart as the controller can tell apart
+// before the next plan, whatever the car, mode or wanted speed. The bottom rung is the speed the brakes stop inside one plan step (brake x kDt):
+// below it a speed is a stop, which is rung 0. notes/GENERATED_LIMITS_DESIGN_20261122.md.
+// ST-C: derived from the commitment (it was a chosen 0.5). A challenger must keep winning for 2 x the switch time (2 reactions) before it takes
+// over, so two speeds are different plans when the car gets from one to the other in that time: the step is accel x 2 x reaction. With the single
+// switch time in place the result no longer depends on it (0.2 to 1.0 s gave the same hairpin and D1 outcomes; before, 0.36 rocked and 1.0 broke D1).
+constexpr double kSettle = 2 * wheelguard::reaction;  // s
+struct Rungs { double v[24]; int n = 0; };
+inline Rungs SpeedRungs(double want, double top, double accel, double brake) {
+    Rungs r; const double floorV = brake * kDt, step = std::max(accel * kSettle, floorV);  // no rung finer than the lowest one
+    double v = std::min(std::max(want, floorV), std::max(top, floorV));
+    while (r.n < 20 && v > floorV + .5 * step) { r.v[r.n++] = v; v -= step; }
+    r.v[r.n++] = floorV; r.v[r.n++] = 0.0;
+    return r;
+}
+inline Rungs WheelRungs(double want, const bicycle::Spec& k) { return SpeedRungs(want, k.maxSpeed, k.accel, k.brake); }
+inline Rungs HoverRungs(double want, const bicycle::Spec& k) { return SpeedRungs(want, k.hoverTop, k.hoverAccel, k.brake); }
 // Step 3 (D6/D7): the hover family. Hover arcs at several speeds, hover then land, and (with a facing to keep) strafing: travel off the nose
 // while the nose turns toward the facing. Only offered where the car can hover.
 inline void AddHover(Candidate* out, int& n, const bicycle::Spec& k, double want, bool facing, double heading = std::numeric_limits<double>::quiet_NaN()) {
@@ -578,7 +599,8 @@ inline void AddHover(Candidate* out, int& n, const bicycle::Spec& k, double want
     const double H = kSteps * kDt, w = std::max(1.0, want);
     static constexpr double in5[] = { -1, -.5, 0, .5, 1 };
     static constexpr double in3[] = { -1, 0, 1 };
-    for (double a : in5) for (double v : { w, w * .5, 3.0, 0.0 }) add({ { a, v, H, 1 } }, v > 0 ? "hover" : "hover in place");
+    const Rungs hv = HoverRungs(want, k);  // HV-2: generated rungs (replaces HV-1's hand list)
+    for (double a : in5) for (int q = 0; q < hv.n; ++q) add({ { a, hv.v[q], H, 1 } }, hv.v[q] > 0 ? "hover" : "hover in place");
     // Landing after 1-4 s (2 s steps let a car stay up 2 s longer than it needed: energyplan_test drive-only barrier, step 3).
     for (double a : in3) for (double v : { w * .5, 3.0 }) for (double t : { 1.0, 2.0, 3.0, 4.0 }) add({ { a, v, t, 1 }, { a, v, H - t, 0 } }, "hover then land");
     // Strafe: turn the nose toward the facing for t s (travel held about straight by half the angle), then hold the nose and slide at the
@@ -605,6 +627,53 @@ inline void AddFollow(Candidate* out, int& n, double want, bool stopAhead) {
     if (stopAhead) for (double v : { w, w * .5, 3.0 }) for (double t : { 2.0, 4.0 }) add({ follow(v, t, 0), follow(0, H - t, 0) }, "follow then stop");
 }
 // The candidate set (step 2): coarse spread over every manoeuvre family, then Plan refines around the best few (Refine).
+// Predict the held command only to the leg's own end, then score its stopping path.
+inline Candidate KTurnLeg(const bicycle::State& start, const bicycle::Spec& spec, const Weights& weights,
+                         double laneHeading, recovery::Command::Step step, double steer, double metres,
+                         const recovery::Rules& rules, bool& faces) {
+    const bool reverse = step == recovery::Command::Step::BackUp;
+    const double speed = reverse ? -rules.backUpSpeed : rules.turnSpeed;
+    constexpr double horizon = kSteps * kDt;
+    constexpr double tau = 6.28318530717958647692;
+    Candidate leg;
+    leg.kind = reverse ? "recover: back up" : "recover: turn to the lane";
+    leg.seg[0] = {steer, speed, 0};
+    const auto control = Command(leg.seg[0], spec, weights);
+    auto pose = start;
+    double distance = 0;
+    int steps = 0;
+    const bool offHeading = std::fabs(std::remainder(start.heading - laneHeading, tau)) >= rules.turnDone;
+    faces = false;
+    while (steps < kSteps && distance < metres && !faces) {
+        const auto next = bicycle::Step(pose, control, spec, kDt);
+        distance += std::hypot(next.x - pose.x, next.y - pose.y);
+        pose = next;
+        ++steps;
+        faces = offHeading && std::fabs(std::remainder(pose.heading - laneHeading, tau)) < rules.turnDone;
+    }
+    leg.seg[0].seconds = std::max(1, steps) * kDt;
+    leg.count = steps < kSteps ? 2 : 1;
+    leg.seg[1] = {0, 0, horizon - leg.seg[0].seconds};
+    return leg;
+}
+
+// ST-D (2026-11-22, notes/GENERATED_COSTS_DESIGN_20261122.md): the manoeuvre library's speeds and lengths come from the car, not from constants.
+//   R      the tightest turn the car makes (Spec::MinRadius); a three-point turn is two of them, so every leg is a fraction or multiple of it.
+//   vBend  the speed full lock holds: sqrt(a_lat R) with a_lat the sideways acceleration the plan counts on (carcap PlanLat), never above the wanted speed.
+//   vRev   the reverse speed: what the brakes stop inside one turn radius, sqrt(2 b R), never above the car's reverse top.
+//   vCreep the lowest rung (the speed the brakes stop inside one plan step): the slow leg speed of a turn on the spot.
+struct Manoeuvre {
+    double R, vBend, vRev, vCreep;
+    double Time(double radii, double v) const { return std::clamp(radii * R / std::max(v, .1), kDt, kSteps * kDt - kDt); }  // s to cover `radii` turn radii at v
+};
+inline Manoeuvre ManoeuvreFor(const bicycle::Spec& k, double want) {
+    Manoeuvre m; m.R = k.MinRadius();
+    m.vBend = std::min(std::max(1.0, want), std::sqrt(carcap::kCar.PlanLat(1.0) * m.R));
+    m.vRev = std::min(k.maxReverse, std::sqrt(2 * k.brake * m.R));
+    m.vCreep = CreepSpeed(k);
+    return m;
+}
+
 inline int Candidates(const bicycle::State& s, const bicycle::Spec& k, double want, const Memory* mem, double now, Candidate* out, bool stopAhead = false, bool hoverOK = false, bool facing = false, bool lane = false) {
     // Every manoeuvre family the full set had, at its speeds and steering, with fewer duration steps (about 230 instead of 450). A first
     // coarse set of 110 left out the slow half-lock forward-reverse-forward and reverse-into-turn shapes, and the 19:51 recorded hairpin,
@@ -615,16 +684,19 @@ inline int Candidates(const bicycle::State& s, const bicycle::Spec& k, double wa
     const double H = kSteps * kDt, w = std::max(1.0, want);
     static constexpr double in5[] = { -1, -.5, 0, .5, 1 };
     static constexpr double in3[] = { -1, 0, 1 };
-    for (double a : in5) for (double v : { w, w * .75, w * .5, 6.0, 3.0, 1.5, 0.0 }) add({ { a, v, H } }, v > 0 ? "forward arc" : "stop");  // ED-2: speeds between full and a crawl
-    for (double a : in5) for (double b : in5) for (double t : { 1.0, 2.5 }) add({ { a, w * .6, t }, { b, w * .6, H - t } }, "forward bend");
-    for (double a : in5) for (double b : in3) add({ { a, 2.5, 2.5 }, { b, 2.5, H - 2.5 } }, "forward bend");
-    for (double r : in5) for (double t : { 1.5, 3.0 }) for (double f : in3) add({ { r, -1.8, t }, { f, 2.5, H - t } }, "reverse then forward");
-    for (double r : in5) add({ { r, -1.8, H } }, "reverse");
+    { const Rungs wr = WheelRungs(want, k); for (double a : in5) for (int q = 0; q < wr.n; ++q) add({ { a, wr.v[q], H } }, wr.v[q] > 0 ? "forward arc" : "stop"); }  // HV-2: generated rungs
+    const Manoeuvre mv = ManoeuvreFor(k, want);
+    // ST-D finding: the plain bends keep w * .6 and 2.5 m/s. Derived values (sqrt(a_lat R) = 3.97 m/s, geometric mid-speed, legs of 1 and 3 R) fail
+    // energyplan_test D1 (static block: no dodge) and 'rock in the lane': 2.5 m/s is a sideways acceleration of about 1.2 m/s^2 on this car (.4 of PlanLat), a
+    // gentler manoeuvring turn than the grip limit, and no rule for it has been found (reported, not hidden).
+    for (double a : in5) for (double b : in5) for (double tt : { 1.0, 2.5 }) for (double v : { w * .6, 2.5 }) add({ { a, v, tt }, { b, v, H - tt } }, "forward bend");
+    for (double r : in5) for (double m : { .5, 1.0 }) for (double f : in3) add({ { r, -mv.vRev, mv.Time(m, mv.vRev) }, { f, mv.vBend, H - mv.Time(m, mv.vRev) } }, "reverse then forward");
+    for (double r : in5) add({ { r, -mv.vRev, H } }, "reverse");
     // D5: drive, then stop, only where a stop is ahead (elsewhere a standing plan is kept by commitment: 19:51 hairpin fell to 4.75 m).
     if (stopAhead) for (double a : in5) for (double v : { w, w * .5, 3.0, 1.5 }) for (double t : { 1.0, 2.5, 4.0 }) add({ { a, v, t }, { a, 0.0, H - t } }, "drive then stop");
-    for (double turn : { -1.0, 1.0 }) for (double f : { .5, 1.0 }) for (double a : { .8, 1.6 }) for (double b : { .8, 1.6, 2.4 }) for (double v : { 1.0, 1.8 })
-        add({ { turn * f, v, a }, { -turn, -v, b }, { turn, v, H - a - b } }, "forward reverse forward");
-    for (double turn : { -1.0, 1.0 }) for (double t : { .8, 1.6, 2.4, 3.2 }) for (double v : { 1.0, 1.8 }) add({ { -turn, -v, t }, { turn, v, H - t } }, "reverse into turn");
+    for (double turn : { -1.0, 1.0 }) for (double f : { .5, 1.0 }) for (double a : { .25, .5 }) for (double b : { .25, .5, 1.0 }) for (double v : { mv.vCreep, mv.vRev })
+        add({ { turn * f, v, mv.Time(a, v) }, { -turn, -v, mv.Time(b, v) }, { turn, v, H - mv.Time(a, v) - mv.Time(b, v) } }, "forward reverse forward");
+    for (double turn : { -1.0, 1.0 }) for (double m : { .25, .5, 1.0, 1.5 }) for (double v : { mv.vCreep, mv.vRev }) add({ { -turn, -v, mv.Time(m, v) }, { turn, v, H - mv.Time(m, v) } }, "reverse into turn");
     if (hoverOK) AddHover(out, n, k, want, facing, s.heading);  // step 3 (LK-1: travel-held strafes from the present heading)
     if (lane) AddFollow(out, n, want, stopAhead);  // LF-1
     if (mem && mem->have && mem->best.count) {
@@ -648,21 +720,23 @@ inline int CandidatesFull(const bicycle::State& s, const bicycle::Spec& k, doubl
     const double H = kSteps * kDt, w = std::max(1.0, want);
     static constexpr double in7[] = { -1, -.66, -.33, 0, .33, .66, 1 };
     static constexpr double in5[] = { -1, -.5, 0, .5, 1 };
-    for (double a : in7) for (double v : { w, w * .75, w * .5, 6.0, 3.0, 1.5, 0.0 }) add({ { a, v, H } }, v > 0 ? "forward arc" : "stop");
-    for (double a : in7) for (double b : in5) for (double t : { 1.0, 2.5 }) for (double v : { w * .6, 2.5 }) add({ { a, v, t }, { b, v, H - t } }, "forward bend");
-    for (double r : in5) for (double t : { 1.5, 3.0 }) for (double f : in5) add({ { r, -1.8, t }, { f, 2.5, H - t } }, "reverse then forward");
-    for (double r : in5) add({ { r, -1.8, H } }, "reverse");
+    { const Rungs wr = WheelRungs(want, k); for (double a : in7) for (int q = 0; q < wr.n; ++q) add({ { a, wr.v[q], H } }, wr.v[q] > 0 ? "forward arc" : "stop"); }  // HV-2
+    const Manoeuvre mv = ManoeuvreFor(k, want);
+    // ST-D: the plain bends keep w * .6 and 2.5 m/s (see Candidates: derived values fail D1 and 'rock in the lane').
+    for (double a : in7) for (double b : in5) for (double tt : { 1.0, 2.5 }) for (double v : { w * .6, 2.5 }) add({ { a, v, tt }, { b, v, H - tt } }, "forward bend");
+    for (double r : in5) for (double m : { .5, 1.0 }) for (double f : in5) add({ { r, -mv.vRev, mv.Time(m, mv.vRev) }, { f, mv.vBend, H - mv.Time(m, mv.vRev) } }, "reverse then forward");
+    for (double r : in5) add({ { r, -mv.vRev, H } }, "reverse");
     // D5 (one-authority step 1): drive, then stop. Without these, every candidate holds one speed for the whole horizon, so near a stop line
     // only a crawl fits the room left and the car never arrives (energyplan_test "D5 stop line", first try: 9.5 m short after 15 s).
     // Only where there is a stop to arrive at: elsewhere a plan that ends standing is kept by the commitment term and the car settles in front of
     // what it should get round (19:51 recorded hairpin: 35 m reached before, 4.75 m with these offered everywhere).
     if (stopAhead) for (double a : in5) for (double v : { w, w * .5, 6.0, 3.0, 1.5 }) for (double t : { 1.0, 2.0, 3.0, 4.0 }) add({ { a, v, t }, { a, 0.0, H - t } }, "drive then stop");
-    for (double turn : { -1.0, 1.0 }) for (double f : { .5, 1.0 }) for (double a : { .8, 1.6, 2.4 })
-        for (double b : { .8, 1.6, 2.4 }) for (double v : { 1.0, 1.8 })
-            add({ { turn * f, v, a }, { -turn, -v, b }, { turn, v, H - a - b } }, "forward reverse forward");
-    for (double turn : { -1.0, 1.0 }) for (double t : { .8, 1.6, 2.4, 3.2, 4.0 })
-        for (double v : { 1.0, 1.8, 2.5 })
-            add({ { -turn, -v, t }, { turn, v, H - t } }, "reverse into turn");
+    for (double turn : { -1.0, 1.0 }) for (double f : { .5, 1.0 }) for (double a : { .25, .5, 1.0 })
+        for (double b : { .25, .5, 1.0 }) for (double v : { mv.vCreep, mv.vRev })
+            add({ { turn * f, v, mv.Time(a, v) }, { -turn, -v, mv.Time(b, v) }, { turn, v, H - mv.Time(a, v) - mv.Time(b, v) } }, "forward reverse forward");
+    for (double turn : { -1.0, 1.0 }) for (double m : { .25, .5, 1.0, 1.5, 2.0 })
+        for (double v : { mv.vCreep, mv.vRev, mv.vBend })
+            add({ { -turn, -v, mv.Time(m, v) }, { turn, v, H - mv.Time(m, v) } }, "reverse into turn");
     if (hoverOK) AddHover(out, n, k, want, facing, s.heading);  // step 3 (LK-1: travel-held strafes from the present heading)
     if (lane) AddFollow(out, n, want, stopAhead);  // LF-1
     if (mem && mem->have && mem->best.count) {
@@ -720,7 +794,7 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
         Terms t; double cl;
         if (std::isfinite(Score(c, s, k, want, w, wt, nullptr, now, t, r.traj, cl, hint, field))) {
             r.ok = true; r.pulse = true; r.best = c; r.why = c.kind; r.terms = t; r.minClearance = cl; r.candidates = r.feasible = 1;
-            r.energy = t.hover + t.modes + t.facing + t.movers + t.soft + t.togo + t.progress + t.lateral + t.speed + t.collision + t.lowEdge + t.slope + t.field + t.gear + t.commit + t.steer;
+            r.energy = t.hover + t.modes + t.facing + t.movers + t.soft + t.togo + t.progress + t.lateral + t.speed + t.collision + t.lowEdge + t.slope + t.field + t.gear;
             r.first = Command(c.seg[0], k, wt); r.firstMode = 0; r.firstHeight = r.traj[std::min(kSteps, 5)].z;
             return r;  // memory untouched: the committed plan resumes after the pulse
         }
@@ -874,8 +948,88 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
             in.meantToStand = trafficHold || queuedWait;
             in.anyFeasible = anyMoving;
         }
-        in.forwardBlocked = !anyForwardClear; in.stepBlocked = mem.recStepBlocked; mem.recStepBlocked = false;
-        cmd = recovery::Update(mem.rec, in);
+        using Step = recovery::Command::Step;
+        const recovery::Rules rules;
+        const bool checkLegs = lane && s.mode == 0 && w.travel != 2;
+        const bool highAngle = recovery::HighAngleTurn(mem.rec, in.headingErrToLane, rules);
+        struct Leg { Candidate candidate; Terms terms; double energy = kInf; bool clear = false, faces = false; };
+        // A short recovery leg must clear the whole body between ordinary rollout samples,
+        // including its stop. Ordinary lane scores keep their existing band tolerance.
+        const bool checkBody = checkLegs && highAngle && w.Clearance(s.x, s.y, s.heading, s.z, k, true) >= 0;
+        auto clearsRecoveryBody = [&](const Candidate& candidate) {
+            constexpr double sampleDt = .05;
+            auto pose = s;
+            for (int i = 0; i < candidate.count; ++i) {
+                const auto& segment = candidate.seg[i];
+                const auto control = Command(segment, k, wt);
+                const int samples = static_cast<int>(std::lround(segment.seconds / sampleDt));
+                for (int tick = 0; tick < samples; ++tick) {
+                    if (std::fabs(pose.speed) < 1e-9 && control.speed == 0) break;
+                    pose = bicycle::Step(pose, control, k, sampleDt);
+                    double floor = pose.z;
+                    if (w.Floor(pose.x, pose.y, floor)) pose.z = floor;
+                    if (w.Clearance(pose.x, pose.y, pose.heading, pose.z, k, true) < 0) return false;
+                }
+            }
+            return true;
+        };
+        auto predictLeg = [&](Step step, double steer, double remaining) {
+            Leg leg;
+            auto assess = [&](double length) {
+                leg.candidate = KTurnLeg(s, k, wt, laneHeading, step, steer, length, rules, leg.faces);
+                double clearance;
+                leg.energy = Score(leg.candidate, s, k, want, w, wt, &mem, now, leg.terms, nullptr, clearance, hint, field, nullptr, weighted, true);
+                leg.clear = std::isfinite(leg.energy) && (!weighted || leg.terms.clearanceTier < 10) &&
+                    (!checkBody || clearsRecoveryBody(leg.candidate));
+            };
+            assess(remaining);
+            if (highAngle && !leg.clear) {
+                for (const double length : rules.kturnPrefixes) {
+                    if (length >= remaining) continue;
+                    assess(length);
+                    if (leg.clear) break;
+                }
+            }
+            return leg;
+        };
+        const double backMetres = recovery::BackUpMetres(mem.rec, in.headingErrToLane, rules);
+        const double backRemaining = mem.rec.step == Step::BackUp
+            ? std::max(0.0, backMetres - mem.rec.backed) : backMetres;
+        const double forwardMetres = rules.turnSpeed * rules.turnMax;
+        Leg forward, reverse;
+        in.wheels = s.mode == 0;
+        in.forwardBlocked = !anyForwardClear;
+        if (checkLegs) {
+            forward = predictLeg(Step::TurnToLane, recovery::LegSteer(mem.rec, in.headingErrToLane, Step::TurnToLane, rules), forwardMetres);
+            reverse = predictLeg(Step::BackUp, recovery::LegSteer(mem.rec, in.headingErrToLane, Step::BackUp, rules), backRemaining);
+            in.legForwardClear = forward.clear;
+            in.legForwardFaces = forward.faces;
+            in.legReverseClear = reverse.clear;
+            if (highAngle) in.reverseFeasible = reverse.clear;
+        }
+        cmd = recovery::Update(mem.rec, in, rules);
+        r.laneErr = in.headingErrToLane; r.legF = forward.clear; r.legFaces = forward.faces; r.legR = reverse.clear;
+        r.recTries = mem.rec.tries; r.recCycles = mem.rec.cycles; r.turnSign = mem.rec.turnSign;
+        const bool heldLeg = cmd.mode == recovery::Mode::Recover &&
+            (cmd.step == Step::BackUp || cmd.step == Step::TurnToLane);
+        auto commandedLeg = [&] {
+            Leg leg;
+            if (heldLeg && checkLegs) {
+                leg = cmd.step == Step::BackUp ? reverse : forward;
+                const double remaining = cmd.step == Step::BackUp ? std::max(0.0, recovery::BackUpMetres(mem.rec, in.headingErrToLane, rules) - mem.rec.backed) : forwardMetres;
+                if (leg.candidate.seg[0].input != cmd.steer || (cmd.step == Step::BackUp && remaining > backRemaining))
+                    leg = predictLeg(cmd.step, cmd.steer, remaining);
+            } else {
+                leg.candidate.count = 1;
+                leg.candidate.seg[0] = {cmd.steer, cmd.wantSpeed, kSteps * kDt};
+                leg.candidate.kind = cmd.step == Step::BackUp ? "recover: back up" :
+                    cmd.step == Step::TurnToLane ? "recover: turn to the lane" : "recover: retry";
+                double clearance;
+                leg.energy = Score(leg.candidate, s, k, want, w, wt, &mem, now, leg.terms, nullptr, clearance, hint, field, nullptr, weighted, true);
+                leg.clear = std::isfinite(leg.energy) && (!weighted || leg.terms.clearanceTier < 10);
+            }
+            return leg;
+        };
         r.layer = cmd.mode == recovery::Mode::Follow ? "follow" : cmd.mode == recovery::Mode::Avoid ? "avoid" : cmd.mode == recovery::Mode::Recover ? "recover" : "stand";
         r.step = cmd.step == recovery::Command::Step::BackUp ? "back_up" : cmd.step == recovery::Command::Step::TurnToLane ? "turn_to_lane" : cmd.step == recovery::Command::Step::Retry ? "retry" : cmd.step == recovery::Command::Step::Hover ? "hover" : "none";
         r.layerWhy = cmd.why ? cmd.why : ""; r.layerChanged = cmd.changed;
@@ -887,16 +1041,12 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
             bool heldStep = false;
             if (cmd.mode == recovery::Mode::Recover && (cmd.step == recovery::Command::Step::BackUp || cmd.step == recovery::Command::Step::TurnToLane) &&
                 std::isfinite(cmd.wantSpeed) && n < kMaxCandidates) {
-                Candidate c; c.count = 1; c.seg[0].input = std::isfinite(cmd.steer) ? cmd.steer : 0.0; c.seg[0].speed = cmd.wantSpeed; c.seg[0].seconds = kSteps * kDt;
-                c.kind = cmd.step == recovery::Command::Step::BackUp ? "recover: back up" : "recover: turn to the lane";
-                Terms t; double cl; const double e = Score(c, s, k, want, w, wt, &mem, now, t, nullptr, cl, hint, field, nullptr, true, true);
-                // PF-2 (18:31 run: 387 back-ups ended at once as "reverse_blocked"): soft tiers (grade, stopping distance, wheel vote,
-                // 1..9) are costs, not blocks; the step is blocked only by a solid or a road user (tier 10 and up).
-                if (std::isfinite(e) && t.clearanceTier < 10) {
-                    cands[n] = c; energies[n] = e; clearanceTiers[n] = t.clearanceTier; rejects[n] = nullptr; ++n; r.candidates = n;
+                const auto leg = commandedLeg();
+                if (leg.clear) {
+                    cands[n] = leg.candidate; energies[n] = leg.energy; clearanceTiers[n] = leg.terms.clearanceTier; rejects[n] = nullptr; ++n; r.candidates = n;
                     only([&](int i) { return i == n - 1; }, "recover_step_only");
                     heldStep = true; heldStepChosen = true;
-                } else mem.recStepBlocked = true;
+                }
             }
             for (int i = 0; i < n && !heldStep; ++i) {
                 if (!std::isfinite(energies[i])) continue;
@@ -918,9 +1068,8 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
         else if (cmd.mode == recovery::Mode::Stand) only([](int) { return false; }, "stand_mode");
         else if (cmd.mode == recovery::Mode::Recover && cmd.step == recovery::Command::Step::Hover) only([&](int i) { return cands[i].count && cands[i].seg[0].mode == 1; }, "recover_hover_only");
         else if (cmd.mode == recovery::Mode::Recover && std::isfinite(cmd.wantSpeed) && n < kMaxCandidates) {  // the routine's step as the one plan
-            Candidate c; c.count = 1; c.seg[0].input = std::isfinite(cmd.steer) ? cmd.steer : 0.0; c.seg[0].speed = cmd.wantSpeed; c.seg[0].seconds = kSteps * kDt;
-            c.kind = cmd.step == recovery::Command::Step::BackUp ? "recover: back up" : cmd.step == recovery::Command::Step::TurnToLane ? "recover: turn to the lane" : "recover: retry";
-            Terms t; double cl; cands[n] = c; energies[n] = Score(c, s, k, want, w, wt, &mem, now, t, nullptr, cl, hint, field, nullptr, false, true); rejects[n] = std::isfinite(energies[n]) ? nullptr : t.reject; ++n; r.candidates = n;
+            const auto leg = commandedLeg();
+            cands[n] = leg.candidate; energies[n] = leg.clear ? leg.energy : kInf; rejects[n] = leg.clear ? nullptr : leg.terms.reject; ++n; r.candidates = n;
             only([&](int i) { return i == n - 1; }, "recover_step_only");
         }
     }
@@ -978,47 +1127,34 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
         r.best.count = 1; r.best.seg[0] = { 0, 0, kSteps * kDt }; r.best.kind = cmd.mode == recovery::Mode::Stand ? "stand: the mode stands (see plan.mode)" : "stand: every candidate enters a solid";
         r.first = { s.input, 0 }; r.why = r.best.kind; for (auto& t : r.traj) t = s; mem.have = false; return r;
     }
-    {   // O1 / O2: the committed plan ("kept", time-shifted) against the cheapest challenger.
+    {   // ST-C (2026-11-22): the committed plan ("kept", time-shifted) against the cheapest challenger, with ONE margin: the time a switch itself costs.
+        // Every energy is in seconds, so replacing a published command costs one controller reaction (wheelguard::reaction), and a challenger must be
+        // cheaper than the kept plan by that long for two reactions before it takes over. Replaces switchBase / challengeFor / holdAfter / jumpWorse /
+        // steepWorse / roomBetter and the commit term: a consistent cost-to-go makes consistent choices, so no extra stickiness is added.
+        constexpr double kSwitchTime = wheelguard::reaction;
         // A candidate's commanded speed (unsigned) t seconds in (segment speeds; the rollout follows them within the car's limits).
         auto speedAt = [](const Candidate& c, double t) { for (int i = 0; i < c.count; ++i) { if (t < c.seg[i].seconds || i + 1 == c.count) return std::fabs(c.seg[i].speed); t -= c.seg[i].seconds; } return 0.0; };
         auto dirOf = [](const Candidate& c) { for (int i = 0; i < c.count; ++i) { if (c.seg[i].speed > .05) return 1; if (c.seg[i].speed < -.05) return -1; } return 0; };
         int keptIdx = -1; for (int i = 0; i < r.candidates; ++i) if (std::strcmp(cands[i].kind, "kept") == 0) { keptIdx = i; break; }
-        const int bestFree = best;  // HC-1: the cheapest plan before the hold decides (the gap baseline is measured against it)
-        // O2: a direction change (forward <-> reverse) needs a clear win like any switch; the committed plan getting a little worse does not
-        // release one (creeping up to a waiting car made the car rock, energyplan_test D1).
         const bool dirChange = keptIdx >= 0 && dirOf(cands[best]) != 0 && dirOf(cands[keptIdx]) != 0 && dirOf(cands[best]) != dirOf(cands[keptIdx]);
         if (keptIdx >= 0 && best != keptIdx && mem.have) {
             const double ek = energies[keptIdx], eb = energies[best];
-            const double margin0 = wt.switchBase;  // MP-1
-            // The hold only settles choices between safe plans: a committed plan that comes within the safety margin of a solid is not held (the
-            // hairpin touched its wall by 4 cm while a plan 0.1 m off it was kept).
-            double keptClear = kInf; if (std::isfinite(ek)) { Terms tk; Score(cands[keptIdx], s, k, want, w, wt, &mem, now, tk, nullptr, keptClear, hint, field, nullptr, weighted); }
             const double gap = ek - eb;
             if (!std::isfinite(ek)) { r.switchWhy = "committed_plan_enters_a_solid"; mem.challengeSince = -1; ++mem.relSolid; }
-            // HC-1: the kept plan within the margin of a solid gives way to a plan that keeps the margin, or clearly more room; to one just as close
-            // it is held (the 19:14 run switched between plans 0.5-0.8 m off the verge every 25 ms).
             else if (weighted && clearanceTiers[best] < clearanceTiers[keptIdx]) {
                 r.switchWhy = "challenger_has_better_clearance_tier"; ++mem.relClose;
             }
-            else if (keptClear < wt.margin && [&] { double bc = kInf; Terms tb; Score(cands[best], s, k, want, w, wt, &mem, now, tb, nullptr, bc, hint, field, nullptr, weighted);
-                                                   return bc >= wt.margin || bc > keptClear + wt.roomBetter; }()) {
-                r.switchWhy = "committed_plan_too_close_to_a_solid"; r.rival = cands[best].kind; r.rivalGap = gap; mem.challengeSince = -1; ++mem.relClose; }
-            // HC-1: the world changed under the committed plan (something ahead): its gap to the best grew by jumpWorse margins past its smallest since
-            // chosen. A shift of every plan at once (the goal moving ahead, the horizon) leaves the gap as it was.
-            else if (std::isfinite(mem.keptGap) && gap > mem.keptGap + (dirChange ? wt.steepWorse : wt.jumpWorse) * margin0) {
-                r.switchWhy = "committed_plan_got_worse"; r.rival = cands[best].kind; r.rivalGap = gap; mem.challengeSince = -1; ++mem.relWorse; }
             // Yielding is never held (as drivers brake at once and speed up with hesitation): a challenger that is slower within the next 2 s by
             // more than 0.5 m/s, or stops, in the same direction, takes over at once. The hold only settles gaining: a faster plan or another line.
             else if (dirOf(cands[best]) * dirOf(cands[keptIdx]) >= 0 && energies[best] < ek
                      && (speedAt(cands[best], 1.0) < speedAt(cands[keptIdx], 1.0) - .5 || speedAt(cands[best], 2.0) < speedAt(cands[keptIdx], 2.0) - .5)) {
                 r.switchWhy = "challenger_yields"; r.rival = cands[keptIdx].kind; r.rivalGap = ek - energies[best]; mem.challengeSince = -1; ++mem.relYield; }
             else {
-                const double margin = wt.switchBase;  // MP-1
-                const bool wins = eb < ek - margin;
+                const bool wins = eb < ek - kSwitchTime;
                 if (wins) { if (mem.challengeSince < 0 || now < mem.challengeSince) mem.challengeSince = now; } else mem.challengeSince = -1;
-                const bool ready = wins && now - mem.challengeSince >= wt.challengeFor && now - mem.switchedAt >= wt.holdAfter;
-                r.rival = cands[best].kind; r.rivalGap = ek - eb;
-                if (ready) { r.switchWhy = "challenger_cheaper_by_the_margin_long_enough"; ++mem.relTimer; }
+                const bool ready = wins && now - mem.challengeSince >= 2 * kSwitchTime;
+                r.rival = cands[best].kind; r.rivalGap = gap;
+                if (ready) { r.switchWhy = "challenger_cheaper_by_the_switch_time_long_enough"; ++mem.relTimer; }
                 else { best = keptIdx; r.energy = ek; r.kept = true; r.switchWhy = !wins ? (dirChange ? "direction_near_tie_kept" : "near_tie_committed_plan_kept") : "challenger_not_yet_long_enough"; }
             }
         } else if (keptIdx >= 0 && best == keptIdx) { r.kept = true; mem.challengeSince = -1; }
@@ -1027,10 +1163,7 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
         if (heldStepChosen && !r.kept && mem.have && mem.best.count && mem.best.kind && std::strcmp(mem.best.kind, cands[best].kind) == 0) {
             r.kept = true; r.switchWhy = "recovery_step_continues"; }
         if (!r.kept) { mem.switchedAt = now; mem.challengeSince = -1; }
-        // HC-1: the release baseline is the kept plan's smallest gap to the best since it was chosen (0 when chosen: it was the best).
-        if (!r.kept) mem.keptGap = 0;
-        else { ++mem.keptN; const double g = keptIdx >= 0 && bestFree >= 0 ? energies[keptIdx] - energies[bestFree] : 0.0;
-               mem.keptGap = std::isfinite(mem.keptGap) ? std::min(mem.keptGap, std::max(0.0, g)) : std::max(0.0, g); }
+        else ++mem.keptN;
     }
     r.ok = true; r.best = cands[best]; r.why = r.best.kind;
     Score(r.best, s, k, want, w, wt, &mem, now, r.terms, r.traj, r.minClearance, hint, field, nullptr, weighted, true);

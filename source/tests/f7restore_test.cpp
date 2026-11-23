@@ -17,8 +17,8 @@ int main() {
     check(f7dock::GroupRows({ { 0, 1 }, { 0, 4 } }).size() == 2, "points 3 apart: two groups");
     check(f7dock::GroupRows({ { 0, 1 }, { 0, 3 } }).size() == 1, "points 2 apart: one group");
     // Levels: the old numbers are unchanged; the new ones have names; place levels.
-    check(f7dock::Routes == 0 && f7dock::Problems == 7 && f7dock::Places == 8 && f7dock::Wires == 15 && f7dock::TrafficLevels == 16 && f7dock::LevelCount == 17, "level numbers");  // variant: the 2026-11-10 traffic levels menu was appended as 16; the old numbers are unchanged
-    check(std::strcmp(f7dock::LevelName(f7dock::Junction), "junction") == 0 && std::strcmp(f7dock::LevelName(16), "traffic levels") == 0 && std::strcmp(f7dock::LevelName(17), "?") == 0, "level names");
+    check(f7dock::Routes == 0 && f7dock::Problems == 7 && f7dock::Places == 8 && f7dock::Wires == 15 && f7dock::TrafficLevels == 16 && f7dock::Hazards == 17 && f7dock::LevelCount == 18, "level numbers");  // variant: the 2026-11-10 traffic levels menu was appended as 16 and the 2026-11-21 hazards menu as 17; the old numbers are unchanged
+    check(std::strcmp(f7dock::LevelName(f7dock::Junction), "junction") == 0 && std::strcmp(f7dock::LevelName(16), "traffic levels") == 0 && std::strcmp(f7dock::LevelName(17), "hazards") == 0 && std::strcmp(f7dock::LevelName(18), "?") == 0, "level names");
     check(f7dock::PlaceSelected(f7dock::Access) && !f7dock::PlaceSelected(f7dock::Places) && f7dock::PlaceLevel(f7dock::Places) && !f7dock::PlaceLevel(f7dock::Nodes), "place levels");
     std::printf("f7restore_test: %d of %d passed\n", total - failed, total);
     return failed ? 1 : 0;

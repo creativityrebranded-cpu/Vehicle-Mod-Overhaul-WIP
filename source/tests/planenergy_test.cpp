@@ -1,4 +1,4 @@
-// ED-1: the energy driver's pure parts (which part of the plan is driven now, when the energy plan may drive, when the field is rebuilt)
+﻿// ED-1: the energy driver's pure parts (which part of the plan is driven now, when the energy plan may drive, when the field is rebuilt)
 // and the scene adapter rule (every measured shape counts; predictions are soft).
 #define PLANENERGY_PURE
 #include "planenergy.h"
@@ -356,13 +356,13 @@ int main() {
         Check(planinput::Scene(f, line, wanted, shapes.data(), 1).solids.empty(), "F: with no fitted road the lane floor stands (0.3 m over it: road)");
     }
     {   // SG-1 (2026-11-19): the grade cap ahead, SlopeLimit brought back by braking (downhill brakes weaker by g*sin).
-        using planspeed::GradeCap; using planspeed::SlopeLimit;
-        Check(std::fabs(GradeCap(16, .42, 0, 3) - SlopeLimit(16, .42)) < 1e-9 && std::fabs(SlopeLimit(16, .42) - 8) < 1e-9,
+        using planspeed::GradeCap; using planspeed::SlopeLimit; const double kMG = carcap::kCar.MaxGrade(1.0);
+        Check(std::fabs(GradeCap(16, .42, 0, 3, kMG) - SlopeLimit(16, .42, kMG)) < 1e-9 && std::fabs(SlopeLimit(16, .42, kMG) - 8) < 1e-9,
               "SG-1: on the 23 deg ramp itself the cap is SlopeLimit (half of 16 m/s)");
-        Check(std::fabs(GradeCap(16, .42, 20, 3) - std::sqrt(64 + 120)) < 1e-9, "SG-1: an uphill 20 m ahead: reachable by braking at 3 m/s^2");
-        Check(GradeCap(16, -.42, 20, 3) < GradeCap(16, .42, 20, 3) && std::fabs(GradeCap(16, -.42, 20, 3) - std::sqrt(64 + 20)) < 1e-9,
+        Check(std::fabs(GradeCap(16, .42, 20, 3, kMG) - std::sqrt(64 + 120)) < 1e-9, "SG-1: an uphill 20 m ahead: reachable by braking at 3 m/s^2");
+        Check(GradeCap(16, -.42, 20, 3, kMG) < GradeCap(16, .42, 20, 3, kMG) && std::fabs(GradeCap(16, -.42, 20, 3, kMG) - std::sqrt(64 + 20)) < 1e-9,
               "SG-1: the same slope downhill: weaker braking (floor 0.5 m/s^2), lower cap");
-        Check(GradeCap(16, 0, 0, 3) == 16 && GradeCap(16, .02, 0, 3) > 15, "SG-1: flat or gentle road: no cap below the top speed");
+        Check(GradeCap(16, 0, 0, 3, kMG) == 16 && GradeCap(16, .02, 0, 3, kMG) > 15, "SG-1: flat or gentle road: no cap below the top speed");
     }
 
     {   // GR-2 (2026-11-19 17:44 run): the lc_ring_road ramp's lane floor at the stop, one sample 0.45 m under the car (seam or lower surface).
@@ -442,8 +442,9 @@ int main() {
         scene.solids.push_back({0, -3.0, 0, 1.5, .25});
         scene.Index();
         r = energyplan::Plan(current, spec, 6, scene, blockedBack, 11.2);
-        Check(r.ok && blockedBack.recStepBlocked && std::strcmp(r.why, "recover: back up") != 0,
-              "AP-1: a blocked back-up step is told to the routine; the candidates choose this tick");
+        Check(std::strcmp(r.why, "recover: back up") != 0 &&
+              (blockedBack.rec.step == recovery::Command::Step::TurnToLane || blockedBack.rec.step == recovery::Command::Step::Retry),
+              "AP-2: a blocked back-up leg advances recovery immediately");
         scene.managerHeld = true;
         scene.stopStation = 0;
         r = energyplan::Plan(current, spec, 0, scene, held, 11.2);

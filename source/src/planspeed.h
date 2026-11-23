@@ -7,28 +7,32 @@
 // Pure; tests: tests/planspeed_test.cpp.
 #include <algorithm>
 #include <cmath>
+#include "carcap.h"
+#include "wheelguard.h"
 
 namespace planspeed {
 constexpr int kSteps = 16;
 constexpr double kDt = .25;                 // 4 s ahead
 constexpr int kMaxLimits = 64, kMaxBlocks = 16;
 
-namespace following {
-constexpr double standstillGap = 3.0;
-constexpr double timeGap = 1.4;
-constexpr double comfortableBrake = 3.0;
+// The toy model's brake (m/s^2): the same 6 as bicycle::Spec. Used where the car's own brake is not known (the traffic add-on); callers
+// that know it pass it.
+constexpr double kToyBrake = 6.0;
+// Stage E (2026-11-22, GENERATED_COSTS_DESIGN): following values come from the car, not from hand numbers (were 3.0 m, 1.4 s, 3.0 m/s^2).
+//   standing gap = 2 x the car's half length (a body length of room);
+//   headway h    = t_r + v_lead / brake (the controller's reaction, then the time the leader's speed takes to brake away);
+//   comfort brake = brake / 2 (half the hard brake).
+// Keep the bumper gap plus headway. Closing on the leader also uses the distance needed to brake down to its speed.
+inline double FollowingCap(double bumperGap, double leaderSpeed, double halfLength, double brake) {
+    const double b = std::max(.1, brake), comfort = .5 * b;
+    const double room = std::max(0.0, bumperGap - 2 * halfLength);
+    const double lead = std::max(0.0, leaderSpeed);
+    const double headway = wheelguard::reaction + lead / b;
+    const double steady = room / headway;
+    if (steady <= lead) return steady;
+    const double bt = comfort * wheelguard::reaction;  // closing: the follower brakes at the comfort rate after one reaction (the leader's own braking is already in `lead`)
+    return std::sqrt(bt * bt + lead * lead + 2 * comfort * room) - bt;
 }
-// Keep the bumper gap plus time headway. Closing on the leader also uses
-// the distance needed to brake down to its speed.
-inline double FollowingCap(double bumperGap, double leaderSpeed) {
-    const double room=std::max(0.0,bumperGap-following::standstillGap);
-    const double steady=room/following::timeGap;
-    const double lead=std::max(0.0,leaderSpeed);
-    if(steady<=lead)return steady;
-    const double bt=following::comfortableBrake*following::timeGap;
-    return std::sqrt(bt*bt+lead*lead+2*following::comfortableBrake*room)-bt;
-}
-
 // A speed limit from `from` metres ahead onward to `to`.
 struct Limit { double from = 0, to = 1e9, speed = 1e9; const char* why = ""; };
 // A part of the branch the car's nose must not be in during a time window. Fixed things: tFrom 0, tTo 1e9.
@@ -36,7 +40,7 @@ struct Block { double from = 0, to = 0, tFrom = 0, tTo = 1e9, gap = 1.5; const c
 
 struct Input {
     double speed = 0, want = 10;            // now; wanted
-    double accel = 6, brake = 6;            // the toy model's limits (m/s^2)
+    double accel = 6, brake = kToyBrake;   // the toy model's limits (m/s^2)
     double length = 1e9;                    // where the line ends: stop there
     double endGap = .75;
     const Limit* limits = nullptr; int limitCount = 0;
@@ -152,22 +156,34 @@ inline Output Solve(const Input& in) {
     return stop;
 }
 
-// Knowledge kept as limits (existing rules, from their own files).
-constexpr double kLateral = 3.5;   // m/s^2 round a corner (railturn.h)
-inline double CornerLimit(double curvature) { const double c = std::fabs(curvature); return c > 1e-5 ? std::sqrt(kLateral / c) : 1e9; }
-constexpr double kGravity = 9.81, kCrestShare = .5, kGradeLoss = 2, kMinShare = .5;  // railslope.h
-inline double SlopeLimit(double top, double grade) { return top * std::clamp(1 - kGradeLoss * std::fabs(grade), kMinShare, 1.0); }
-// SG-1 (2026-11-19): SlopeLimit for a slope `distance` m ahead, brought back to the car by braking at `brake` (as the crest and bend caps
+// Knowledge kept as limits. Stage E (2026-11-22): each reads the car's own record (carcap.h) instead of a hand number.
+// Corner: aLat is the sideways acceleration the car turns with: ground carcap::kCar.PlanLat(grip of the gear) (3.0 x grip; was a separate
+// 3.5), flight the hull's sustained turn (hulllogic Flight lateral x the gear's lateralScale).
+inline double CornerLimit(double curvature, double aLat) { const double c = std::fabs(curvature); return c > 1e-5 ? std::sqrt(std::max(0.0, aLat) / c) : 1e9; }
+constexpr double kGravity = 9.81;  // physical
+// kMinShare: CHOSEN RESOLUTION, no physical derivation. A grade the wheels cannot climb at all would be a speed of 0; the planner treats
+// the grade as a constraint (carcap MaxGrade), so the speed cap only has to say "slow", never "stop": it bottoms at half the top speed.
+constexpr double kMinShare = .5;
+// Slope: the share of the tyres' grip that gravity along the grade uses is |grade| / MaxGrade(grip) (MaxGrade = friction limit or engine
+// grade, carcap.h); what is left may go to speed. Was 1 - 2 |grade|: the same rule with MaxGrade .5.
+inline double SlopeLimit(double top, double grade, double maxGrade) {
+    const double used = std::fabs(grade) / std::max(1e-3, maxGrade);
+    return top * std::clamp(1 - used, kMinShare, 1.0);
+}// SG-1 (2026-11-19): SlopeLimit for a slope `distance` m ahead, brought back to the car by braking at `brake` (as the crest and bend caps
 // are: planrules crestBrake). grade: rise over run along travel (+ up). Down a slope gravity takes g*sin from the brakes, so the braking
 // that brings the cap back is that much weaker (never under 0.5 m/s^2): a steep descent in sight is met at its speed.
-inline double GradeCap(double top, double grade, double distance, double brake) {
-    const double v = SlopeLimit(top, grade);
+inline double GradeCap(double top, double grade, double distance, double brake, double maxGrade) {
+    const double v = SlopeLimit(top, grade, maxGrade);
     const double down = grade < 0 ? kGravity * -grade / std::sqrt(1 + grade * grade) : 0.0;
     const double b = std::max(.5, brake - down);
     return std::sqrt(v * v + 2 * b * std::max(0.0, distance));
 }
-inline double CrestLimit(double curvature) { return curvature > 1e-3 ? std::sqrt(kCrestShare * kGravity / curvature) : 1e9; }
-// Sideways: D3. 1.2 m/s at speed; slowly, half a metre across per metre along (pathgrid.h, lanedriver.h kPassRate).
+// Crest: the wheels keep their grip while the road's downward bend takes less than the share of their load the planner's safety margin
+// can spare: friction goes with wheel load and the planner counts on `safety` of it (carcap Car::safety), so the share is 1 - safety
+// (was a hand .5). The record has no suspension travel, so travel is NOT part of this share (a longer-travel car would be allowed more).
+inline double CrestShare(const carcap::Car& car) { return 1.0 - car.safety; }
+inline double CrestLimit(double curvature, double share) { return curvature > 1e-3 ? std::sqrt(std::max(0.0, share) * kGravity / curvature) : 1e9; }
+// Sideways: D3. 1.2 m/s at speed; slowly, half a metre across per metre along (pathgrid.h, lanedriver.h kPassRate). (kept, see the report: no physical derivation was found for these three; they are chosen resolutions).
 constexpr double kSideRate = 1.2, kSlowAcross = .5, kSlowSpeed = 6;
 inline double SideLimit(double acrossPerMetre) {
     const double s = std::fabs(acrossPerMetre);

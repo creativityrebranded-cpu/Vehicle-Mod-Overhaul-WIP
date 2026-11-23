@@ -7,6 +7,7 @@
 #include "ringlogic.h"
 #include "roadplan.h"
 #include "routeend.h"
+#include "routehazard.h"
 #include "routeschedule.h"
 #include "routepolicy.h"
 #include "laneplan.h"
@@ -62,6 +63,7 @@ struct Route {
     roadplan::Plan road;
     journeyplan::Plan journey;trafficconstraints::Rules restrictions;
     routeend::Plan end;              // line_end / line_arrive (2026-11-06); none written: pass, as before
+    routehazard::Plan hazards;       // hazard_boxes (2026-11-21): oriented boxes the planner and the rail go round; none written: as before
     double trafficMetres = 0;        // derived on file load for the addon's demand readers
 
 };
@@ -424,7 +426,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data, b
             if (!get("corridor").empty() && (!Number(get("corridor"),r.corridor) || r.corridor<1 || r.corridor>200)) { bad(sec,"corridor","1..200 metres per lane"); continue; }
             r.road=roadplan::Read(get("road_tiles"));r.spacePlan=splinekit::Read(get("space_plan"));r.lanePlan=laneplan::Read(get("lane_plan"));r.lanePlan.vehicles=lanevehicles::Read(get("lane_vehicles"));r.lanePlan.transforms=lanetransform::Read(get("lane_transforms"));r.journey=journeyplan::Read(get("journey_plan"));r.restrictions=trafficconstraints::Read(get("restrictions"));
             // Field boxes and line ending (2026-11-06): text this build cannot read is kept, never a reason to skip the route.
-            roadplan::ReadBoxes(get("road_boxes"),r.road);r.end=routeend::Read(get("line_end"),get("line_arrive"));
+            roadplan::ReadBoxes(get("road_boxes"),r.road);r.end=routeend::Read(get("line_end"),get("line_arrive"));r.hazards=routehazard::Read(get("hazard_boxes"));
             if (!get("sections").empty() && (!routepolicy::ReadIni(get("sections"),r.sections) || r.ring || r.sections.size()!=r.points.size())) { bad(sec,"sections","one valid section rule per point required"); continue; }
             r.trafficMetres = DemandLength(r);
             data.routes.push_back(r);
@@ -599,7 +601,7 @@ inline void PlaceWorld(Data& d, const std::string& name, const std::string& game
         r.shape.cx += shift.x; r.shape.cy += shift.y; r.shape.z += shift.z;
         for (auto& p : r.points) { p.x += shift.x; p.y += shift.y; p.z += shift.z; }
         for(auto& stop:r.journey.stops){stop.x+=shift.x;stop.y+=shift.y;stop.z+=shift.z;}
-        routeend::Shift(r.end,shift.x,shift.y,shift.z);
+        routeend::Shift(r.end,shift.x,shift.y,shift.z);routehazard::Shift(r.hazards,shift.x,shift.y,shift.z);
     }
     for (auto& p : d.places)
         if (p.world == name) { p.at.x += shift.x; p.at.y += shift.y; p.at.z += shift.z;placeaccess::Move(p.access,shift.x,shift.y,shift.z);placeaccess::MoveWires(p.wires,shift.x,shift.y,shift.z); }

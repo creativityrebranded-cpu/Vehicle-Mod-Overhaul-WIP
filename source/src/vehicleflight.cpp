@@ -17,6 +17,7 @@
 #include "runtimeforms.h"
 #include "loadedarea.h"
 #include "routesurvey_run.h"
+#include "hazardfield.h"
 #include "wheelgrip.h"
 #include "autogear.h"
 #include <chrono>
@@ -491,6 +492,7 @@ namespace vehicleflight
             __except (EXCEPTION_EXECUTE_HANDLER) { return true; }  // unknown: leave it to the game
         }
         // Cruise boost: the rail's target speed may rise when only the car's top speed holds it back (corners still win).
+        int g_scriptLogged[1 + prefetch::kSlotPilotCount] = {};  // Script mode: last state logged per pilot (0 off, 1 on)
         bool g_railFree[1 + prefetch::kSlotPilotCount] = {};       // this frame only top speed limits the car
         double g_railCorner[1 + prefetch::kSlotPilotCount] = {};   // this frame's corner speed limit (1e9 none)  // when this pilot last drove a Drive lane on lane waypoints
         ULONGLONG g_navWantAt[1 + prefetch::kSlotPilotCount] = {};
@@ -991,6 +993,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 		// A seated ship pilot has no PlayerVehicle link. Count whether the last driven rover's physics
 		// callback keeps running after dismount; comparison only, never dereference a stale reference.
 		std::atomic<std::uint32_t> g_manualDriverId{0};
+        std::mutex g_saveControlLock;
+        fleetownershipstore::PlayerControl g_saveControl;
         std::atomic<std::uintptr_t> g_driverVehicle{ 0 }, g_lastDrivenVehicle{ 0 };
 		std::atomic<unsigned> g_physicalSteps{0}, g_physicalFailures{0};
 		std::atomic<unsigned> g_physicalReject{0};
@@ -1857,6 +1861,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             Actuator advice = Actuator::Waiting;  // AC-2: the manager's advice
             std::uint64_t adviceAt = 0;
             double toPlayer = 0.0;
+            double hazardOffset = 0.0;  // routehazard.h: how far the carried car stands to the right of its path to go round a hazard box
         };
         std::mutex g_fleetRailLock;
         std::unordered_map<unsigned, FleetRail> g_fleetRails;
@@ -1922,16 +1927,27 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         }
         // AC-2 virtual actuator: the fleet rail's path carries the car at the autopilot's wanted speed (capped by the path's corner speed);
         // returns the next pose (the path gives the height and heading). False: no rail path for this car.
-        bool RailVirtualStep(unsigned vehicle, double x, double y, double z, double want, double dt, double& ox, double& oy, double& oz, double& yaw, double& used) {
+        bool RailVirtualStep(unsigned vehicle, double x, double y, double z, double want, double dt, double& ox, double& oy, double& oz, double& yaw, double& used,
+                             double halfWidth = 1.4, double halfLength = 3.0, double height = 2.5) {
             std::lock_guard lk(g_fleetRailLock); const auto it = g_fleetRails.find(vehicle);
             if (it == g_fleetRails.end() || !(it->second.path.End() > 1.0)) return false;
             auto& car = it->second;
+            // HJ-2 (2026-11-22 18:54 run: FF10A329 jumped 140 m when it went virtual again): the station kept from an earlier virtual
+            // stretch is not where the car is now. Re-seed from the car's real position whenever they differ by more than 3 m.
+            if (car.seeded) { const auto onPath = car.path.At(car.station); const double off = std::hypot(onPath.x - x, onPath.y - y);
+                if (!(off <= 3.0)) { car.seeded = false; logger::Write("OBS system=traffic.actuator vehicle=%08X event=virtual_reseed stale_m=%.1f reason=station_from_an_earlier_virtual_stretch", vehicle, off); } }
             if (!car.seeded) { car.station = car.path.Project(x, y, z); car.seeded = true; car.railSpeed = 0; }
-            const double v = fleetrail::Approach(car.railSpeed, std::min(want, car.path.CornerSpeed(car.station)), dt);
+            // Hazard boxes (routehazard.h): the same boxes the physical planner sees. A valid shift round them if one exists, else stop short.
+            routehazard::Plan hazards; { routehazard::Box found[16]; const int n = hazardfield::NearNow(x, y, z - 20.0, z + 20.0, 150.0, found, 16); hazards.boxes.assign(found, found + n); }
+            const auto advice = routehazard::Advise(hazards, [&](double s) { return car.path.At(s); }, car.station, car.path.End(), car.railSpeed, halfWidth, halfLength, height, car.hazardOffset, dt);
+            if (advice.blocked || advice.detour) { static ULONGLONG told = 0; const auto t = GetTickCount64(); if (t - told > 2000) { told = t; logger::Write("OBS system=world.hazard event=rail_%s vehicle=%08X offset_m=%.2f stop_in_m=%.1f reason=hazard_box_on_the_rail_path", advice.blocked ? "stop" : "detour", vehicle, advice.offset, advice.stopIn); } }
+            car.hazardOffset = advice.offset;
+            const double v = fleetrail::Approach(car.railSpeed, std::min({ want, car.path.CornerSpeed(car.station), advice.speedCap }), dt);
             const double st = car.path.Advance(car.station, std::max(0.0, v) * dt);
-            const auto pt = car.path.At(st), q = car.path.At(car.path.Advance(st, 1.0));
+            auto pt = car.path.At(st); const auto q = car.path.At(car.path.Advance(st, 1.0));
             if (!std::isfinite(pt.x + pt.y + pt.z)) return false;
             car.station = st; car.railSpeed = v; car.position = pt;
+            if (advice.offset != 0.0) { const double dx = q.x - pt.x, dy = q.y - pt.y, len = std::hypot(dx, dy); if (len > 1e-6) { pt.x += dy / len * advice.offset; pt.y -= dx / len * advice.offset; } }
             ox = pt.x; oy = pt.y; oz = pt.z; yaw = std::atan2(q.x - pt.x, q.y - pt.y); used = v; return true;
         }
         bool FarYaw(std::uintptr_t vehicle, double yaw) { __try { reinterpret_cast<float*>(vehicle + off::kRefRotation)[2] = float(yaw); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
@@ -2830,6 +2846,18 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			if (!lock.owns_lock() || s.physical) return true;
 			const auto instance = s.instance.load();
 			return instance && s.lastStepInstance == instance && s.lastStepAt && now - s.lastStepAt < 1500;
+		}
+		// HJ-1: this pilot's physics body is in the live scene (the read interface says it is valid). Read-only, the same reads WK-1 uses.
+		bool BodyInScene(int idx)
+		{
+			if (idx < 0 || idx >= kPilots) return false;
+			const auto instance = g_shs[idx].instance.load();
+			if (!instance) return false;
+			__try {
+				const auto b = FindBody(instance, 0, 0, 0, true);
+				if (!b.body || !b.read || At<std::uint32_t>(b.body, 0x50) != b.id) return false;
+				return VFn<int (*)(std::uintptr_t, std::uint32_t)>(b.read, 0x58)(b.read, b.id) != 0;
+			} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 		}
 		// A descent that does not get down in time ends anyway: 20 s plus 1 s per 5 m it started above the ground (2026-10-28 18:43
 		// run: 306 m and 351 m up after the drivers were lost; a flat 25 s dropped them from about 150 m).
@@ -4758,7 +4786,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 		// One tick of a vehicle's radar: the rays, the path sweep, one check against the game, and the list's range rule. Main thread only.
 		void RadarStep(int idx, std::uint32_t self, double x, double y, double base, double heading, double speed, double halfWidth, double halfLength, double now, bool floorProofLane)
 		{
-			if (!features::On(features::Id::Radar) || idx < 0 || idx >= int(sizeof g_radar / sizeof g_radar[0]) || !routesurvey::OnMainThread()) return;
+			if (!features::On(features::Id::Radar) || features::On(features::Id::ScriptMode) || idx < 0 || idx >= int(sizeof g_radar / sizeof g_radar[0]) || !routesurvey::OnMainThread()) return;
 			auto& st = g_radar[idx]; auto& sh = g_shs[idx];
 			const std::uintptr_t instance = sh.instance.load(std::memory_order_relaxed); const std::uint32_t ownBody = sh.bodyId.load(std::memory_order_relaxed);
 			const unsigned long long frame = routesurvey::Frame(); if (frame != g_radarFrame) { g_radarFrame = frame; g_radarFrameRays = 0; g_radarFrameSweeps = 0; }
@@ -4907,7 +4935,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 
 		void RadarAppend(int idx, std::vector<planworld::Shape>& shapes, double now, double connectedFloorCarHeight = 0)
 		{
-			if (!features::On(features::Id::Radar) || idx < 0 || idx >= int(sizeof g_radar / sizeof g_radar[0])) return;
+			if (!features::On(features::Id::Radar) || features::On(features::Id::ScriptMode) || idx < 0 || idx >= int(sizeof g_radar / sizeof g_radar[0])) return;
 			const auto& st = g_radar[idx];
 			planworld::Shape tmp[radar::kMaxBoxes];
 			const int n = radar::ToShapes(st, now, tmp, radar::kMaxBoxes);
@@ -4972,6 +5000,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					s.heading = b.yaw; s.seenAt = now; shapes.push_back(s);
 				}
 			}
+			hazardfield::AppendNow(.5 * (x + gx), .5 * (y + gy), base - 1.0, base + 3.5, .5 * reach + 6.0, now, shapes, kMax + 16);  // a route's hazard boxes
 			const auto& world = WorldThisFrame(now);  // vehicles and people (D4: moving ones become movers in the scene); World excludes the asking car
 			planworld::Shape nearby[48]; const int nn = world.Near(x, y, reach + 10.0, self, nearby, 48);
 			for (int k = 0; k < nn && shapes.size() < kMax; ++k) shapes.push_back(nearby[k]);
@@ -5028,8 +5057,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 		// The energy by term (2026-11-14: the 15:12 crawl at energy 110 with 406 of 408 moves possible did not say which cost held it).
 		const char* TermsText(const energyplan::Terms& t, char* out, std::size_t n)
 		{
-			std::snprintf(out, n, "togo=%.1f progress=%.1f lateral=%.1f speed=%.1f collision=%.1f field=%.1f slope=%.1f commit=%.1f gear=%.1f soft=%.1f movers=%.1f low_edge=%.1f steer=%.1f hover=%.1f modes=%.1f facing=%.1f end_free=%.1f",
-				t.togo, t.progress, t.lateral, t.speed, t.collision, t.field, t.slope, t.commit, t.gear, t.soft, t.movers, t.lowEdge, t.steer, t.hover, t.modes, t.facing, t.endFree);
+			std::snprintf(out, n, "togo=%.1f progress=%.1f lateral=%.1f speed=%.1f collision=%.1f field=%.1f slope=%.1f gear=%.1f soft=%.1f movers=%.1f low_edge=%.1f hover=%.1f modes=%.1f facing=%.1f end_free=%.1f",
+				t.togo, t.progress, t.lateral, t.speed, t.collision, t.field, t.slope, t.gear, t.soft, t.movers, t.lowEdge, t.hover, t.modes, t.facing, t.endFree);
 			return out;
 		}
 		// CT-1: what the plan weighed: candidates rejected per rule, and the cheapest lane-following plan at each speed (its energy and main
@@ -5040,8 +5069,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			for (int q = 0; q < r.rejectKinds && o < sizeof rj - 64; ++q) o += std::snprintf(rj + o, sizeof rj - o, "%s%s:%d", q ? "," : "", r.rejectName[q] ? r.rejectName[q] : "?", r.rejectCount[q]);
 			char ls[900]; o = 0; ls[0] = 0;
 			for (int q = 0; q < r.laneSpeedCount && o < sizeof ls - 160; ++q) { const auto& L = r.laneSpeeds[q];
-				if (std::isfinite(L.energy)) o += std::snprintf(ls + o, sizeof ls - o, "%s%.1f:E=%.1f(lateral=%.1f,field=%.1f,togo=%.1f,collision=%.1f,speed=%.1f,commit=%.1f,hover=%.1f,end_free=%.1f)", q ? "|" : "", L.speed, L.energy,
-					L.terms.lateral, L.terms.field, L.terms.togo, L.terms.collision, L.terms.speed, L.terms.commit, L.terms.hover, L.terms.endFree);
+				if (std::isfinite(L.energy)) o += std::snprintf(ls + o, sizeof ls - o, "%s%.1f:E=%.1f(lateral=%.1f,field=%.1f,togo=%.1f,collision=%.1f,speed=%.1f,hover=%.1f,end_free=%.1f)", q ? "|" : "", L.speed, L.energy,
+					L.terms.lateral, L.terms.field, L.terms.togo, L.terms.collision, L.terms.speed, L.terms.hover, L.terms.endFree);
 				else o += std::snprintf(ls + o, sizeof ls - o, "%s%.1f:rejected_%s", q ? "|" : "", L.speed, L.reject && *L.reject ? L.reject : "unnamed"); }
 			logger::Write("OBS system=plan.choices vehicle=%08X pilot=%d when=%s candidate=\"%s\" energy=%.1f clearance_tier=%d wheel_vote_speed=%.2f wheel_vote_reason=%s feasible=%d/%d rejected={%s} lane_speeds={%s} raw_start_grade=%.2f start_grade=%.2f grade_points=%d grade_set_aside=%d max_grade=%.2f floor_set_aside=%d reason=what_the_plan_weighed",
 				self, idx, when, r.why ? r.why : "", r.energy, r.terms.clearanceTier, r.terms.wheelSpeed, r.terms.wheelReason, r.feasible, r.candidates, rj, ls, r.startGrade.raw, r.startGrade.grade, r.startGrade.points, r.startGrade.setAside, r.maxGrade, r.floorSetAside);
@@ -5550,14 +5579,19 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 // AC-3/AC-4: no car waits, fleet or not: physical the moment the engine steps it, carried virtually otherwise (the rail path
                 // for a fleet car, its lane for any other). A car under its birth hold is not the autopilot's yet: no actuator moves it.
                 const bool birthHeld = vehiclediag::BirthHeld(self);
-                const bool moveVirtual = idx >= 1 && !birthHeld && (!hasModel || !stepping);
-                const char* gateWhy = birthHeld ? "birth_hold_not_released" : !haveAdvice ? (moveVirtual ? "not_a_fleet_car_lane_carries_it" : "not_a_fleet_car_physical") :
+                // HJ-1 (2026-11-22 18:45 run: FF100010 snapped 158 m, 45 m from the player): a car stopped long enough has a sleeping
+                // body, so "not stepping"; moving its reference left the body behind and the car snapped back when physics woke it.
+                // A car whose physics body exists (model loaded) stays physical: the rail's WK-1 wake starts it from where it really is.
+                // Only a car with no body is carried virtually (the engine builds its body where the car is).
+                const bool bodyHere = hasModel && !stepping && idx >= 1 && BodyInScene(idx);
+                const bool moveVirtual = idx >= 1 && !birthHeld && (!hasModel || (!stepping && !bodyHere));
+                const char* gateWhy = birthHeld ? "birth_hold_not_released" : bodyHere ? "body_in_scene_stays_physical_wake" : !haveAdvice ? (moveVirtual ? "not_a_fleet_car_lane_carries_it" : "not_a_fleet_car_physical") :
                     advised == Actuator::Virtual && stepping ? "physics_live_takes_over_at_once" :
                     advised == Actuator::Physical && moveVirtual ? "physics_not_ready_keeps_going_on_rail" : "as_advised";
                 // AC-2/AC-3: the arbiter's owner for this car this update (MB-4 one decider): the rail path carries it, or the physical actuator.
                 if (idx >= 1 && moveVirtual) driverOwner = "plan_virtual";
                 if (idx >= 1 && idx < int(sizeof actuatorWas / sizeof actuatorWas[0])) {
-                    const char* now = moveVirtual ? "virtual" : birthHeld ? "birth_hold" : stepping ? "physical" : "physical_not_stepping";
+                    const char* now = moveVirtual ? "virtual" : birthHeld ? "birth_hold" : stepping ? "physical" : bodyHere ? "physical_body_waking" : "physical_not_stepping";
                     if (actuatorWas[idx] != now) { actuatorWas[idx] = now;
                         logger::Write("OBS system=traffic.actuator vehicle=%08X pilot=%d event=swap to=%s advice=%s gate=%s distance=%.0f physics_radius=%.0f physics_live=%d model=%d",
                             self, idx, now, haveAdvice ? ActuatorName(advised) : "none", gateWhy, toPlayerM, physicsR, int(stepping), int(hasModel)); }
@@ -5572,11 +5606,15 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     for(int k=0;k<in.otherCount&&in.others;++k){const auto& o=in.others[k];const double dx=o.x-in.x,dy=o.y-in.y,ahead=dx*fx+dy*fy,side=std::fabs(-dx*fy+dy*fx);
                         if(ahead>0&&ahead<14&&side<3)want=0;}
                     if(live&&dt>0&&want>0){
-                        const double s=here.along+want*dt;auto p=laneWindow.At(s);const auto q=laneWindow.At(s+1.0);
+                        // Hazard boxes (routehazard.h): a lane car carried without physics goes round them or stops short, like the physical planner does.
+                        routehazard::Advice hz;{static std::unordered_map<unsigned,double> hzOffset;routehazard::Plan hp;routehazard::Box found[16];const int hn=hazardfield::NearNow(in.x,in.y,in.z-20.0,in.z+20.0,150.0,found,16);hp.boxes.assign(found,found+hn);
+                            hz=routehazard::Advise(hp,[&](double st){return laneWindow.At(st);},here.along,here.along+130.0,want,in.shape.halfWidth,in.shape.halfLength,in.shape.height,hzOffset[self],dt);hzOffset[self]=hz.offset;}
+                        const double s=here.along+std::min(want,hz.speedCap)*dt;auto p=laneWindow.At(s);const auto q=laneWindow.At(s+1.0);
+                        if(hz.offset!=0.0){const double dx=q.x-p.x,dy=q.y-p.y,len=std::hypot(dx,dy);if(len>1e-6){p.x+=dy/len*hz.offset;p.y-=dx/len*hz.offset;}}
                         double z=p.z+in.shape.originAbove;double fz=0;
                         if(surfaceOwner&&fieldgate::surfaceProvider(surfaceOwner,p.x,p.y,&fz)==1)z=fz+in.shape.originAbove;
                         double railYaw=0,railUsed=0,rx=0,ry=0,rz=0;
-                        const bool onRail=RailVirtualStep(self,in.x,in.y,in.z,want,dt,rx,ry,rz,railYaw,railUsed);  // AC-2: the rail path is the virtual actuator
+                        const bool onRail=RailVirtualStep(self,in.x,in.y,in.z,want,dt,rx,ry,rz,railYaw,railUsed,in.shape.halfWidth,in.shape.halfLength,in.shape.height);  // AC-2: the rail path is the virtual actuator
                         if(onRail){p.x=rx;p.y=ry;z=rz;}
                         {const auto m=navmap::At(p.x,p.y,z+2.0);if(m.haveGround&&std::isfinite(m.ground)&&double(m.ground)+in.shape.originAbove>z&&double(m.ground)-z<4.0)z=double(m.ground)+in.shape.originAbove;}  // AC-1: never under the real ground at the swap
                         const double yaw=onRail?railYaw:std::atan2(q.x-p.x,q.y-p.y);
@@ -5775,9 +5813,15 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         const bool contained=nbox>0?g_fieldHold[idx].Update(in.now,fieldShareNow):(g_fieldHold[idx]=fieldbox::Containment{},false);
                         auto wanted=[&](double d,double){const int i=std::clamp(int(std::lround(d/kStep)),0,kSamples-1);planworld::Wanted w;w.have=wantHave[i];w.z=wantZ[i];w.measured=wantMeasured[i];w.step=in.limits.maxStep;w.faceStep=laneline::kFaceStep;return w;};
                         // World: real hit points, object boxes, vehicles, people. Each policy flag applies once, here.
-                        const bool useFieldSlice=nbox>0&&wantHave[0]&&effective.obstacles!=2;
+                        // Script mode (2026-11-22, the user): no object detection. World keeps hazard boxes (planned separately), the known positions
+                        // of other vehicles (each one's real box is its avoid distance) and people; every sensed source below is skipped.
+                        const bool scriptMode=features::On(features::Id::ScriptMode);
+                        if(idx>=0&&idx<int(sizeof g_scriptLogged/sizeof g_scriptLogged[0])&&g_scriptLogged[idx]!=int(scriptMode)){g_scriptLogged[idx]=int(scriptMode);
+                            logger::Write("OBS system=world.script vehicle=%08X pilot=%d event=%s sources=%s reason=traffic_manager_script_mode",self,idx,scriptMode?"on":"off",
+                                scriptMode?"hazard_boxes,vehicle_positions,people":"all_sensors");}
+                        const bool useFieldSlice=nbox>0&&wantHave[0]&&effective.obstacles!=2&&!scriptMode;
                         // F1: with no road surface under the line the volume is cast too, beside the older sources (nothing is bypassed for it).
-                        const bool volumeExtra=!useFieldSlice&&effective.obstacles!=2&&idx>=0&&(nbox==0||!wantHave[0])&&VolumeEverywhereOn();
+                        const bool volumeExtra=!scriptMode&&!useFieldSlice&&effective.obstacles!=2&&idx>=0&&(nbox==0||!wantHave[0])&&VolumeEverywhereOn();
                         const bool volumeAir=volumeExtra&&!wantHave[0];  // nothing is wanted under the car: any agreeing hit in its way is a solid
                         auto survey=routesurvey::ReadSweep();
                         const auto tWorld0=std::chrono::steady_clock::now();
@@ -5787,7 +5831,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         static thread_local std::vector<Shape> shapes;shapes.clear();constexpr std::size_t kMaxShapes=128;int sweptOverBand=0,wholeBoxes=0,wholeTooBig=0,bandCells=0,sweepKnown=0,sweepShapes=0;  // WB-1 counts
                         const double span=std::max(double(lane->halfWidth),6.0);
                         auto tProbe0=tWorld0;
-                        if(!useFieldSlice){
+                        if(!useFieldSlice&&!scriptMode){
                         if(effective.obstacles!=2)for(int i=0;i<kSamples&&shapes.size()<kMaxShapes;i+=2){const auto p=lineAt(i*kStep);navmap::KeptHit kh[32];
                             const int n=navmap::HitsNear(p.x,p.y,wantZ[i]-1.0,wantZ[i]+3.5,span,kh,32);
                             for(int k=0;k<n&&shapes.size()<kMaxShapes;++k){bool dup=false;for(const auto& s:shapes)if(std::fabs(s.centre.x-kh[k].x)<.05&&std::fabs(s.centre.y-kh[k].y)<.05&&std::fabs(s.centre.z-kh[k].z)<.05){dup=true;break;}
@@ -5908,10 +5952,11 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                                 pr=ProbeStats{};pr.logAt=in.now;}}
                         }
                         const auto tWorld1=std::chrono::steady_clock::now();
-                        if(!useFieldSlice)pcProbeUs=std::chrono::duration<double,std::micro>(tWorld1-tProbe0).count();
+                        if(!useFieldSlice&&!scriptMode)pcProbeUs=std::chrono::duration<double,std::micro>(tWorld1-tProbe0).count();
                         {   // Vehicles and people from World's per-frame store; each policy flag applies once, here.
                             const auto& W=WorldThisFrame(in.now);static thread_local planworld::Shape around[96];const int nn=W.Near(in.x,in.y,90.0,self,around,96);
                             for(int k=0;k<nn&&shapes.size()<kMaxShapes+96;++k){const auto& s=around[k];
+                                if(scriptMode&&s.source!=planworld::Source::Vehicle&&s.source!=planworld::Source::Person)continue;  // Script mode: known positions only
                                 if(s.source==planworld::Source::Vehicle){
                                     if(effective.moving==2||(useFieldSlice&&s.steerRound&&!planworld::Moving(s)))continue;
                                 }
@@ -5934,7 +5979,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         {   // Contact is a sensor (G6): pushing without moving puts a shape at the nose for 8 s, so the next branches go round it.
                             // One event on the contact bus (contactevent.h); World reads it back as a shape, health counts it.
                             contactevent::Event live[8];const int nl=g_contacts.For(self,in.now,live,8);
-                            for(int k=0;k<nl;++k){
+                            for(int k=0;k<nl&&!scriptMode;++k){  // Script mode: contact inferences are detection too
                                 if(useFieldSlice&&live[k].kind==contactevent::Kind::Push)continue;
                                 Shape s;s.source=planworld::Source::Contact;s.centre={live[k].x,live[k].y,live[k].z};s.halfWidth=live[k].halfWidth;s.halfLength=.4;s.halfHeight=1.0;s.heading=live[k].heading;
                                 s.seenAt=live[k].at;s.expires=live[k].expires;
@@ -5964,7 +6009,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                             double gradeCap=1e9;int gradeAt=-1;  // SG-1: the measured floor's grade ahead over ~4 m (planspeed::GradeCap); downhill only:
                             for(int i=0;i+2<kSamples;++i){if(!(wantMeasured[i]&&wantMeasured[i+2]))continue;  // uphill is the tyre push's (SP-1), never a cap
                                 const double g=std::min(0.0,(wantZ[i+2]-wantZ[i])/(2*kStep));
-                                const double r=planspeed::GradeCap(f.topSpeed,g,i*kStep,planbranch::rules::crestBrake);
+                                const double r=planspeed::GradeCap(f.topSpeed,g,i*kStep,planbranch::rules::crestBrake,carcap::kCar.MaxGrade(wheelgrip::PlanGrip(g_gs[idx>=0&&idx<kPilots?idx:0].gear,g_gripSet)));  // SE: the grade the car climbs, from its record
                                 if(r<gradeCap){gradeCap=r;gradeAt=i;}}
                             if(gradeCap<crestCap){crestCap=gradeCap;crestAt=gradeAt;}
                             static double slideUntil[1+prefetch::kSlotPilotCount]{},slideCap[1+prefetch::kSlotPilotCount]{},capLogAt[1+prefetch::kSlotPilotCount]{};
@@ -6248,6 +6293,22 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                             logger::Observe("world.volume",self,unsigned(vc.solid)|(unsigned(vc.doubt)<<16)|(std::uint64_t(vc.unmeasured)<<24)|(std::uint64_t(vc.remembered)<<32)|(std::uint64_t(vc.byObject)<<40),"pilot=%d shapes=%d solid=%d doubt=%d not_measured=%d dropped=%d confirmed_by_same_object=%d remembered=%d depth=%.1f speed=%.1f mode=%s reason=volume_cells_given_to_world_as_shapes_for_the_one_collision_test",
                                 idx,nv,vc.solid,vc.doubt,vc.unmeasured,vc.dropped,vc.byObject,vc.remembered,f.slice.end,spd,useFieldSlice?"road_surface_sole_fixed_source":volumeAir?"air_extra_source":"no_field_extra_source");
                         }
+                        {   // Hazard boxes (routehazard.h): the route files' marks as World volumes, through the same shapes the walls use. A box on another deck (its height range clear of this road) is not here.
+                            double zLo=carBase,zHi=carBase;for(int i=0;i<kSamples;++i)if(wantHave[i]){zLo=std::min(zLo,wantZ[i]);zHi=std::max(zHi,wantZ[i]);}
+                            hazardfield::AppendNow(in.x,in.y,zLo-.5,zHi+in.shape.height,110.0,in.now,shapes,kMaxShapes+16);}
+                        if(hazardfield::IsTest(self)){   // Test route: fixed things that intrude into this car's path become suggested boxes (hazardfield.h Suggestions; the editor offers them, nothing is saved until accepted)
+                            std::vector<routehazard::P3> lp;for(double d=0;d<=std::min(55.0,(kSamples-1)*double(kStep));d+=2.0){const auto q=lineAt(d);lp.push_back({q.x,q.y,q.z});}
+                            const double laneYaw=lineAt(0).yaw*180.0/routehazard::kPi;
+                            for(const auto& s:shapes){
+                                if(s.hazardMark||s.source==planworld::Source::Vehicle||s.source==planworld::Source::Person||s.source==planworld::Source::Contact||s.source==planworld::Source::Ground||s.source==planworld::Source::Survey)continue;
+                                if(planworld::Top(s)<=carBase+.5||(s.haveNormal&&s.normalZ>.7)||s.unmeasured||!s.mayStop)continue;
+                                const bool coarseCell=s.source==planworld::Source::Box&&s.halfWidth==1.0&&s.halfLength==1.0;  // the 4 m map's band cells are not objects
+                                if(coarseCell||(s.source==planworld::Source::Ray&&s.support<2))continue;
+                                routehazard::Box b;b.x=s.centre.x;b.y=s.centre.y;b.z=s.centre.z;
+                                if(s.source==planworld::Source::Box||s.source==planworld::Source::Volume||s.source==planworld::Source::Radar){b.hx=std::max(.3,s.halfWidth);b.hy=std::max(.3,s.halfLength);b.yaw=s.heading*180.0/routehazard::kPi;}
+                                else{b.hx=b.hy=.35;b.yaw=laneYaw;}
+                                b.hz=std::max(.3,s.halfHeight);
+                                if(routehazard::Intrudes(b,lp,in.shape.halfWidth,in.shape.height))hazardfield::NoteSighting(self,b,in.now);}}
                         f.rearOpen=true;for(double side:{-1.0,0.0,1.0}){const double d=in.shape.halfLength+1.5,bx=in.x-std::sin(in.heading)*d+std::cos(in.heading)*side*in.shape.halfWidth,by=in.y-std::cos(in.heading)*d-std::sin(in.heading)*side*in.shape.halfWidth;
                             const auto cell=navmap::At(bx,by,in.z);if(cell.objBlocked||(cell.blocked&&cell.blockedZ>=carBase+in.limits.maxStep))f.rearOpen=false;}
                         // Navmesh: asked only when no progress has opened it, at most once a second.
@@ -6800,6 +6861,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				if (g.drive) g.flightShift = {};
 				flightgear::Ask fa;
 				fa.landing = g.landing; fa.takeOff = g.liftoff || g.drive; fa.planSpeed = g.adOut.speed;
+				fa.car = bicycle::Spec{};  // Stage F: the spec the energy plan plans with (brake, hoverClear, climbRate, hoverAccel) sets the gear zones
 				fa.strafe = idx < int(sizeof g_planSplit / sizeof g_planSplit[0]) && g_planSplit[idx].at && GetTickCount64() - g_planSplit[idx].at < 300;
 				fa.floorGap = groundOk ? above : 1e9;
 				fa.toArrival = goal.keepGoing ? 1e9 : std::hypot(goal.x - pos.x, goal.y - pos.y);
@@ -9007,7 +9069,9 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			}
 		}
 		const std::uint32_t id = At<std::uint32_t>(vehicle, 0x28);
-		if (vehicle == g_hoverVehicle.load() || (id == g_roverId && npcvehicles::CrewOrderOf(id) == npcvehicles::CrewOrder::None)) return false;  // the player's rover only for a crew job
+		if (vehicle == g_hoverVehicle.load() ||
+            (id == g_roverId && npcvehicles::CrewOrderOf(id) == npcvehicles::CrewOrder::None &&
+             !trafficpool::AdoptionPilotAllowed(id, npcvehicles::VehicleDriverId(id)))) return false;
 		if (IsDisabled(id)) return false;  // the hit counter switched its autopilot off
 		// 2026-10-28 (01:29 run): the player took an NPC job's vehicle and the job restarted the flight 1764 times ("the player
 		// took the vehicle" each frame). The vehicle the player sits in is refused.
@@ -9685,6 +9749,62 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 
 	std::uint32_t OwnRoverId() { return g_roverId; }
 
+    fleetownershipstore::PlayerControl PlayerControlForSave() {
+        std::lock_guard lock(g_saveControlLock);
+        return g_saveControl;
+    }
+
+    // RS-1 (2026-11-22, the user: "Yes, resume it"): a save made on the player's own Auto or Cruise resumes it once on load,
+    // through the same ToggleAuto / ToggleCruise the T key uses, when the player sits at the wheel of that same vehicle
+    // (reference and base unchanged). Manual, unknown or older saves change nothing. Called by the traffic profile restore
+    // (any thread); consumed by Tick.
+    namespace {
+        std::mutex g_resumeLock;
+        fleetownershipstore::PlayerControl g_resume;
+        ULONGLONG g_resumeFirst = 0, g_resumeMatched = 0;
+        void ResumeTick() {
+            fleetownershipstore::PlayerControl want;
+            {
+                std::lock_guard lock(g_resumeLock);
+                if (!fleetownershipstore::ResumesOnLoad(g_resume.control)) return;
+                want = g_resume;
+            }
+            using fleetownershipstore::Control;
+            const ULONGLONG now = GetTickCount64();
+            auto finish = [&](const char* event, const char* why) {
+                std::lock_guard lock(g_resumeLock);
+                if (g_resume.vehicle == want.vehicle && g_resume.control == want.control) g_resume = {};
+                g_resumeFirst = g_resumeMatched = 0;
+                logger::Write("OBS system=player.resume vehicle=%08X event=%s mode=%s reason=%s", want.vehicle, event,
+                    want.control == Control::Cruise ? "cruise" : "auto", why);
+            };
+            if (!g_resumeFirst) g_resumeFirst = now;
+            if (now - g_resumeFirst > fleetownershipstore::kResumeWindowMs) { finish("expired", "not_at_the_wheel_of_the_saved_vehicle"); return; }
+            const auto driven = DrivenBy(Ptr(addr::kPlayerCharacterPtr));
+            const auto base = driven ? At<std::uintptr_t>(driven, 0x98) : 0;
+            const bool same = driven && base && At<std::uint32_t>(driven, off::kFormId) == want.vehicle &&
+                At<std::uint32_t>(base, off::kFormId) == want.base;
+            if (!same) { g_resumeMatched = 0; return; }
+            if (!g_resumeMatched) g_resumeMatched = now;
+            if (now - g_resumeMatched < fleetownershipstore::kResumeSettleMs) return;  // seated and steady first
+            if (g_gs[0].playerAuto) { finish("skipped", "already_on_auto"); return; }
+            if (IsDisabled(want.vehicle)) { finish("skipped", "autopilot_disabled_after_hits"); return; }
+            if (want.control == Control::Cruise) {
+                if (!g_cruisePlanner) return;  // the add-on registers its planner after load; wait inside the window
+                ToggleCruise();
+            } else ToggleAuto();
+            if (g_gs[0].playerAuto) finish("resumed", "saved_on_autopilot");
+            else finish("refused", "auto_did_not_start");
+        }
+    }
+    void ResumeSavedControl(fleetownershipstore::PlayerControl control) {
+        std::lock_guard lock(g_resumeLock);
+        g_resume = fleetownershipstore::ResumesOnLoad(control.control) ? control : fleetownershipstore::PlayerControl{};
+        g_resumeFirst = g_resumeMatched = 0;
+        if (g_resume.vehicle) logger::Write("OBS system=player.resume vehicle=%08X event=queued base=%08X mode=%s", control.vehicle, control.base,
+            control.control == fleetownershipstore::Control::Cruise ? "cruise" : "auto");
+    }
+
 	void Tick()
 	{
         ReportStepCost();
@@ -9695,7 +9815,26 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				TrailTick(player);
 				PlayerAirTick(player);
 			}
-			PlayerTick();}
+			PlayerTick();
+            using fleetownershipstore::Control;
+            const auto driven = g_manualDriverId.load() ? g_driverVehicle.load() : 0;
+            // The player's own Auto or Cruise only (not a guard or summon flight without the player).
+            const auto flown = g_gs[0].active && g_gs[0].autopilot && g_gs[0].playerAuto ? g_hoverVehicle.load() : 0;
+            const auto rover = RefById(g_roverId);
+            const auto vehicle = driven ? driven : rover;
+            fleetownershipstore::PlayerControl current;
+            if (vehicle) {
+                const auto base = At<std::uintptr_t>(vehicle, 0x98);
+                if (base) current = {At<std::uint32_t>(vehicle, off::kFormId),
+                    At<std::uint32_t>(base, off::kFormId),
+                    flown != vehicle ? Control::Manual : g_gs[0].cruise ? Control::Cruise : Control::Autopilot};
+            }
+            {
+                std::lock_guard lock(g_saveControlLock);
+                g_saveControl = current;
+            }
+            ResumeTick();
+        }
         {costparts::Scope c(costparts::FlightRails);RefreshFleetRails();}
 		{costparts::Scope c(costparts::FlightPilots);PilotsTick();}
 		{costparts::Scope c(costparts::FlightBind);
@@ -9810,6 +9949,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			g_jobs[i] = PilotJob{};
 		}
 		g_driverVehicle.store(0);g_manualDriverId.store(0);
+        { std::lock_guard lock(g_saveControlLock); g_saveControl = {}; }
 		g_lastDrivenVehicle.store(0);
 		g_tapBoost = Tap{};
 		g_tapThrust = Tap{};

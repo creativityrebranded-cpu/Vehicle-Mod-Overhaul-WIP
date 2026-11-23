@@ -43,6 +43,7 @@ namespace features
 			{ Id::RouteMarkers, "Show traffic routes", "Probes in the sky along every route in the FVO_Traffic files of the world you are in, larger ones at exits and landing places. The routes themselves are only defined in the files.", L"traffic", L"markers", true },
 			{ Id::WallPass, "FVO vehicles pass the loaded-area wall", "The game keeps an invisible box round the loaded cells: moving bodies that touch its sides bounce back, and characters are moved back inside (this pulled traffic drivers out of their seats). On: vehicles FVO is flying and their drivers pass the side walls and are not moved back; everything else, and the floor, stay as the game made them.", L"physics", L"fvoWallPass", true },
 			{ Id::Radar, "Vehicle radar", "Test builds: each vehicle sweeps around and ahead of itself; every object a sweep hits is looked up in the game's own collision rules and given its real size, and the energy planner sees those boxes. Off: no radar.", L"traffic", L"radar", true },  // radar.h
+			{ Id::ScriptMode, "Script mode", "Vehicles follow their route paths with no object detection: only hazard boxes you place, the known positions of other vehicles and people are obstacles. For roads the normal autopilot does not handle well.", L"traffic", L"scriptMode", false },  // features.h ScriptMode
 		};
 
 		std::atomic<bool> g_on[kCount];

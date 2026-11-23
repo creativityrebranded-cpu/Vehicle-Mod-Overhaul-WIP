@@ -2,12 +2,16 @@
 // FC-1 / FG-1 (2026-11-19, work/flight-gears/DESIGN.md): the flight gear in use and what it does to the standard hover.
 //   Plan (FG-1): the autopilot's flight gear. A deterministic rule, as AG-1 (autogear.h) is on the ground: low gear where the flight must
 //     be precise (take-off, landing, holding a spot, a strafe, near the floor, near the arrival, near an obstacle, a turn tighter than the
-//     gear holds), otherwise the lowest gear whose top reaches the route's wanted speed, one up on a long straight leg. Down after 0.4 s,
-//     up one gear after 2.5 s (AG-1's holds). The player's gear key sets the player's gear (no automatic shift for the player).
+//     gear holds), otherwise the lowest gear whose top reaches the route's wanted speed, one up on a long straight leg. Down after
+//     2 reactions (2 x wheelguard::reaction), up one gear after kUpHold.
+//   Stage F (GENERATED_COSTS_DESIGN_20261122.md): the distances and speeds are the car's own, not fixed metres (see Gear thresholds below). The player's gear key sets the player's gear (no automatic shift for the player).
 //   Actuation (standard hover): the spin easing and the sideways leak of carcap::FlightRow, in the one place that writes them.
 // The row itself is carcap::Flight (the one car record). Pure: no game calls, no globals, no logging. Tests: tests/flightgear_test.cpp.
+#include "bicycle.h"
 #include "carcap.h"
+#include "energyplan.h"
 #include "hoverfollow.h"
+#include "wheelguard.h"
 #include <algorithm>
 #include <cmath>
 
@@ -33,13 +37,23 @@ inline double PeakTurn(const hoverfollow::Path& p) {
 }
 
 // ---- FG-1: the autopilot's flight gear ----
-constexpr double kNearFloor = 3.0;       // m over the floor: take-off and touchdown height
-constexpr double kNearArrival = 15.0;    // m to a stop
-constexpr double kNearObstacle = 20.0;   // m to a wall or vehicle ahead
-constexpr double kHoldBelow = 1.0;       // m/s: a plan this slow holds its spot
-constexpr double kLongLeg = 200.0;       // m: farther than this from a stop with a straight plan, one gear up (momentum carried)
-constexpr double kStraightShare = .25;   // a plan turning under this share of the gear's lateral is straight
-constexpr double kDownHold = .4, kUpHold = 2.5;  // s (AG-1's holds)
+// Gear thresholds, generated from the car (bicycle::Spec: brake, hoverClear, climbRate, hoverAccel) and the controller reaction t_r
+// (wheelguard::reaction). Replaces kNearFloor 3 m, kNearArrival 15 m, kNearObstacle 20 m, kHoldBelow 1 m/s, kLongLeg 200 m, kDownHold .4 s.
+constexpr double kReaction = wheelguard::reaction;
+// Distance the car needs to stop from speed v: braking v^2 / (2 b) plus the distance covered while the controller replaces its command.
+inline double StopDistance(double v, double brake) { v = std::fabs(v); return v * v / (2.0 * std::max(.1, brake)) + v * kReaction; }
+// A plan this slow holds its spot: the speed the brakes stop within one plan step (the same bottom rung as energyplan::SpeedRungs).
+inline double HoldBelow(const bicycle::Spec& k) { return k.brake * energyplan::kDt; }
+// Near the floor: the hover height plus the height the climb still carries it while the lift answers (climbRate^2 / (2 accel)).
+inline double NearFloor(const bicycle::Spec& k) { return k.hoverClear + k.climbRate * k.climbRate / (2.0 * std::max(.1, k.hoverAccel)); }
+// Straight share: CHOSEN RESOLUTION, no physical derivation. A plan whose sharpest turn asks under this share of the gear's lateral is
+// called straight (the margin that stops a plan's small wobble from counting as a bend). Kept at today's value; reported, not derived.
+constexpr double kStraightShare = .25;
+// Down hold = two reactions (the cause must outlast one command replacement and its check). Up hold: CHOSEN RESOLUTION kept at 2.5 s.
+// The gear row's own thrust response (carcap::FlightRow yawResponse / tiltResponse, 2.4-10 /s = 0.1-0.4 s per time constant) is
+// only the lower bound; an upshift also must not follow a downshift inside the time a plan changes its mind, which no car number gives.
+constexpr double kDownHold = 2.0 * kReaction;
+constexpr double kUpHold = 2.5;  // s
 
 struct Ask {
     bool landing = false, takeOff = false, strafe = false;
@@ -51,6 +65,7 @@ struct Ask {
     double speed = 0;            // m/s now
     double peakTurn = 0;         // rad/s: the committed plan's sharpest turn
     double lateral[5] = { 0, 0, 0, 0, 0 };  // m/s^2 the hull holds in gears 1-4 (hulllogic::Flight per gear)
+    bicycle::Spec car;           // the car's own numbers (the spec the energy plan plans with): brake, hoverClear, climbRate, hoverAccel
 };
 struct Pick { int gear = 1; const char* reason = ""; double need = 0; };
 inline Pick Target(const Ask& a) {
@@ -58,21 +73,23 @@ inline Pick Target(const Ask& a) {
     if (a.landing) { p.reason = "landing"; return p; }
     if (a.takeOff) { p.reason = "take_off"; return p; }
     if (a.strafe) { p.reason = "strafe"; return p; }
-    if (a.planSpeed < kHoldBelow) { p.reason = "hover_in_place"; return p; }
-    if (a.floorGap < kNearFloor) { p.reason = "near_floor"; return p; }
-    if (a.toArrival < kNearArrival) { p.reason = "near_arrival"; return p; }
-    if (a.obstacle < kNearObstacle) { p.reason = "near_obstacle"; return p; }
+    const double vNow = std::max(std::fabs(a.speed), std::fabs(a.planSpeed));  // the speed to be shed
+    if (a.planSpeed < HoldBelow(a.car)) { p.reason = "hover_in_place"; return p; }
+    if (a.floorGap < NearFloor(a.car)) { p.reason = "near_floor"; return p; }
+    if (a.toArrival < StopDistance(vNow, a.car.brake)) { p.reason = "near_arrival"; return p; }
+    if (a.obstacle < StopDistance(vNow, a.car.brake)) { p.reason = "near_obstacle"; return p; }
     int g = 4; for (int i = 1; i <= 4; ++i) if (carcap::kFlightTop[i] >= a.want) { g = i; break; }
     p.gear = g; p.reason = "wanted_speed";
     if (a.lateral[g] < p.need) {  // the plan turns tighter than this gear holds: the highest lower gear that holds it (else gear 1)
         int lo = 1; for (int i = g - 1; i >= 1; --i) if (a.lateral[i] >= p.need) { lo = i; break; }
         p.gear = lo; p.reason = "tight_turn"; return p;
     }
-    if (g < 4 && a.toArrival > kLongLeg && p.need < kStraightShare * a.lateral[g + 1]) { p.gear = g + 1; p.reason = "long_straight_leg"; }
+    if (g < 4 && a.toArrival > StopDistance(carcap::kFlightTop[g + 1], a.car.brake) &&  // a leg long enough to stop from the higher gear's top
+         p.need < kStraightShare * a.lateral[g + 1]) { p.gear = g + 1; p.reason = "long_straight_leg"; }
     return p;
 }
 struct Shift { int gear = 0; int dir = 0; double since = 0; const char* reason = ""; };
-// The gear held: the first pick at once; a lower pick after kDownHold s (straight to it), a higher one gear up after kUpHold s.
+// The gear held: the first pick at once; a lower pick after kDownHold (straight to it), a higher one gear up after kUpHold.
 // Returns true when the gear changed.
 inline bool Update(Shift& s, const Pick& p, double now) {
     if (s.gear < 1) { s.gear = p.gear; s.dir = 0; s.reason = p.reason; return true; }

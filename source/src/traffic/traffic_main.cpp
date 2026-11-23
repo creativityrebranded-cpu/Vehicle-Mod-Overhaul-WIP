@@ -323,6 +323,7 @@ namespace
     std::atomic<std::uint64_t> g_journeyGeneration{0};
 	struct Slot {
         std::uint64_t generation=g_journeyGeneration.fetch_add(1,std::memory_order_relaxed)+1;
+        bool borrowedChassis=false;  // temporary driving right is not restored as an owned fleet record
         trafficdata::Route spec;std::vector<trafficdata::Route> plannedRoutes;std::vector<trafficdata::Link> plannedLinks;bool networkSnapshot=false;
         roadnetwork::Itinerary itinerary;
         unsigned heldWhyLogged=0;  // last traffic.lane_hold reasons logged
@@ -413,13 +414,13 @@ namespace
     bool ReadVector(std::istream& in,trafficdata::Vec& v){return bool(in>>v.x>>v.y>>v.z)&&std::isfinite(v.x)&&std::isfinite(v.y)&&std::isfinite(v.z);}
     std::string HexText(const std::string& text){const char* digits="0123456789ABCDEF";std::string out;out.reserve(text.size()*2);for(unsigned char c:text){out.push_back(digits[c>>4]);out.push_back(digits[c&15]);}return out;}
     bool UnhexText(const std::string& text,std::string& out){if(text.size()%2||text.size()>4000000)return false;auto digit=[](char c){return c>='0'&&c<='9'?c-'0':c>='A'&&c<='F'?c-'A'+10:-1;};for(std::size_t i=0;i<text.size();i+=2){const int a=digit(text[i]),b=digit(text[i+1]);if(a<0||b<0)return false;out.push_back(char(a*16+b));}return true;}
-    routefiles::Route ArchiveRoute(const trafficdata::Route& r){routefiles::Route out;out.world=r.world;out.world=r.world;out.id=r.name;out.label=r.label;out.ring=r.ring;out.shape=r.shape;out.tilt=r.tilt;out.tiltToward=r.tiltToward;out.points=r.points;out.rounding=r.rounding;out.closed=r.closed;out.lanePlan=r.lanePlan;out.spacePlan=r.spacePlan;out.road=r.road;out.journey=r.journey;out.restrictions=r.restrictions;out.lanes=r.lanes;out.speed=r.speed;out.width=r.width;out.schedule=r.schedule;out.color=r.color;out.exclude=r.exclude;out.role=r.role;out.group=r.group;out.travel=r.travel;out.sections=r.sections;out.corridor=r.corridor;out.end=r.end;return out;}
+    routefiles::Route ArchiveRoute(const trafficdata::Route& r){routefiles::Route out;out.world=r.world;out.world=r.world;out.id=r.name;out.label=r.label;out.ring=r.ring;out.shape=r.shape;out.tilt=r.tilt;out.tiltToward=r.tiltToward;out.points=r.points;out.rounding=r.rounding;out.closed=r.closed;out.lanePlan=r.lanePlan;out.spacePlan=r.spacePlan;out.road=r.road;out.journey=r.journey;out.restrictions=r.restrictions;out.lanes=r.lanes;out.speed=r.speed;out.width=r.width;out.schedule=r.schedule;out.color=r.color;out.exclude=r.exclude;out.role=r.role;out.group=r.group;out.travel=r.travel;out.sections=r.sections;out.corridor=r.corridor;out.end=r.end;out.hazards=r.hazards;return out;}
     void CommitNetwork(Slot& slot,const roadnetwork::Network& network){slot.plannedRoutes.clear();slot.plannedLinks.clear();slot.networkSnapshot=true;for(const auto& route:network.routes)if(std::find(slot.itinerary.routes.begin(),slot.itinerary.routes.end(),route.name)!=slot.itinerary.routes.end())slot.plannedRoutes.push_back(route);for(const auto& link:g_data.links){const bool a=std::any_of(slot.plannedRoutes.begin(),slot.plannedRoutes.end(),[&](const auto& r){return r.name==link.from;}),b=std::any_of(slot.plannedRoutes.begin(),slot.plannedRoutes.end(),[&](const auto& r){return r.name==link.to;});if(a&&b)slot.plannedLinks.push_back(link);}}
     std::string ArchiveNetwork(const Slot& slot){if(!slot.networkSnapshot)return {};routefiles::File file;file.worldId=slot.world;file.traffic=false;for(const auto& route:slot.plannedRoutes)file.routes.push_back(ArchiveRoute(route));for(const auto& link:slot.plannedLinks)file.links.push_back({link.name,link.from,link.to,link.at,link.toEnd,link.share,link.toAt,link.radius,link.type,link.fromLane,link.toLane});return HexText(routefiles::Format(file));}
     std::string JourneyRoute(Slot& slot){
         const auto& r=Spec(slot);routefiles::File file;file.worldId=slot.world.empty()?"saved_world":slot.world;routefiles::Route out;
         out.id=r.name;out.label=r.label;out.ring=r.ring;out.shape=r.shape;out.tilt=r.tilt;out.tiltToward=r.tiltToward;out.points=r.points;out.rounding=r.rounding;out.closed=r.closed;
-        out.restrictions=r.restrictions;out.journey=slot.authoredJourney;out.lanePlan=r.lanePlan;out.spacePlan=r.spacePlan;out.road=r.road;out.lanes=r.lanes;out.speed=r.speed;out.width=r.width;out.schedule=r.schedule;out.color=r.color;out.exclude=r.exclude;out.role=r.role;out.group=r.group;out.travel=r.travel;out.sections=r.sections;out.corridor=r.corridor;out.end=r.end;
+        out.restrictions=r.restrictions;out.journey=slot.authoredJourney;out.lanePlan=r.lanePlan;out.spacePlan=r.spacePlan;out.road=r.road;out.lanes=r.lanes;out.speed=r.speed;out.width=r.width;out.schedule=r.schedule;out.color=r.color;out.exclude=r.exclude;out.role=r.role;out.group=r.group;out.travel=r.travel;out.sections=r.sections;out.corridor=r.corridor;out.end=r.end;out.hazards=r.hazards;
         file.routes.push_back(out);return routefiles::Format(file)+"\n; journey_signal = "+std::to_string(slot.scriptSignal)+"\n; place_access = "+placeaccess::Write(slot.accessPlan)+"\n; manoeuvre_plan = "+placeaccess::Write(slot.manoeuvrePlan)+"\n; place_approach = "+std::to_string(slot.placeApproach)+" "+std::to_string(slot.placePath)+" "+std::to_string(slot.pickupWait)+"\n; committed_network = "+ArchiveNetwork(slot)+"\n";
     }
     void WriteJourney(std::ostream& out,Slot& s){
@@ -459,7 +460,11 @@ namespace
     int SaveJourneys(){
         trafficprofileclient::Guard lock;if(!lock)return 0;std::lock_guard journeyLock(g_journeyMutex);if(g_journeyProfile.empty())return 1;if(!g_journeyWritable)return 0;
         const auto target=std::filesystem::path(g_journeyProfile)/L"journeys.state";auto temp=target;temp+=L".pending";
-        auto records=g_rememberedJourneys;for(auto& s:g_slots)if(s.used&&s.vehicleId&&s.factoryPhase==FactoryRoutePhase::None)records[s.vehicleId]=s;
+        auto records=g_rememberedJourneys;
+        for(const auto& s:g_slots)if(s.used&&s.vehicleId&&s.factoryPhase==FactoryRoutePhase::None){
+            if(s.borrowedChassis)records.erase(s.vehicleId);
+            else records[s.vehicleId]=s;
+        }
         std::ofstream out(temp,std::ios::binary|std::ios::trunc);out.precision(17);out<<"FVO_JOURNEYS 1 "<<records.size()<<' '<<std::quoted(g_roadWorld)<<' '<<g_signalSeconds<<'\n';for(auto& [id,s]:records){(void)id;WriteJourney(out,s);}out.flush();if(!out)return 0;out.close();
         return MoveFileExW(temp.c_str(),target.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)?1:0;
     }
@@ -1011,7 +1016,7 @@ namespace
                 (next.y-point.y)*other.stepVelocity.y+(next.z-point.z)*other.stepVelocity.z)/length:0;
             if(!ownBumper)ownBumper=LaneBumper(self);
             const double available=distance-ownBumper-LaneBumper(other);
-            const double cap=planspeed::FollowingCap(available,pace);
+            const double cap=planspeed::FollowingCap(available,pace,ownBumper,planspeed::kToyBrake);
             if(cap<holds.lane.speed){holds.lane.speed=cap;leader=other.vehicleId;gap=available;}
         }
         if(leader){
@@ -1766,7 +1771,7 @@ namespace
 		Slot* free = nullptr;
 		for (auto& s : g_slots) {
             if(s.used&&now-s.seen>kLostMs&&!(s.vehicleId&&g_trafficApi&&
-                (engineport::Forward<&FvoTrafficApi::usesVehicle>(g_trafficApi,"usesVehicle","routes",0u,s.vehicleId)||(g_trafficApi->tripActive&&engineport::Forward<&FvoTrafficApi::tripActive>(g_trafficApi,"tripActive","routes",0u,s.vehicleId))))){if(s.vehicleId&&s.factoryPhase==FactoryRoutePhase::None)g_rememberedJourneys[s.vehicleId]=s;s.used=false;}
+                (engineport::Forward<&FvoTrafficApi::usesVehicle>(g_trafficApi,"usesVehicle","routes",0u,s.vehicleId)||(g_trafficApi->tripActive&&engineport::Forward<&FvoTrafficApi::tripActive>(g_trafficApi,"tripActive","routes",0u,s.vehicleId))))){if(s.vehicleId&&s.factoryPhase==FactoryRoutePhase::None&&!s.borrowedChassis)g_rememberedJourneys[s.vehicleId]=s;s.used=false;}
 			if (s.used) ++active; else if (!free) free = &s;
 		}
 		return free;
@@ -1845,12 +1850,14 @@ namespace
 		char world[201]{};
 		if (!g_worldName || !engineport::FunctionForward(g_worldName,"worldName","routes",0u,world, sizeof world)) return RefuseTrip(vehicleId, "no_world_name");
 		if (!vehicleId && !out) return Wanted(world, x, y) ? 1 : 0;
+        std::lock_guard journeyLock(g_journeyMutex);
 		int active = 0;
 		Slot* free = VehicleSlot(vehicleId,active);
 		if (!free) { RefuseTrip(vehicleId, "no_free_trip_slot", active, kSlots); TraceTrip(spot, vehicleId, 0, active); return 0; }
         const bool initial=generator::InitialVehicle(spot)&&spot>=0&&spot<int(g_initialSlots.size());
         const int ok = Begin(RuleFor(world), world, free, x, y, z, vehicleId, out, true,
             initial?g_initialSlots[spot].route:std::string(),initial?g_initialSlots[spot].lane:-1);
+        if(ok&&generator::AdoptedVehicle(vehicleId))free->borrowedChassis=true;
 		if (ok) Log("FVO traffic: cold-start spot %d: vehicle %08X takes a trip", spot, vehicleId);
 		TraceTrip(spot, vehicleId, ok, active);  // SR-1
 		return ok;
@@ -2197,6 +2204,10 @@ namespace
 		if (!test&&!useInitial) route = FairRoute(world, rule, nullptr, pool, x, y, std::string(), &line, vehicleId);  // fair share (routeshare.h)
 		if (!route) return RefuseTrip(vehicleId, "no_route_with_room_in_reach");
 		if (test) Log("FVO traffic: test route %s: vehicle %08X flies it once (asked for in the map route editor)", route->name.c_str(), vehicleId);
+		if (test) {  // hazard boxes: the core watches this vehicle's path for fixed obstacles and offers them as suggestions (additive export; an older core has none)
+			if (const HMODULE core = GetModuleHandleW(L"FlyingVehicleOverhaul.dll"))
+				if (const auto watch = reinterpret_cast<void (*)(unsigned, const char*)>(GetProcAddress(core, "FVO_HazardTestV1"))) watch(vehicleId, route->name.c_str());
+		}
 		const trafficdata::Vec home{ x, y, z };
 		// Lap or a destination.
 		bool toPlace = rule.trips == trafficdata::Trips::Places || (rule.trips == trafficdata::Trips::Mixed && (g_mixedPlace = !g_mixedPlace));
@@ -2280,6 +2291,28 @@ namespace
         out={a.x,a.y,a.z,std::atan2(b.x-a.x,b.y-a.y)};
         return std::isfinite(out.x)&&std::isfinite(out.y)&&std::isfinite(out.z);
     }
+    bool InitialAdoptionSite(int slot,const FvoTrafficVehicle& vehicle,FvoPoolSpot& pose,double& gap){
+        if(slot<0||slot>=int(g_admissionLanes.size())||!g_admissionLanes[slot])return false;
+        const auto& plan=*g_admissionLanes[slot];
+        if(!plan.route||plan.line.error||plan.stations.size()<2)return false;
+        double station=0;
+        int lane=-1;
+        if(!trafficinitial::ProjectRoadStation(*plan.route,plan.line,plan.stations,
+            {vehicle.x,vehicle.y,vehicle.z},station,&lane)||lane!=plan.lane)return false;
+        const auto u=trafficinitial::AtStation(plan.stations,station);
+        const auto a=trafficroute::At(plan.line,lane,u);
+        const auto before=trafficroute::At(plan.line,lane,u-.001);
+        const auto after=trafficroute::At(plan.line,lane,u+.001);
+        const auto direction=trafficroute::Direction(plan.line,lane);
+        const auto& seed=g_initialSlots[slot];
+        if(std::abs(a.z-vehicle.z)>std::clamp(vehicle.halfHeight,1.0,4.0))return false;
+        const auto flow=std::size_t(slot)<g_flow.size()&&g_flow[slot].seeded
+            ?g_flow[slot].metres:trafficinitial::StationAt(plan.stations,seed.u);
+        gap=trafficinitial::StationGap(flow,station,plan.stations.back(),plan.line.closed);
+        pose={vehicle.x,vehicle.y,vehicle.z,std::atan2(direction*(after.x-before.x),direction*(after.y-before.y))};
+        return std::isfinite(gap)&&std::isfinite(pose.heading);
+    }
+
     int InitialSite(int slot,int attempt,unsigned base,double radius,double halfHeight,FvoPoolSpot& at,bool occupied,bool spotRejected,generator::RoadSite& road,const char** why){
         *why="no_admission_lane";
         if(slot<0||slot>=int(g_admissionLanes.size())||!g_admissionLanes[slot]||!g_admissionLanes[slot]->route)return 0;
@@ -2459,12 +2492,12 @@ namespace
                     r.name.c_str(),routeschedule::LevelName(r.schedule.trafficLevel),r.trafficMetres,band.low,band.high,
                     int(demand.known),demand.vehicles,trafficdata::Scaled(demand.vehicles,city));
             }
-            // Cars on drawn lanes only for now: hover-only routes get no positions (the user, 2026-11-06).
-            if(demand.known&&demand.active&&(r.road.enabled||r.travel==routepolicy::Travel::Drive)){
+            // Every route is a route (the user, 2026-11-22: births treat all routes the same; the autopilot decides drive or hover after birth).
+            if(demand.known&&demand.active){
                 std::vector<std::pair<double,double>> junctions;
                 for(const auto& link:g_data.links){if(link.from==r.name)junctions.push_back({link.at,link.radius});if(link.to==r.name)junctions.push_back({link.toEnd?double(r.points.size()-1):link.toAt,link.radius});}
                 // Crossings constrain placement even when they do not authorize a route connection.
-                if(r.road.enabled||r.travel==routepolicy::Travel::Drive)for(const auto& other:g_data.routes)if(other.name!=r.name&&!other.ring&&trafficdata::SameWorld(g_data,other.world,world))
+                for(const auto& other:g_data.routes)if(other.name!=r.name&&!other.ring&&trafficdata::SameWorld(g_data,other.world,world))
                     for(std::size_t i=0;i+1<r.points.size();++i)for(std::size_t j=0;j+1<other.points.size();++j){
                         const auto a=r.points[i],b=r.points[i+1],c=other.points[j],d=other.points[j+1];
                         const double x=b.x-a.x,y=b.y-a.y,vx=d.x-c.x,vy=d.y-c.y,den=x*vy-y*vx;
@@ -2551,6 +2584,7 @@ namespace
         }
         generator::SetModelGate(&InitialModelFits);
         generator::SetSiteGate(&InitialSite,&InitialRoadGap);
+        generator::SetAdoptionSite(&InitialAdoptionSite);
         generator::SetFlowPose(kBackgroundFlow?&FlowPose:nullptr);
         Log("Traffic arrival: %zu active route positions prepared; ground origins are only for later departures",initial.size());
         Log("FVO traffic: %s: stable fleet capacity %d, %zu authored ground origins, %zu total registry slots; additions require validated concealed departure",world,target,origins.size(),spots.size());
@@ -2817,6 +2851,9 @@ namespace
             reinterpret_cast<handoff::ReadFacts>(GetProcAddress(core,"FVO_TrafficHandoffFactsV1")),
             reinterpret_cast<handoff::Release>(GetProcAddress(core,"FVO_TrafficHandoffReleaseV1")),
             reinterpret_cast<handoff::RetireShow>(GetProcAddress(core,"FVO_TrafficRetirementShowV2")));
+        generator::SetAdoptionSources(
+            reinterpret_cast<FvoAdoptionFactsFnV1>(GetProcAddress(core,"FVO_TrafficAdoptionFactsV1")),
+            reinterpret_cast<FvoAdoptionClaimFnV1>(GetProcAddress(core,"FVO_TrafficAdoptionClaimV1")));
         generator::SetBirthListener(reinterpret_cast<FvoTrafficBirthFnV1>(GetProcAddress(core,"FVO_TrafficBirthRequestV1")));
         generator::SetRoadClearance(reinterpret_cast<int (*)(FvoTrafficVehicle*,int)>(GetProcAddress(core,"FVO_TrafficRoadVehiclesV1")),
             reinterpret_cast<FvoRoadCheckFnV1>(GetProcAddress(core,"FVO_TrafficRoadCheckV1")),
@@ -2833,7 +2870,7 @@ namespace
 		if (const auto plan = reinterpret_cast<FvoRegisterCruisePlanner_t>(GetProcAddress(core, "FVO_RegisterCruisePlanner"))) plan(&PlanCruise);
 		if (const auto tick = reinterpret_cast<FvoRegisterTick_t>(GetProcAddress(core, "FVO_RegisterTick"))) tick(&Markers);
 		if (!g_worldName) { Log("FVO traffic: core has no FVO_WorldName (an older FlyingVehicleOverhaul.dll); traffic files off"); return; }
-		if (g_trafficApi) Log("FVO Traffic addon 0.4.0: route traffic attached (playthrough files loaded after the save)");
+		if (g_trafficApi) Log("FVO Traffic addon 0.4.1: route traffic attached (playthrough files loaded after the save)");
 	}
 
 	void SfseMessage(SFSEMessagingInterface::Message* msg)

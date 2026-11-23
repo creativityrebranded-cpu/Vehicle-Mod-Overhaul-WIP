@@ -31,6 +31,7 @@ struct Shape {
     int layer = -1;                               // world truth A: the game's collision layer of a ray hit (-1 unknown)
     bool tireClimb = false;                       // World: measured loose-object height is within half a tire; Speed owns its limit
     bool mayStop = true;                          // world truth B1: false = an unexplained road or terrain hit: it eases the speed, never stops or steers
+    bool hazardMark = false;                      // a route's hazard box (routehazard.h, hazardfield.h): the user's own mark; a field box's "solids allowed" never lets the car through it
     bool unmeasured = false;                      // one flow: space this car's volume did not measure. Never a solid and never clear road: Speed slows through it, Avoid does not steer for it
     // A published plan: where this vehicle intends to be and when. Used instead of guessing from its velocity.
     int trackCount = 0; double trackT[kTrackPoints] = {}; V3 track[kTrackPoints] = {};

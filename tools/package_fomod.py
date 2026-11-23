@@ -12,7 +12,7 @@ DLL = 'SFSE/Plugins/FlyingVehicleOverhaul.dll'
 PILOTS = 'FVO_NPCPilots.esm'
 PATCH = 'FVO_ParkedVehiclesPatch.esm'
 CITY = 'FVO_CityPlacements.esm'
-TRAFFIC_ADDON_VERSION = '0.4.0'  # API 13 retained for prior-version compatibility; 0.4.0 needs the FVO 1.3.0 core's fleet exports
+TRAFFIC_ADDON_VERSION = '0.4.1'  # API 13 retained for prior-version compatibility; 0.4.x needs the FVO 1.3.x core's fleet exports
 CITY_DLL = 'SFSE/Plugins/FVO_Traffic.dll'  # FVO Traffic (was FVO_CityPlacements.dll before 2026-10-29)
 OLD_CITY_DLL = 'SFSE/Plugins/FVO_CityPlacements.dll'  # never install both
 CITY_TRAFFIC = 'SFSE/Plugins/FVO_Traffic/NewAtlantis.ini'
@@ -70,12 +70,13 @@ FEATURE_PAGES = ('Flight and Navigation','NPCs and Combat')  # 0.8.6: the stream
 # Not offered: removed or development switches (written off) and the always-on features (written on; the DLL ignores them anyway).
 ALWAYS_ON = ('CombatAi','HoverOrDrive','VehicleDamage','HealthBars','StatusCard','Witnesses','NativeGround','WallPass')
 # Radar (1.3.0): a settings.ini-only test switch, not in the menu; written at its shipping default (on).
-FIXED_FEATURES = {'Placement':False,'PlacementMode':False,'DebugLog':False,'PhysicalAi':False,'Radar':True, **{name:True for name in ALWAYS_ON}}
+# ScriptMode (1.3.1): toggled in the Traffic Manager, not in the menu; written at its default (off).
+FIXED_FEATURES = {'Placement':False,'PlacementMode':False,'DebugLog':False,'PhysicalAi':False,'Radar':True,'ScriptMode':False, **{name:True for name in ALWAYS_ON}}
 FEATURE_GROUPS = {
     'PhysicalVtol':FEATURE_PAGES[0], 'FlightAssist':FEATURE_PAGES[0], 'FreeRoll':FEATURE_PAGES[0],
     'NpcVehicles':FEATURE_PAGES[1], 'Traffic':FEATURE_PAGES[1], 'RouteMarkers':'Route beacons', 'WallPass':None,
     'HoverOrDrive':None, 'NativeGround':None, 'CombatAi':None, 'VehicleDamage':None, 'Witnesses':None, 'HealthBars':None, 'StatusCard':None,
-    'PhysicalAi':None, 'Placement':None, 'PlacementMode':None, 'DebugLog':None, 'Radar':None,
+    'PhysicalAi':None, 'Placement':None, 'PlacementMode':None, 'DebugLog':None, 'Radar':None, 'ScriptMode':None,
 }
 
 
@@ -88,7 +89,7 @@ def feature_definitions(source_dir):
     for name,label,description,section,key,default in re.findall(pattern,source):
         items.append({'id':name,'label':label,'description':description,'section':section,'key':key,'default':default=='true',
                       'page':FEATURE_GROUPS[name],'configurable':name not in FIXED_FEATURES})
-    if len(items)!=19 or len({(f['section'],f['key']) for f in items})!=len(items):
+    if len(items)!=20 or len({(f['section'],f['key']) for f in items})!=len(items):
         raise ValueError('Feature list changed or could not be parsed; review installer coverage')
     return items
 

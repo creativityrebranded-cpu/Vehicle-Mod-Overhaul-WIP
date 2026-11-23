@@ -480,12 +480,14 @@ inline void CALLBACK PlanWork(PTP_CALLBACK_INSTANCE inst, void* ctx) {
             if (p.pulse || p.testRefused) r.spotPulseSerial = f.test.serial;
             r.factorySpotPulse = p.pulse && f.test.factory;
             if (p.layerChanged)  // RV-1 trace: each change of the mode or the routine's step, and why
-                logger::Write("OBS system=plan.mode vehicle=%08X mode=%s step=%s reason=%s chose=%s energy=%.2f feasible=%d", s.vehicle, p.layer, p.step, p.layerWhy, p.why ? p.why : "", p.energy, p.feasible);
+                logger::Write("OBS system=plan.mode vehicle=%08X mode=%s step=%s reason=%s chose=%s energy=%.2f feasible=%d lane_err=%.3f leg_f=%d leg_faces=%d leg_r=%d rec_tries=%d rec_cycles=%d turn_sign=%d",
+                    s.vehicle, p.layer, p.step, p.layerWhy, p.why ? p.why : "", p.energy, p.feasible,
+                    p.laneErr, p.legF, p.legFaces, p.legR, p.recTries, p.recCycles, p.turnSign);
             r.ok = p.ok; r.why = p.why; r.energy = p.energy; r.clearance = p.minClearance; r.gears = p.gearChanges; r.feasible = p.feasible; r.candidates = p.candidates; r.field = field != nullptr;
             r.path = DrivenPath(p.traj, energyplan::kSteps + 1, r.reverse);
             r.hoverPath = hoverfollow::FromTraj(p.traj, energyplan::kSteps + 1, energyplan::kDt);  // step 5
             r.speed = p.first.speed; r.hover = p.firstMode == 1 || p.traj[1].mode == 1;  // hovering or still coming down: not a wheels path yet
-            r.laneCentre = LaneCentrePath(p, scene, s.car, s.spec, station, lateral, half, r.reverse, r.hover, gripWt.margin);
+            r.laneCentre = LaneCentrePath(p, scene, s.car, s.spec, station, lateral, half, r.reverse, r.hover, energyplan::Margin(s.car.speed, s.spec));  // the line keeps the plan's own collision margin (v x reaction) from the edges
             if (p.layerChanged && std::strcmp(p.layerWhy, "verified_floor_retry") == 0)
                 d.floorRetryUntil = s.nowS + .75;
             if (r.reverse && r.speed > 0) r.speed = 0; if (!r.reverse && r.speed < 0) r.speed = 0;  // the first move and the path agree (a gear change waits for a stop)

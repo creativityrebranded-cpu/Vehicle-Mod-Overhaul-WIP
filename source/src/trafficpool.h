@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include "fleetownershipstore.h"
 #ifndef FVO_RELEASE
 #include <optional>
 namespace trafficpair { struct SeatPose; }
@@ -38,6 +39,8 @@ namespace trafficpool
     bool PlayerOwnsHandoff(unsigned vehicle);
     std::vector<unsigned> SavePlayerTakeovers();
     void RestorePlayerTakeovers(const std::vector<unsigned>& vehicles);
+    void RestorePlayerControl(fleetownershipstore::PlayerControl control);
+    bool AdoptionPilotAllowed(unsigned vehicle, unsigned driver);
     std::uint64_t CaptureWheelHandoff(unsigned vehicle);
 	void ReloadFiles();
 }

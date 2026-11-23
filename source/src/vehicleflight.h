@@ -7,6 +7,7 @@
 
 #include "vcontract.h"
 #include "triplogic.h"
+#include "fleetownershipstore.h"
 
 // Planetary flight on the REV-8 rover (user, 2026-10-14; design: notes/plan-vehicle-flight.md). While driving, H
 // toggles hover: the rover holds a height above the ground with an infinite boost and flies with the flight model's
@@ -25,6 +26,8 @@ namespace vehicleflight
     bool PilotHolds(std::uint32_t vehicleId);
     int PilotLive(std::uint32_t vehicleId);  // -1 no pilot, 0 a pilot but no physics steps, 1 stepping (or a scripted or physical flight, which does not use them)
     bool PlayerDriving(std::uint32_t vehicle);
+    fleetownershipstore::PlayerControl PlayerControlForSave();
+    void ResumeSavedControl(fleetownershipstore::PlayerControl control);  // RS-1: resume the player's saved Auto/Cruise once on load
 	std::uint64_t NativeStepCount(); // load trace: vehicle physics steps seen by the step hook so far
 	bool PhysicalCameraActive(std::uintptr_t vehicle); // atomic identity gate for the VTOL camera, instrument and key set: physical flight with you at the wheel, you or the autopilot flying
 

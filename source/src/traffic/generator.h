@@ -10,6 +10,7 @@
 #include "traffic_api.h"
 #include "../fleetrail_api.h"
 #include "birth_api.h"
+#include "adoption_api.h"
 #include "factorybirth_api.h"
 #include "factorydispatch_api.h"
 #include "../trafficcensusapi.h"
@@ -53,6 +54,10 @@ namespace generator
     void SetCensusPublisher(FvoTrafficCensusPublishV1 publish,FvoTrafficCensusForgetV1 forget);
     void SetBirthListener(FvoTrafficBirthFnV1 listener);
     void SetHandoffListeners(handoff::ReadFacts facts,handoff::Release release,handoff::RetireShow retire);
+    using AdoptionSite=bool (*)(int slot, const FvoTrafficVehicle&, FvoPoolSpot& pose, double& distance);
+    void SetAdoptionSite(AdoptionSite site);
+    void SetAdoptionSources(FvoAdoptionFactsFnV1 facts, FvoAdoptionClaimFnV1 claim);
+    bool AdoptedVehicle(unsigned vehicle);
     void SetRoadClearance(int (*read)(FvoTrafficVehicle*,int), FvoRoadCheckFnV1 check, FvoTrafficBirthFnV2 birth);
     void ReportDriverRetirement(unsigned vehicle,unsigned driver);
     int DecideParkedRetirement(unsigned vehicle,const char* reason,bool protectedIdentity);

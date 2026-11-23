@@ -8,6 +8,7 @@
 #include "fleetrail_api.h"
 #include "fleetownershipstore.h"
 #include "trafficpool.h"
+#include "vehicleflight.h"
 #endif
 #include "log.h"
 #include "notify.h"
@@ -83,15 +84,29 @@ float& SavedValue() {
     return value;
 }
 #ifndef FVO_TRAFFICPROFILE_TEST
-void SaveFleetOwnership(const std::filesystem::path& routes) {
-    const auto path = routes / fleetownershipstore::kFileName;
+void SaveFleetState(const std::filesystem::path& path, const std::string& content) {
     auto staging = path;
     staging += L".pending";
-    trafficprofilestore::Write(staging, fleetownershipstore::Write(trafficpool::SavePlayerTakeovers()));
+    trafficprofilestore::Write(staging, content);
     if (!MoveFileExW(staging.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         throw std::runtime_error("Could not save traffic vehicle ownership");
 }
+void SaveFleetOwnership(const std::filesystem::path& routes) {
+    SaveFleetState(routes / fleetownershipstore::kFileName,
+                   fleetownershipstore::Write(trafficpool::SavePlayerTakeovers()));
+    SaveFleetState(routes / fleetownershipstore::kPlayerControlFileName,
+                   fleetownershipstore::WritePlayerControl(vehicleflight::PlayerControlForSave()));
+}
 void RestoreFleetOwnership(const std::filesystem::path& routes) {
+    const auto control = routes / fleetownershipstore::kPlayerControlFileName;
+    std::error_code controlError;
+    const auto controlBytes = std::filesystem::file_size(control, controlError);
+    fleetownershipstore::PlayerControl playerControl;
+    if (!controlError && controlBytes <= 64) {
+        std::ifstream in(control, std::ios::binary);
+        playerControl = fleetownershipstore::ReadPlayerControl(in);
+    }
+    trafficpool::RestorePlayerControl(playerControl);
     const auto path = routes / fleetownershipstore::kFileName;
     std::error_code error;
     const auto bytes = std::filesystem::file_size(path, error);
@@ -146,6 +161,7 @@ void BeginLoad() {
 #ifndef FVO_TRAFFICPROFILE_TEST
     FvoFleetRailReset();
     trafficpool::RestorePlayerTakeovers({});
+    trafficpool::RestorePlayerControl({});
 #endif
     Guard lock(g_lock);
     // Reloading the same save also discards unsaved route changes and branches anew.

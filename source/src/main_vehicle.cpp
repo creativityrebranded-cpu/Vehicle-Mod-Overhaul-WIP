@@ -18,6 +18,7 @@
 #include "mapguard.h"
 #include "cellbake.h"
 #include "routesurvey_run.h"
+#include "hazardfield.h"
 #include "disableguard.h"
 #include "realvehicles.h"
 #include "runtimecells.h"
@@ -352,7 +353,7 @@ namespace
         const char* slowName[2]={"",""};double slowMs[2]={0,0};
         auto part=[&](int bucket,const char* name,auto&& fn){LARGE_INTEGER a{},b{};QueryPerformanceCounter(&a);fn();QueryPerformanceCounter(&b);
             const double ms=1000.0*double(b.QuadPart-a.QuadPart)/frequency.QuadPart;if(ms>slowMs[bucket]){slowMs[bucket]=ms;slowName[bucket]=name;}};
-        part(0,"cell bake",[]{cellbake::Tick(Loading(GetTickCount64()));});part(0,"route survey",[]{routesurvey::Tick(Loading(GetTickCount64()));});part(0,"navmesh input probe",[]{navprobe::Tick(Loading(GetTickCount64()));});part(0,"car navmesh",[]{navmesh::Tick(Loading(GetTickCount64()));});part(0,"collision-box scan",[]{navseed::Tick();});part(0,"flight field",[]{navfield::Service();});
+        part(0,"cell bake",[]{cellbake::Tick(Loading(GetTickCount64()));});part(0,"route survey",[]{routesurvey::Tick(Loading(GetTickCount64()));});part(0,"hazard boxes",[]{hazardfield::Tick(Loading(GetTickCount64()));});part(0,"navmesh input probe",[]{navprobe::Tick(Loading(GetTickCount64()));});part(0,"car navmesh",[]{navmesh::Tick(Loading(GetTickCount64()));});part(0,"collision-box scan",[]{navseed::Tick();});part(0,"flight field",[]{navfield::Service();});
         part(0,"surface checks",[]{environment::Tick();});part(0,"nav map",[]{navmap::Tick();});mark(2);
         profiles::Tick();context::Tick();mark(3);
         npcvehicles::Tick();passenger::Tick();mark(4);
@@ -610,7 +611,7 @@ __declspec(dllexport) bool SFSEPlugin_Load(const SFSEInterface* sfse)
 	// Before the game reads its plugins: FVO_CityTraffic.esm rebuilt from the recordings when they changed (citystartup.h).
 	// citystartup::Run() rebuilt FVO_CityTraffic.esm at every launch; the user removed City Traffic for its hitches (2026-10-27), so
 	// core no longer writes it back.
-	logger::Important("Flying Vehicle Overhaul (FVO) 1.3.0 loaded; core optional");
+	logger::Important("Flying Vehicle Overhaul (FVO) 1.3.1 loaded; core optional");
 	logger::Write("Autopilot revision: live-heading-air-recovery-20261028 (shared chassis heading; hover escapes use airspace)");
 	logger::Write("Boarding revision: pre-entry-actor-scope-20261028 (no late player seat teardown)");
 	return true;

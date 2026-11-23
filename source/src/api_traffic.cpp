@@ -63,6 +63,7 @@
 #include <optional>
 #include <string>
 #include "costparts.h"
+#include "traffic/adoption_api.h"
 
 namespace
 {
@@ -242,7 +243,8 @@ namespace
     void OnStagedCreated(void*,void* ref){if(ref)vehiclediag::StageBirth(At<unsigned>(reinterpret_cast<uptr>(ref),off::kFormId));}
     void* const kStagedCreation[1]={reinterpret_cast<void*>(&OnStagedCreated)};
 
-	std::uint32_t Create(const char* source, uptr base, uptr cell, uptr ws, double x, double y, double z, double heading, const void* vtbl)
+	std::uint32_t Create(const char* source, uptr base, uptr cell, uptr ws, double x, double y, double z,
+                         double heading, const void* vtbl, bool persistent=true)
 	{
 		const uptr data = Ptr(addr::kDataHandlerPtr);
 		if (!base || !cell || !ws || !data) return 0;
@@ -259,16 +261,20 @@ namespace
 		const uptr ref = RefFromHandle(static_cast<std::uint32_t>(handle));
 		if (!ref) return 0;
 		std::uint32_t id = 0;
-		__try { id = At<std::uint32_t>(ref, off::kFormId); EngineFn<void(*)(uptr,char,char)>(addr::kMarkerPost1)(ref,1,0);EngineFn<void (*)(uptr)>(addr::kRefRelease)(ref); }
+		__try {
+            id=At<std::uint32_t>(ref,off::kFormId);
+            if(persistent)EngineFn<void(*)(uptr,char,char)>(addr::kMarkerPost1)(ref,1,0);
+            EngineFn<void (*)(uptr)>(addr::kRefRelease)(ref);
+        }
 		__except (EXCEPTION_EXECUTE_HANDLER) {}
 		return id;
 	}
     std::uint64_t CreateSeatedActor(const char* source, unsigned base, uptr vehicle, uptr cell, uptr world,
-                                    double x, double y, double z, double heading)
+                                    double x, double y, double z, double heading, bool persistent=true)
     {
         const Birth previous=g_birth;
         g_birth={vehicle,-99};
-        const unsigned id=Create(source,runtimeforms::Lookup(base),cell,world,x,y,z,heading,kSeatedCreation);
+        const unsigned id=Create(source,runtimeforms::Lookup(base),cell,world,x,y,z,heading,kSeatedCreation,persistent);
         const auto seat=g_birth.result;
         g_birth=previous;
         return std::uint64_t(id)|(std::uint64_t(std::uint32_t(seat))<<32);
@@ -780,6 +786,10 @@ namespace
 	struct TrafficAuthority { unsigned chassis; std::uint64_t epoch; };
     TrafficAuthority CaptureTrafficAuthority(unsigned chassis);
     bool TrafficAuthorityCurrent(TrafficAuthority authority);
+    std::uint64_t CaptureAdoption(unsigned vehicle);
+    bool AdoptionSeatAllowed(unsigned vehicle, std::uint64_t serial);
+    void RememberAdoptionDriver(unsigned vehicle, std::uint64_t serial, unsigned driver);
+    bool HasAdoption(unsigned vehicle);
     void RememberFactoryDriver(unsigned driver,unsigned vehicle);
     unsigned RequestDriver(const FvoTrafficBirthV1& request, int* seatResult, FvoBirthState* state)
 	{
@@ -787,6 +797,7 @@ namespace
 		if (seatResult) *seatResult = -99;
 		const auto key=BirthKey(MutationKey("driver",vehicleId),request);
         const auto authority=CaptureTrafficAuthority(vehicleId);
+        const auto adoption=source==FvoBirthSource::DriverRepair?CaptureAdoption(vehicleId):0;
 		const auto result=ListenBirth(request,key,vehicleId,[=]()->lifecycle::Work {
 			logger::Write("OBS system=create.driver vehicle=%08X event=request base=%08X pos=%.2f,%.2f,%.2f",vehicleId,baseId,x,y,z);
 			const auto owned=lifecycle::Keep(VehicleRef(vehicleId),vehicleId);FvoTrafficPlayer pl{};
@@ -823,7 +834,7 @@ namespace
 					logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=service reason=%s base=%08X flags=%08X",vehicleId,(vehicleFlags&(kDisabledFlag|kDeletedFlag))?"vehicle_hidden_or_deleted":"invalid_origin",baseId,vehicleFlags);
 					return 0;
 				}
-				if(!TrafficAuthorityCurrent(authority)){
+				if(!(adoption?AdoptionSeatAllowed(vehicleId,adoption):TrafficAuthorityCurrent(authority))){
                     logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=service reason=traffic_authority_revoked",vehicleId);
                     return 0;
                 }
@@ -833,11 +844,12 @@ namespace
                     logger::Write("OBS system=create.driver vehicle=%08X event=refused stage=service reason=chassis_left_requested_seat_position",vehicleId);
                     return 0;
                 }
-                return CreateSeatedActor("traffic_driver",baseId,vehicle,cell,ws,x,y,z,heading);
+                return CreateSeatedActor("traffic_driver",baseId,vehicle,cell,ws,x,y,z,heading,!adoption);
 			};
 		},state);
 		if(!result)return 0;
 		const unsigned id=unsigned(*result);if(seatResult)*seatResult=int(*result>>32);RememberIdentity(id);
+        if(id&&adoption)RememberAdoptionDriver(vehicleId,adoption,id);
         if(id&&FactoryStockId(vehicleId))RememberFactoryDriver(id,vehicleId);
 		logger::Write("OBS system=create.driver vehicle=%08X event=completion driver=%08X seat_result=%d ok=%d source=%s slot=%d key=%s",vehicleId,id,int(*result>>32),id!=0,BirthSourceName(source),slot,key.c_str());return id;
 	}
@@ -860,6 +872,7 @@ namespace
     void RememberFactoryDriver(unsigned driver,unsigned vehicle){g_madeDrivers[driver]=vehicle;}
 	unsigned g_lastMadeVehicle = 0;
 	std::set<unsigned> g_madeVehicles;  // every vehicle the addon made or reused since the load
+    std::set<unsigned> g_adoptionDrivers; // transient drivers live only for the runtime claim
 	void RememberDriver(unsigned id) { g_madeDrivers[id] = g_lastMadeVehicle; }
 	std::map<unsigned,int> g_unpersisted; // id -> actor; as desired visibility, survives a full table or a job's cancel: a reference that never turns persistent can never be deleted
 	void QueuePersist(unsigned id,int actor)
@@ -878,6 +891,7 @@ namespace
 	}
 	int ApiMakeTraffic(unsigned id, int actor)
 	{
+        if((actor&&g_adoptionDrivers.count(id))||(!actor&&HasAdoption(id)))return 0;
 		const uptr r = TrafficRef(id);
 		if (!r) return 0;
         if(actor&&!npcvehicles::LooksLikeActor(r))return 0;
@@ -885,7 +899,7 @@ namespace
 		// Registries belong to the controller, never the engine callback.
         if(actor){
             const auto existing=g_madeDrivers.find(id);
-            if(existing==g_madeDrivers.end()||!FactoryStockId(existing->second))RememberDriver(id);
+            if(existing==g_madeDrivers.end()||(!FactoryStockId(existing->second)&&!HasAdoption(existing->second)))RememberDriver(id);
         }else {g_lastMadeVehicle=id;g_madeVehicles.insert(id);std::lock_guard lock(g_uncollectedChassisLock);g_uncollectedChassis.erase(id);}
 		g_unpersisted[id]=actor;QueuePersist(id,actor);
 		return (At<unsigned>(r,kFormFlags)&kPersistentFlag)?1:0;
@@ -952,7 +966,7 @@ namespace
 			g_unpersisted[id]=actor;
 		};
 		for(const unsigned id:g_madeVehicles)watch(id,0);
-		for(const auto& [id,vehicle]:g_madeDrivers)watch(id,1);
+		for(const auto& [id,vehicle]:g_madeDrivers)if(!g_adoptionDrivers.count(id))watch(id,1);
 	}
 	void ServiceVisibility(){
 		WatchPersistence();
@@ -1296,12 +1310,53 @@ namespace
 	std::set<unsigned> g_playerTook;  // stolen or given: the player's now. Traffic lets go of it (2026-10-30, the user: "shoot at, steal their vehicles, or board them").
 	std::mutex g_tookLock;  // KO-1: written by the seat rules' thread and the traffic tick, read by the addon tick
 	std::uint64_t g_trafficEpoch=1;
+    struct Adoption {
+        unsigned base, driver;
+        FvoAdoptionOwner owner;
+        std::uint64_t serial;
+    };
+    std::map<unsigned,Adoption> g_adoptions;
+    std::uint64_t g_adoptionSerial=0;
+    fleetownershipstore::PlayerControl g_savedPlayerControl;
+    bool LivePlayerUses(unsigned vehicle) {
+        return vehicleflight::PlayerDriving(vehicle)||ApiVehicleOf(0x14)==vehicle;
+    }
+    bool ReadAdoption(unsigned vehicle,Adoption& lease) {
+        std::lock_guard lock(g_tookLock);
+        const auto it=g_adoptions.find(vehicle);
+        if(it==g_adoptions.end())return false;
+        lease=it->second;
+        return true;
+    }
+    bool HasAdoption(unsigned vehicle) {
+        Adoption lease{};
+        return ReadAdoption(vehicle,lease);
+    }
+    std::uint64_t CaptureAdoption(unsigned vehicle) {
+        Adoption lease{};
+        return ReadAdoption(vehicle,lease)?lease.serial:0;
+    }
+    bool AdoptionSeatAllowed(unsigned vehicle,std::uint64_t serial) {
+        Adoption lease{};
+        const auto ref=VehicleRef(vehicle);
+        if(!ref||!ReadAdoption(vehicle,lease)||lease.serial!=serial||BaseIdOf(ref)!=lease.base||
+           LivePlayerUses(vehicle)||npcvehicles::UsesVehicle(vehicle))return false;
+        return npcvehicles::VehicleDriverId(vehicle)==0;
+    }
+    void RememberAdoptionDriver(unsigned vehicle,std::uint64_t serial,unsigned driver) {
+        std::lock_guard lock(g_tookLock);
+        if(const auto it=g_adoptions.find(vehicle);it!=g_adoptions.end()&&it->second.serial==serial)it->second.driver=driver;
+        g_madeDrivers[driver]=vehicle;
+        g_adoptionDrivers.insert(driver);
+    }
     TrafficAuthority CaptureTrafficAuthority(unsigned chassis){
         std::lock_guard lk(g_tookLock);return {chassis,g_trafficEpoch};
     }
     bool TrafficAuthorityCurrent(TrafficAuthority authority){
         std::lock_guard lk(g_tookLock);
-        return authority.epoch==g_trafficEpoch&&!g_playerTook.count(authority.chassis);
+        if(authority.epoch!=g_trafficEpoch||g_playerTook.count(authority.chassis))return false;
+        const auto adopted=g_adoptions.find(authority.chassis);
+        return adopted==g_adoptions.end()||trafficadoption::MayRetireChassis(adopted->second.owner);
     }
     int ApiPlayerTook(unsigned vehicle) { std::lock_guard lk(g_tookLock); return vehicle && g_playerTook.count(vehicle) ? 1 : 0; }
 	// KO-1 (2026-11-08, kick-out port): the player took this vehicle (pulled out, handed over, hijacked, or in its driver's seat). Traffic lets go of it
@@ -1310,7 +1365,11 @@ namespace
 	{
 		if (!vehicle) return;
 		bool added = false;
-		{ std::lock_guard lk(g_tookLock); added = g_playerTook.insert(vehicle).second; if(added)++handoff::wheelGeneration; }
+		{ std::lock_guard lk(g_tookLock);
+            added = g_playerTook.insert(vehicle).second;
+            if(g_savedPlayerControl.vehicle==vehicle)g_savedPlayerControl={};
+            if(g_adoptions.erase(vehicle)||added)++handoff::wheelGeneration;
+        }
 		if (added) logger::Write("OBS system=traffic.taken vehicle=%08X event=player_took reason=%s", vehicle, why ? why : "");
 	}
 	int ApiPairHealth(unsigned vehicle) { const auto it = g_pairHealth.find(vehicle); return it == g_pairHealth.end() ? 0 : int(it->second.health); }
@@ -1444,6 +1503,7 @@ namespace
         {std::lock_guard lock(g_uncollectedChassisLock);g_uncollectedChassis.erase(id);}
         g_retireAuthority.erase(id);
 		g_madeDrivers.erase(id);g_madeVehicles.erase(id);g_pairHealth.erase(id);g_watched.erase(id);g_guardOthers.erase(id);g_guardHidden.erase(id);
+        g_adoptionDrivers.erase(id);
 		if(g_lastMadeVehicle==id)g_lastMadeVehicle=0;
 	}
 	int ApiDeleteRef(unsigned id)
@@ -1565,7 +1625,9 @@ namespace
 					job ? 1 : 0, made != g_madeDrivers.end() ? 1 : 0, ExposureAt(d.x, d.y, d.z), std::hypot(d.x - pl.x, d.y - pl.y), d.x, d.y, d.z, above, CellStateOf(id), sit);
 			}
 			if (requestRetirement && !w.requested && g_retirementReport && (!linked||linked==made->second)) {
-				w.requested=true;++retireRequests;g_retirementReport(made->second,id);
+				w.requested=true;++retireRequests;
+                const unsigned chassis=g_adoptionDrivers.count(id)?0:made->second;  // an adopted chassis is never ours to retire
+                g_retirementReport(chassis,id);
 			}
 		}
 		if (g_healthLaunch) {  // the query at launch: every pair the first time play is running
@@ -1613,7 +1675,7 @@ namespace trafficpool
 	void Tick() {
 		if (const unsigned own = vehicleflight::OwnRoverId()) { std::lock_guard lk(g_tookLock); g_playerTook.insert(own); }
 		// KO-1: the player in the driver's seat of a vehicle traffic made (not riding as a passenger) has taken it.
-		if (const unsigned in = ApiVehicleOf(0x14); in && (g_madeVehicles.count(in)||FactoryStockId(in)) && passenger::RidingVehicle() != in) NoteTaken(in, "player_in_the_driver_seat");
+		if (const unsigned in = ApiVehicleOf(0x14); in && (g_madeVehicles.count(in)||FactoryStockId(in)||HasAdoption(in)) && passenger::RidingVehicle() != in) NoteTaken(in, "player_in_the_driver_seat");
 		if (g_attached.load() && g_hooks.tick) {
 #ifndef FVO_RELEASE
             if(ApiPresentation()==1){FactoryCamera camera;RememberFactoryCamera(camera);}
@@ -1662,16 +1724,17 @@ namespace trafficpool
     bool MayHideParked(unsigned id,const char* reason,bool protectedPlacement){
         if(FactoryStockId(id))return false;
         if(!id)return false;
-        bool protectedIdentity=protectedPlacement||ApiPlayerTook(id)||MadeVehicle(id);
+        bool protectedIdentity=protectedPlacement||ApiPlayerTook(id)||MadeVehicle(id)||HasAdoption(id);
         {std::lock_guard lock(g_uncollectedChassisLock);protectedIdentity|=g_uncollectedChassis.count(id)!=0;}
         return g_parkedRetirement?g_parkedRetirement(id,reason,protectedIdentity)!=0:!protectedIdentity;
     }
 	void Reset() {
         lifecycle::Reset();
+        g_adoptionDrivers.clear();
 #ifndef FVO_RELEASE
         {std::lock_guard lock(g_factoryBirthLock);g_factorySite={};g_factoryCamera={};g_dynamicStock.clear();}
 #endif
-        {std::lock_guard lock(g_uncollectedChassisLock);g_uncollectedChassis.clear();}g_coverScanned=false;g_coverActorCount=0;realvehicles::ResetRoadInventory();g_visibility.clear();g_retireCamera.clear();g_retireAuthority.clear();{std::lock_guard lock(g_coverHideLock);g_coverHides.clear();}g_unpersisted.clear();g_birthProof={};g_guardOthers.clear();g_guardHidden.clear();trafficarrival::Reset();g_madeVehicles.clear();g_madeDrivers.clear();g_watched.clear();g_pairHealth.clear();g_recoverTimes.clear();{std::lock_guard lk(g_tookLock);++g_trafficEpoch;++handoff::wheelGeneration;}g_healthLaunch=true;g_lastMadeVehicle=0;g_watchLines=0;if (g_attached.load() && g_hooks.reset) g_hooks.reset();
+        {std::lock_guard lock(g_uncollectedChassisLock);g_uncollectedChassis.clear();}g_coverScanned=false;g_coverActorCount=0;realvehicles::ResetRoadInventory();g_visibility.clear();g_retireCamera.clear();g_retireAuthority.clear();{std::lock_guard lock(g_coverHideLock);g_coverHides.clear();}g_unpersisted.clear();g_birthProof={};g_guardOthers.clear();g_guardHidden.clear();trafficarrival::Reset();g_madeVehicles.clear();g_madeDrivers.clear();g_watched.clear();g_pairHealth.clear();g_recoverTimes.clear();{std::lock_guard lk(g_tookLock);g_adoptions.clear();++g_trafficEpoch;++handoff::wheelGeneration;}g_healthLaunch=true;g_lastMadeVehicle=0;g_watchLines=0;if (g_attached.load() && g_hooks.reset) g_hooks.reset();
     }
 	void RushTick() { if (g_attached.load() && g_hooks.housekeeping) g_hooks.housekeeping();ServiceVisibility(); }
 	void Rush(const RushPlace* places, int count)
@@ -1691,8 +1754,14 @@ namespace trafficpool
 	bool AddonAttached() { return g_attached.load(); }
 	bool PlayerOwnsHandoff(unsigned vehicle) { return ApiPlayerTook(vehicle)!=0; }
     std::uint64_t CaptureWheelHandoff(unsigned vehicle) {
+        {
+            std::lock_guard lock(g_tookLock);
+            if(!g_playerTook.count(vehicle))return handoff::wheelGeneration.load(std::memory_order_relaxed);
+            if(!g_adoptions.count(vehicle))return 0;
+        }
+        const bool adopted=AdoptionPilotAllowed(vehicle,npcvehicles::VehicleDriverId(vehicle));
         std::lock_guard lock(g_tookLock);
-        return g_playerTook.count(vehicle)?0:handoff::wheelGeneration.load(std::memory_order_relaxed);
+        return adopted&&g_adoptions.count(vehicle)?handoff::wheelGeneration.load(std::memory_order_relaxed):0;
     }
     std::vector<unsigned> SavePlayerTakeovers() {
         std::lock_guard lock(g_tookLock);
@@ -1705,6 +1774,23 @@ namespace trafficpool
             g_playerTook.swap(owned);
             ++handoff::wheelGeneration;
         }
+    }
+    void RestorePlayerControl(fleetownershipstore::PlayerControl control) {
+        {
+            std::lock_guard lock(g_tookLock);
+            g_savedPlayerControl=control;
+            if(!g_adoptions.empty()) {
+                g_adoptions.clear();
+                ++handoff::wheelGeneration;
+            }
+        }
+        vehicleflight::ResumeSavedControl(control);  // RS-1: an empty record (load start) clears a pending resume
+    }
+    bool AdoptionPilotAllowed(unsigned vehicle,unsigned driver) {
+        Adoption lease{};
+        if(!driver||!ReadAdoption(vehicle,lease)||lease.driver!=driver||LivePlayerUses(vehicle))return false;
+        const auto ref=VehicleRef(vehicle);
+        return ref&&BaseIdOf(ref)==lease.base;
     }
     void NotePlayerTook(unsigned vehicle, const char* why) { NoteTaken(vehicle, why); }  // KO-1
 	void ReloadFiles() { if (g_attached.load() && g_hooks.reload) g_hooks.reload(); }
@@ -1741,8 +1827,56 @@ extern "C" __declspec(dllexport) void FVO_TrafficParkedRetirementV1(int (*arbite
 }
 extern "C" __declspec(dllexport) int FVO_TrafficPanelCoveredV1(){return trafficarrival::panel.load()?1:0;}
 extern "C" __declspec(dllexport) void FVO_TrafficRetirementListenerV1(RetirementReport report){g_retirementReport=report;}
+extern "C" __declspec(dllexport) int FVO_TrafficAdoptionFactsV1(unsigned vehicle,unsigned base,FvoAdoptionOwner* owner) {
+    using Owner=FvoAdoptionOwner;
+    FvoTrafficRef info{};
+    if(!owner||!vehicle||!base||!ApiRef(vehicle,&info)||info.baseId!=base||info.isActor||!info.usable)return 0;
+    if(LivePlayerUses(vehicle)){*owner=Owner::PlayerProtected;return 1;}
+    Adoption lease{};
+    const auto driver=npcvehicles::VehicleDriverId(vehicle);
+    if(ReadAdoption(vehicle,lease)&&lease.base==base) {
+        *owner=driver&&driver!=lease.driver?Owner::OtherProtected:lease.owner;
+        return 1;
+    }
+    fleetownershipstore::PlayerControl saved;
+    {std::lock_guard lock(g_tookLock);saved=g_savedPlayerControl;}
+    const bool savedPlayer=saved.vehicle==vehicle&&saved.base==base;
+    if(savedPlayer||ApiPlayerTook(vehicle)||realvehicles::PlayersOrOwn(vehicle)) {
+        *owner=!driver&&!ApiTripActive(vehicle)&&ApiPresentation()==3&&saved.SavedAutopilot(vehicle,base)
+            ?Owner::PlayerSavedAuto:Owner::PlayerProtected;
+        return 1;
+    }
+    bool reserved=false;
+    {std::lock_guard lock(g_uncollectedChassisLock);reserved=g_uncollectedChassis.count(vehicle)!=0;}
+    *owner=driver||ApiTripActive(vehicle)||FactoryStockId(vehicle)||reserved?Owner::OtherProtected:
+        trafficpool::MadeVehicle(vehicle)?Owner::FvoDisposable:Owner::Unclaimed;
+    return 1;
+}
+extern "C" __declspec(dllexport) int FVO_TrafficAdoptionClaimV1(unsigned vehicle,unsigned base,int claim) {
+    if(!vehicle||!base)return 0;
+    if(!claim) {
+        std::lock_guard lock(g_tookLock);
+        const auto it=g_adoptions.find(vehicle);
+        if(it==g_adoptions.end()||it->second.base!=base)return 0;
+        g_adoptions.erase(it);
+        ++handoff::wheelGeneration;
+        return 1;
+    }
+    const int screen=ApiPresentation();
+    FvoAdoptionOwner owner{};
+    if(!FVO_TrafficAdoptionFactsV1(vehicle,base,&owner)||
+       !trafficadoption::MayClaim(owner,screen==3,screen==3||(screen==2&&trafficarrival::panel.load()),
+                                  npcvehicles::VehicleDriverId(vehicle)!=0))return 0;
+    std::lock_guard lock(g_tookLock);
+    if(const auto it=g_adoptions.find(vehicle);it!=g_adoptions.end())return it->second.base==base;
+    if(g_playerTook.count(vehicle)&&owner!=FvoAdoptionOwner::PlayerSavedAuto)return 0;
+    g_adoptions.emplace(vehicle,Adoption{base,0,owner,++g_adoptionSerial});
+    return 1;
+}
 extern "C" __declspec(dllexport) int FVO_TrafficHandoffReleaseV1(unsigned vehicle,bool player){
-    if(!vehicle||player!=(ApiPlayerTook(vehicle)!=0))return 0;
+    if(!vehicle)return 0;
+    const bool adoption=trafficpool::AdoptionPilotAllowed(vehicle,npcvehicles::VehicleDriverId(vehicle));
+    if(player!=(ApiPlayerTook(vehicle)!=0&&!adoption))return 0;
     const bool released=player?vehiclediag::ReleaseBirthToPlayer(vehicle):vehiclediag::ReleaseBirth(vehicle);
 #ifndef FVO_RELEASE
     if(released&&!player)npcvehicles::FactoryLeaseReleased(vehicle);
@@ -1782,7 +1916,7 @@ extern "C" __declspec(dllexport) int FVO_TrafficFactoryLeaseV1(
 extern "C" __declspec(dllexport) void FVO_TrafficHandoffFactsV1(unsigned vehicle,unsigned driver,handoff::Facts* out){
     if(!out)return;
     *out={};
-    if(!vehicle||!driver||ApiPlayerTook(vehicle))return;
+    if(!vehicle||!driver||(ApiPlayerTook(vehicle)&&!trafficpool::AdoptionPilotAllowed(vehicle,driver)))return;
     out->package=npcvehicles::TrafficPackageReady(vehicle,driver);
     if(!out->package)return;
     const auto physics=vehicleflight::HandoffPhysics(vehicle);

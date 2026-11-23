@@ -74,6 +74,7 @@ inline bool ProjectionInRoute(const Shape& s, double t, const Frame& f) {
     return ProjectionInRoute(s, t, f, planworld::Project(s, t));
 }
 inline bool SolidAllowed(const Shape& s, const Frame& f) {
+    if (s.hazardMark) return false;  // a hazard box is a mark, not a structure the route runs through
     if (s.source != planworld::Source::Ray && s.source != planworld::Source::Box && s.source != planworld::Source::Ground && s.source != planworld::Source::Survey && s.source != planworld::Source::Volume && s.source != planworld::Source::Radar) return false;
     for (int k = 0; k < f.fieldCount && f.field; ++k) if (f.field[k].solids && fieldbox::Contains(f.field[k], { s.centre.x, s.centre.y, s.centre.z }, .5)) return true;
     return false;

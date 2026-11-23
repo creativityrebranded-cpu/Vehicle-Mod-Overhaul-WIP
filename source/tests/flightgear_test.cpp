@@ -227,6 +227,23 @@ int main() {
         p.gear = 1; Check(!flightgear::Update(s, p, .1) && !flightgear::Update(s, p, .45) && flightgear::Update(s, p, .55) && s.gear == 1, "fg1_down_after_0_4_s");
         p.gear = 4; Check(!flightgear::Update(s, p, 1) && !flightgear::Update(s, p, 3.4) && flightgear::Update(s, p, 3.6) && s.gear == 2, "fg1_up_one_gear_after_2_5_s");
         Check(!flightgear::Update(s, p, 4) && flightgear::Update(s, p, 6.2) && s.gear == 3, "fg1_next_up_waits_again");
+        // Stage F: the thresholds are the car's own (Spec brake / hoverClear / climbRate / hoverAccel, wheelguard::reaction), not fixed metres.
+        {
+            const auto& k = a.car; const double tr = wheelguard::reaction;
+            Check(std::fabs(flightgear::HoldBelow(k) - k.brake * energyplan::kDt) < 1e-12, "stageF_hold_below_is_brake_times_plan_step");
+            Check(std::fabs(flightgear::NearFloor(k) - (k.hoverClear + k.climbRate * k.climbRate / (2 * k.hoverAccel))) < 1e-12, "stageF_near_floor_from_hover_clear_and_climb");
+            Check(std::fabs(flightgear::StopDistance(20, k.brake) - (400 / (2 * k.brake) + 20 * tr)) < 1e-12, "stageF_stop_distance_v2_over_2b_plus_v_tr");
+            Check(std::fabs(flightgear::kDownHold - 2 * tr) < 1e-12, "stageF_down_hold_is_two_reactions");
+            // The same 30 m to a stop is near at 20 m/s (needs 37 m) and not near at 8 m/s (needs 11 m): the distance follows the speed.
+            auto f = a; f.toArrival = 30; f.speed = 20; f.planSpeed = 20; Check(std::string_view(flightgear::Target(f).reason) == "near_arrival", "stageF_fast_car_30m_from_stop_is_near");
+            f.speed = 8; f.planSpeed = 8; f.want = 8; Check(std::string_view(flightgear::Target(f).reason) != "near_arrival", "stageF_slow_car_30m_from_stop_is_not_near");
+            // A better brake shortens the zone; a worse one lengthens it (same speed, same distance).
+            f = a; f.toArrival = 30; f.speed = 20; f.planSpeed = 20; f.car.brake = 12; Check(std::string_view(flightgear::Target(f).reason) != "near_arrival", "stageF_stronger_brake_shrinks_near_zone");
+            f.car.brake = 3; f.toArrival = 60; Check(std::string_view(flightgear::Target(f).reason) == "near_arrival", "stageF_weaker_brake_widens_near_zone");
+            // Floor zone follows the climb: a faster climb needs more height.
+            f = a; f.floorGap = 6; Check(std::string_view(flightgear::Target(f).reason) != "near_floor", "stageF_6m_over_floor_clear_at_default_climb");
+            f.car.climbRate = 9; Check(std::string_view(flightgear::Target(f).reason) == "near_floor", "stageF_faster_climb_widens_floor_zone");
+        }
         hoverfollow::Path path; path.count = 3; path.p[0] = { 0, 0, 0, 0, 0 }; path.p[1] = { .2, 0, 0, 0, .1 }; path.p[2] = { .4, 0, 0, 0, .3 };
         Check(std::fabs(flightgear::PeakTurn(path) - 1.0) < 1e-9, "peak_turn_of_a_plan");
     }

@@ -43,6 +43,7 @@ struct Route {
     roadplan::Plan road;
     journeyplan::Plan journey;trafficconstraints::Rules restrictions;
     routeend::Plan end;                // line_end / line_arrive (2026-11-06)
+    routehazard::Plan hazards;         // hazard_boxes (2026-11-21)
 
 };
 // A landing place (parked: a vehicle stands there) or a spawn spot. world: empty for the editor's world, else an anchored city's
@@ -146,7 +147,7 @@ inline std::string TravelLines(const Route& r) {
     const auto road=roadplan::Write(r.road);if(!road.empty())out+="road_tiles = "+road+"\n";
     // Field boxes, one per tile (2026-11-06): only once someone set one; a route without them reads exactly as before.
     if(!r.ring){const std::size_t tiles=r.closed?r.points.size():r.points.size()>0?r.points.size()-1:0;const auto boxes=roadplan::WriteBoxes(r.road,tiles);if(!boxes.empty())out+="road_boxes = "+boxes+"\n";}
-    out+=routeend::Lines(r.end);
+    out+=routeend::Lines(r.end);out+=routehazard::Lines(r.hazards);
     const auto space=splinekit::Write(r.spacePlan);if(!space.empty())out+="space_plan = "+space+"\n";
     const auto transforms=lanetransform::Write(r.lanePlan.transforms);if(!transforms.empty())out+="lane_transforms = "+transforms+"\n";
     const auto models=lanevehicles::Write(r.lanePlan.vehicles);if(!models.empty())out+="lane_vehicles = "+models+"\n";
@@ -253,7 +254,7 @@ inline bool Parse(const std::string& text, const std::string& name, File& out, s
     const std::string w = WorldKey(f.worldId);
     for (const auto& r : d.routes) {
         Route e;
-        e.restrictions=r.restrictions;e.journey=r.journey;e.lanePlan=r.lanePlan;e.spacePlan=r.spacePlan;e.road=r.road;e.end=r.end;e.travel=r.travel; e.sections=r.sections; e.corridor=r.corridor; e.id = r.name; e.label = r.label.empty() ? r.name : r.label; e.color = r.color; e.points = r.points; e.rounding=r.rounding; e.closed = r.closed;
+        e.restrictions=r.restrictions;e.journey=r.journey;e.lanePlan=r.lanePlan;e.spacePlan=r.spacePlan;e.road=r.road;e.end=r.end;e.hazards=r.hazards;e.travel=r.travel; e.sections=r.sections; e.corridor=r.corridor; e.id = r.name; e.label = r.label.empty() ? r.name : r.label; e.color = r.color; e.points = r.points; e.rounding=r.rounding; e.closed = r.closed;
         e.lanes = r.lanes; e.speed = r.speed; e.width = r.width; e.schedule = r.schedule; e.test = r.test; e.exclude = r.exclude; e.role = r.role; e.group = r.group;
         e.world = r.world == w ? std::string() : r.world;
         e.removed = r.removed; e.ring = r.ring; e.shape = r.shape; e.tilt = r.tilt; e.tiltToward = r.tiltToward;

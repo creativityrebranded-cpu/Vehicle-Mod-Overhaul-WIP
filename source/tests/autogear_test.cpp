@@ -24,6 +24,7 @@ int main() {
     Check(gw == 1, "RB-1: the back stepping out 12 degrees: gear 1");
     State ramp; double tr = 0; int gr = 3; for (; tr < 5.0; tr += .05) gr = Update(ramp, tr, 0, 0);
     Check(gr == 3, "SP-1: a straight climb with no slip stays in gear 3 (the slope is the tyre controller's)");
+    Check(std::fabs(rules::downHold - 2 * wheelguard::reaction) < 1e-12 && std::fabs(rules::slipSmooth - wheelguard::reaction) < 1e-12, "stageF: down hold = 2 reactions, slip filter = 1 reaction");
     std::printf(failed ? "FAILED\n" : "ALL PASS\n");
     return failed ? 1 : 0;
 }

@@ -105,10 +105,10 @@ def verify(path, schema=None):
                       ('fvo_scheduledtraffic.esm', 'fvo_roadtrafficpool.esm', 'galactichighwaynetwork.esm', 'vehicles - real.esm')
                       + tuple(r.casefold() for r in RETIRED)), 'Removed content not reintroduced')
         features=json.loads(archive.read('fomod/features.json'))
-        check(len(features)==19 and len({f['id'] for f in features})==19,'Complete runtime profile has 19 distinct keys')
+        check(len(features)==20 and len({f['id'] for f in features})==20,'Complete runtime profile has 20 distinct keys')
         check(len([f for f in features if f['configurable']])==6,'Only the 6 menu switches are configurable')
         hidden=[f for f in features if not f['configurable']]
-        check({f['id'] for f in hidden}=={'Placement','PlacementMode','DebugLog','PhysicalAi','Radar',*ALWAYS_ON},'Removed, development, merged and always-on switches are excluded')
+        check({f['id'] for f in hidden}=={'Placement','PlacementMode','DebugLog','PhysicalAi','Radar','ScriptMode',*ALWAYS_ON},'Removed, development, merged and always-on switches are excluded')
         steps=root.findall('installSteps/installStep')
         check([p.get('name') for p in steps]==['Core and feature setup','Flight and Navigation','NPCs and Combat','City traffic routes','Traffic options','Route beacons'],
               'Installer pages (0.9.0)')

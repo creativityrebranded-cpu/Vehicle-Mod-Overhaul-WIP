@@ -318,7 +318,8 @@ int main() {
     Check(s.ok && Near(s.floor, 10) && Near(s.pose.z, 10 + .9 + rules::dropMargin), "siting: floor + rest height + drop margin");
     Check(Near(s.pose.x, 2) && Near(s.pose.y, 20), "siting: on the lane point");
     Check(!Place(false, {}, lane, car, false, false).ok && !std::strcmp(Place(false, {}, lane, car, false, false).why, "no_field_box"), "siting: no box, no birth");
-    Check(!std::strcmp(Place(true, FlatBox(10, 10, 5, 0), lane, car, false, false).why, "no_floor_hover_tile"), "siting: hover tile has no floor");
+    {   const auto air = Place(true, FlatBox(10, 10, 5, 0), lane, car, false, false);   // all routes are the same to birth (user, 2026-11-22)
+        Check(air.ok && Near(air.pose.z, 10 + .9 + rules::dropMargin), "siting: a hover tile is sited like any other, on its box bottom"); }
     Check(!std::strcmp(Place(true, FlatBox(10, 6), { 2, 20, 0, 0 }, car, false, false).why, "model_wider_than_field"), "siting: body must fit inside the box");
     Check(!std::strcmp(Place(true, FlatBox(10, 10, 2), lane, car, false, false).why, "model_taller_than_field"), "siting: body must fit under the roof");
     Check(!std::strcmp(Place(true, FlatBox(10), lane, car, true, false).why, "another_vehicle_there"), "siting: occupied");
@@ -334,7 +335,8 @@ int main() {
         const auto d = Place(true, f, { 0, 20, 0, 0 }, car, false, false);
         Check(d.ok && d.defaultBox && Near(d.floor, 10, .3) && !std::strcmp(d.why, "default_box_floor"), "siting: default box floor at the route height");
         r.travel = routepolicy::Travel::Hover; FvoFieldBoxV1 g; tilebox::TileBox(r, line, 0, g);
-        Check(!Place(true, g, { 0, 20, 0, 0 }, car, false, false).ok, "siting: hover-only routes stay out of spawning");
+        { const auto h = Place(true, g, { 0, 20, 0, 0 }, car, false, false);
+          Check(h.ok && Near(h.floor, 10, .3), "siting: a hover-only route is sited like any route (user, 2026-11-22)"); }
         r.travel = routepolicy::Travel::Drive; r.road.primitives.resize(1); r.road.primitives[0].kind = roadplan::Tube;
         Check(!tilebox::TileBox(r, line, 0, g), "siting: D11 shapes get no box, so no birth"); }
 

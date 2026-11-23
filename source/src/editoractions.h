@@ -36,6 +36,9 @@
 			kRowBase = 1000,   // + index in the routes list (editor routes, then the other files' routes)
 			kViewBase = 2000,  // + View item
 		};
+// Hazard boxes (2026-11-21): the Hazards tool and its steppers.
+enum HazardId { kHazardTool=9800,kHazardDone,kHazardDelete,kHazardAcrossDown,kHazardAcrossUp,kHazardAlongDown,kHazardAlongUp,kHazardHeightDown,kHazardHeightUp,kHazardBaseDown,kHazardBaseUp,kHazardTurnLeft,kHazardTurnRight,
+    kHazardInherit,kHazardKeep,kHazardDismiss,kHazardKeepAll,kHazardPlace,kHazardNextSuggest };
 // Three-layer F7 (2026-11-03): group tabs, shape and link-shape choices, dock values, tag controls, Field panel rows.
 enum F7Id { kF7GroupBase=9600,kF7PrimBase=9610,kF7LinkBase=9620,kF7ValueBase=9630,kF7TagPrev=9640,kF7TagNext,kF7TagMinus,kF7TagPlus,kF7TagToggle,kF7TagTravel,
     kF7FlowAlong=9650,kF7FlowAgainst,kF7PosDown,kF7PosUp,kF7TravelBase=9660,kF7FieldShape=9670,kF7FieldWidth,kF7FieldParam,kF7FieldPrev,kF7FieldNext,kF7FieldMedian=9675,kF7Taper=9513,kF7Arrange=9680,kF7NodeView=9681,kRoadSnap=9690,kRoadFit=9691 };

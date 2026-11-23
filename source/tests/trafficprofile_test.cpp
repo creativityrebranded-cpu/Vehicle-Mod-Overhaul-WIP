@@ -2,6 +2,7 @@
 #include "fleetownershipstore.h"
 #include <chrono>
 #include <iostream>
+#include <sstream>
 
 using namespace trafficprofilestore;
 std::string Read(const fs::path& p) {
@@ -52,10 +53,16 @@ int main() {
         Write(a.routes / "journeys.state", journey);
         const std::vector<unsigned> owned{0xFF002104, 0xFF002108};
         Write(a.routes / fleetownershipstore::kFileName, fleetownershipstore::Write(owned));
+        using fleetownershipstore::Control;
+        const fleetownershipstore::PlayerControl autoControl{owned.front(),0x00123456,Control::Autopilot};
+        const auto controlName=fleetownershipstore::kPlayerControlFileName;
+        Write(a.routes / controlName,fleetownershipstore::WritePlayerControl(autoControl));
         const auto saved = Clone(profiles, a.routes, 123);
         Write(a.routes.parent_path() / "trafficpool.ini", "different live fleet");
         Write(a.routes / "journeys.state", "different live route assignment");
         Write(a.routes / fleetownershipstore::kFileName, fleetownershipstore::Write({0xFF002120}));
+        Write(a.routes / controlName,
+              fleetownershipstore::WritePlayerControl({autoControl.vehicle,autoControl.base,Control::Manual}));
         const auto restored = Clone(profiles / "Working", Open(profiles, saved.id), 456);
         Check(Read(restored.routes.parent_path() / "trafficpool.ini") == roster,
               "save retains the committed physical fleet");
@@ -65,6 +72,30 @@ int main() {
         Check(fleetownershipstore::Read(ownerFile) == owned, "restore prevents player-owned cars rejoining traffic");
         ownerFile.close();
         Check(!fs::exists(b.routes / fleetownershipstore::kFileName), "ownership is local to the game save");
+        {
+            std::ifstream controlFile(restored.routes / controlName,std::ios::binary);
+            const auto control=fleetownershipstore::ReadPlayerControl(controlFile);
+            Check(control.SavedAutopilot(autoControl.vehicle,autoControl.base),"save restores matching player autopilot");
+            Check(!control.SavedAutopilot(autoControl.vehicle,autoControl.base+1),"reused player chassis identity is refused");
+            std::ifstream manualFile(a.routes / controlName,std::ios::binary);
+            const auto manual=fleetownershipstore::ReadPlayerControl(manualFile);
+            Check(manual.control==Control::Manual&&!manual.SavedAutopilot(autoControl.vehicle,autoControl.base),
+                  "manual control cannot grant traffic authority");
+            std::ifstream olderFile(b.routes / controlName,std::ios::binary);
+            Check(!fleetownershipstore::ReadPlayerControl(olderFile).SavedAutopilot(autoControl.vehicle,autoControl.base),
+                  "older save cannot grant traffic authority");
+            {   // RS-1: Cruise is kept apart from Auto; both resume on load, Manual and Unknown never do.
+                std::istringstream cruise(fleetownershipstore::WritePlayerControl({autoControl.vehicle,autoControl.base,Control::Cruise}));
+                const auto c=fleetownershipstore::ReadPlayerControl(cruise);
+                Check(c.control==Control::Cruise&&c.SavedAutopilot(autoControl.vehicle,autoControl.base),"RS-1: saved Cruise reads back as Cruise and resumes");
+                Check(fleetownershipstore::ResumesOnLoad(Control::Autopilot)&&!fleetownershipstore::ResumesOnLoad(Control::Manual)&&
+                      !fleetownershipstore::ResumesOnLoad(Control::Unknown),"RS-1: only Auto and Cruise resume");
+                std::istringstream future("FVO_PLAYER_CONTROL 1\nff002104 123456 4\n");
+                Check(fleetownershipstore::ReadPlayerControl(future).control==Control::Unknown,"RS-1: an unknown later mode reads as unknown (protected)");
+                std::istringstream v1auto("FVO_PLAYER_CONTROL 1\nff002104 123456 2\n");
+                Check(fleetownershipstore::ReadPlayerControl(v1auto).control==Control::Autopilot,"RS-1: a record written before Cruise existed still reads as Auto");
+            }
+        }
         Write(restored.routes / "journeys.state", "new working assignment");
         Check(Read(Open(profiles, saved.id) / "journeys.state") == journey,
               "running a restored fleet cannot mutate its saved assignment");

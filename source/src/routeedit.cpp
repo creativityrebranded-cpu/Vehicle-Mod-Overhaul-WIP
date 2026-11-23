@@ -21,6 +21,8 @@
 #include "roadmigrate.h"
 #include "f7layers.h"
 #include "f7dock.h"
+#include "editormessage.h"
+#include "features.h"  // Script mode toggle (docklayout.inl)
 #include "fieldbox.h"
 #include "tilebox.h"
 #include "roadvisual.h"
@@ -49,6 +51,8 @@
 #include "log.h"
 #include "environment.h"
 #include "navmap.h"
+#include "hazardfield.h"
+#include "hazardpick.h"
 #include "roadfit.h"
 #include "cellbake.h"
 #include "vehicle_probe.h"
@@ -457,20 +461,21 @@ namespace routeedit
 				return false;
 			}
 			trafficpool::ReloadFiles();  // FVO Traffic re-reads its files now (it no longer polls the folder)
+			hazardfield::Invalidate();   // hazard boxes: the core reads the saved boxes at its next frame
 			return true;
 		}
 		constexpr char kSignature[] = "written by the map route editor";
 
 		// ---- Editor state (only the star map movie's thread touches it) ----
 		// Route (2026-10-30, Traffic Manager stage 2): the whole route at once: drag moves it, its handle turns it, the wheel raises it.
-		enum class Mode { Select, Drop, Drag, Landing, Spawn, Connect, Route, Shape, Zone, AccessEntry, AccessExit, LanePlace, KitPlace };
+		enum class Mode { Select, Drop, Drag, Landing, Spawn, Connect, Route, Shape, Zone, AccessEntry, AccessExit, LanePlace, KitPlace, Hazard };
 		// Ctrl+click (2026-10-31): anything placed can join one selection. Found again by id, so it survives other things being added or removed; a point by its place in the open route.
-		enum : int { kPickPoint = 1, kPickLanding, kPickSpawn, kPickZone, kPickLink, kPickRoute };
+		enum : int { kPickPoint = 1, kPickLanding, kPickSpawn, kPickZone, kPickLink, kPickRoute, kPickHazard };  // kPickHazard: index in the shown route's hazard boxes, like a point
 		struct Pick { int kind = 0; std::string id; int index = -1; };
 		struct MassSnap { routefiles::File file; bool draftChanged = false; std::size_t depth = 0; };
 		const char* ModeName(Mode m)
 		{
-			switch (m) { case Mode::Drop: return "Add"; case Mode::Drag: return "Move"; case Mode::Landing: return "Land"; case Mode::Spawn: return "Spawn spot"; case Mode::Connect: return "Link"; case Mode::Route: return "Route"; case Mode::Shape: return "Shape"; case Mode::Zone: return "Zone"; default: return "Select"; }
+			switch (m) { case Mode::Drop: return "Add"; case Mode::Drag: return "Move"; case Mode::Landing: return "Land"; case Mode::Spawn: return "Spawn spot"; case Mode::Connect: return "Link"; case Mode::Route: return "Route"; case Mode::Shape: return "Shape"; case Mode::Zone: return "Zone"; case Mode::Hazard: return "Hazard"; default: return "Select"; }
 		}
 		// What the map shows (the View menu, stage 2). Session only.
 		struct View { bool others = true, flow = true, stems = true, numbers = true, names = true, spots = true, volumes=true; };
@@ -494,8 +499,8 @@ namespace routeedit
 			std::string ruleGroup;
 			int namingGroup = 0;                    // the name being typed is for: 0 a route, 1 a new group, 2 the group ruleGroup
 			std::vector<Pick> picks;                // Ctrl+click: read through PicksNow. The fields here stay the one the panel shows.
-			std::array<int, 7> pickPrimary{};       // those fields when the selection last changed: anything else selecting something ends it
-			int picksCount = 0;                     // points in the open route then
+			std::array<int, 8> pickPrimary{};       // those fields when the selection last changed: anything else selecting something ends it
+			int picksCount = 0, picksHazards = 0;   // points / hazards in the open route then
 			std::vector<MassSnap> massUndo, massRedo;
 			int groupDrag = 0;                      // 1 a point, 2 a place, 3 the Route tool
 			double groupTurn = 0;                   // the turn under way, degrees clockwise: landing areas and spawn spots turn with it
@@ -536,14 +541,17 @@ namespace routeedit
             int inspectIndex=0,journeyIndex=0,restrictionScope=0,populationIndex=0;double accessHeight=0;
             std::vector<LanePick> lanePicks;double laneMoveSide=0,laneMoveHeight=0;drive::Shape previewShape;bool envelopePreview=false;int previewDestination=0;double signalPreviewSeconds=0;bool showLivePaths=false;std::vector<trafficdata::Vec> itineraryPreview;std::string itineraryExplanation;
 			int zone = -1;                // selected keep-out or slow zone (file.zones)
+			// Hazards tool (routehazard.h): the selected box of the shown route, the yaw a new one will get, a drag in progress, the selected suggestion, and the pick-an-object-to-copy switch.
+			// 2026-11-22: a Hazard is a first-class item (Select, Move, PgUp/PgDn, Del, Undo work on it like on a point); the Hazard tool only PLACES (two clicks: hazardLine = the first).
+			int hazard = -1, suggest = -1; double hazardYaw = 0, hazardAcross = hazardpick::kDefaultAcross, hazardTall = hazardpick::kDefaultHeight; bool hazardCopy = false; hazardpick::Placing hazardLine; routemap::Vec3 placeGrab{};
 			// The Shape tool: which shape, and its centre once the first click has placed it.
 			routeeditor::Shape shape = routeeditor::Shape::Circle;
 			bool shapeAt = false;
 			routemap::Vec3 shapeCentre{};
 			// Moving a landing area, spawn spot or zone in 3D (2026-10-30, the user: 3D for everything that can be placed): 1 landing, 2 spawn, 3 zone; Alt moves it up and down.
-			int placeKind = 0, placeIndex = -1;
+			int placeKind = 0, placeIndex = -1;  // 4: a Hazard (2026-11-22, the Move tool drags it like a place; the draft holds it)
 			routemap::Vec3 placeAt{}, placeFrom{};
-			bool placeAlt = false, placeMoved = false;
+			bool placeAlt = false, placeMoved = false, placeStepped = false;
 			double placeAltY = 0, placeAltZ = 0, placePpm = 1;
 			// The Alt key hub: a burst of moves (one undo step), checked when the keys are let go.
 			bool hubOn = false;
@@ -597,6 +605,9 @@ namespace routeedit
 		// Defined with the drawing below.
 		bool Local(const routemap::Camera& c, routemap::Vec3 p, double& x, double& y);
 		bool CursorLocal(const routemap::Camera& c, double& x, double& y);
+		bool HazardZ(double dz);        // hazardedit.inl
+		bool HazardDelete();            // hazardedit.inl
+		bool HazardMove(double dx, double dy, double dz);  // hazardedit.inl: nudge the selected Hazard (MoveXY, the Alt hub)
 		double SegmentDistance(double px, double py, double ax, double ay, double bx, double by);
 		double PanelX();
 		// Junction positions on a route follow its points (2026-10-29: junctions may sit at any point): an inserted point at
@@ -625,7 +636,7 @@ namespace routeedit
 		trafficdata::Route ToTd(const routefiles::Route& r, const std::string& world)
 		{
 			trafficdata::Route t;
-            t.restrictions=r.restrictions;t.journey=r.journey;t.lanePlan=r.lanePlan;t.spacePlan=r.spacePlan;t.road=r.road;t.end=r.end;t.travel=r.travel;t.sections=r.sections;t.corridor=r.corridor;
+            t.restrictions=r.restrictions;t.journey=r.journey;t.lanePlan=r.lanePlan;t.spacePlan=r.spacePlan;t.road=r.road;t.end=r.end;t.hazards=r.hazards;t.travel=r.travel;t.sections=r.sections;t.corridor=r.corridor;
 			t.name = r.id; t.label = r.label; t.world = r.world.empty() ? world : r.world; t.ring = r.ring; t.shape = r.shape;
 			t.tilt = r.tilt; t.tiltToward = r.tiltToward; t.points = r.points; t.rounding=r.rounding; t.closed = r.closed; t.removed = r.removed;
 			t.lanes = r.lanes; t.speed = r.speed; t.width = r.width; t.schedule = r.schedule; t.test = r.test; t.color = r.color; t.exclude = r.exclude; t.role = r.role; t.group = r.group;
@@ -635,7 +646,7 @@ namespace routeedit
 		routefiles::Route FromTd(const trafficdata::Route& t)
 		{
 			routefiles::Route r;
-            r.id = t.name; r.label = t.label; r.points = t.points; r.rounding=t.rounding;r.restrictions=t.restrictions;r.journey=t.journey;r.spacePlan=t.spacePlan;r.road=t.road;r.end=t.end;r.lanePlan=t.lanePlan.inherited?laneplan::Plan{}:t.lanePlan;r.lanePlan.vehicles=t.lanePlan.vehicles;r.lanePlan.transforms=t.lanePlan.transforms;r.travel=t.travel;r.sections=t.sections;r.corridor=t.corridor; r.closed = t.closed; r.lanes = t.lanes; r.speed = t.speed;
+            r.id = t.name; r.label = t.label; r.points = t.points; r.rounding=t.rounding;r.restrictions=t.restrictions;r.journey=t.journey;r.spacePlan=t.spacePlan;r.road=t.road;r.end=t.end;r.hazards=t.hazards;r.lanePlan=t.lanePlan.inherited?laneplan::Plan{}:t.lanePlan;r.lanePlan.vehicles=t.lanePlan.vehicles;r.lanePlan.transforms=t.lanePlan.transforms;r.travel=t.travel;r.sections=t.sections;r.corridor=t.corridor; r.closed = t.closed; r.lanes = t.lanes; r.speed = t.speed;
 			r.width = t.width; r.schedule = t.schedule; r.test = t.test; r.color = t.color; r.exclude = t.exclude; r.role = t.role; r.group = t.group;
 			r.world = t.world == EditorKey() ? std::string() : t.world;
 			r.ring = t.ring; r.shape = t.shape; r.tilt = t.tilt; r.tiltToward = t.tiltToward; r.removed = t.removed;
@@ -702,6 +713,7 @@ namespace routeedit
 			for (auto& p : r.points) { p.x += sign * s.x; p.y += sign * s.y; p.z += sign * s.z; }
             for(auto& stop:r.journey.stops){stop.x+=sign*s.x;stop.y+=sign*s.y;stop.z+=sign*s.z;}
             routeend::Shift(r.end,sign*s.x,sign*s.y,sign*s.z);  // an arrive place moves with its anchored city
+            routehazard::Shift(r.hazards,sign*s.x,sign*s.y,sign*s.z);  // hazard boxes too
 			r.shape.cx += sign * s.x; r.shape.cy += sign * s.y; r.shape.z += sign * s.z;
 		}
 		// File coordinates -> game coordinates for every editor route whose world is placed here (now or later).
@@ -1388,7 +1400,7 @@ namespace routeedit
 		}
 		// ---- One selection for everything placed (2026-10-31, the user: Ctrl+click, "universal"). The route's point, spot, zone and junction fields stay the one the panel
 		// shows; this adds the others. Anything that selects something else ends it, without having to know about it: those fields no longer match pickPrimary. ----
-		std::array<int, 7> PrimaryNow() { return { g_ed.route, g_ed.other, g_ed.point, g_ed.spot, g_ed.spotKind, g_ed.zone, g_ed.link }; }
+		std::array<int, 8> PrimaryNow() { return { g_ed.route, g_ed.other, g_ed.point, g_ed.spot, g_ed.spotKind, g_ed.zone, g_ed.link, g_ed.hazard }; }
 		int LandingIndex(const std::string& id) { for (std::size_t i = 0; i < g_ed.file.landings.size(); ++i) if (g_ed.file.landings[i].id == id) return int(i); return -1; }
 		int SpawnIndex(const std::string& id) { for (std::size_t i = 0; i < g_ed.file.spawns.size(); ++i) if (g_ed.file.spawns[i].id == id) return int(i); return -1; }
 		int ZoneIndex(const std::string& id) { for (std::size_t i = 0; i < g_ed.file.zones.size(); ++i) if (g_ed.file.zones[i].name == id) return int(i); return -1; }
@@ -1402,9 +1414,12 @@ namespace routeedit
 			if (PrimaryNow() != g_ed.pickPrimary) { picks.clear(); return picks; }
 			const int n = g_ed.draft ? int(g_ed.draft->Value().points.size()) : 0;
 			const bool pointsOk = g_ed.draft && n == g_ed.picksCount;
+			const int nh = g_ed.draft ? int(g_ed.draft->Value().hazards.boxes.size()) : 0;
+			const bool hazardsOk = g_ed.draft && nh == g_ed.picksHazards;  // a box added or deleted since: the indices no longer mean the same boxes
 			picks.erase(std::remove_if(picks.begin(), picks.end(), [&](const Pick& p) {
 				switch (p.kind) {
 				case kPickPoint: return !pointsOk || !IsDraftRoute(p.id) || p.index < 0 || p.index >= n;
+				case kPickHazard: return !hazardsOk || !IsDraftRoute(p.id) || p.index < 0 || p.index >= nh;
 				case kPickLanding: return LandingIndex(p.id) < 0;
 				case kPickSpawn: return SpawnIndex(p.id) < 0;
 				case kPickZone: return ZoneIndex(p.id) < 0;
@@ -1423,12 +1438,12 @@ namespace routeedit
 		}
 		std::string PicksWords()
 		{
-			int count[7] = {};
+			int count[8] = {};
 			for (const auto& p : PicksNow()) ++count[p.kind];
-			static const char* const one[7] = { "", "point", "landing area", "spawn spot", "zone", "junction", "route" };
+			static const char* const one[8] = { "", "point", "landing area", "spawn spot", "zone", "junction", "route", "Hazard" };
 			std::string out = std::to_string(g_ed.picks.size()) + " selected:";
 			bool first = true;
-			for (int k = 1; k < 7; ++k) {
+			for (int k = 1; k < 8; ++k) {
 				if (!count[k]) continue;
 				out += (first ? " " : ", ") + std::to_string(count[k]) + " " + one[k] + (count[k] > 1 ? "s" : "");
 				first = false;
@@ -1441,11 +1456,12 @@ namespace routeedit
 			splinekit::Transform(r.spacePlan,{m.cx,m.cy,0},{m.dx,m.dy,m.dz},m.radians,m.factor);
     lanetransform::Parent(r.lanePlan.transforms,lanetransform::Multiply(lanetransform::Rotation(2,m.radians),{m.factor,0,0,0,m.factor,0,0,0,1}),{m.cx,m.cy,0},{m.dx,m.dy,m.dz},m.factor);
             for (auto& p : r.points) routeeditor::Apply(m, p.x, p.y, p.z);
+			for (auto& hb : r.hazards.boxes) { routeeditor::Apply(m, hb.x, hb.y, hb.z); hb.yaw = std::fmod(hb.yaw + g_ed.groupTurn + 360.0, 360.0); }  // the route's Hazards ride with it, turned as well
 			if (m.factor != 1) for (auto& q : r.rounding) if (q > 0) q = std::clamp(q * m.factor, 5.0, 200.0);
 		}
 		bool DraftTouched()
 		{
-			for (const auto& p : PicksNow()) if (p.kind == kPickPoint || (p.kind == kPickRoute && IsDraftRoute(p.id))) return true;
+			for (const auto& p : PicksNow()) if (p.kind == kPickPoint || p.kind == kPickHazard || (p.kind == kPickRoute && IsDraftRoute(p.id))) return true;
 			return false;
 		}
 		// `file` and `draft` are copies, or the real ones during a drag. A route selected whole carries its points, so they do not move twice.
@@ -1458,6 +1474,9 @@ namespace routeedit
 				switch (p.kind) {
 				case kPickPoint:
 					if (draft && !whole) { auto& q = draft->points[std::size_t(p.index)]; routeeditor::Apply(m, q.x, q.y, q.z); }
+					break;
+				case kPickHazard:  // a Hazard moves and turns with the group like a landing area: position about the middle, heading by the turn
+					if (draft && !whole && p.index < int(draft->hazards.boxes.size())) { auto& hb = draft->hazards.boxes[std::size_t(p.index)]; routeeditor::Apply(m, hb.x, hb.y, hb.z); hb.yaw = std::fmod(hb.yaw + g_ed.groupTurn + 360.0, 360.0); }
 					break;
 				case kPickLanding: case kPickSpawn: {
 					auto& list = p.kind == kPickLanding ? file.landings : file.spawns;
@@ -1494,6 +1513,7 @@ namespace routeedit
 			for (const auto& p : PicksNow()) {
 				switch (p.kind) {
 				case kPickPoint: { const auto& q = g_ed.draft->Value().points[std::size_t(p.index)]; add(q.x, q.y, q.z); break; }
+				case kPickHazard: { const auto& q = g_ed.draft->Value().hazards.boxes[std::size_t(p.index)]; add(q.x, q.y, q.z); break; }
 				case kPickLanding: { const auto& s = g_ed.file.landings[std::size_t(LandingIndex(p.id))]; add(s.at.x, s.at.y, s.at.z); break; }
 				case kPickSpawn: { const auto& s = g_ed.file.spawns[std::size_t(SpawnIndex(p.id))]; add(s.at.x, s.at.y, s.at.z); break; }
 				case kPickZone: { const auto& s = g_ed.file.zones[std::size_t(ZoneIndex(p.id))]; add(s.at.x, s.at.y, s.slow ? s.at.z : s.top); break; }
@@ -1641,8 +1661,13 @@ namespace routeedit
 			}
 			const std::string words = PicksWords();
 			PushSnap();
-			if (!points.empty() && !draftGoes) {
-				const auto next = routeeditor::WithoutPoints(g_ed.draft->Value(), points);
+			std::vector<int> hazards;  // the selected Hazards go in the same undo step as the selected points
+			for (const auto& p : picks) if (p.kind == kPickHazard) hazards.push_back(p.index);
+			std::sort(hazards.begin(), hazards.end());
+			if ((!points.empty() || !hazards.empty()) && !draftGoes) {
+				auto base = g_ed.draft->Value();
+				for (auto i = hazards.rbegin(); i != hazards.rend(); ++i) base.hazards.boxes.erase(base.hazards.boxes.begin() + *i);
+				const auto next = points.empty() ? base : routeeditor::WithoutPoints(base, points);
 				const std::string name = next.name;
 				std::size_t count = g_ed.draft->Value().points.size();
 				g_ed.draft->Edit(next);
@@ -1672,11 +1697,12 @@ namespace routeedit
 			}
 			if (draftGoes) { g_ed.draft.reset(); g_ed.draftIndex = -1; g_ed.massUndo.back().depth = 0; }
 			g_ed.picks.clear();
-			g_ed.route = g_ed.draft ? g_ed.route : -1; g_ed.other = -1; g_ed.point = -1; g_ed.spot = -1; g_ed.zone = -1; g_ed.link = -1;
+			g_ed.route = g_ed.draft ? g_ed.route : -1; g_ed.other = -1; g_ed.point = -1; g_ed.spot = -1; g_ed.zone = -1; g_ed.link = -1; g_ed.hazard = -1;
 			Status("Deleted " + words + ". Undo brings it back; Save keeps it.");
 		}
 		void ChangeZ(double dz)
 		{
+            if(HazardZ(dz))return;  // a selected Hazard (one; several go through Many() below), whatever the tool
             if(ContextLaneStep({0,0,dz}))return;
             if(g_ed.sheet==19&&g_ed.draft&&g_ed.draft->Value().spacePlan.enabled){auto r=g_ed.draft->Value();auto& p=r.spacePlan;if(p.handles.size()!=r.points.size()||r.points.empty())return;const auto i=std::min(std::size_t(std::max(0,g_ed.point)),r.points.size()-1);auto lane=std::find_if(p.lanes.begin(),p.lanes.end(),[&](const auto& l){return l.lane==g_ed.laneFocus;});auto& h=lane==p.lanes.end()?p.handles[i]:lane->anchors[i].handle;if(g_ed.kitTarget==0){if(lane==p.lanes.end())r.points[i].z+=dz;else lane->anchors[i].point.z+=dz;}else {auto v=g_ed.kitTarget==1?h.incoming:h.outgoing;v.z+=dz;splinekit::SetHandle(h,g_ed.kitTarget==1,v);}g_ed.draft->Edit(r);Status("Toolkit target height changed; the map placement plane follows this Z.");return;}
 
@@ -1721,6 +1747,7 @@ namespace routeedit
 			const double dx = side * fy + ahead * fx, dy = -side * fx + ahead * fy;
             if(ContextLaneStep({dx,dy,0}))return;
 			if (Many()) { routeeditor::GroupMove m; m.dx = dx; m.dy = dy; GroupStep(m, "Move"); return; }
+			if (HazardMove(dx, dy, 0)) return;  // a selected Hazard: the same left / right / forward / back buttons and I J K L
 			char b[128];
 			if (g_ed.zone >= 0 && g_ed.zone < int(g_ed.file.zones.size())) {
 				auto& z = g_ed.file.zones[std::size_t(g_ed.zone)];
@@ -1923,6 +1950,7 @@ namespace routeedit
 		void DeleteSelected()
 		{
 			if (Many()) { GroupDelete(); return; }
+			if (HazardDelete()) return;  // a selected Hazard (or test suggestion): removed through the draft, Ctrl+Z brings it back
 			if (g_ed.zone >= 0 && g_ed.zone < int(g_ed.file.zones.size())) {
 				g_ed.file.zones.erase(g_ed.file.zones.begin() + g_ed.zone);
 				g_ed.zone = -1; Status("Zone removed (Save to keep it)"); return;
@@ -2273,7 +2301,7 @@ namespace routeedit
 			{ 'N', kNew, "N" }, { 'O', kPrevRoute, "O" }, { 'P', kNextRoute, "P" }, { 'X', kStartSwap, "X" },
 			{ 'I', kMoveForward, "I" }, { 'J', kMoveLeft, "J" }, { 'K', kMoveBack, "K" }, { 'L', kMoveRight, "L" },
 			{ 'V', kReverse, "V" }, { 'B', kLoop, "B" }, { 'H', kWays, "H" }, { 'T', kTest, "T" }, { 'Y', kViewMenu, "Y" },
-			{ VK_OEM_MINUS, kVehDown, "-" }, { VK_OEM_PLUS, kVehUp, "=" }, { VK_F2, kRename, "F2" }, { 'U', kColor, "U" },
+			{ VK_OEM_MINUS, kVehDown, "-" }, { VK_OEM_PLUS, kVehUp, "=" }, { VK_F2, kRename, "F2" }, { 'U', kColor, "U" }, { VK_OEM_5, kHazardTool, "\\" },
 		};
 		const char* KeyOf(int id)
 		{
@@ -2794,7 +2822,7 @@ namespace routeedit
 						item(kShapeBase + 5, "Parallel lanes", route && !ring && !draft, "beside the route");
 					}
 					else if (g_ed.menu == 1) {
-                        item(kConnect,"Link",true);item(kShapeTool,"Shape",true);item(kLanding,"Landing",true);item(kZoneTool,"Zone",true);
+                        item(kConnect,"Link",true);item(kShapeTool,"Shape",true);item(kLanding,"Landing",true);item(kZoneTool,"Zone",true);item(kHazardTool,"Hazards",route&&!ring,"\\");
 						item(kCopy, "Copy route", route && !draft, "beside it");
 						item(kMirror, "Mirror", route && !ring, "left - right");
 						item(kRoadSnap, "Snap road to deck", route && !ring, "measured surface");
@@ -4116,6 +4144,7 @@ namespace routeedit
 			}
 		}
 		void ShowReadme();
+		void ShowScriptModeMessage();  // Script mode (2026-11-22): docklayout.inl's toggle
 		void Press(int id, const routemap::Camera& c);
 		// Basic road editor (2026-11-05 strip, the user: "leaving only the basic tools for making a road ... basic basic"). Only these
 		// tools exist; every other button, key and menu is gone (the code is archived in notes/strip-20261105/). Route files keep every
@@ -4293,10 +4322,12 @@ namespace routeedit
 			return true;
 		}
 		#include "laneedit.inl"
+		#include "hazardedit.inl"
         #include "splineedit.inl"
 		void Press(int id, const routemap::Camera& c)
 		{
 			if (DockAction(id, c)) return;  // the F7 dock's own buttons (docklayout.inl); every other id as before
+			if (id >= kHazardTool && id <= kHazardNextSuggest && HazardPress(id, c)) return;  // the Hazards tool (hazardedit.inl)
             if (id >= kTrafficLevelPick && id < kTrafficLevelPick + 1 + routeschedule::LevelCount) {
                 if (EnsureDraft()) {
                     auto r = g_ed.draft->Value();
@@ -4901,9 +4932,10 @@ namespace routeedit
 		// The panel shows the one last touched.
 		void ShowPick(const Pick& p)
 		{
-			g_ed.point = -1; g_ed.spot = -1; g_ed.zone = -1; g_ed.link = -1;
+			g_ed.point = -1; g_ed.spot = -1; g_ed.zone = -1; g_ed.link = -1; g_ed.hazard = -1;
 			switch (p.kind) {
 			case kPickPoint: g_ed.point = p.index; break;
+			case kPickHazard: g_ed.hazard = p.index; g_ed.suggest = -1; break;
 			case kPickLanding: g_ed.spotKind = 1; g_ed.spot = LandingIndex(p.id); break;
 			case kPickSpawn: g_ed.spotKind = 2; g_ed.spot = SpawnIndex(p.id); break;
 			case kPickZone: g_ed.zone = ZoneIndex(p.id); break;
@@ -4929,6 +4961,12 @@ namespace routeedit
 					if (!EnsureDraft()) return true;
 					g_ed.point = keep;
 					hit.kind = kPickPoint; hit.id = g_ed.draft->Value().name; hit.index = p;
+				}
+			}
+			if (!hit.kind && shown && !shown->ring) {  // a Hazard of the shown route (its footprint), after the points so a corner under a box stays pickable
+				if (const int h = HazardAt(c, mx, my); h >= 0) {
+					if (!EnsureDraft()) return true;
+					hit.kind = kPickHazard; hit.id = g_ed.draft->Value().name; hit.index = h;
 				}
 			}
 			for (int kind = 1; kind <= 2 && !hit.kind; ++kind) {
@@ -4966,6 +5004,7 @@ namespace routeedit
 			if (picks.empty()) {
 				if (hit.kind == kPickPoint) { if (g_ed.point >= 0) picks.push_back({ kPickPoint, hit.id, g_ed.point }); }
 				else if (g_ed.point >= 0 && g_ed.draft) picks.push_back({ kPickPoint, g_ed.draft->Value().name, g_ed.point });
+				if (g_ed.hazard >= 0 && g_ed.draft && g_ed.hazard < int(g_ed.draft->Value().hazards.boxes.size())) picks.push_back({ kPickHazard, g_ed.draft->Value().name, g_ed.hazard });
 				if (AreaOn()) picks.push_back({ kPickLanding, g_ed.file.landings[std::size_t(g_ed.spot)].id });
 				else if (g_ed.spot >= 0 && g_ed.spot < int(g_ed.file.spawns.size()) && g_ed.spotKind == 2) picks.push_back({ kPickSpawn, g_ed.file.spawns[std::size_t(g_ed.spot)].id });
 				if (ZoneOn()) picks.push_back({ kPickZone, g_ed.file.zones[std::size_t(g_ed.zone)].name });
@@ -4982,6 +5021,7 @@ namespace routeedit
 			else ShowPick(picks.back());
 			g_ed.pickPrimary = PrimaryNow();
 			g_ed.picksCount = g_ed.draft ? int(g_ed.draft->Value().points.size()) : 0;
+			g_ed.picksHazards = g_ed.draft ? int(g_ed.draft->Value().hazards.boxes.size()) : 0;
 			Status(picks.size() >= 2 ? PicksWords() + ". Ctrl+click adds or removes one; a plain click ends it." : std::to_string(picks.size()) + " selected. Ctrl+click more to change them together.");
 			return true;
 		}
@@ -5026,7 +5066,8 @@ namespace routeedit
 			}
 			g_ed.link = -1;
 			g_ed.zone = -1;
-			// Select: a point of the shown route, else a spot, else a route.
+			g_ed.hazard = -1;
+			// Select: a point of the shown route, else a Hazard of it, else a spot, else a route.
 			if (const int p = PointAt(c, mx, my, 14); p >= 0) {
 				g_ed.point = p; g_ed.spot = -1;
 				trafficdata::Route scratch;
@@ -5034,6 +5075,7 @@ namespace routeedit
 				char b[96]; std::snprintf(b, sizeof b, "Point %d: (%.0f, %.0f), height %.0f m", p + 1, q.x, q.y, q.z);
 				Status(b); return;
 			}
+			if (HazardSelectAt(c, mx, my)) return;  // 2026-11-22: Select (Q) picks a Hazard by its footprint, like a point
 			for (int kind = 1; kind <= 2; ++kind) {
 				const auto& list = kind == 1 ? g_ed.file.landings : g_ed.file.spawns;
 				for (std::size_t i = 0; i < list.size(); ++i) {
@@ -5115,7 +5157,7 @@ namespace routeedit
 			if (g_ed.mode != Mode::Drag && g_ed.mode != Mode::Landing && g_ed.mode != Mode::Spawn && g_ed.mode != Mode::Zone) return false;
 			auto begin = [&](int kind, int index, const trafficdata::Vec& at) {
 				g_ed.placeKind = kind; g_ed.placeIndex = index; g_ed.placeAt = { at.x, at.y, at.z }; g_ed.placeFrom = g_ed.placeAt;
-				g_ed.placeAlt = false; g_ed.placeMoved = false;
+				g_ed.placeAlt = false; g_ed.placeMoved = false; g_ed.placeStepped = false; g_ed.placeGrab = {};
 				const std::string name = kind == 3 ? g_ed.file.zones[std::size_t(index)].name : (kind == 1 ? g_ed.file.landings : g_ed.file.spawns)[std::size_t(index)].id;
 				const bool group = Many() && IsPicked(kind == 3 ? kPickZone : kind == 1 ? kPickLanding : kPickSpawn, name);  // asked before the fields change
 				g_ed.point = -1; g_ed.link = -1;
@@ -5137,11 +5179,36 @@ namespace routeedit
 				double x, y;
 				if (!g_ed.unplacedSpots.count(z.name) && Local(c, { at.x, at.y, at.z }, x, y) && std::hypot(x - mx, y - my) < 14) return begin(3, int(i), at);
 			}
+			// A Hazard of the shown route (Move tool only), after the route's own points so a corner under a box can still be dragged. It moves like a place: in 3D, Alt = height,
+			// a picked group together with it, one undo step; the box stays where it was until the cursor has moved 2 m (a click that selects never nudges it).
+			if (g_ed.mode == Mode::Drag) {
+				trafficdata::Route scratch; const auto* shown = Shown(scratch);
+				if (shown && !shown->ring && PointAt(c, mx, my, 16) < 0) {
+					const int h = HazardAt(c, mx, my);
+					if (h >= 0 && EnsureDraft()) {
+						const auto b = g_ed.draft->Value().hazards.boxes[std::size_t(h)];
+						const bool group = Many() && IsPicked(kPickHazard, g_ed.draft->Value().name, h);  // asked before the fields change
+						g_ed.placeKind = 4; g_ed.placeIndex = h; g_ed.placeAt = { b.x, b.y, b.z }; g_ed.placeFrom = g_ed.placeAt;
+						g_ed.placeAlt = false; g_ed.placeMoved = false; g_ed.placeStepped = false; g_ed.placeGrab = {};
+						routemap::Vec3 under; if (routemap::MouseAt(c, b.z, under)) g_ed.placeGrab = { b.x - under.x, b.y - under.y, 0 };  // where on the box it was taken
+						g_ed.point = -1; g_ed.link = -1; g_ed.spot = -1; g_ed.zone = -1; g_ed.hazard = h; g_ed.suggest = -1; g_ed.lanePicks.clear();
+						if (group) { g_ed.pickPrimary = PrimaryNow(); GroupBegin(); g_ed.groupDrag = 2; g_ed.groupLast = g_ed.placeAt; }
+						else HazardSay(b, "selected");
+						return true;
+					}
+				}
+			}
 			return false;
 		}
 		// Puts the dragged thing at (x, y, z).
 		void SetPlace(const routemap::Vec3& p)
 		{
+			if (g_ed.placeKind == 4) {  // a Hazard: it lives in the draft, so the move is the draft's own undo step (new on the first frame, amended after)
+				if (g_ed.groupDrag == 2) return;
+				const int i = g_ed.placeIndex;
+				if (HazardEdit(!g_ed.placeStepped, [&](routehazard::Plan& pl) { if (i >= 0 && i < int(pl.boxes.size())) { auto& b = pl.boxes[std::size_t(i)]; b.x = p.x; b.y = p.y; b.z = p.z; } })) g_ed.placeStepped = true;
+				return;
+			}
 			if (g_ed.placeKind == 3) {
 				if (g_ed.placeIndex >= int(g_ed.file.zones.size())) return;
 				auto& z = g_ed.file.zones[std::size_t(g_ed.placeIndex)];
@@ -5161,6 +5228,11 @@ namespace routeedit
 			if (Many()) {
 				if (!g_ed.hubOn) { g_ed.hubOn = true; g_ed.hubKind = 4; GroupBegin(); }
 				routeeditor::GroupMove m; m.dx = dx; m.dy = dy; m.dz = dz; GroupLive(m);
+				return;
+			}
+			if (HazardOn()) {  // Alt + WASD / Q E on a selected Hazard: one burst, one undo step
+				if (!g_ed.hubOn) { g_ed.hubOn = true; g_ed.hubKind = 5; if (EnsureDraft()) g_ed.draft->Edit(g_ed.draft->Value()); }
+				HazardNudge(dx, dy, dz);
 				return;
 			}
 			if (ZoneOn()) {
@@ -5197,6 +5269,7 @@ namespace routeedit
 			if (!g_ed.hubOn) return;
 			g_ed.hubOn = false;
 			if (g_ed.hubKind == 4) { if (GroupEnd("Move")) Status(PicksWords() + ": moved (Save keeps it)"); return; }
+			if (g_ed.hubKind == 5) { if (HazardOn()) HazardSay(HazardsNow().boxes[std::size_t(g_ed.hazard)], "moved"); return; }
 			char b[96];
 			if (g_ed.hubKind == 3) {
 				if (ZoneOn()) { const auto& z = g_ed.file.zones[std::size_t(g_ed.zone)]; std::snprintf(b, sizeof b, "Zone at (%.0f, %.0f), %s (Save keeps it)", z.at.x, z.at.y, ZoneWords(z).c_str()); Status(b); }
@@ -5804,42 +5877,88 @@ namespace routeedit
 			if (g_ui.built && IsObject(g_ui.layer)) SetMember(g_ui.layer, "visible", Bool(false));
 		}
 
-		// The Traffic Manager's first-time message (2026-10-30, the user): the game's own message box, as for the first use of the console, the first time the local map is open in a
-		// playthrough. The game's call, as Debug.MessageBox (FUN_1420035D0) makes it: FUN_141ED62B0(*0x1461DE720, &{callback, title, body, third, type 5}, 0); strings set by FUN_1402D31D0.
+		// The Traffic Manager's first-time message and its Readme (2026-10-30, the user; rebuilt 2026-11-21). They were the game's own message box, which in
+		// photo mode split the mouse into two pointers and ignored E: inputgate marks every key and button as blocked for the game while the editor is open, and
+		// the box is a game menu with its own arrow. They are now the editor's own modal panel (editormessage.h): drawn in the dock's overlay, so there is one
+		// pointer, and read through the editor's own key reads. While it is open the rest of the editor gets no input (it is folded into the editor's
+		// resumePending / navigating gates in WorkBody) and it is gone, with the input handed back, the moment it closes, the world changes or the editor closes.
 		// The flag is global FVO_TrafficManagerSeen in FVO_NPCPilots.esm: the game writes globals into the save, so later saves inherit it and a new game starts without it. Written as
-		// GlobalVariable.SetValue does (14204FD20: the float at +0x48). Written first: if the call ever failed, it must not fail on every open.
-		bool ShowGameMessage(const char* title, const char* body)
+		// GlobalVariable.SetValue does (14204FD20: the float at +0x48). Written first, when the message is shown (unchanged since 2026-10-30).
+		static_assert(editormessage::kLetterPx == f7layers::kLetterPx);
+		constexpr int kMsgOk = 22190, kMsgPrev = 22191, kMsgNext = 22192;
+		editormessage::Panel g_msg;
+		editormessage::FirstTimer g_msgFirst;
+		editormessage::Geometry MessageGeometry()
 		{
-			struct Text { void* data; std::uint32_t a; std::uint32_t b; };
-			struct Box { void* callback; Text title, body, third; std::uint32_t type; std::uint8_t spare[0x44]; };
-			static_assert(offsetof(Box, title) == 8 && offsetof(Box, body) == 0x18 && offsetof(Box, third) == 0x28 && offsetof(Box, type) == 0x38);
-			__try {
-				Box box{};
-				box.title.b = box.body.b = box.third.b = 1;
-				box.type = 5;
-				const auto set = reinterpret_cast<void (*)(Text*, const char*, int)>(game::Base() + 0x002D31D0);
-				set(&box.title, title, 0); set(&box.body, body, 0); set(&box.third, nullptr, 0);
-				reinterpret_cast<void (*)(std::uintptr_t, Box*, char)>(game::Base() + 0x01ED62B0)(*reinterpret_cast<std::uintptr_t*>(game::Base() + 0x061DE720), &box, 0);
-				return true;
-			}
-			__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+			return editormessage::Layout(g_ui.width, g_ui.height, g_msg.PageCount() > 1 ? 0 : int(g_msg.Lines().size()));
+		}
+		void ShowMessage(const char* why, const char* title, const char* body)
+		{
+			const auto g = editormessage::Layout(g_ui.width, g_ui.height, 0);
+			g_msg.Show(title, body, g.perLine, g.perPage);
+			logger::Write("OBS routeedit.message event=open why=%s pages=%d letters_per_line=%d lines_per_page=%d", why, g_msg.PageCount(), g.perLine, g.perPage);
 		}
 		void ShowReadme()
 		{
 			g_ed.menu = 0;
-			if (!ShowGameMessage("Traffic Manager - Readme",
-				"Press F8 to open the Traffic Manager (it opens photo mode for you); press F8 again to close it and leave photo mode. Hold right mouse (controller: left stick click) to move the camera. Select a route in the view or in the route list.\n\n"
-				"Use New route to make a route, then the point and shape tools to draw its path. Select an existing route to edit it. Set its height, speed, lanes and vehicle count; use Time rules for its schedule.\n\n"
-				"Save (Ctrl+S) applies route edits; Cancel discards unsaved edits. Red structure warnings do not block routes. Use Test route to check clearance.\n\n"
-				"City controls local traffic and density. Prepare traffic applies the current setup. Finish or cancel your route edits and leave combat first.\n\n"
-				"Save your game to keep its routes, groups and traffic settings. Loading an older game save restores its setup. Other playthroughs start with installed defaults.\n\n"
-				"Autopilot near a traffic zone follows its path. Reopen this Readme whenever you need it."))
-				Status("Could not open the Readme. Close and reopen photo mode, then try again.");
+			ShowMessage("readme", editormessage::kReadmeTitle, editormessage::kReadmeBody);
 		}
-		int g_mapOpenFrames = 0;
+		void ShowScriptModeMessage()
+		{
+			g_ed.menu = 0;
+			ShowMessage("script_mode_on", editormessage::kScriptTitle, editormessage::kScriptBody);
+		}
+		// One frame of the panel's input, before the editor reads anything else: fresh key presses from the keyboard and pad the editor already owns, and a fresh
+		// left click in the OK or page buttons at the editor's pointer (lx, ly). Edges are tracked here every frame, so a key or button held when it opens is not a press.
+		void MessageInput(bool appFocused, bool navigating, double lx, double ly, std::uint32_t rawPad)
+		{
+			static bool was[8]{}, lmbWas = false;
+			static std::uint32_t padWas = 0;
+			static int lastPerLine = 0, lastPerPage = 0;
+			constexpr int keys[8] = { 'E', VK_RETURN, VK_SPACE, VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_PRIOR, VK_NEXT };
+			bool fresh[8]{};
+			for (int i = 0; i < 8; ++i) { const bool held = appFocused && (GetAsyncKeyState(keys[i]) & 0x8000) != 0; fresh[i] = held && !was[i]; was[i] = held; }
+			const bool lmb = appFocused && !navigating && (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+			const bool lmbFresh = lmb && !lmbWas; lmbWas = lmb;
+			const std::uint32_t pad = appFocused ? rawPad : 0u, padFresh = pad & ~padWas; padWas = pad;
+			if (!g_msg.IsOpen()) return;
+			const auto size = editormessage::Layout(g_ui.width, g_ui.height, 0);
+			if (size.perLine != lastPerLine || size.perPage != lastPerPage) { lastPerLine = size.perLine; lastPerPage = size.perPage; g_msg.Rewrap(size.perLine, size.perPage); }
+			const auto g = MessageGeometry();
+			editormessage::Input in;
+			in.e = fresh[0]; in.enter = fresh[1]; in.space = fresh[2]; in.escape = fresh[3];
+			in.padAccept = (padFresh & bindlogic::kA) != 0; in.padBack = (padFresh & bindlogic::kB) != 0;
+			in.prevPage = fresh[4] || fresh[6] || (padFresh & bindlogic::kDLeft) != 0;
+			in.nextPage = fresh[5] || fresh[7] || (padFresh & bindlogic::kDRight) != 0;
+			if (lmbFresh) {
+				if (g.ok.Contains(lx, ly)) in.okClicked = true;
+				else if (g_msg.PageCount() > 1 && g.prev.Contains(lx, ly)) in.prevPage = true;
+				else if (g_msg.PageCount() > 1 && g.next.Contains(lx, ly)) in.nextPage = true;
+			}
+			const auto result = g_msg.Update(in);
+			if (result.closed) logger::Write("OBS routeedit.message event=close by=%s", in.okClicked ? "click_ok" : in.padAccept ? "pad_accept" : in.padBack ? "pad_back" : in.e ? "key_e" : in.enter ? "key_enter" : in.space ? "key_space" : "key_escape");
+		}
+		// The panel's picture, after the dock was laid out: the editor's dim cover, one centred glass box, wrapped text, the OK and page buttons. Everything the dock
+		// or the old panels laid out this frame is dropped, so there is nothing under the pointer to click.
+		void MessageLayout()
+		{
+			g_ui.buttons.clear(); g_ui.polygons.clear(); g_ui.boxes.clear(); g_panelText.clear(); g_ed.menu = 0;
+			const auto g = MessageGeometry();
+			g_ui.boxes.push_back({ -20, -20, g_ui.width + 40, g_ui.height + 40, 0x05080C, .55, 0, 0 });
+			g_ui.boxes.push_back({ g.panel.x, g.panel.y, g.panel.w, g.panel.h, 0x141C29, .97, 0x3A4658, 1 });
+			DockText(g_msg.Title(), g.titleX, g.titleY, g.textW, kTeal);
+			double y = g.textY;
+			for (const auto& line : g_msg.Lines()) { if (!line.empty()) DockText(line, g.textX, y, g.textW, kText); y += editormessage::kLineH; }
+			if (g_msg.PageCount() > 1) {
+				DockButton(kMsgPrev, g.prev.x, g.prev.y, g.prev.w, g.prev.h, "Previous", false, g_msg.Page() > 0, 0);
+				DockButton(kMsgNext, g.next.x, g.next.y, g.next.w, g.next.h, "Next", false, g_msg.Page() + 1 < g_msg.PageCount(), 0);
+				DockText("Page " + std::to_string(g_msg.Page() + 1) + " / " + std::to_string(g_msg.PageCount()), g.next.x + g.next.w + 14, g.ok.y + 6, 120, kDim);
+			}
+			DockButton(kMsgOk, g.ok.x, g.ok.y, g.ok.w, g.ok.h, "OK [E]", true, true, 0);
+		}
 		void FirstMapMessage(bool focused)
 		{
-			if (!focused || ++g_mapOpenFrames != 30) return;  // once per opening, half a second in: the map has finished opening
+			if (!g_msgFirst.Tick(g_ed.on, focused)) return;  // once per editor opening, half a second in: the editor has finished opening
 			const uptr seen = runtimeforms::Lookup(runtimeforms::Resolve(pilotlayout::kMapMessageSeen));
 			if (!seen || *reinterpret_cast<const std::uint8_t*>(seen + 0x2E) != 10) {
 				static bool told = false;
@@ -5849,11 +5968,8 @@ namespace routeedit
 			float& value = *reinterpret_cast<float*>(seen + 0x48);
 			if (value != 0.f) return;
 			value = 1.f;
-			const bool shown = ShowGameMessage("Traffic Manager",
-				"You can manage traffic routes for this planet from photo mode. The routes you create decide where vehicles fly, and traffic is generated along them.\n\n"
-				"Press F8 to open the Traffic Manager in photo mode, then create or edit a route. F8 again takes you back to the game.\n\n"
-				"Autopilot near a traffic zone will follow the same path.");
-			logger::Write("Route editor: first-time Traffic Manager message %s", shown ? "shown" : "could not be shown");
+			ShowMessage("first_time", editormessage::kFirstTitle, editormessage::kFirstBody);
+			logger::Write("Route editor: first-time Traffic Manager message shown");
 		}
 
         void MapOverview(uptr movie,const routemap::Camera& c){
@@ -5918,12 +6034,12 @@ namespace routeedit
             }
             const bool appFocused=Focused();
             const auto rawPad=appFocused?bindings::PadState():0;
-            const bool navigating=g_photoHost&&g_ed.on&&appFocused&&!g_ed.loading&&!TextEntryActive()&&!g_ed.dragging&&!g_ed.routeDrag.kind&&
+            const bool navigating=g_photoHost&&g_ed.on&&appFocused&&!g_ed.loading&&!g_msg.IsOpen()&&!TextEntryActive()&&!g_ed.dragging&&!g_ed.routeDrag.kind&&
                 (((GetAsyncKeyState(VK_RBUTTON)&0x8000)!=0)||(rawPad&bindlogic::kLS));
             // Do not turn a camera button held across release of the gesture into
             // a route click/shortcut. Native releases still pass through inputgate.
             static bool resumePending=false;
-            if(navigating)resumePending=true;
+            if(navigating||g_msg.IsOpen())resumePending=true;  // the message panel owns input; what is held when it closes is not a click or a key for the editor
             else if(resumePending){
                 bool held=rawPad!=0;
                 for(int key=1;key<256&&!held;++key)
@@ -5942,13 +6058,13 @@ namespace routeedit
                 const bool held=open&&boostSeen&&boostNow-boostSeen<200;
                 PhotoSpeed(!open?1.0f:g_ed.on?(held?kEditorBoost:kEditorSpeed):(held?kPhotoBoost:1.0f));
             }
-			if (!open) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);PhotoRange(false);} Hide(); g_ed.dragging = false; g_mapOpenFrames = 0; g_ed.orbiting = false; g_orbitOn = false; return; }
+			if (!open) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);PhotoRange(false);} Hide(); g_ed.dragging = false; g_msg.Reset(); g_ed.orbiting = false; g_orbitOn = false; return; }
 			// The Traffic Manager comes with the Traffic Addon (2026-10-30, the user): without it no traffic would fly these routes, so no F7, no hint and no first-time
 			// message. The message's flag stays unset, so someone who adds the addon later still gets it.
-			if (!trafficpool::AddonAttached()) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);} Hide(); g_ed.dragging = false; return; }
+			if (!trafficpool::AddonAttached()) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);} Hide(); g_ed.dragging = false; g_msg.Reset(); return; }
 			const auto profile = TrafficDir();
-			if (profile.empty()) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);} Hide(); return; }
-			if (g_ed.loaded && g_ed.profileDir != profile) { g_ed = Editor{}; g_mapOpenFrames = 0; }
+			if (profile.empty()) { if(g_photoHost){inputgate::PhotoEditor(false,false);PhotoChrome(menu,false);} Hide(); g_msg.Reset(); return; }
+			if (g_ed.loaded && g_ed.profileDir != profile) { g_ed = Editor{}; g_msg.Reset(); }
 			if(g_photoHost)FirstMapMessage(focused);
 			// Our values belong to one movie; they are forgotten only after it is destroyed (MovieGone), never overwritten
 			// while still linked into a live movie.
@@ -5997,7 +6113,7 @@ namespace routeedit
             // Always read F8 so the press that entered photo mode is used up here, not seen as a second press.
             const bool f7=g_keys.Pressed(VK_F8, appFocused);  // the Traffic Manager key (F8)
             const bool rs=((rawPad & ~padWasForToggle) & bindlogic::kRS)!=0;  // right stick click: open and close on a pad
-            auto closeEditor=[&]{ g_ed.on = false; g_ed.dragging = false; g_ed.naming = false;if(g_contextPlace)g_ed.file=g_contextPlaceBase;g_contextPlace=false;g_contextNumber=-1;g_contextDrag=0;g_contextPreview.clear();g_contextDragBase.clear(); logger::Write("Route editor: closed%s", g_ed.draft ? " (the open route is kept until you save or cancel)" : ""); };
+            auto closeEditor=[&]{ g_ed.on = false; g_msg.Reset(); g_ed.dragging = false; g_ed.naming = false;if(g_contextPlace)g_ed.file=g_contextPlaceBase;g_contextPlace=false;g_contextNumber=-1;g_contextDrag=0;g_contextPreview.clear();g_contextDragBase.clear(); logger::Write("Route editor: closed%s", g_ed.draft ? " (the open route is kept until you save or cancel)" : ""); };
             if(newPhotoVisit){
                 const bool wanted=g_editorOnPhotoOpen.exchange(false);
                 if(g_ed.loading){}
@@ -6019,7 +6135,7 @@ namespace routeedit
 			std::optional<Pen> flowPen; if (g_ui.flowOk) { flowPen.emplace(g_ui.flow); flowPen->Clear(); } Pen& flow = flowPen ? *flowPen : lines;  // DRAW-1
 			SetMember(g_ui.volumes,"visible",Bool(g_ed.on));
             if (!g_ed.on) {
-                g_ui.volumeSignature.clear();
+                g_ui.volumeSignature.clear();g_msg.Reset();
 				g_ed.orbiting = false; g_orbitOn = false;
 				Text(movie, "F8  Traffic routes", g_ui.width - 232, 24, 0xBFD9E8, 220, true);
 				FlushText();
@@ -6055,7 +6171,27 @@ namespace routeedit
 					const bool ran = secretunpause::Active();
 					secretunpause::End("traffic armed");
 					if (st.total == 0) {
-						Status("No traffic spots are known in this world yet: add landing spots, close the map once, then press Prepare traffic again");
+						// NM-1 (2026-11-22): name the real reason. Positions come only from routes with Road on or Travel Drive
+						// (traffic_main PreparePool, the user's 2026-11-06 rule); landing spots are later departures only.
+						int routes = 0, ground = 0;
+						auto count = [&](const auto& r) {  // routefiles::Route (editor) and trafficdata::Route (other files)
+							++routes;
+							if (r.road.enabled || r.travel == routepolicy::Travel::Drive) ++ground;
+						};
+						for (const auto& r : g_ed.file.routes) count(r);
+						for (const auto& o : g_ed.others) count(o.route);
+						const char* why = !routes ? "no_routes" : !ground ? "hover_only" : "no_demand_now";
+						logger::Write("OBS routeedit.prepare event=no_positions reason=%s routes=%d ground_routes=%d", why, routes, ground);
+						if (!routes)
+							Status("No traffic routes in this world yet: draw a route with Travel set to Drive (or Road on), Save, then press Prepare traffic");
+						else if (!ground) {
+							char m[260];
+							std::snprintf(m, sizeof m, "Cars only start on Drive or Road routes, and this world's %d route%s Hover only. "
+								"Select a route, set Travel to Drive or turn Road on, Save, then press Prepare traffic again",
+								routes, routes == 1 ? " is" : "s are");
+							Status(m);
+						} else
+							Status("No route here asks for cars right now: check the routes' schedule and density, then press Prepare traffic again");
 						goto loaded;
 					}
 					char b[260];
@@ -6110,6 +6246,7 @@ namespace routeedit
 					c.mouseX = (lx - g_ui.bx) / g_ui.ax * c.width; c.mouseY = (ly - g_ui.by) / g_ui.ay * c.height;
 				}
 			}
+			MessageInput(appFocused, navigating, lx, ly, rawPad);  // the message panel: its keys and OK click (the rest of this frame is already off: focused is false while it is open)
 			const bool ctrl = focused && (GetAsyncKeyState(VK_CONTROL) & 0x8000);
 			const bool shift = focused && (GetAsyncKeyState(VK_SHIFT) & 0x8000);
 			const bool mouseDown = focused && ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (pad & bindlogic::kA));
@@ -6156,12 +6293,13 @@ namespace routeedit
 					}
 					else if (g_ed.mode == Mode::Drag && ZoneOn()) { const auto& z = g_ed.file.zones[std::size_t(g_ed.zone)]; placeHeight = placeHeight || (Local(c, { z.at.x, z.at.y, z.slow ? z.at.z : z.top }, sx, sy) && std::hypot(sx - lx, sy - ly) < 70); }
 					else if (AreaOn() && g_ed.mode == Mode::Landing) { const auto& a = g_ed.file.landings[std::size_t(g_ed.spot)].at; placeWheel = Local(c, { a.x, a.y, a.z }, sx, sy) && std::hypot(sx - lx, sy - ly) < 90; }
+					else if (HazardWheelNear(c, lx, ly)) placeHeight = true;  // near the selected Hazard the wheel sets its height, as it does for a point (not its size: sizes are typed in the dock)
 					else if (ZoneOn() && g_ed.mode == Mode::Zone) { const auto& z = g_ed.file.zones[std::size_t(g_ed.zone)]; placeWheel = Local(c, { z.at.x, z.at.y, z.slow ? z.at.z : z.top }, sx, sy) && std::hypot(sx - lx, sy - ly) < 90; }
 				}
 				inputgate::WheelForEditor(focused && (wheelNear || routeWheel || placeWheel || placeHeight));
 				if (const int notches = inputgate::TakeWheel(); notches && (wheelNear || routeWheel || placeWheel || placeHeight)) {
 					const double dz = notches * (shift ? 25.0 : 5.0);
-					if (g_ed.placeKind) { g_ed.placeAt.z += dz; g_ed.placeMoved = true; SetPlace(g_ed.placeAt); }
+					if (g_ed.placeKind) { g_ed.placeAt.z += g_ed.placeKind == 4 ? dz * .2 : dz; g_ed.placeMoved = true; SetPlace(g_ed.placeAt); }
 					else if (placeHeight) ChangeZ(dz);
 					else if (placeWheel && AreaOn()) Press(notches > 0 ? kAreaTurnUp : kAreaTurnDown, c);
 					else if (placeWheel) Press(notches > 0 ? kZoneSizeUp : kZoneSizeDown, c);
@@ -6266,7 +6404,8 @@ namespace routeedit
 					if (id != 9016 && id != 9017 && id != kMoreMenu && id != kViewMenu && id != kShapeTool && !(id >= kViewBase && id < kViewBase + 6)) g_ed.menu = 0;  // Reset map angle closes it
 				}
                 else if(!OverUi(lx,ly)&&g_ed.mode==Mode::Drag&&!g_ed.lanePicks.empty()&&ContextStartDrag(kContextMove,c,lx,ly)) {}
-                else if(!OverUi(lx,ly)&&g_ed.mode==Mode::Select&&PointAt(c,lx,ly,12)<0&&PickLaneVolume(c,lx,ly,ctrl)) {}
+                else if(!OverUi(lx,ly)&&g_ed.mode==Mode::Select&&PointAt(c,lx,ly,12)<0&&HazardAt(c,lx,ly)<0&&PickLaneVolume(c,lx,ly,ctrl)) {}
+				else if (g_ed.mode == Mode::Hazard && !OverUi(lx, ly) && HazardClick(c, lx, ly)) {}  // the Hazard tool only PLACES: click 1 sets it down, click 2 sets length and direction (or copies an object's shape)
 				else if (ctrl && !altHeld && !OverUi(lx, ly) && PickClick(c, lx, ly)) {}
 				else if (!OverUi(lx, ly) && StartPlaceDrag(c, lx, ly)) {}
 				else if (g_ed.mode == Mode::Route && !OverUi(lx, ly) && Many()) {
@@ -6344,7 +6483,10 @@ namespace routeedit
 				else {
 					g_ed.placeAlt = false;
 					routemap::Vec3 at;
-					if (routemap::MouseAt(c, g_ed.placeAt.z, at) && (g_ed.placeMoved || std::hypot(at.x - g_ed.placeFrom.x, at.y - g_ed.placeFrom.y) > 2.0)) { g_ed.placeAt = at; g_ed.placeMoved = true; }
+					if (routemap::MouseAt(c, g_ed.placeAt.z, at)) {
+						const routemap::Vec3 target{ at.x + g_ed.placeGrab.x, at.y + g_ed.placeGrab.y, at.z };  // placeGrab: where on a Hazard it was taken (zero for places)
+						if (g_ed.placeMoved || std::hypot(target.x - g_ed.placeFrom.x, target.y - g_ed.placeFrom.y) > 2.0) { g_ed.placeAt = target; g_ed.placeMoved = true; }
+					}
 				}
 				if (g_ed.groupDrag == 2) GroupDragTo(g_ed.placeAt);
 				else if (g_ed.placeMoved) SetPlace(g_ed.placeAt);
@@ -6354,8 +6496,9 @@ namespace routeedit
 				}
 				else if (release || !mouseDown) {
 					const auto p = g_ed.placeAt;
-					const char* why = g_ed.placeMoved && g_ed.placeKind != 3 ? PointProblem(p.x, p.y, p.z) : nullptr;
+					const char* why = g_ed.placeMoved && g_ed.placeKind < 3 ? PointProblem(p.x, p.y, p.z) : nullptr;
 					if (why) { SetPlace(g_ed.placeFrom); Refused("Place move", p.x, p.y, p.z, why); }
+					else if (g_ed.placeKind == 4) { if (g_ed.placeMoved && HazardOn()) HazardSay(HazardsNow().boxes[std::size_t(g_ed.hazard)], "moved"); }  // already in the draft, one undo step
 					else if (g_ed.placeMoved) {
 						// A zone's foot stays on the ground under it.
 						if (double ground = 0; g_ed.placeKind == 3 && g_ed.placeIndex < int(g_ed.file.zones.size()) && !g_ed.file.zones[std::size_t(g_ed.placeIndex)].slow && DownRay(p.x, p.y, p.z + 1500.0, p.z - 1500.0, ground) == 1) g_ed.file.zones[std::size_t(g_ed.placeIndex)].at.z = ground;
@@ -6373,6 +6516,7 @@ namespace routeedit
 					if (Many()) TurnRoute(turnRight ? 15 : -15);
 					else if (AreaOn()) Press(turnRight ? kAreaTurnUp : kAreaTurnDown, c);
 					else if (ZoneOn()) Press(turnRight ? kZoneSizeUp : kZoneSizeDown, c);
+					else if (HazardOn()) HazardTurn(turnRight ? 15 : -15);  // a selected Hazard turns on its own, not the route
 					else if (g_ed.draft || g_ed.route >= 0 || g_ed.other >= 0) TurnRoute(turnRight ? 15 : -15);
 				}
 				else if (!turnLeft && !turnRight) g_ed.hubTurnAt = 0;
@@ -6381,7 +6525,7 @@ namespace routeedit
 				const bool grow = (GetAsyncKeyState('R') & 0x8000) != 0, shrink = (GetAsyncKeyState('F') & 0x8000) != 0;
 				if ((grow != shrink) && now - sizedAt >= 200) {
 					sizedAt = now;
-					if (Many() || (g_ed.spot < 0 && !ZoneOn() && (g_ed.draft || g_ed.route >= 0 || g_ed.other >= 0))) ScaleRoute(grow ? (ctrl ? 1.02 : 1.1) : (ctrl ? 1 / 1.02 : 1 / 1.1));
+					if (Many() || (g_ed.spot < 0 && !ZoneOn() && !HazardOn() && (g_ed.draft || g_ed.route >= 0 || g_ed.other >= 0))) ScaleRoute(grow ? (ctrl ? 1.02 : 1.1) : (ctrl ? 1 / 1.02 : 1 / 1.1));
 				}
 				else if (!grow && !shrink) sizedAt = 0;
 			}
@@ -6438,12 +6582,12 @@ namespace routeedit
 					else Press(k.id, c);
 				}
 			if (!TextEntryActive()&&!numericThisFrame) {
-			if (g_keys.Pressed(VK_INSERT, focused)) DropPoint(c);
+			if (g_keys.Pressed(VK_INSERT, focused)) { if (g_ed.mode == Mode::Hazard) { double lx = 0, ly = 0; if (CursorLocal(c, lx, ly)) HazardClick(c, lx, ly); } else DropPoint(c); }  // Insert: Add anywhere; in the Hazard tool it is a click at the cursor (set down / set length and direction)
 			if (g_f7NodeView && g_keys.Pressed(VK_RETURN, focused) && g_nodePicks.size() >= 2) MakeRouteFromPicks();  // Node view: Enter makes the picked route
 			if (g_f7NodeView && g_keys.Pressed(VK_ESCAPE, focused) && !g_nodePicks.empty()) { g_nodePicks.clear(); Status("Picks cleared."); }
 			if (g_keys.Pressed(VK_DELETE, focused) && !(g_f7NodeView && NodeViewDelete())) {
 				// Del removes the selected point, spot or junction; with only a route selected it deletes the route (asked first, as the button).
-				const bool part = g_ed.point >= 0 || g_ed.spot >= 0 || ZoneOn() || (g_ed.link >= 0 && g_ed.link < int(g_ed.file.links.size()));
+				const bool part = g_ed.point >= 0 || g_ed.spot >= 0 || ZoneOn() || HazardOn() || g_ed.suggest >= 0 || Many() || (g_ed.link >= 0 && g_ed.link < int(g_ed.file.links.size()));  // a Hazard or a test suggestion is a part too: Del never takes the whole route for it
 				if (!part && (g_ed.draft || g_ed.route >= 0 || g_ed.other >= 0)) DeleteRoute(); else DeleteSelected();
 			}
 			if (g_keys.Pressed(VK_PRIOR, focused) || (!ctrl && g_keys.Pressed(VK_OEM_6, focused))) ChangeZ(shift ? 25 : 5);
@@ -6757,6 +6901,7 @@ namespace routeedit
                     for(const auto& path:paths){if(now<path.at||now-path.at>3000)continue;lines.Style(2,path.kind==2?kClearanceRed:path.kind==1?0xFFD27C:0xF4F7FA,.75);bool down=false;for(int i=0;i<path.count;++i){double x=0,y=0;if(Local(c,{path.points[i].x,path.points[i].y,path.points[i].z},x,y)){if(down)lines.Line(x,y);else lines.Move(x,y);down=true;}else down=false;}}lines.NoLine();}
             }
             if(g_ed.view.volumes&&AreaOn())DrawParkingAccess(lines,c,g_ed.file.landings[std::size_t(g_ed.spot)]);
+            HazardDraw(lines,c);  // the shown route's Hazards, always (2026-11-22: not only in the tool); the selected one highlighted
 			// A faint copy of what the next click places, at the height it would get: Land, Spawn, Zone and a shape's centre.
 			{
 				const bool newLand = g_ed.mode == Mode::Landing && !AreaOn(), newSpawn = g_ed.mode == Mode::Spawn;
@@ -6846,6 +6991,7 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 			}
 			if (g_dock.on) { Layout(shown, timeKnown, minute); DockLayout(shown, c); }  // the F7 dock (2026-11-06) replaces the side panel and context layers
 			else { Layout(shown, timeKnown, minute);ContextLayout(shown,c);BasicFilter(); }
+			if (g_msg.IsOpen()) MessageLayout();  // the message panel replaces everything laid out above while it is open
 			constexpr unsigned kFrost = 0x3A424D;  // (the old frost tint; the panels are sheen glass now)
 			constexpr unsigned kGlassTint = 0x121E26, kGlassAmber = 0xF2C46B;  // look A: a clear dark tint; Save is amber glass
 			// Multi-colour on states (2026-11-20): the same colours the map uses for travel (Drive green, Hover blue, Both violet), Allow amber,
@@ -7028,6 +7174,7 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 				case Mode::Connect: hints = { { "Click a route", "Join the selected end" }, { "- / +", "Share" } }; break;
 				case Mode::Landing: hints = { { "Click", "Place" }, { "Drag", "Move" }, { "Alt+drag", "Up/down" }, { "Wheel", "Turn" } }; break;
 				case Mode::Zone: hints = { { "Click", "Place" }, { "Drag", "Move" }, { "Alt+drag", "Up/down" }, { "Wheel", "Size" } }; break;
+				case Mode::Hazard: hints = { { "Click", g_ed.hazardLine.active ? "Set length and direction" : "Set it down" }, { "Esc", "Cancel" }, { "Q / R", "Select / Move it" }, { "Sizes", "in the dock" } }; break;
 				case Mode::Spawn: hints = { { "Click", "Place" }, { "Drag", "Move" }, { "Alt+drag", "Up/down" } }; break;
 				case Mode::Shape: hints = { { "Click", g_ed.shapeAt ? "Set its size" : "Place its centre" }, { "R-drag", "Turn map" } }; break;
 				default: hints = { { "Click", "Select" }, { "Ctrl+click", "Add to selection" }, { "Del", "Delete" }, { "R-drag", "Turn map" } }; break;

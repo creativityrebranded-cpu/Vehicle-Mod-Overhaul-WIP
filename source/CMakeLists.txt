@@ -78,7 +78,7 @@ sp_options(sp_common)
 
 # Recast & Detour 1.6.0 (zlib licence, unmodified: ../third_party/recastnavigation-1.6.0/SOURCE.txt). The car navmesh bake (navbake.h,
 # 2026-11-05, the user: "Download Recast") builds car-sized navmesh from the game's own navmesh input triangles.
-set(FVO_RECAST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/recastnavigation-1.6.0" CACHE PATH "Recast Navigation 1.6.0 source (zlib licence)")
+set(FVO_RECAST_ROOT "C:/Users/serci/OneDrive/Desktop/seemless/fvo-main/third_party/recastnavigation-1.6.0")
 file(GLOB FVO_RECAST_SOURCES "${FVO_RECAST_ROOT}/Recast/Source/*.cpp" "${FVO_RECAST_ROOT}/Detour/Source/*.cpp")
 add_library(fvo_recast STATIC ${FVO_RECAST_SOURCES})
 target_include_directories(fvo_recast PUBLIC "${FVO_RECAST_ROOT}/Recast/Include" "${FVO_RECAST_ROOT}/Detour/Include")
@@ -98,7 +98,7 @@ add_library(FlyingVehicleOverhaul SHARED
     src/lifecycle.cpp
     src/native_movement_controller.cpp src/native_movement_engine.cpp src/native_movement_probe.cpp
     src/main_vehicle.cpp src/resources.cpp src/api_client.cpp src/vehicle_probe.cpp src/hoverui.cpp src/realvehicles.cpp src/ringroad.cpp src/routeprobes.cpp src/api_traffic.cpp src/crash.cpp
-    src/npcvehicles.cpp src/flightsave.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/navmap.cpp src/navfield.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/secretunpause.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp src/routeedit.cpp src/disableguard.cpp src/mapguard.cpp src/cellbake.cpp src/routesurvey.cpp src/navprobe.cpp src/navmesh.cpp
+    src/npcvehicles.cpp src/flightsave.cpp src/vehicleaim.cpp src/passenger.cpp src/pilotquest.cpp src/vehicleworld.cpp src/navmap.cpp src/navfield.cpp src/environment.cpp src/traffic.cpp src/context.cpp src/viewdist.cpp src/vehiclekeep.cpp src/loadedarea.cpp src/vcontract.cpp src/profiles.cpp src/modscene.cpp src/scantarget.cpp src/bindings.cpp src/inputgate.cpp src/controlspage.cpp src/vehiclediag.cpp src/secretunpause.cpp src/vehiclehits.cpp src/features.cpp src/navseed.cpp src/mappoints.cpp src/routeedit.cpp src/disableguard.cpp src/mapguard.cpp src/cellbake.cpp src/routesurvey.cpp src/hazardfield.cpp src/navprobe.cpp src/navmesh.cpp
     src/vehicleflight.cpp src/vehiclecamera.cpp src/shipmodel.cpp src/shipvehicle.cpp
     src/flightmodel.cpp src/flighttune.cpp src/camtune.cpp)
 sp_options(FlyingVehicleOverhaul)
@@ -368,6 +368,15 @@ target_compile_features(routeitems_test PRIVATE cxx_std_20)
 add_executable(routeend_test tests/routeend_test.cpp)
 target_include_directories(routeend_test PRIVATE src)
 target_compile_features(routeend_test PRIVATE cxx_std_20)
+add_executable(routehazard_test tests/routehazard_test.cpp)
+target_include_directories(routehazard_test PRIVATE src)
+target_compile_features(routehazard_test PRIVATE cxx_std_20)
+add_executable(hazardpick_test tests/hazardpick_test.cpp)
+target_include_directories(hazardpick_test PRIVATE src)
+target_compile_features(hazardpick_test PRIVATE cxx_std_20)
+add_executable(editormessage_test tests/editormessage_test.cpp)
+target_include_directories(editormessage_test PRIVATE src)
+target_compile_features(editormessage_test PRIVATE cxx_std_20)
 add_executable(f7restore_test tests/f7restore_test.cpp)
 target_include_directories(f7restore_test PRIVATE src)
 target_compile_features(f7restore_test PRIVATE cxx_std_20)
@@ -395,6 +404,9 @@ target_compile_features(surface_test PRIVATE cxx_std_20)
 add_executable(recovery_test tests/recovery_test.cpp)
 target_include_directories(recovery_test PRIVATE src)
 target_compile_features(recovery_test PRIVATE cxx_std_20)
+add_executable(kturn_test tests/kturn_test.cpp)
+target_include_directories(kturn_test PRIVATE src)
+target_compile_features(kturn_test PRIVATE cxx_std_20)
 add_executable(tracking_test tests/tracking_test.cpp)
 target_include_directories(tracking_test PRIVATE src)
 target_compile_features(tracking_test PRIVATE cxx_std_20)

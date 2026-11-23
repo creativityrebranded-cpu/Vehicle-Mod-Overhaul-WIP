@@ -2,8 +2,9 @@
 
 ### Hover vehicles, an autopilot that thinks, and NPCs who actually use vehicles - for Starfield
 
-Current packaged version: **1.3.0**, with Traffic Addon 0.4.0, as a prerelease that has passed offline checks only and has **not been run in
-game** (Starfield 1.16.244, SFSE). The previous release is 1.2.4 with Traffic Addon 0.3.1 (tag `v1.2.4`). The mod is listed on Nexus as
+Current packaged version: **1.3.1**, with Traffic Addon 0.4.1, as a prerelease that has passed offline checks only and has **not been run in
+game** (Starfield 1.16.244, SFSE). 1.3.0 (tag `v1.3.0`) was packaged but not published; the previous published line is 1.2.x
+(tag `v1.2.4`: 1.2.4 with Traffic Addon 0.3.1). The mod is listed on Nexus as
 *Flying Vehicle Overhaul*; this repository was first named *Vehicle Mod Overhaul*.
 
 Compatible native vehicles become hover vehicles with gears, terrain following and a real autopilot. Call it, let it cover you, send it to a
@@ -158,6 +159,16 @@ Version 0.73.0 gives each command its own binding row. Rebinding a row preserves
 Hold = 0.5 s; double tap = within 0.3 s. Controller names above use PlayStation names; Xbox Cross/Circle/Square/Triangle are A/B/X/Y. Native aim, fire and look remain on the game's controls. Physical flight is experimental.
 
 The complete keyboard/controller, passenger, placement and HUD editor guide is [CONTROLS_0.73.0.md](docs/CONTROLS_0.73.0.md). Each command's device slot can be changed independently, so changing Gear does not change Descend and changing Summon does not change Recall escorts. The new build needs live verification: [test checklist](docs/TESTING_0.73.0.md).
+
+## What's new in 1.3.1 (Traffic Addon 0.4.1)
+
+- **Script mode:** a button in the Traffic Manager. Vehicles follow the route path with no object detection; the only obstacles
+  are the hazard boxes you place, other vehicles (kept apart by their own size) and people. For roads the normal autopilot does
+  not handle well. A message explains it each time it is switched on.
+- **Fixed:** traffic cars could jump 20-160 m in view when a parked car's physics woke, or when a car went back onto the route.
+- **Also since 1.3.0:** background traffic flow, batched creation under cover, hazard boxes, K-turn recovery, planner limits from
+  each car's own physics, saved Auto / Cruise on load, performance passes. Details: [release notes](docs/RELEASE_1.3.1.md),
+  Nexus text: [NEXUS_1.3.1.md](docs/NEXUS_1.3.1.md).
 
 ## What's new in 1.3.0 (Traffic Addon 0.4.0)
 

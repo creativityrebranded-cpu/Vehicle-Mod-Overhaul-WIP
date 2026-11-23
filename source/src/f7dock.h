@@ -14,9 +14,9 @@ namespace f7dock {
 // Problems: card RI-3 (route item warnings). Places .. Wires: notes/f7-restore-20261108/CHANGE_CARDS.md (R3-R6), the restored places,
 // Nodes view and route extras, each a bottom-bar menu.
 enum Level { Routes = 0, Route = 1, Tile = 2, Point = 3, Types = 4, Arrive = 5, City = 6, Problems = 7,
-    Places = 8, Landing = 9, Zone = 10, Junction = 11, Nodes = 12, Extras = 13, Access = 14, Wires = 15, TrafficLevels = 16, LevelCount = 17 };
+    Places = 8, Landing = 9, Zone = 10, Junction = 11, Nodes = 12, Extras = 13, Access = 14, Wires = 15, TrafficLevels = 16, Hazards = 17, LevelCount = 18 };
 inline const char* LevelName(int l) {
-    constexpr const char* n[]{ "routes", "route", "tile", "point", "types", "arrive", "city", "problems", "places", "landing", "zone", "junction", "nodes", "extras", "access", "wires", "traffic levels" };
+    constexpr const char* n[]{ "routes", "route", "tile", "point", "types", "arrive", "city", "problems", "places", "landing", "zone", "junction", "nodes", "extras", "access", "wires", "traffic levels", "hazards" };
     return l >= 0 && l < LevelCount ? n[l] : "?";
 }
 // A selected place's menus (a landing, its access and wires, a zone, a junction): they follow the map's selection.

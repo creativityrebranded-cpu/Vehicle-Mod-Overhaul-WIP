@@ -100,7 +100,7 @@ static GoalRun GoalDrive(planscene::Scene& sc, bicycle::State s, const bicycle::
     sc.Index(); energyplan::Memory mem; GoalRun r; double lastDir = 0, builtAt = -1e9, bx = 1e9, by = 1e9; planlattice::Field togo;
     for (double t = 0; t < limit; t += .1) {
         if (t - builtAt >= 1.0 || std::hypot(s.x - bx, s.y - by) >= 5.0) {
-            sc.SetGoal(s.x, s.y, g, k.halfLength, energyplan::Weights{}.stopGap);
+            sc.SetGoal(s.x, s.y, g, k.halfLength, energyplan::StopGap(k));
             double gx = g.x, gy = g.y;  // the window: between the car and the field's goal (the goal, or the sub-goal mark)
             if (!sc.goalFinal) { const double f = sc.goalStation / sc.route.back().station; gx = s.x + (g.x - s.x) * f; gy = s.y + (g.y - s.y) * f; }
             togo = planlattice::Build(sc, k, .5 * (s.x + gx), .5 * (s.y + gy), sc.goalStation, std::nan(""), {}, s.x, s.y); builtAt = t; bx = s.x; by = s.y;
@@ -122,6 +122,14 @@ static GoalRun GoalDrive(planscene::Scene& sc, bicycle::State s, const bicycle::
 
 int main() {
 #ifndef FVO_RELEASE
+    {   // ST-A..D (2026-11-22): the generated values come from the car and the controller, not from constants.
+        bicycle::Spec k0; k0.car = carmodel::Fallback(2.3);
+        const auto mv = energyplan::ManoeuvreFor(k0, 8);
+        std::printf("   generated: R=%.2f vBend=%.2f vRev=%.2f vCreep=%.2f margin(10 m/s)=%.2f stopGap=%.2f settle=%.2f\n", mv.R, mv.vBend, mv.vRev, mv.vCreep, energyplan::Margin(10, k0), energyplan::StopGap(k0), energyplan::kSettle);
+        Check(std::fabs(mv.R - k0.MinRadius()) < 1e-9 && mv.vRev <= k0.maxReverse + 1e-9 && mv.vRev > mv.vCreep && mv.vBend <= 8 + 1e-9, "ST-D: manoeuvre speeds and lengths come from the car (R, brake, reverse top)");
+        Check(std::fabs(energyplan::Margin(10, k0) - 10 * wheelguard::reaction) < 1e-9 && std::fabs(energyplan::Margin(0, k0) - energyplan::CreepSpeed(k0) * wheelguard::reaction) < 1e-9, "ST-B: the margin is the distance covered in one reaction, never below the creep speed's");
+        Check(std::fabs(energyplan::kSettle - 2 * wheelguard::reaction) < 1e-12 && std::fabs(energyplan::StopGap(k0) - .5 * k0.halfLength) < 1e-12, "ST-C: the rung step comes from the commitment time; the stop gap from the body");
+    }
     {   // The planned collision must report the same sensor and object that supplied its hard shape.
         planscene::Scene sc;
         Straight(sc, 40);
@@ -290,6 +298,29 @@ int main() {
         const auto r = Drive(sc, s, k, 10, 20, 60);
         std::printf("   flight-only: reached=%d hover %.1f s of %.1f, highest %.2f m\n", int(r.reached), r.hoverSeconds, r.seconds, r.maxAbove);
         Check(r.reached && r.hoverSeconds >= r.seconds - .3 && r.maxAbove > 1.5, "D6 flight-only: flies the whole way");
+    }
+    {   // HV-1 probe (2026-11-22, the 12:54 run: traffic cars on a hover loop planned 0.6 / 3 m/s with 22 wanted; median 0.6, p90 3.0).
+        // A long flight-only road with 22 m/s wanted: flat, and rising 0.09 (Akila's loop climbs 36 -> 92 m over 1.1 km).
+        for (int rising = 0; rising < 2; ++rising) {
+            planscene::Scene sc; road(sc, 700, 2, true);
+            if (rising) sc.floor = [](double, double y, double& z) { z = std::max(0.0, y) * .09; return true; };
+            bicycle::State s; s.speed = 0;
+            double sum = 0; int n = 0, slow = 0; double peak = 0;
+            const auto r = Drive(sc, s, k, 22, 60, 600, false, [&](planscene::Scene&, double, const bicycle::State& st) { if (st.mode == 1 || st.speed > 0) { sum += st.speed; ++n; if (st.speed < 4) ++slow; peak = std::max(peak, st.speed); } });
+            {   planscene::Scene s2; road(s2, 700, 2, true); s2.Index(); energyplan::Memory m2; double h2, l2, f2; bicycle::State st; st.speed = 10; st.mode = 1; st.z = 2.5; st.y = 100; s2.Route(st.x, st.y, h2, l2, f2);
+                planlattice::Field togo2 = planlattice::Build(s2, k, 0, 130, 130, h2);
+                const auto p = energyplan::Plan(st, k, 22, s2, m2, 0, {}, h2, &togo2);
+                std::printf("   HV-1 one plan at 10 m/s: chose '%s' speed %.1f; feasible %d/%d; rejects:", p.why ? p.why : "", p.first.speed, p.feasible, p.candidates);
+                for (int q = 0; q < p.rejectKinds; ++q) std::printf(" %s=%d", p.rejectName[q] ? p.rejectName[q] : "?", p.rejectCount[q]);
+                std::printf("\n");
+                for (double v : { 22.0, 18.0, 14.0, 10.0, 6.0, 2.0 }) {   // what each hover speed costs, by term (HV-2 probe)
+                    energyplan::Candidate c; c.kind = "hover"; c.seg[0] = { 0, v, energyplan::kSteps * energyplan::kDt, 1 }; c.count = 1;
+                    energyplan::Terms t; double mc; energyplan::Weights wt;
+                    const double e = energyplan::Score(c, st, k, 22, s2, wt, nullptr, 0, t, nullptr, mc, h2, &togo2);
+                    std::printf("     v=%4.1f E=%7.2f togo=%6.2f progress=%6.2f speed=%5.2f endFree=%6.1f reject=%s\n", v, e, t.togo, t.progress, t.speed, t.endFree, t.reject ? t.reject : "-"); } }
+            std::printf("   HV-1 flight-only, %s: reached=%d in %.1f s, mean speed %.1f, peak %.1f, share under 4 m/s %.0f%%\n", rising ? "rising .09" : "flat", int(r.reached), r.seconds, n ? sum / n : 0, peak, n ? 100.0 * slow / n : 0);
+            Check(r.reached && n && sum / n > 13.0 && peak >= 16.0, "HV-1 flight-only, 22 wanted: holds well over half the wanted speed (was mean 10.7, peak 11)");
+        }
     }
     {   // D6 both: the stair-stepped 23 deg ramp. Wheels can take it, so it stays on its wheels (the 17:40 stall came from a flight decision).
         planscene::Scene sc; road(sc, 80, 0, true); sc.solids.clear();

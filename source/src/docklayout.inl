@@ -31,7 +31,7 @@ constexpr int kDockHealthAllow = 20098;  // card FR1: allow every model Health l
 constexpr int kDockGoBase = 22000;  // + f7dock::Level, for levels >= Places
 inline int DockLevelId(int level) { return level < f7dock::Places ? kDockLevelBase + level : kDockGoBase + level; }
 inline int DockIdLevel(int id) { if (id >= kDockLevelBase && id < kDockLevelBase + f7dock::Places) return id - kDockLevelBase; if (id >= kDockGoBase + f7dock::Places && id < kDockGoBase + f7dock::LevelCount) return id - kDockGoBase; return -1; }
-constexpr int kDockPlaceTool = 22100, kDockReadme = 22101, kDockHelp = 22102, kDockPlaceNext = 22110;  // + 0 landing, 1 zone, 2 junction
+constexpr int kDockPlaceTool = 22100, kDockReadme = 22101, kDockHelp = 22102, kDockScript = 22103, kDockPlaceNext = 22110;  // kDockScript: Script mode toggle (2026-11-22)  // + 0 landing, 1 zone, 2 junction
 constexpr int kDockProbView = 22120, kDockProbFilter = 22130, kDockFixSafe = 22140;  // view + 0 grouped, 1 items; filter + 0..3
 constexpr int kDockNodeMake = 22150, kDockNodeClear = 22151, kDockNodeRemove = 22152, kDockWireAddIn = 22160, kDockWireAddOut = 22161;
 constexpr int kDockProbShow = 22200, kDockProbFix = 22300, kDockWire = 22400;  // + problem row (< 100); + wire * 4 + op (< 64 wires)
@@ -51,8 +51,9 @@ constexpr int kDockField = 20400;  // + field * 4: +0 the typed box, +1 minus, +
 constexpr int kDockPickerEntry = 1000;  // entry.field for the pickers: + f7dock::Point / Tile
 enum DockField { FSpeed, FRoadWidth, FMedian, FLanes, FLane, FTileWidth, FTileHeight, FYaw, FPitch, FRoll, FTileSpeed, FDivider, FSide, FSwing,
     FPZ, FPX, FPY, FRadius, FAX, FAY, FAZ, FAH, FDensity, FLimit, FEdgeLeft, FEdgeRight,
+    FHzAcross, FHzAlong, FHzHeight, FHzBase, FHzTurn,  // the selected Hazard's numbers, typed or stepped like Width and Divider
     FTrafficBand, FFieldCount = FTrafficBand + routeschedule::LevelCount * 2 };
-constexpr double kDockStep[FFieldCount]{ 1, .5, .5, 1, 1, .5, .5, 5, 5, 5, 5, 1, 5, 5, 5, 5, 5, 5, 1, 1, 1, 5, 10, 1, 1, 1, 1, 1, 1, 1 };
+constexpr double kDockStep[FFieldCount]{ 1, .5, .5, 1, 1, .5, .5, 5, 5, 5, 5, 1, 5, 5, 5, 5, 5, 5, 1, 1, 1, 5, 10, 1, 1, 1, .25, .25, .5, .5, 5, 1, 1, 1, 1 };
 inline bool TileField(int f) { return f >= FTileWidth && f <= FSwing && f != FDivider; }
 inline bool PointField(int f) { return f >= FPZ && f <= FRadius; }
 struct DockState {
@@ -112,7 +113,7 @@ int DockLanes(const trafficdata::Route& r) { return RoadLanes(r); }
 
 // ---- selection ----
 void DockSyncPicks() {
-    std::erase_if(g_ed.picks, [](const Pick& p) { return p.kind == kPickPoint; });
+    if (g_dock.level != f7dock::Hazards) std::erase_if(g_ed.picks, [](const Pick& p) { return p.kind == kPickPoint; });  // at the Hazard level a group of points + Hazards (Ctrl+click) is the editor's own and stays
     trafficdata::Route scratch; const auto* r = Shown(scratch);
     if (g_dock.level == f7dock::Point && g_dock.points.Many() && r) for (int i : g_dock.points.items) g_ed.picks.push_back({ kPickPoint, r->name, i });
     if (g_dock.level == f7dock::Point && g_dock.points.primary >= 0) g_ed.point = g_dock.points.primary;
@@ -170,6 +171,20 @@ void DockSync() {
     // R2: the Nodes view has its own menu while it is on (the Nodes tool turns it on and off).
     if (g_f7NodeView) { if (g_dock.level != f7dock::Nodes) DockGo(f7dock::Nodes, "node_view_on"); g_dock.routeKey = key; return; }
     if (g_dock.level == f7dock::Nodes) DockGo(r ? f7dock::Route : f7dock::Routes, "node_view_off");
+    // Hazard (2026-11-22): a first-class item. Its selection is one of the editor's primary fields (g_ed.hazard, like g_ed.point): choosing anything else, another route or an index
+    // that no longer exists ends it; the dock follows the selection (the Hazard level opens for a selected Hazard or test suggestion, and while the Place tool is on).
+    {
+        static std::string hazardKey;
+        if (key != hazardKey) { hazardKey = key; g_ed.hazard = -1; g_ed.suggest = -1; hazardpick::Cancel(g_ed.hazardLine); g_ed.hazardCopy = false; }
+        if (g_ed.hazard >= int(r ? r->hazards.boxes.size() : 0)) g_ed.hazard = -1;
+        const bool other = g_ed.point >= 0 || g_ed.spot >= 0 || ZoneOn() || (g_ed.link >= 0 && g_ed.link < int(g_ed.file.links.size())) || !g_ed.lanePicks.empty();
+        if (other && g_ed.hazard >= 0) { g_ed.hazard = -1; DockTrace("hazard", "deselected_other_selected"); }
+        if (other) g_ed.suggest = -1;
+        if (g_ed.mode != Mode::Hazard) { hazardpick::Cancel(g_ed.hazardLine); g_ed.hazardCopy = false; }
+    }
+    const bool hazardTool = g_ed.mode == Mode::Hazard && r && !r->ring, hazardSelected = r && !r->ring && (g_ed.hazard >= 0 || g_ed.suggest >= 0);
+    if ((hazardTool || hazardSelected) && g_dock.level != f7dock::Hazards) DockGo(f7dock::Hazards, hazardSelected ? "hazard_selected" : "hazard_tool_on");
+    if (g_dock.level == f7dock::Hazards) { if (hazardTool || hazardSelected) { g_dock.routeKey = key; return; } DockGo(r ? f7dock::Route : f7dock::Routes, "hazard_done"); }
     // R3: a selected landing, zone or junction (clicked on the map, placed, or picked by Next) opens its menu; none selected goes back to Places.
     {
         const bool link = g_ed.link >= 0 && g_ed.link < int(g_ed.file.links.size());
@@ -209,6 +224,10 @@ double DockValue(int f, const trafficdata::Route& r, int at) {
     const auto box = DockBox(r, at);
     const auto tile = roadplan::DividerAt(r.road, std::size_t(std::max(0, g_roadDivider)), std::size_t(std::max(0, at)));
     switch (f) {
+    case FHzAcross: case FHzAlong: case FHzHeight: case FHzBase: case FHzTurn: {
+        const auto hz = HazardsNow(); if (g_ed.hazard < 0 || g_ed.hazard >= int(hz.boxes.size())) return 0;
+        const auto& hb = hz.boxes[std::size_t(g_ed.hazard)];
+        return f == FHzAcross ? 2 * hb.hx : f == FHzAlong ? 2 * hb.hy : f == FHzHeight ? 2 * hb.hz : f == FHzBase ? hb.z - hb.hz : hb.yaw; }
     case FSpeed: return r.speed;
     case FRoadWidth: return DockRoadWidth(r); case FMedian: return r.road.median; case FEdgeLeft: return r.road.edgeLeft; case FEdgeRight: return r.road.edgeRight; case FLanes: return DockLanes(r); case FLane: return g_roadLane + 1; case FDivider: return g_roadDivider + 1;
     case FTileWidth: return std::max(box.width > 0 ? box.width : tilebox::RoadWidth(r), tilebox::LaneSpanWidth(r));  // the width the field really has (tilebox.h FW-1: never narrower than its lanes) case FTileHeight:  // width 0 = what the Field Provider uses (tilebox.h) return box.height > 0 ? box.height : DockRoadHeight(r);
@@ -237,6 +256,21 @@ routeend::Place DockArriveDefault(const trafficdata::Route& r) {
 }
 // One typed value (delta = false) or one step (delta = true) for every selected item. false: refused, the draft unchanged.
 bool DockApply(int f, double v, bool delta) {
+    if (f >= FHzAcross && f <= FHzTurn) {   // the selected Hazard's size, base and heading: one typed value or one step, through the editor's own undo
+        if (!HazardOn()) { Status("Select a Hazard first (click it on the map)"); return false; }
+        const int i = g_ed.hazard; const auto b0 = HazardsNow().boxes[std::size_t(i)];
+        const double cur = f == FHzAcross ? 2 * b0.hx : f == FHzAlong ? 2 * b0.hy : f == FHzHeight ? 2 * b0.hz : f == FHzBase ? b0.z - b0.hz : b0.yaw;
+        const double next = delta ? cur + v : v;
+        const bool ok = HazardEdit(true, [&](routehazard::Plan& p) { auto& b = p.boxes[std::size_t(i)];
+            switch (f) {
+            case FHzAcross: b.hx = next * .5; break;
+            case FHzAlong: b.hy = next * .5; break;
+            case FHzHeight: { const double base = b.z - b.hz; b.hz = next * .5; b.z = base + b.hz; break; }  // the base stays, the top moves
+            case FHzBase: b.z = next + b.hz; break;
+            default: { double yaw = std::fmod(next, 360.0); if (yaw < 0) yaw += 360.0; b.yaw = yaw; break; } } });
+        if (ok && HazardOn()) HazardSay(HazardsNow().boxes[std::size_t(g_ed.hazard)], "changed");
+        DockTrace(ok ? "field" : "refused", "hazard", int(next * 10)); return ok;
+    }
     if (f >= FTrafficBand && f < FFieldCount) {
         trafficdata::Route scratch; const auto* r = Shown(scratch); if (!r) return false;
         const int i = f - FTrafficBand, level = i / 2;
@@ -407,6 +441,7 @@ bool DockSafeFix(const Problem& p) { return p.kind == 2 || p.kind == 4; }  // Ea
 void DockDoor(int level, const trafficdata::Route* r) {
     if (level == f7dock::Places) { if (g_f7NodeView) { g_f7NodeView = false; DockTrace("node", "view_off_for_places"); } DockGo(f7dock::Places, "door"); return; }
     if (level == f7dock::Extras || level == f7dock::TrafficLevels) { if (r) DockGo(level, "door"); return; }
+    if (level == f7dock::Hazards) { if (r && !r->ring) { g_ed.mode = Mode::Hazard; g_ed.hazard = -1; g_ed.suggest = -1; hazardpick::Cancel(g_ed.hazardLine); DockGo(f7dock::Hazards, "door"); Status("Place Hazard: click the surface to set it down, click again to set its length and direction (Esc cancels). Q selects a Hazard, R moves it."); } else DockTrace("refused", "hazards_need_an_open_route"); return; }
     if ((level == f7dock::Access || level == f7dock::Wires || level == f7dock::Landing) && AreaOn()) { DockGo(level, "door"); return; }
     if (level == f7dock::Zone && ZoneOn()) { DockGo(level, "door"); return; }
     if (level == f7dock::Junction && LinkOn()) { DockGo(level, "door"); return; }
@@ -414,7 +449,19 @@ void DockDoor(int level, const trafficdata::Route* r) {
 }
 bool DockRestoreAction(int id, const trafficdata::Route* r) {
     if (id == kDockReadme) { g_dock.readme = !g_dock.readme; if (g_dock.readme) g_dock.help = false; DockTrace("readme", g_dock.readme ? "open" : "close"); return true; }
+    if (id == kDockScript) {  // Script mode toggle: saved to settings.ini at once; the message every time it is switched on
+        const bool on = !features::On(features::Id::ScriptMode);
+        features::Set(features::Id::ScriptMode, on);
+        DockTrace("script_mode", on ? "on" : "off");
+        if (on) ShowScriptModeMessage();
+        Status(on ? "Script mode on: vehicles follow the path; only Hazard boxes, vehicles and people are obstacles" : "Script mode off: vehicles detect objects again");
+        return true;
+    }
     if (id == kDockHelp) { g_dock.help = !g_dock.help; if (g_dock.help) g_dock.readme = false; DockTrace("help", g_dock.help ? "open" : "close"); return true; }
+    if (id == kHazardTool) {  // the Hazards tool (key \ or its cards): its own dock level; pressed again it ends
+        if (g_ed.mode == Mode::Hazard) { g_ed.mode = Mode::Select; g_ed.hazardCopy = false; hazardpick::Cancel(g_ed.hazardLine); Status("Place off: Select (Q) picks a Hazard, Move (R) drags it"); DockTrace("hazard", "place_tool_off"); return true; }  // the level follows the selection (DockSync)
+        DockDoor(f7dock::Hazards, r); return true;
+    }
     if (id == kDockPlaceTool || id == kShapeTool) {  // F (the shape key) opens Places too: the shapes are there now
         if (f7dock::PlaceLevel(g_dock.level) && id == kDockPlaceTool) { DockGo(r ? f7dock::Route : f7dock::Routes, "place_tool_off"); return true; }
         DockDoor(f7dock::Places, r); return true;
@@ -785,6 +832,7 @@ std::vector<std::pair<std::string, std::string>> DockReadme(int level) {
     case f7dock::Zone: return { { "Keep out", "flying traffic stays above the height inside the circle." }, { "Slow", "a speed limit inside the circle." }, { "Radius", "the size of the circle; drag it on the map with Zone on." } };
     case f7dock::Junction: return { { "Type", "Both: either way; A > B: leave A for B; B > A: join A from B; Cross: they cross." }, { "Share turning", "how many cars take the junction." }, { "Lanes", "which lanes it joins; Any eligible lets traffic choose." }, { "Corner", "sharp or round, and the radius." } };
     case f7dock::Nodes: return { { "Wire", "drag a landing's socket to a route; to a landing makes a new route." }, { "Make route", "Ctrl+click nodes, then Make route (or Enter)." }, { "Tidy", "drag nodes; double-click puts one back. The world does not move." }, { "", "Del removes the selected wire. Nodes again goes back to the map." } };
+    case f7dock::Hazards: return { { "Place", "click the surface: it is set down. Click again: the line from the first click to the cursor is its length and direction. Esc cancels." }, { "Hazard", "Q then click it to select, R to move it (Alt = up / down), PgUp / PgDn or the wheel near it set its height, Del deletes, Ctrl+Z undoes, Ctrl+click groups." }, { "Copy object", "click a game object: the Hazard takes its size and heading." }, { "Suggestions", "Test route shows what blocked the car; select one (Q), then Keep or Dismiss. Only kept ones are saved." } };
     case f7dock::Extras: return { { "Copy", "a copy beside this route." }, { "Mirror", "left and right swap, as the map shows it." }, { "Reverse", "traffic flies the other way." }, { "Merge", "joins the nearest open route that starts or ends near this one's end." }, { "Original", "edit the game's original as your copy, or go back to the original." } };
     case f7dock::TrafficLevels: return { { "Min / max", "vehicles per kilometre of this route. City traffic settings still apply." },
         { "All day", "uses the midpoint of the selected range." }, { "Scheduled", "keeps its hours and bounds each open period's count by the range." },
@@ -808,6 +856,7 @@ std::vector<std::pair<std::string, std::string>> DockHelp(int level, int group) 
     case f7dock::Types: return V{ { "Vehicle type", "click to leave it out of this route or allow it again." }, { "Health", "models the health check left out; you can allow them." } };
     case f7dock::Arrive: return V{ { "X / Y / Z", "where a car on this line finishes." }, { "Heading", "the direction it faces there, in degrees." }, { "Park", "Yes: it parks there. No: it stops and waits." } };
     case f7dock::City: return V{ { "Traffic", "on or off for the world." }, { "Density", "how busy, in percent." }, { "Limit", "the most vehicles at once." }, { "Use", "whether the game's own routes fly as well as yours." } };
+    case f7dock::Hazards: return V{ { "Across / Along", "the Hazard's width and length in metres: type a number or use - / +." }, { "Height / Base", "how tall it is and where its floor sits: a Hazard can block one deck and leave the lane above open." }, { "Turn", "its heading in degrees; the arrow shows it." }, { "Test suggestions", "obstacles the test vehicle met; Keep adds them to the route." } };
     case f7dock::TrafficLevels: return V{ { "Min per km", "fewest cars per kilometre of this route." }, { "Max per km", "most cars per kilometre." }, { "This route", "applies the range to this route." }, { "Saved", "uses the route's original counts and hours." } };
     case f7dock::Zone: return V{ { "Kind", "Keep out or Slow." }, { "Radius", "size of the circle, in metres." }, { "Speed inside", "the speed limit in a Slow zone." }, { "Height / Stay above", "flying traffic stays above this height in a Keep-out zone." } };
     case f7dock::Junction: return V{ { "Type", "Both, A > B, B > A or Cross." }, { "Share turning", "how many cars take the junction." }, { "From / To lane", "which lanes it joins; Any lets traffic choose." }, { "Corner", "Sharp or Round, and the radius." } };
@@ -884,6 +933,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     case f7dock::Nodes: h = rowsH(2); break;
     case f7dock::Extras: h = rowsH(2); break;
     case f7dock::TrafficLevels: h = rowsH(5); break;
+    case f7dock::Hazards: h = rowsH(7); break;  // 7 rows in the Hazard box column (was 6: the Box row fell below the dock, 2026-11-21 screenshot)
     default: h = rowsH(3); break;
     }
     // The save column for this menu: the route's (Test .. Permanent Delete, then Delete point / route), or a place's (Done, Save, Cancel, Remove).
@@ -920,6 +970,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
         if (level == f7dock::Problems) crumb(f7dock::Problems, "Problems", true);
         if (level == f7dock::TrafficLevels) crumb(f7dock::TrafficLevels, "Traffic levels", true);
         if (level == f7dock::Extras) crumb(f7dock::Extras, "Actions", true);
+        if (level == f7dock::Hazards) crumb(f7dock::Hazards, "Hazard", true);
     }
     // The save column, always at the right edge.
     const double sx = d.x + d.w - 12 - kSaveW; double sy = d.y + 10;
@@ -928,7 +979,11 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     DockButton(kDockReadme, readmeX, y0, 84, 26, "Readme", g_dock.readme, !DockReadme(level).empty(), 0);
     const double helpX = readmeX - 8 - 70;
     DockButton(kDockHelp, helpX, y0, 70, 26, "Help", g_dock.help, !DockHelp(level, g_dock.routeGroup).empty(), 0);
-    const double headRight = helpX - 8;
+    // Script mode (2026-11-22): a toggle for every route; lit while on.
+    const bool scriptOn = features::On(features::Id::ScriptMode);
+    const double scriptX = helpX - 8 - 120;
+    DockButton(kDockScript, scriptX, y0, 120, 26, scriptOn ? "Script mode: on" : "Script mode", scriptOn, true, 0);
+    const double headRight = scriptX - 8;
     if (nSel > 1) { const std::string what = std::to_string(nSel) + (level == f7dock::Point ? " points" : " tiles") + " selected: edits apply to all"; DockText(what, x + 12, y0 + 5, TextWidth(what) + 4, 0xFFE15A); x += TextWidth(what) + 24; DockButton(kDockSelOne, x, y0, 104, 26, "Select one", false, true, 0); x += 112; }
     else if (level == f7dock::Point || level == f7dock::Tile) { DockButton(level == f7dock::Point ? kDockSelAllPoints : kDockSelAllTiles, x + 8, y0, 104, 26, level == f7dock::Point ? "All points" : "All tiles", false, true, 0); x += 120; }
     if (level == f7dock::Problems && r) {  // R6: the view, the filters with their counts, and Fix all safe, in the header row
@@ -977,7 +1032,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     // Columns.
     const double left = level == f7dock::Tile ? kCubeW + 10 : 0;
     int cols = 2;
-    switch (level) { case f7dock::Routes: case f7dock::Types: cols = 4; break; case f7dock::Route: cols = 2; break; case f7dock::Tile: case f7dock::Point: case f7dock::Places: case f7dock::Landing: case f7dock::Access: case f7dock::Junction: case f7dock::Extras: case f7dock::TrafficLevels: cols = 3; break; default: cols = 2; break; }
+    switch (level) { case f7dock::Routes: case f7dock::Types: cols = 4; break; case f7dock::Route: cols = 2; break; case f7dock::Tile: case f7dock::Point: case f7dock::Places: case f7dock::Landing: case f7dock::Access: case f7dock::Junction: case f7dock::Extras: case f7dock::TrafficLevels: case f7dock::Hazards: cols = 3; break; default: cols = 2; break; }
     if (level == f7dock::Point && (!r || r->ring)) cols = 2;
     const double gap = 10, cw = (area - left - gap * (cols - 1)) / cols; auto cx = [&](int i) { return d.x + 12 + left + i * (cw + gap); };
     // Labels take about a third of the column, between 92 and 132 px (10 to 14 letters), so a label never squeezes its values.
@@ -1049,7 +1104,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     else if (level == f7dock::Places) {  // R3: what can be placed, and what this world has
         const bool draft = g_ed.draft.has_value(), routeOk = r && !r->ring;
         column(0, "Add", [&](double x0, double vx, double vw, double& y) {
-            pick(x0, vx, vw, y, "Place", { { kLanding, "Landing", g_ed.mode == Mode::Landing }, { kZoneTool, "Zone", g_ed.mode == Mode::Zone }, { kConnect, "Junction", g_ed.mode == Mode::Connect, 0, r != nullptr } }); });
+            pick(x0, vx, vw, y, "Place", { { kLanding, "Landing", g_ed.mode == Mode::Landing }, { kZoneTool, "Zone", g_ed.mode == Mode::Zone }, { kConnect, "Junction", g_ed.mode == Mode::Connect, 0, r != nullptr }, { kHazardTool, "Hazard", g_ed.mode == Mode::Hazard, 0, r != nullptr } }); });
         column(1, "Shapes", [&](double x0, double vx, double vw, double& y) {
             auto on = [&](int k) { return g_ed.mode == Mode::Shape && int(g_ed.shape) == k; };
             pick(x0, vx, vw, y, "Draw", { { kShapeBase + 0, "Circle", on(0), 0, !draft }, { kShapeBase + 1, "Ellipse", on(1), 0, !draft }, { kShapeBase + 2, "Rectangle", on(2), 0, !draft } });
@@ -1178,6 +1233,28 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
         column(1, "Finish", [&](double x0, double vx, double vw, double& y) { step(x0, vx, vw, y, "Heading", FAH, fmt("%.0f deg", p.heading)); pick(x0, vx, vw, y, "Park", { { kDockPark + 1, "Yes", p.park == 1 }, { kDockPark, "No", p.park == 0 } });
             if (!r->end.placeUnsupported.empty()) note(x0, y, "Stored place unreadable: kept until set", kAmber); });
     }
+    else if (level == f7dock::Hazards && r) {  // hazard boxes (hazardedit.inl): the route's boxes, the selected one, and what Test route suggested
+            const auto boxes = HazardsNow(); const auto sugg = HazardSuggestions(); const bool one = g_ed.hazard >= 0 && g_ed.hazard < int(boxes.boxes.size());
+            const routehazard::Box hb = one ? boxes.boxes[std::size_t(g_ed.hazard)] : routehazard::Box{};
+            column(1, "Hazard", [&](double x0, double vx, double vw, double& y) {
+                info(x0, vx, vw, y, "Placed", std::to_string(boxes.boxes.size()) + (one ? ", #" + std::to_string(g_ed.hazard + 1) + " selected" : ", none selected (Q, click one)"));
+                step(x0, vx, vw, y, "Across", FHzAcross, one ? fmt("%.2f m", 2 * hb.hx) : std::string("-"), one);   // typed or - / +, like Width and Divider
+                step(x0, vx, vw, y, "Along", FHzAlong, one ? fmt("%.2f m", 2 * hb.hy) : std::string("-"), one);
+                step(x0, vx, vw, y, "Height", FHzHeight, one ? fmt("%.1f m", 2 * hb.hz) : std::string("-"), one);
+                step(x0, vx, vw, y, "Base", FHzBase, one ? fmt("%.1f m", hb.z - hb.hz) : std::string("-"), one);
+                step(x0, vx, vw, y, "Turn", FHzTurn, one ? fmt("%.0f deg", hb.yaw) : std::string("-"), one);
+                pick(x0, vx, vw, y, "Hazard", { { kHazardInherit, "Copy object", g_ed.hazardCopy }, { kHazardDelete, "Delete", false, 0, one }, { kHazardDone, "Done", false } }); });
+            column(2, "Test suggestions", [&](double x0, double vx, double vw, double& y) {
+                info(x0, vx, vw, y, "Suggested", std::to_string(sugg.size()) + (sugg.empty() ? ": run Test (T), then watch" : " from the last test"), sugg.empty() ? kDim : 0xF2B04E);
+                pick(x0, vx, vw, y, "Pick", { { kHazardNextSuggest, "Next", false, 0, !sugg.empty() } });
+                pick(x0, vx, vw, y, "Selected", { { kHazardKeep, "Keep", false, 0, g_ed.suggest >= 0 }, { kHazardDismiss, "Dismiss", false, 0, g_ed.suggest >= 0 } });
+                pick(x0, vx, vw, y, "All", { { kHazardKeepAll, "Keep all", false, 0, !sugg.empty() } }); });
+        column(0, "Hazard", [&](double x0, double vx, double vw, double& y) {
+            info(x0, vx, vw, y, "Route", r->label.empty() ? r->name : r->label);
+            pick(x0, vx, vw, y, "Place", { { kHazardPlace, g_ed.hazardLine.active ? "Click again" : "Place", g_ed.mode == Mode::Hazard }, { kHazardInherit, "Copy object", g_ed.hazardCopy }, { kHazardDone, "Done", false } });
+            act(x0, vx, vw, y, "Test route", "flies it once", kTest, "Test", 0, !r->ring);
+            info(x0, vx, vw, y, "Keys", "Q select, R move, PgUp/Dn height, Del", kDim); });
+    }
     else if (level == f7dock::Extras) {  // R4: the route's actions (existing ids; each handler keeps its own checks and messages)
         const bool draft = g_ed.draft.has_value();
         const bool edited = g_ed.route >= 0 && g_ed.route < int(g_ed.file.routes.size()) && IsOriginal(g_ed.file.routes[std::size_t(g_ed.route)]);
@@ -1247,6 +1324,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
                 step(x0, vx, vw, y, "Left edge", FEdgeLeft, fmt("%.1f m", r->road.edgeLeft), !r->ring); step(x0, vx, vw, y, "Right edge", FEdgeRight, fmt("%.1f m", r->road.edgeRight), !r->ring); });
             right([&](double x0, double vx, double vw, double& y) {
                 std::snprintf(v, sizeof v, "%.1f m, %s", laneW, none ? "no vehicle fits" : tight ? "small vehicles only" : "all vehicles fit"); info(x0, vx, vw, y, "Each lane", v, none ? kClearanceRed : tight ? kAmber : 0xDFE7EE);
+                act(x0, vx, vw, y, "Hazard", std::to_string(r->hazards.boxes.size()) + " placed, no-go volumes", kHazardTool, "Open", 1, !r->ring);  // 2026-11-21: under Road, where the user looks for it (was Extras)
                 if (none || tight) note(x0, y, none ? "Widen the road or use fewer lanes." : "Widen the road for large vehicles.", none ? kClearanceRed : kAmber); });
         }
         else if (group == 2) {
@@ -1394,6 +1472,13 @@ bool DockClick(const routemap::Camera& c, double mx, double my, bool ctrl, bool 
         const auto& q = r->points[std::size_t(p)]; char b[96]; std::snprintf(b, sizeof b, "Point %d: (%.0f, %.0f), height %.0f m", p + 1, q.x, q.y, q.z); Status(b);
         return true;
     }
+    // A Hazard under the click (its footprint), before the tile: a Hazard usually sits ON the road, so the road line under it must not take the click. Select picks it,
+    // Ctrl+click goes to the editor's own group (PickClick), the Move tool drags it (StartPlaceDrag). Points above stay first.
+    if (r && !r->ring && HazardAt(c, mx, my) >= 0) {
+        if (ctrl || g_ed.mode == Mode::Drag) return false;
+        return HazardSelectAt(c, mx, my);
+    }
+    if (r && !r->ring && g_ed.mode == Mode::Select && !ctrl && HazardSuggestAt(c, mx, my) >= 0) return HazardSelectAt(c, mx, my);  // an amber test suggestion, the same way
     auto tileHere = [&](const trafficdata::Route& route) {
         std::vector<f7dock::Screen> sc; for (const auto& q : route.points) { f7dock::Screen s; s.seen = Local(c, { q.x, q.y, q.z }, s.x, s.y); sc.push_back(s); }
         return f7dock::TileAt(sc, route.closed, mx, my, 10); };
@@ -1451,6 +1536,9 @@ bool DockKeys(bool focused, bool ctrl) {
             else DockGo(haveRoute ? f7dock::Route : f7dock::Routes, "esc");
             break;
         case f7dock::Extras: case f7dock::TrafficLevels: DockGo(f7dock::Route, "esc"); break;
+        case f7dock::Hazards:  // Esc steps back one thing at a time: the pending first click, the copy switch, the selection, then the tool and the level
+            if (HazardEscape()) { DockTrace("hazard", "esc_step"); break; }
+            g_ed.mode = Mode::Select; g_ed.hazard = -1; g_ed.suggest = -1; g_ed.hazardCopy = false; hazardpick::Cancel(g_ed.hazardLine); DockGo(haveRoute ? f7dock::Route : f7dock::Routes, "esc"); break;
         case f7dock::Tile: case f7dock::Point: case f7dock::Types: case f7dock::Arrive: case f7dock::Problems: DockGo(f7dock::Route, "esc"); break;
         case f7dock::Route: if (g_ed.draft) { Status("Save or Cancel the open route first"); DockTrace("refused", "esc_draft_open"); } else { g_ed.route = -1; g_ed.other = -1; g_dock.routeKey.clear(); DockGo(f7dock::Routes, "esc"); } break;
         case f7dock::City: DockGo(f7dock::Routes, "esc"); break;

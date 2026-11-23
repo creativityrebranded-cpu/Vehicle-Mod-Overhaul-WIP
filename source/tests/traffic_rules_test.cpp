@@ -1,5 +1,6 @@
 // RR-1 (roomrule.h) and SW-1 / SW-2 (retiringrecord.h), each owner step alone. Offline logic only: never proof of behaviour in game.
 #include "traffic/roomrule.h"
+#include "traffic/adoption_api.h"
 #include "traffic/slotcookie.h"
 #include "traffic/retiringrecord.h"
 #include <cstdio>
@@ -9,6 +10,24 @@ static void Check(bool ok, const char* what) { ++checks; std::printf("%s %s\n", 
 static bool Is(const char* a, const char* b) { return a && b && !std::strcmp(a, b); }
 
 int main() {
+    {
+        using FvoAdoptionOwner::Unclaimed;
+        using FvoAdoptionOwner::PlayerSavedAuto;
+        using FvoAdoptionOwner::PlayerProtected;
+        using FvoAdoptionOwner::OtherProtected;
+        using FvoAdoptionOwner::FvoDisposable;
+        using trafficadoption::MayClaim;
+        Check(MayClaim(Unclaimed,false,true,false) && !MayClaim(Unclaimed,false,false,false),
+              "covered adoption takes a free unclaimed chassis only under cover");
+        Check(MayClaim(PlayerSavedAuto,true,true,false) && !MayClaim(PlayerSavedAuto,false,true,false) &&
+              !MayClaim(PlayerSavedAuto,true,true,true),
+              "saved player autopilot admits an empty seat only on the loading screen");
+        Check(!MayClaim(PlayerProtected,true,true,false) && !MayClaim(OtherProtected,true,true,false),
+              "manual, unknown player state and other protected owners stay protected");
+        Check(trafficadoption::MayRetireChassis(FvoDisposable) && !trafficadoption::MayRetireChassis(Unclaimed) &&
+              !trafficadoption::MayRetireChassis(PlayerSavedAuto),
+              "driving permission does not grant chassis retirement");
+    }
     {   struct Slot { double a[3]; } slots[256], foreign{};
         bool same = true;
         for (auto& slot : slots) same &= slotcookie::Find(slots, &slot) == &slot;

@@ -31,10 +31,12 @@ static double Drive(Input in, double seconds, double* finalAlong = nullptr, doub
 }
 
 int main() {
-    Check(FollowingCap(following::standstillGap,12)==0,"following: minimum bumper gap applies even to a moving leader");
-    Check(std::fabs(FollowingCap(following::standstillGap+following::timeGap*8,8)-8)<1e-9,
+    const double kL = 2.3, kB = 6.0;  // a car half length and brake for the following checks
+
+    Check(FollowingCap(2*kL,12,kL,kB)==0,"following: minimum bumper gap applies even to a moving leader");
+    Check(std::fabs(FollowingCap(2*kL+(wheelguard::reaction+8/kB)*8,8,kL,kB)-8)<1e-9,
         "following: stable at the leader's speed and the configured headway");
-    Check(FollowingCap(25,0)<FollowingCap(25,10)&&FollowingCap(15,0)<FollowingCap(25,0),
+    Check(FollowingCap(25,0,kL,kB)<FollowingCap(25,10,kL,kB)&&FollowingCap(15,0,kL,kB)<FollowingCap(25,0,kL,kB),
         "following: brake more for a nearer or stopped leader");
     {   Input in; in.want = 18; const double v = Drive(in, 8);
         Check(std::fabs(v - 18) < 1, "an open road reaches the wanted speed"); }
@@ -61,11 +63,24 @@ int main() {
     {   Input in; in.speed = 0; in.want = 0; const auto o = Solve(in); Check(o.feasible && o.speed[kSteps] == 0, "wanting nothing stays stopped"); }
     {   Input in; in.speed = 10; in.want = 18; Limit l; l.from = 5; l.to = 9; l.speed = 1; l.why = "corner"; in.limits = &l; in.limitCount = 1;
         const auto o = Solve(in); Check(o.why[0] != 0, "it names what held the speed down"); }
-    Check(std::fabs(CornerLimit(1.0 / 14) - 7) < .01, "corner speed keeps railturn's 3.5 m/s^2");
-    Check(std::fabs(SlopeLimit(20, .12) - 15.2) < .01, "slope keeps railslope's rule");
-    Check(CrestLimit(0) > 1e8 && CrestLimit(.05) < 10, "crest keeps railslope's rule");
+    Check(std::fabs(CornerLimit(1.0 / 14, 3.5) - 7) < .01, "corner speed: sqrt(a_lat / curvature) (3.5 m/s^2 given)");
+    Check(std::fabs(SlopeLimit(20, .12, .5) - 15.2) < .01, "slope: the old rule is the rule with MaxGrade .5");
+    Check(CrestLimit(0, .5) > 1e8 && CrestLimit(.05, .5) < 10, "crest: sqrt(share g / curvature), flat is no limit");
     Check(std::fabs(SideLimit(.1) - 12) < 1e-9 && SideLimit(.6) == 3 && SideLimit(0) > 1e8, "sideways limit is D3");
-    {   Input in; in.speed = 15; in.want = 18; Limit ls[6]; Block bs[4];
+    {   // Stage E: values come from the car record
+        const carcap::Car car = carcap::kCar;
+        Check(FollowingCap(2*kL,0,kL,kB)==0 && FollowingCap(2*kL+1,0,kL,kB)>0, "E: standing gap is two half lengths");
+        Check(FollowingCap(30,0,3.0,kB)<FollowingCap(30,0,1.5,kB), "E: a longer car keeps a longer gap");
+        const double room=20,lead=10,h=wheelguard::reaction+lead/kB;
+        { const double bt=.5*kB*wheelguard::reaction; Check(std::fabs(FollowingCap(2*kL+room,lead,kL,kB)-(room/h<=lead?room/h:std::sqrt(bt*bt+lead*lead+kB*room)-bt))<1e-9,"E: headway = t_r + v_lead/brake, comfort brake = brake/2, one reaction before braking"); }
+        Check(FollowingCap(40,8,kL,12)>FollowingCap(40,8,kL,3),"E: better brakes follow closer");
+        { const double a=1e9; double prev=-1; bool mono=true; for(double g=2*kL;g<80;g+=.5){const double c=FollowingCap(g,10,kL,kB); if(c<prev-1e-9)mono=false; prev=c; (void)a;} Check(mono,"E: following cap grows with the gap (continuous at the steady branch)"); }
+        Check(std::fabs(CornerLimit(1.0/14,car.PlanLat(1.0))-std::sqrt(car.PlanLat(1.0)*14))<1e-9,"E: corner speed uses the car's PlanLat");
+        Check(CornerLimit(1.0/14,car.PlanLat(2.0))>CornerLimit(1.0/14,car.PlanLat(1.0)),"E: a grippier gear corners faster");
+        Check(SlopeLimit(20,.12,car.MaxGrade(1.0))>SlopeLimit(20,.12,.5)&&SlopeLimit(20,0,car.MaxGrade(1.0))==20,"E: slope loss follows the car's MaxGrade");
+        Check(SlopeLimit(20,.6,car.MaxGrade(1.0))==20*kMinShare&&SlopeLimit(20,.2,.8)>SlopeLimit(20,.2,.4),"E: steeper than it climbs bottoms at the floor; more grade = less loss");
+        Check(std::fabs(CrestShare(car)-(1-car.safety))<1e-12&&CrestLimit(.05,CrestShare(car))<CrestLimit(.05,.5),"E: crest share is what the safety margin spares");
+    }    {   Input in; in.speed = 15; in.want = 18; Limit ls[6]; Block bs[4];
         for (int i = 0; i < 6; ++i) { ls[i].from = 10.0 * i; ls[i].to = ls[i].from + 8; ls[i].speed = 12 + i; ls[i].why = "x"; }
         for (int i = 0; i < 4; ++i) { bs[i].from = 30 + 8.0 * i; bs[i].to = bs[i].from + 3; bs[i].tFrom = i; bs[i].tTo = i + 1.5; bs[i].why = "y"; }
         in.limits = ls; in.limitCount = 6; in.blocks = bs; in.blockCount = 4;
