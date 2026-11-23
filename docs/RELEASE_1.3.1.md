@@ -7,7 +7,12 @@ installing it. 1.3.0 (tag v1.3.0) was packaged on 2026-11-21 and never published
 
 NEW: SCRIPT MODE
 - One button in the Traffic Manager (F7 / F8), next to Help and Readme. Saved in settings.ini ([traffic] scriptMode, default off).
-- In Script mode every vehicle's World takes only the hazard boxes you place, the known positions of other vehicles (each one's
+- In Script mode a car on its wheels on a drive lane takes the route's line as its plan (planenergy::ScriptFollow): no candidate
+  search, no avoidance arcs, no recovery routine (back up, K-turn, turn to lane). Speed = the lane speed (bend and crest caps),
+  0 under a lane hold or stop line, and one stop rule: the first point along the line ahead where its body would touch a scene
+  solid limits the speed to sqrt(2 x brake x distance left). Edge bands are not obstacles (the path is taken as perfect). Hover
+  lanes keep the normal planner with the sensors off. Trace: plan.script.
+- Every vehicle's World takes only the hazard boxes you place, the known positions of other vehicles (each one's
   own box is its avoid distance) and people. Ray hits, the coarse map's band cells and kept boxes, the clear-path sweep, the
   look-ahead probe rays, the field slice and volume beams, contact inferences and the radar are all off. Floors still come from
   the map's measured floor, so cars keep to the road surface.
@@ -22,6 +27,9 @@ FIXED: TRAFFIC CARS JUMPING IN VIEW (2026-11-22 18:38 run: 8 jumps of 22-158 m, 
   physics body is carried virtually. Trace: traffic.actuator gate=body_in_scene_stays_physical_wake, to=physical_body_waking.
 - HJ-2: the virtual actuator resumed from the route station of an earlier virtual stretch. It now re-seeds from the car's real
   position whenever they differ by more than 3 m. Trace: traffic.actuator event=virtual_reseed stale_m=...
+
+- HJ-3 (2026-11-22 22:35 run: FF1014A1 carried 162 m while still Proving, snapped 159 m back at the hand-off): a traffic car whose
+  census life is Born or Proving is never moved by an actuator. Trace: gate=birth_not_handed_off_no_carry, to=birth_proving.
 
 SINCE 1.3.0 (main tree, 2026-11-21/22)
 - Traffic population: background flow (every route position is a moving car), batched creation under the loading screen and the

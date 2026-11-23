@@ -10,7 +10,7 @@ Features
 * Combat: improved vehicle combat AI, squads and morale, Defend / Attack / Hold fire and focus fire.
 * Damage and wrecks: vehicles and occupants take damage, wrecks come down, and occupants climb out.
 * Traffic Manager: press F7 on the local map (or F8 for photo mode) to create and edit traffic routes, hazard boxes, places and links. Readme and Help explain every screen. Autopilot near a traffic zone follows its path.
-* Script mode (new): one button in the Traffic Manager. Vehicles follow the route path with no object detection; only the hazard boxes you place, other vehicles and people are obstacles. For roads the normal autopilot does not handle well.
+* Script mode (new): one button in the Traffic Manager. Vehicles take the route as a perfect path and just drive it: no object detection, no swerving, no backing up or recovering. They only slow or stop for other vehicles, people and the hazard boxes you place on the path. For roads the normal autopilot does not handle well.
 * Traffic Addon 0.4.1: one physical fleet. Every traffic car is a real vehicle with a real driver, created out of sight and kept moving along its route, with models from your whole load order. Each playthrough keeps its own routes, route groups and traffic settings.
 * City Placements: parked vehicles in nine cities.
 * Saved hover: a save made while hovering comes back hovering. Saved Auto / Cruise resumes on load.
@@ -76,9 +76,10 @@ Making your own routes
 Changelog (from 1.2)
 
 1.3.1 (FVO) / 0.4.1 (Traffic Addon)
-* New: Script mode in the Traffic Manager. Vehicles follow the route path with no object detection; only hazard boxes, other vehicles (kept apart by their own size) and people are obstacles. A message explains it each time it is switched on.
+* New: Script mode in the Traffic Manager. Vehicles drive the route as a perfect path with no object detection, no avoiding and no recovery; they slow or stop only for other vehicles, people and hazard boxes on the path. Takes effect at once; a message explains it each time it is switched on. One setting for all routes.
 * Fixed: traffic cars could jump 20-160 m in view when the game woke a parked car's physics. A stopped car now stays where its physics body is and is woken there; only cars with no physics body are moved along the route.
 * Fixed: a car taken back onto the route could jump to where it had been carried before.
+* Fixed: a new traffic car could be moved along its route before it was handed over, then jump back to where it was made.
 * Traffic spawns on every route the same way, including hover-only routes; Prepare traffic says the real reason when a route gets no positions.
 * Autopilot: K-turn recovery in tight places, planner limits derived from each car's own speed, braking and turning instead of fixed numbers, and adoption of cars under the loading screen.
 * Your saved Auto / Cruise resumes when you load the save.

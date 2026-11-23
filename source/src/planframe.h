@@ -18,6 +18,7 @@ struct LinePoint { double x = 0, y = 0, z = 0, yaw = 0; };
 struct Frame {
     double now = 0, speed = 0, lateral = 0, station = 0, want = 10, sinceStart = 1e9;
     double accel = 6, brake = 6, topSpeed = 20, lineEnd = 1e9;
+    bool script = false;  // Script mode (2026-11-22): the route's line is the plan (planenergy::ScriptFollow): no search, no avoidance arcs, no recovery
     planworld::Car car;
     fieldslice::Slice slice;  // World's own record of this car's ray volume (trace and the shadow body check). The planner does not read it:
                               // the volume reaches it as shapes (fieldvolume.h), through the one collision test.

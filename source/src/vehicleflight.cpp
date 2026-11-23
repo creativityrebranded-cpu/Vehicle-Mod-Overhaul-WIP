@@ -2847,6 +2847,16 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			const auto instance = s.instance.load();
 			return instance && s.lastStepInstance == instance && s.lastStepAt && now - s.lastStepAt < 1500;
 		}
+		// HJ-3 (2026-11-22 22:35 run: FF1014A1 carried 162 m while still Proving, then snapped 159 m back to its birth spot at the
+		// hand-off): a traffic car whose census life is Born or Proving is not the autopilot's yet, so no actuator moves it. A busy
+		// census lock counts as unfinished for this tick (never move on a guess).
+		bool BirthUnfinished(unsigned vehicle)
+		{
+			std::unique_lock lk(g_ownersLock, std::try_to_lock);
+			if (!lk.owns_lock()) return true;
+			const auto* r = g_owners.Find(vehicle);
+			return r && r->owner == planowner::Owner::Traffic && (r->life == planowner::Life::Born || r->life == planowner::Life::Proving);
+		}
 		// HJ-1: this pilot's physics body is in the live scene (the read interface says it is valid). Read-only, the same reads WK-1 uses.
 		bool BodyInScene(int idx)
 		{
@@ -5584,14 +5594,15 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 // A car whose physics body exists (model loaded) stays physical: the rail's WK-1 wake starts it from where it really is.
                 // Only a car with no body is carried virtually (the engine builds its body where the car is).
                 const bool bodyHere = hasModel && !stepping && idx >= 1 && BodyInScene(idx);
-                const bool moveVirtual = idx >= 1 && !birthHeld && (!hasModel || (!stepping && !bodyHere));
-                const char* gateWhy = birthHeld ? "birth_hold_not_released" : bodyHere ? "body_in_scene_stays_physical_wake" : !haveAdvice ? (moveVirtual ? "not_a_fleet_car_lane_carries_it" : "not_a_fleet_car_physical") :
+                const bool provingBirth = idx >= 1 && !stepping && BirthUnfinished(self);  // HJ-3
+                const bool moveVirtual = idx >= 1 && !birthHeld && !provingBirth && (!hasModel || (!stepping && !bodyHere));
+                const char* gateWhy = birthHeld ? "birth_hold_not_released" : provingBirth ? "birth_not_handed_off_no_carry" : bodyHere ? "body_in_scene_stays_physical_wake" : !haveAdvice ? (moveVirtual ? "not_a_fleet_car_lane_carries_it" : "not_a_fleet_car_physical") :
                     advised == Actuator::Virtual && stepping ? "physics_live_takes_over_at_once" :
                     advised == Actuator::Physical && moveVirtual ? "physics_not_ready_keeps_going_on_rail" : "as_advised";
                 // AC-2/AC-3: the arbiter's owner for this car this update (MB-4 one decider): the rail path carries it, or the physical actuator.
                 if (idx >= 1 && moveVirtual) driverOwner = "plan_virtual";
                 if (idx >= 1 && idx < int(sizeof actuatorWas / sizeof actuatorWas[0])) {
-                    const char* now = moveVirtual ? "virtual" : birthHeld ? "birth_hold" : stepping ? "physical" : bodyHere ? "physical_body_waking" : "physical_not_stepping";
+                    const char* now = moveVirtual ? "virtual" : birthHeld ? "birth_hold" : provingBirth ? "birth_proving" : stepping ? "physical" : bodyHere ? "physical_body_waking" : "physical_not_stepping";
                     if (actuatorWas[idx] != now) { actuatorWas[idx] = now;
                         logger::Write("OBS system=traffic.actuator vehicle=%08X pilot=%d event=swap to=%s advice=%s gate=%s distance=%.0f physics_radius=%.0f physics_live=%d model=%d",
                             self, idx, now, haveAdvice ? ActuatorName(advised) : "none", gateWhy, toPlayerM, physicsR, int(stepping), int(hasModel)); }
@@ -5988,7 +5999,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 #endif
                                 shapes.push_back(s);}}
                         pcWorldUs+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-tWorld1).count();
-                        planrun::Frame f;f.now=in.now;f.speed=spd;f.lateral=c0;f.station=stNow;f.x=in.x;f.y=in.y;f.carBase=carBase;
+                        planrun::Frame f;f.script=scriptMode;f.now=in.now;f.speed=spd;f.lateral=c0;f.station=stNow;f.x=in.x;f.y=in.y;f.carBase=carBase;
                         f.topSpeed=f.want=planbranch::WantedSpeed(lane->speed,flightLine?in.limits.hoverTop:in.limits.driveTop,idx>=1);
                         {   // PD-1c: say why the line holds or slows the car (route data), so a stop is never "held by nothing"
                             const double carTop=planbranch::WantedSpeed(1e9,flightLine?in.limits.hoverTop:in.limits.driveTop,idx>=1);
