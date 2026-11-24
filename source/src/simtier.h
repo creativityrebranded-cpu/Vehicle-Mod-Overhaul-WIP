@@ -46,6 +46,29 @@ inline Tier Decide(Tier prev, double distM, bool hasModel, double nearRadiusM = 
 	return prev == Tier::FarRail ? Tier::FarRail : Tier::NearPhysical;
 }
 
+// Adaptive Havok sweep budget: full 30 Hz + side sweep for player, off-corridor, or obstacle-present NPCs;
+// clean pre-baked corridor NPCs drop to 15 Hz (<=90 m) or 10 Hz center-only (>90 m) with zero visual pop-in.
+struct RadarPolicy {
+	unsigned frameInterval = 2;
+	bool sideSweep = true;
+};
+
+inline RadarPolicy RadarBudget(bool isPlayer, bool floorProofLane, bool hasObstacles, double distM) {
+	if (isPlayer) return {1u, true};
+	if (hasObstacles || !floorProofLane) return {2u, true};
+	if (std::isfinite(distM) && distM > 90.0) return {6u, false};
+	return {4u, true};
+}
+
+// Staggered NPC planning cadence (ms): 20 Hz right beside player or with obstacles, ~15 Hz for clean near
+// in-view cars, ~8 Hz out-of-view, while cars beyond kDefaultNearRadiusM (160 m) glide on FleetRail at ~0 ms.
+inline unsigned PlanIntervalMs(int rank, double distM, bool viewed, bool hasObstacles, int nearCap = 10) {
+	if (!std::isfinite(distM) || distM <= 45.0 || hasObstacles) return 50u;
+	if (rank < nearCap && distM < 150.0) return viewed ? 67u : 120u;
+	if (distM < 300.0) return 150u;
+	return 300u;
+}
+
 // Per-vehicle entry in the once-per-frame read-only FrameContext.
 struct VehicleEntry {
 	std::uint32_t vehicleId = 0;
@@ -102,7 +125,8 @@ struct FrameContext {
 
 	void Add(std::uint32_t id, std::uintptr_t ref, const float pos[3], const float vel[3], bool has3D, bool playerOwned) {
 		if (!id || count >= kMaxEntries) return;
-		const double d = havePlayer ? std::hypot(double(pos[0]) - playerPos[0], double(pos[1]) - playerPos[1]) : 0.0;
+		// 3D distance so high-altitude flight above the city keeps distant cars below on zero-pop-in FarRail instead of full physics.
+		const double d = havePlayer ? std::hypot(double(pos[0]) - playerPos[0], double(pos[1]) - playerPos[1], double(pos[2]) - playerPos[2]) : 0.0;
 		const auto prevIt = prevTier.find(id);
 		const Tier prev = prevIt != prevTier.end() ? prevIt->second : Tier::Unloaded;
 		const Tier next = playerOwned ? (has3D ? Tier::NearPhysical : Tier::Unloaded)

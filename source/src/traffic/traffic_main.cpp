@@ -1,6 +1,7 @@
 #include "../roadfield.h"
 #include "../nodeflow.h"
 #include "../trafficlook.h"
+#include "../citypolish.h"
 #include "../routecache.h"
 #include "../populationinspect.h"
 #include "engineport.h"
@@ -364,6 +365,9 @@ namespace
 		ULONGLONG holdStartMs = 0;
 		ULONGLONG holdUntilMs = 0;
 		bool dwellEndNotified = false;
+		int liftoffDefers = 0;
+		citypolish::Watchdog watchdog;
+		std::uint32_t lastLightFlags = 0;
 		double x = 0, y = 0, z = 0;      // where its vehicle was last step (the lane slot check)
 		bool holding = false;bool connectionBlocked=false;
 		// Junctions (2026-10-29): the route the trip belongs to, where it left that route for a branch, and the junctions of the
@@ -812,9 +816,13 @@ namespace
 			if (passed.empty()) return;
 			for (const auto* j : passed) {
 				const auto* ov = g_linkDirector.Find(j->link, nowMs);
-				if (ov && ov->divertAll && TakeJunction(s, *j, true)) {
-					EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &s, j->link, ov->reason.empty() ? "director_divert" : ov->reason);
-					return;
+				if (ov && ov->divertAll) {
+					const std::string linkName = j->link;
+					const std::string why = ov->reason.empty() ? "director_divert" : ov->reason;
+					if (TakeJunction(s, *j, true)) {
+						EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &s, linkName, why);
+						return;
+					}
 				}
 			}
 			std::string key = s.route + "@";for (const auto* j : passed) key += j->link + "|";
@@ -831,31 +839,36 @@ namespace
 			for (const auto& j : s.junctions) {
 				const double start=j.radius>0?trafficroute::LeadU(s.line,s.trip.lane,j.u,2.5*j.radius,true):j.u;
                 if (!trafficlinks::Crossed(s.line,s.trip.lane,before.lastU,s.trip.lastU,start))continue;
-				EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_ENTER, &s, j.link, s.trip.lap ? "lap_cross" : "landing_bound_cross");
-				const auto* ov = g_linkDirector.Find(j.link, nowMs);
+				const std::string linkName = j.link;
+				EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_ENTER, &s, linkName, s.trip.lap ? "lap_cross" : "landing_bound_cross");
+				const auto* ov = g_linkDirector.Find(linkName, nowMs);
 				if (ov && ov->divertAll) {
-					if (!s.place.empty() || !s.trip.lap) ClearLandingPlanForDivert(s, ov->reason.empty() ? "director_divert" : ov->reason);
+					const std::string why = ov->reason.empty() ? "director_divert" : ov->reason;
+					if (!s.place.empty() || !s.trip.lap) ClearLandingPlanForDivert(s, why);
 					if (TakeJunction(s, j, true)) {
-						EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &s, j.link, ov->reason.empty() ? "director_divert" : ov->reason);
+						EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &s, linkName, why);
 						return;
 					}
 				}
 				if (!s.trip.lap) {
-					EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &s, j.link, "landing_bound_pass");
+					EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &s, linkName, "landing_bound_pass");
 					continue;
 				}
 				if (ov && ov->closed) {
-					EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &s, j.link, ov->reason.empty() ? "link_closed" : ov->reason);
+					EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &s, linkName, ov->reason.empty() ? "link_closed" : ov->reason);
 					continue;
 				}
 				const double effShare = (ov && ov->shareOverride >= 0.0) ? ov->shareOverride : j.share;
 				// Any junction passed rolls its share: into a branch from the route, and (a junction in the middle of a branch,
 				// 2026-10-29) back out to the trip's own route before the branch's end. The far end of a branch is always taken (below).
-				if (trafficlinks::Roll(s.dice) < effShare && TakeJunction(s, j, false)) {
-					EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &s, j.link, (ov && ov->shareOverride >= 0.0) ? (ov->reason.empty() ? "share_override" : ov->reason) : "share_roll");
-					return;
+				if (trafficlinks::Roll(s.dice) < effShare) {
+					const std::string why = (ov && ov->shareOverride >= 0.0) ? (ov->reason.empty() ? "share_override" : ov->reason) : "share_roll";
+					if (TakeJunction(s, j, false)) {
+						EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &s, linkName, why);
+						return;
+					}
 				}
-				EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &s, j.link, "stay_on_route");
+				EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &s, linkName, "stay_on_route");
 			}
 		}
 		if (!s.trip.lap) return;
@@ -1803,9 +1816,41 @@ namespace
 		out->x = g.x; out->y = g.y; out->z = g.z; out->stop = g.stop;
 		out->passThrough = g.passThrough ? 1 : 0;
 		out->fly = 1;  // routes are flight lanes
-		out->speed = float(s->trip.leg == trafficroute::Leg::Follow ? s->speed : 15.0);
+		int todMin = -1;
+		const auto tod = citypolish::EvaluateTimeOfDay(LocalMinute(todMin), todMin);
+		out->speed = float((s->trip.leg == trafficroute::Leg::Follow ? s->speed : 15.0) * tod.speedScale);
 		ZoneLimits(*s, x, y, out, s->trip.leg == trafficroute::Leg::Follow);
 		if (s->trip.leg == trafficroute::Leg::Follow) CrossLimit(*s, x, y, out);
+		// Update visual light intent (night headlights, brake/slow, turn beacon, landing glow).
+		{
+			const bool braking = s->holding || s->scriptHolding || (out->speed < s->speed * 0.72);
+			const bool turning = !s->turn.empty() || s->placePath || s->placeApproach;
+			const bool landingGlow = s->trip.leg == trafficroute::Leg::Leave || s->trip.leg == trafficroute::Leg::Climb || s->queue;
+			const std::uint32_t lf = citypolish::ComputeLightFlags(tod.headlightsOn, braking, turning, landingGlow);
+			if (lf != s->lastLightFlags) {
+				s->lastLightFlags = lf;
+				Log("OBS system=traffic.lights car=%08X route=%s flags=%u headlights=%d brake=%d beacon=%d glow=%d phase=%s",
+				    s->vehicleId, s->route.c_str(), lf, int((lf & FVO_LIGHT_HEADLIGHTS) != 0),
+				    int((lf & FVO_LIGHT_BRAKE) != 0), int((lf & FVO_LIGHT_TURN_BEACON) != 0),
+				    int((lf & FVO_LIGHT_LANDING_GLOW) != 0), citypolish::PhaseName(tod.phase));
+			}
+		}
+		// Silent out-of-view / wedged self-heal watchdog: if an active moving car stays motionless >= 18 s,
+		// clear wedged turn/access state and let the unified arbiter smoothly rejoin its lane.
+		{
+			const bool movingExpected = !s->holding && !s->scriptHolding && !s->queue && !s->pickupWait && s->trip.leg != trafficroute::Leg::Done;
+			const double stuckS = s->watchdog.Update(x, y, z, s->seen, movingExpected);
+			if (stuckS > 0.0) {
+				s->turn.clear(); s->turnAt = 0; s->turnFrom.clear();
+				s->placePath = false; s->placeApproach = false; s->connectionBlocked = false;
+				s->trip.uKnown = false;
+				if (s->trip.leg == trafficroute::Leg::Leave && !s->place.empty()) {
+					ClearLandingPlanForDivert(*s, "selfheal_wedged");
+				}
+				Log("OBS system=traffic.selfheal car=%08X route=%s lane=%d stuck_s=%.1f heals=%u reason=wedged_auto_recover",
+				    s->vehicleId, s->route.c_str(), s->trip.lane, stuckS, s->watchdog.healCount);
+			}
+		}
 		return 0;
 	}
 
@@ -1825,8 +1870,12 @@ namespace
 			// Occupancy rules: it stays parked in its space this long (counted from when it has landed), bounded by max hold.
 			const ULONGLONG now = GetTickCount64();
 			if (!s->stayUntil) {
-				s->stayUntil = now + ULONGLONG(nodeflow::ClampHoldSeconds(s->stay, s->stay) * 1000.0);
+				int todMin = -1;
+				const auto tod = citypolish::EvaluateTimeOfDay(LocalMinute(todMin), todMin);
+				const double scaledStay = s->stay * tod.dwellScale;
+				s->stayUntil = now + ULONGLONG(nodeflow::ClampHoldSeconds(scaledStay, scaledStay) * 1000.0);
 				s->dwellEndNotified = false;
+				s->liftoffDefers = 0;
 				EmitNodeEvent(FVO_NODE_LANDING, FVO_EVT_PARKED, s, s->place, "landed_dwell_start");
 			}
 			if (now < s->stayUntil) return 0;
@@ -1886,6 +1935,27 @@ namespace
 			s->line = trafficroute::Build(*route);s->spec=*route;s->completedControl=-1;s->controlStopped=0;
 			s->speed = RoleSpeed(*route); s->route = route->name;
 			const int lane = trafficroute::KeepLane(s->line,route->lanes,s->trip.lane);
+			// Gap-aware lift-off: if an oncoming car on the target route is within 40 m, defer 3 s (max 3x) to avoid platooning.
+			{
+				const ULONGLONG nowMs = GetTickCount64();
+				double nearestGap = 1e30;
+				for (const auto& other : g_slots) {
+					if (!other.used || &other == s || other.route != route->name || other.trip.leg == trafficroute::Leg::Done) continue;
+					if (nowMs - other.seen > 4000) continue;
+					const double d = std::hypot(other.x - x, other.y - y);
+					if (d < nearestGap) nearestGap = d;
+				}
+				if (citypolish::ShouldDeferLiftoff(nearestGap, s->liftoffDefers)) {
+					++s->liftoffDefers;
+					s->stayUntil = nowMs + ULONGLONG(citypolish::kLiftoffDeferS * 1000.0);
+					Log("OBS system=traffic.nodeevent t_ms=%llu node=%s kind=landing event=dwell_stagger car=%08X tier=%s route=%s lane=%d dir=%d u=%.3f speed=%.2f held_s=%.1f reason=gap_aware_liftoff",
+					    static_cast<unsigned long long>(nowMs), s->place.empty() ? route->name.c_str() : s->place.c_str(), s->vehicleId,
+					    nodeflow::SimTierName(s->onRail ? FVO_TIER_RAIL : FVO_TIER_PHYS), route->name.c_str(),
+					    lane, (lane & 1) ? -1 : 1, 0.0, 0.0, citypolish::kLiftoffDeferS);
+					return 0;
+				}
+				s->liftoffDefers = 0;
+			}
 			if (!s->place.empty()) EmitNodeEvent(FVO_NODE_LANDING, FVO_EVT_DEPART, s, s->place, "departing_bay");
 			s->place.clear(); s->space = -1; s->queue = false; s->stay = 0; s->stayUntil = 0; s->dwellEndNotified = false;
 			// Landing areas are used lap after lap, not only by a vehicle's first trip: places, or every other trip with mixed.
@@ -2857,23 +2927,28 @@ namespace
             for (const auto& j : slot.junctions) {
                 const double start = j.radius > 0 ? trafficroute::LeadU(line, lane, j.u, 2.5 * j.radius, true) : j.u;
                 if (!trafficlinks::Crossed(line, lane, prevU, u, start)) continue;
-                EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_ENTER, &slot, j.link, slot.trip.lap ? "rail_lap_cross" : "rail_landing_cross", 0.0, FVO_TIER_RAIL);
-                const auto* ov = g_linkDirector.Find(j.link, railNowMs);
+                const std::string linkName = j.link;
+                EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_ENTER, &slot, linkName, slot.trip.lap ? "rail_lap_cross" : "rail_landing_cross", 0.0, FVO_TIER_RAIL);
+                const auto* ov = g_linkDirector.Find(linkName, railNowMs);
                 if (ov && ov->divertAll) {
-                    if (!slot.place.empty() || !slot.trip.lap) ClearLandingPlanForDivert(slot, ov->reason.empty() ? "director_divert" : ov->reason);
+                    const std::string why = ov->reason.empty() ? "director_divert" : ov->reason;
+                    if (!slot.place.empty() || !slot.trip.lap) ClearLandingPlanForDivert(slot, why);
                     if (TakeJunction(slot, j, true)) {
-                        EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &slot, j.link, ov->reason.empty() ? "director_divert" : ov->reason, 0.0, FVO_TIER_RAIL);
-                        break;
+                        EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &slot, linkName, why, 0.0, FVO_TIER_RAIL);
+                        return false;  // route/line/lane swapped; rebuild path on next tick
                     }
                 }
                 if (slot.trip.lap && !(ov && ov->closed)) {
                     const double effShare = (ov && ov->shareOverride >= 0.0) ? ov->shareOverride : j.share;
-                    if (trafficlinks::Roll(slot.dice) < effShare && TakeJunction(slot, j, false)) {
-                        EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &slot, j.link, (ov && ov->shareOverride >= 0.0) ? (ov->reason.empty() ? "share_override" : ov->reason) : "rail_share_roll", 0.0, FVO_TIER_RAIL);
-                        break;
+                    if (trafficlinks::Roll(slot.dice) < effShare) {
+                        const std::string why = (ov && ov->shareOverride >= 0.0) ? (ov->reason.empty() ? "share_override" : ov->reason) : "rail_share_roll";
+                        if (TakeJunction(slot, j, false)) {
+                            EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_DIVERT, &slot, linkName, why, 0.0, FVO_TIER_RAIL);
+                            return false;  // route/line/lane swapped; rebuild path on next tick
+                        }
                     }
                 }
-                EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &slot, j.link, "rail_stay", 0.0, FVO_TIER_RAIL);
+                EmitNodeEvent(FVO_NODE_LINK, FVO_EVT_PASS, &slot, linkName, "rail_stay", 0.0, FVO_TIER_RAIL);
             }
         } else {
             slot.trip.lastU = u;
@@ -3098,7 +3173,7 @@ namespace
 		if (const auto plan = reinterpret_cast<FvoRegisterCruisePlanner_t>(GetProcAddress(core, "FVO_RegisterCruisePlanner"))) plan(&PlanCruise);
 		if (const auto tick = reinterpret_cast<FvoRegisterTick_t>(GetProcAddress(core, "FVO_RegisterTick"))) tick(&Markers);
 		if (!g_worldName) { Log("FVO traffic: core has no FVO_WorldName (an older FlyingVehicleOverhaul.dll); traffic files off"); return; }
-		if (g_trafficApi) Log("FVO Traffic addon 0.4.1: route traffic attached (playthrough files loaded after the save)");
+		if (g_trafficApi) Log("FVO Traffic addon 0.4.2: route traffic attached (playthrough files loaded after the save)");
 	}
 
 	void SfseMessage(SFSEMessagingInterface::Message* msg)
@@ -3337,4 +3412,22 @@ extern "C" __declspec(dllexport) int FVO_Traffic_DelayDepartureV1(std::uint32_t 
     std::lock_guard guard(g_journeyMutex);
     g_departDelay[vehicleId] = { std::clamp(extraSeconds, 0.0, nodeflow::kMaxStaggerDelayS), (reason && *reason) ? reason : "stagger" };
     return 1;
+}
+
+extern "C" __declspec(dllexport) int FVO_Traffic_VehicleVisualIntentV1(std::uint32_t vehicleId, FvoVehicleVisualIntentV1* out) {
+    if (!vehicleId || !out || out->size != sizeof(*out) || out->version != 1) return 0;
+    std::lock_guard guard(g_journeyMutex);
+    for (const auto& s : g_slots) {
+        if (!s.used || s.vehicleId != vehicleId) continue;
+        int todMin = -1;
+        const auto tod = citypolish::EvaluateTimeOfDay(LocalMinute(todMin), todMin);
+        FvoVehicleVisualIntentV1 v{};
+        v.vehicleId = s.vehicleId;
+        v.lightFlags = s.lastLightFlags | (tod.headlightsOn ? FVO_LIGHT_HEADLIGHTS : 0u);
+        v.localMinute = todMin;
+        v.speedScale = tod.speedScale;
+        *out = v;
+        return 1;
+    }
+    return 0;
 }

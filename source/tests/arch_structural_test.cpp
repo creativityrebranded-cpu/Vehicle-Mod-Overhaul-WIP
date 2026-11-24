@@ -2,6 +2,7 @@
 // Verifies semantic collider radius clamp, SimTier hysteresis, FrameContext O(1) lookup,
 // FrameBudget governor with starvation prevention, and pre-baked uniform-arclength lane tables.
 
+#include "citypolish.h"
 #include "game.h"
 #include "nodeflow.h"
 #include "simtier.h"
@@ -267,6 +268,59 @@ int main() {
 		      td.links.size() == 1 && td.links[0].tag == "mast" && td.links[0].eventId == "convoy" &&
 		      td.zones.size() == 1 && td.zones[0].tag == "plaza_calm" && td.zones[0].eventId == "hero_calm",
 			"trafficdata::Read parses optional tag and event_id on places, links, and zones without problems");
+	}
+
+	// 12. Zero-pop-in LOD & adaptive Havok sweep / staggered planning budgets (simtier.h).
+	{
+		const auto pPlayer = simtier::RadarBudget(true, true, false, 0.0);
+		const auto pObs = simtier::RadarBudget(false, true, true, 120.0);
+		const auto pNearClean = simtier::RadarBudget(false, true, false, 60.0);
+		const auto pMidClean = simtier::RadarBudget(false, true, false, 120.0);
+		Check(pPlayer.frameInterval == 1u && pPlayer.sideSweep, "RadarBudget keeps full 60 Hz + side sweep for player");
+		Check(pObs.frameInterval == 2u && pObs.sideSweep, "RadarBudget keeps full 30 Hz + side sweep when obstacles exist");
+		Check(pNearClean.frameInterval == 4u && pNearClean.sideSweep && pMidClean.frameInterval == 6u && !pMidClean.sideSweep,
+			"RadarBudget relaxes clean pre-baked corridor NPCs to 15 Hz (<=90 m) and 10 Hz center-only (>90 m)");
+		Check(simtier::PlanIntervalMs(0, 30.0, true, false) == 50u &&
+		      simtier::PlanIntervalMs(2, 80.0, true, false) == 67u &&
+		      simtier::PlanIntervalMs(2, 80.0, false, false) == 120u &&
+		      simtier::PlanIntervalMs(2, 80.0, true, true) == 50u,
+			"PlanIntervalMs staggers clean near NPCs to 15 Hz while keeping 20 Hz beside player or near obstacles");
+		simtier::FrameContext fc3d;
+		fc3d.Begin(1, true, 0.0f, 0.0f, 250.0f, 160.0, 500.0);
+		const float belowPos[3] = {0.0f, 0.0f, 0.0f}, zeroVel[3] = {0.0f, 0.0f, 0.0f};
+		const float divePos[3] = {0.0f, 0.0f, 160.0f};
+		fc3d.Add(0xFF100001u, 1u, belowPos, zeroVel, true, false);
+		fc3d.Add(0xFF100002u, 2u, divePos, zeroVel, true, false);
+		fc3d.Finish();
+		const auto* eBelow = fc3d.Find(0xFF100001u);
+		const auto* eDive = fc3d.Find(0xFF100002u);
+		Check(eBelow && eBelow->tier == simtier::Tier::FarRail && eDive && eDive->tier == simtier::Tier::NearPhysical,
+			"FrameContext uses 3D distance so cars 250 m directly below a high-flying player stay on zero-pop-in FarRail");
+	}
+
+	// 13. Production City Polish: Time-of-day rhythm, night headlights, gap-aware lift-off, and self-heal watchdog.
+	{
+		const auto rNight = citypolish::EvaluateTimeOfDay(true, 23 * 60 + 15);
+		const auto rMidday = citypolish::EvaluateTimeOfDay(true, 13 * 60);
+		const auto rRush = citypolish::EvaluateTimeOfDay(true, 18 * 60);
+		Check(rNight.headlightsOn && rNight.phase == citypolish::DayPhase::LateNight && rNight.speedScale < 1.0 && rNight.dwellScale > 1.0,
+			"EvaluateTimeOfDay turns headlights on at late night with gentler speed and longer calm dwell");
+		Check(!rMidday.headlightsOn && rMidday.phase == citypolish::DayPhase::Midday && std::fabs(rMidday.speedScale - 1.0) < 1e-6,
+			"EvaluateTimeOfDay keeps headlights off at midday with baseline 1.0x speed");
+		Check(!rRush.headlightsOn && rRush.phase == citypolish::DayPhase::EveningRush && rRush.dwellScale < 1.0,
+			"EvaluateTimeOfDay recognizes evening rush with brisker pad turnover");
+		const auto lf = citypolish::ComputeLightFlags(true, true, true, false);
+		Check((lf & FVO_LIGHT_HEADLIGHTS) && (lf & FVO_LIGHT_BRAKE) && (lf & FVO_LIGHT_TURN_BEACON) && !(lf & FVO_LIGHT_LANDING_GLOW),
+			"ComputeLightFlags composes headlights, brake, and turn beacon flags accurately");
+		Check(citypolish::ShouldDeferLiftoff(25.0, 0) && !citypolish::ShouldDeferLiftoff(55.0, 0) && !citypolish::ShouldDeferLiftoff(10.0, 3),
+			"ShouldDeferLiftoff defers when oncoming car < 40 m and caps deferrals at 3 to prevent starvation");
+		citypolish::Watchdog wd;
+		Check(wd.Update(10.0, 20.0, 0.0, 1000, true) == 0.0 && wd.Update(10.1, 20.0, 0.0, 15000, true) == 0.0,
+			"Watchdog does not trigger self-heal before 18 s stuck threshold");
+		Check(wd.Update(10.1, 20.0, 0.0, 20000, true) >= 18.0 && wd.healCount == 1,
+			"Watchdog triggers self-heal after >= 18 s motionless when moving is expected");
+		Check(wd.Update(10.1, 20.0, 0.0, 40000, true) == 0.0,
+			"Watchdog respects 30 s cooldown after self-heal");
 	}
 
 	if (!g_fail) std::printf("ALL PASS\n");

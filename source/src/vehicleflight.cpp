@@ -5067,7 +5067,12 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 		void RadarSweep(int idx, std::uint32_t self, radar::State& st, std::uintptr_t instance, std::uint32_t ownBody, double x, double y, double base, double heading, double speed, double now, unsigned long long frame, bool floorProofLane)
 		{
 			if (!instance || !ownBody) return;
-			if (idx != 0 && frame - st.sweptFrame < 2) return;  // the player's car every frame; others every second frame
+			double distToPlayer = 0.0;
+			if (idx != 0) {
+				if (const auto* ce = simtier::Context().Find(self)) distToPlayer = ce->distM;
+			}
+			const auto rpol = simtier::RadarBudget(idx == 0, floorProofLane, st.count > 0, distToPlayer);
+			if (idx != 0 && frame - st.sweptFrame < rpol.frameInterval) return;
 			const double reach = std::clamp(std::fabs(speed) * radar::rules::ttc, radar::rules::aheadMin, radar::rules::aheadMax);
 			radar::Segment seg[radar::rules::sweepSegments]; int ns = 0; const char* along = "nose";
 			bool backing = speed < -.3;
@@ -5082,11 +5087,11 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				}
 			}
 			if (!ns) { ns = radar::SweepPlan(nullptr, nullptr, 0, x, y, backing ? heading + radar::kPi : heading, reach, seg, radar::rules::sweepSegments); if (backing) along = "reverse"; }
-			// Every pass: the path itself, and the path shifted to one side (cycling right and left out to 2 m), so the Plan learns which
-			// shifted lines are clear before it picks one (the 19:55 run's tree: the open half of the road was never swept).
+			// Every pass: the path itself, and (when radar budget permits) the path shifted to one side so the Plan learns which
+			// shifted lines are clear before it picks one.
 			constexpr int kSides = int(sizeof radar::rules::sideOffsets / sizeof radar::rules::sideOffsets[0]);
-			const bool side = true; const double sideOff = radar::rules::sideOffsets[st.sweepPass % kSides];
-			const int cost = ns * 2;
+			const bool side = rpol.sideSweep; const double sideOff = radar::rules::sideOffsets[st.sweepPass % kSides];
+			const int cost = ns * (side ? 2 : 1);
 			if (g_radarFrameSweeps + cost > kRadarFrameSweeps) { ++st.stats.sweepBudget; return; }
 			g_radarFrameSweeps += cost; st.sweptFrame = frame; ++st.sweepPass;
 			// The hull is cast from the body's origin, where it stands now over the floor `base`; each piece is shifted by the measured floor's
@@ -9499,7 +9504,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			// Planning tiers (2026-10-29, the user: 64 vehicles, "find a way for it to work and still be performant"): the kNearPilots
 			// nearest pilots within kNearM plan at 20 Hz as before; others within kMidM at 10 Hz, the rest at 5 Hz. Planning and its probes
 			// both follow (Fly asks them); the physics hook keeps applying the last targets in between.
-			constexpr int kNearPilots = 16;
+			constexpr int kNearPilots = 10;
 			constexpr double kNearM = 150.0, kMidM = 300.0;
 			static double dist[kPilots];
 			static ULONGLONG tierEvery[kPilots];
@@ -9532,7 +9537,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 						dist[idx] = ce->distM;
 					} else if (const auto v = g_shs[idx].vehicle.load()) {
 						const auto vp = At<game::Vec3>(v, off::kRefPosition);
-						dist[idx] = std::hypot(double(vp.x) - pp.x, double(vp.y) - pp.y);
+						dist[idx] = std::hypot(double(vp.x) - pp.x, double(vp.y) - pp.y, double(vp.z) - pp.z);
 					}
 					order[nActive++] = idx;
 				}
@@ -9540,19 +9545,20 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				for (int k = 0; k < nActive; ++k) {
 					const int idx = order[k];
 					const double d = dist[idx];
-					tierEvery[idx] = (k < kNearPilots && d < kNearM) ? 50 : d < kMidM ? 120 : d < 350.0 ? 250 : 400;
-					g_ageScale[idx] = unsigned(tierEvery[idx] / 50);
+					const bool hasObs = dangerAt[idx] != 0 && now - dangerAt[idx] < 2000;
+					tierEvery[idx] = simtier::PlanIntervalMs(k, d, true, hasObs, kNearPilots);
+					g_ageScale[idx] = std::max(1u, unsigned(tierEvery[idx] / 50));
 				}
 			}
 			// Process the nearest kNearPilots first so cars right beside the player never wait behind distant ones,
-			// then round-robin the remaining active pilots within the 4 ms frame budget.
+			// then round-robin the remaining active pilots within the 1.8 ms frame budget.
 			static int rrPilot = 0;
 			const int nearCount = std::min(nActive, kNearPilots);
 			const int farCount = nActive - nearCount;
 			LARGE_INTEGER ptFreq{}, ptStart{}, ptNow{};
 			QueryPerformanceFrequency(&ptFreq);
 			QueryPerformanceCounter(&ptStart);
-			constexpr double kPilotsBudgetMs = 2.5;
+			constexpr double kPilotsBudgetMs = 1.8;
 			int pilotsRunThisFrame = 0;
 			for (int step = 0; step < nActive; ++step) {
 				const int idx = step < nearCount ? order[step] : order[nearCount + ((rrPilot + (step - nearCount)) % farCount)];
