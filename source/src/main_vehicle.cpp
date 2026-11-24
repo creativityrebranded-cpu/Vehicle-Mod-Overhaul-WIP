@@ -33,6 +33,7 @@
 #include "environment.h"
 #include "npcvehicles.h"
 #include "pilotquest.h"
+#include "simtier.h"
 #include "passenger.h"
 #include "traffic.h"
 #include "profiles.h"
@@ -271,6 +272,7 @@ namespace
         lifecycle::Reset();  // first: a queued callback must not refill what the resets below clear
         secretunpause::Reset();
         g_worldReady=false;g_pacing={};g_schedule.Reset();g_scheduleBegan=g_scheduleWork=0;ResetCostWindow();
+        framebudget::Main().ResetAll();
         runtimecells::Reset();
 		bindings::ResetRuntime();
 		vehicleflight::LoadReset();
@@ -341,7 +343,9 @@ namespace
     void Update()
     {
         LARGE_INTEGER frequency,start,previous,stamp;QueryPerformanceFrequency(&frequency);QueryPerformanceCounter(&start);previous=start;
+        auto elapsedNow=[&](){LARGE_INTEGER t{};QueryPerformanceCounter(&t);return 1000.0*double(t.QuadPart-start.QuadPart)/frequency.QuadPart;};
         double cost[8]{};auto mark=[&](int i){QueryPerformanceCounter(&stamp);cost[i]=1000.0*double(stamp.QuadPart-previous.QuadPart)/frequency.QuadPart;previous=stamp;};
+        framebudget::Main().BeginFrame();
         costparts::BeginFrame();
         modscene::NewFrame();
         features::Tick();bindings::Tick();
@@ -353,18 +357,57 @@ namespace
         const char* slowName[2]={"",""};double slowMs[2]={0,0};
         auto part=[&](int bucket,const char* name,auto&& fn){LARGE_INTEGER a{},b{};QueryPerformanceCounter(&a);fn();QueryPerformanceCounter(&b);
             const double ms=1000.0*double(b.QuadPart-a.QuadPart)/frequency.QuadPart;if(ms>slowMs[bucket]){slowMs[bucket]=ms;slowName[bucket]=name;}};
-        part(0,"cell bake",[]{cellbake::Tick(Loading(GetTickCount64()));});part(0,"route survey",[]{routesurvey::Tick(Loading(GetTickCount64()));});part(0,"hazard boxes",[]{hazardfield::Tick(Loading(GetTickCount64()));});part(0,"navmesh input probe",[]{navprobe::Tick(Loading(GetTickCount64()));});part(0,"car navmesh",[]{navmesh::Tick(Loading(GetTickCount64()));});part(0,"collision-box scan",[]{navseed::Tick();});part(0,"flight field",[]{navfield::Service();});
+        const bool isLoading = Loading(GetTickCount64());
+        auto& gov = framebudget::Main();
+        if(isLoading || gov.Allow(framebudget::CellBake, elapsedNow())) part(0,"cell bake",[&]{cellbake::Tick(isLoading);});
+        if(isLoading || gov.Allow(framebudget::RouteSurvey, elapsedNow())) part(0,"route survey",[&]{routesurvey::Tick(isLoading);});
+        if(isLoading || gov.Allow(framebudget::HazardField, elapsedNow())) part(0,"hazard boxes",[&]{hazardfield::Tick(isLoading);});
+        part(0,"navmesh input probe",[&]{navprobe::Tick(isLoading);});
+        if(isLoading || gov.Allow(framebudget::NavMesh, elapsedNow())) part(0,"car navmesh",[&]{navmesh::Tick(isLoading);});
+        if(isLoading || gov.Allow(framebudget::NavSeed, elapsedNow())) part(0,"collision-box scan",[]{navseed::Tick();});
+        part(0,"flight field",[]{navfield::Service();});
         part(0,"surface checks",[]{environment::Tick();});part(0,"nav map",[]{navmap::Tick();});mark(2);
         profiles::Tick();context::Tick();mark(3);
         npcvehicles::Tick();passenger::Tick();mark(4);
         // (The native movement-controller probe did its job, 2026-10-27: every vehicle has a controller. Off: it took an engine lock every 5 s.)
         vehicleflight::Tick();vehiclediag::Tick();loadedarea::Tick();mark(5);
+        gov.NoteGameplayMs(cost[4] + cost[5]);
         part(1,"ship vehicle",[]{shipvehicle::Tick();});part(1,"vehicle registry",[]{realvehicles::Tick();});part(1,"ring road",[]{ringroad::Tick();});part(1,"route markers",[]{routeprobes::Tick();});part(1,"traffic pool",[]{trafficpool::Tick();});
         part(1,"scanner target",[]{scantarget::Tick();});
         part(1,"traffic destinations",[]{traffic::Tick();});part(1,"view distance",[]{viewdist::Tick();});part(1,"keep in sight",[]{vehiclekeep::Tick();});
         part(1,"log writer",[]{logger::Service();});mark(6);
         bindings::EndUpdate();
-        cost[7]=1000.0*double(stamp.QuadPart-start.QuadPart)/frequency.QuadPart;g_frameCost.Finish(cost);
+        cost[7]=1000.0*double(stamp.QuadPart-start.QuadPart)/frequency.QuadPart;
+        gov.EndFrame(cost[7]);
+        g_frameCost.Finish(cost);
+        {
+            static ULONGLONG archAt = 0;
+            const ULONGLONG nowArch = GetTickCount64();
+            if (!archAt) archAt = nowArch;
+            else if (nowArch - archAt >= 10000) {
+                archAt = nowArch;
+                const auto& ctx = simtier::Context();
+                auto& ap = archproof::State();
+                logger::Write("OBS system=arch.proof tier_near=%u tier_rail=%u tier_unloaded=%u rail_active=%u rail_blk=%u/%u/%u "
+                    "ctx_hits=%llu/%llu hud_cache=%llu budget_over=%u/%u pilots_cap=%u bg_runs=%u,%u,%u,%u,%u bg_defers=%u,%u,%u,%u,%u starve=%u "
+                    "life_player=%u life_dyn=%u life_refile=%u viol_kf=%u viol_fg=%u viol_exp=%u collider_r=%.0f broadphase_r=%.0f",
+                    ctx.tierNear.load(), ctx.tierRail.load(), ctx.tierUnloaded.load(), ap.railActive.load(),
+                    ap.railBlockedNoPath.load(), ap.railBlockedNoChassis.load(), ap.railBlockedBirthHold.load(),
+                    static_cast<unsigned long long>(ctx.hits.load()), static_cast<unsigned long long>(ctx.lookups.load()),
+                    static_cast<unsigned long long>(ap.hudFollowerCacheUses.load()),
+                    gov.framesOverBudget, gov.frames, gov.pilotsCapped,
+                    gov.runs[0], gov.runs[1], gov.runs[2], gov.runs[3], gov.runs[4],
+                    gov.defers[0], gov.defers[1], gov.defers[2], gov.defers[3], gov.defers[4], gov.starveGrants,
+                    ap.lifeToPlayer.load(), ap.lifeEnsureDyn.load(), ap.lifeUnseatRefile.load(),
+                    ap.violKeyframedPlayer.load(), ap.violFallguard.load(), ap.violExpiredLane.load(),
+                    ctx.colliderRadiusM, ctx.broadphaseRadiusM);
+                logger::Write("OBS system=arch.corridor rail_clamped=%u plan_clamped=%u phys_wall_arrest=%u tyre_yaw_damped=%u",
+                    ap.corridorRailClamped.load(), ap.corridorPlanClamped.load(),
+                    ap.corridorPhysWallArrest.load(), ap.corridorTyreYawDamped.load());
+                gov.ResetWindow();
+                ap.ResetWindow();
+            }
+        }
         // An admitted update, not a rendered frame: name slow work at most every two seconds.
         static ULONGLONG spikeAt=0;
         if(cost[7]>12.0&&GetTickCount64()-spikeAt>=2000){spikeAt=GetTickCount64();

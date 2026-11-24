@@ -24,11 +24,10 @@ namespace rules {
 inline constexpr double factoryPoseHorizontal = 2.0, factoryPoseVertical = 2.5;
 inline constexpr double dropMargin = .3;            // m: births stand this far above the field floor and drop (user, 2026-11-06)
 inline constexpr int maxCreatePerTick = 1;          // Arbiter: at most one create request per tick
-inline constexpr int maxWaitingCovered = 24;        // Arbiter: pairs still being proved at once (loading screen / X panel); 12 until 2026-11-21
-// Batches under cover (2026-11-21, user: "batch them"): the loading screen's arrival window is ~5 s after the world is ready, so one
-// create per tick placed at most ~15-20 of 61. Under cover nothing is seen and the frame is held: up to 4 create requests per tick.
-inline constexpr int maxCreatePerTickCovered = 4;
-inline constexpr int maxLookCovered = 32;           // Arbiter: slots looked at per tick
+inline constexpr int maxWaitingCovered = 24;        // Arbiter: sliding window of in-flight pairs under cover (safe vs 79-actor crash; 2026-11-23)
+// Batches under cover (2026-11-21 / 2026-11-23): async sliding window; 6 creates/tick keeps lifecycle queue saturated without expiring proofs.
+inline constexpr int maxCreatePerTickCovered = 6;
+inline constexpr int maxLookCovered = 64;           // Arbiter: slots looked at per tick
 // Health's verdict values (models, spots, every stage, the seat time) live in spawnhealth::rules: one rule (card HR1).
 inline constexpr unsigned long long seatProveMs = spawnhealth::rules::seatProveMs;  // minimum observed play time to record a terminal seat failure
 inline constexpr double fitMargin = .15;            // Siting: the body's half width needs this much room inside the box

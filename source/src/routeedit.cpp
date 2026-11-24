@@ -21,6 +21,7 @@
 #include "roadmigrate.h"
 #include "f7layers.h"
 #include "f7dock.h"
+#include "trafficlook.h"
 #include "editormessage.h"
 #include "features.h"  // Script mode toggle (docklayout.inl)
 #include "fieldbox.h"
@@ -2319,8 +2320,9 @@ namespace routeedit
 		constexpr double kPanelW = 412;  // 2026-11-11: was 380; 32 px more keeps 42 letters a line at the Future face's 9 px a letter
 		constexpr double kInner = kPanelW - 28;      // content width
 		constexpr double kLabelW = 130;              // a row's label cell
-		constexpr unsigned kTeal = 0x6FE0D0, kText = 0xDFE7EE, kDim = 0x8C9AAB, kAmber = 0xF2B04E, kCoral = 0xE8705C, kRowA = 0x27303F, kRowB = 0x1A2331;
-		constexpr unsigned kClearanceRed = 0xFF5555;
+		// Constellation Slate palette (2026-11-24, user approved): obsidian glass, warm ivory text, cyan nav, gold field/warn, emerald save, coral hazard/delete.
+		constexpr unsigned kTeal = 0x38BDF8, kText = 0xF1EFEA, kDim = 0x7A8BA3, kAmber = 0xF59E0B, kCoral = 0xEF4444, kRowA = 0x131A26, kRowB = 0x1A2333;
+		constexpr unsigned kClearanceRed = 0xEF4444, kEmerald = 0x10B981, kDockBg = 0x0F141C, kDockBorder = 0x2A3444, kWellBg = 0x0B1018;
 		constexpr double kLaneNoneFit = 2.5, kLaneAllFit = 3.5;  // m of lane: the smallest traffic hull (~2.2 m) plus margin; the widest common hulls
 		double PanelX() { return std::clamp(g_ui.width - kPanelW - 12 + g_f7Offset[2].dx, 12.0, std::max(12.0, g_ui.width - kPanelW - 12)); }
 		bool OverPanel(double x, double y) { for(const auto& r:g_contextRects)if(r.Contains(x,y))return true;return g_contextPanel&&x >= PanelX() && x <= PanelX() + kPanelW && y >= 12 && y <= g_ui.panelBottom; }
@@ -6993,49 +6995,48 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 			else { Layout(shown, timeKnown, minute);ContextLayout(shown,c);BasicFilter(); }
 			if (g_msg.IsOpen()) MessageLayout();  // the message panel replaces everything laid out above while it is open
 			constexpr unsigned kFrost = 0x3A424D;  // (the old frost tint; the panels are sheen glass now)
-			constexpr unsigned kGlassTint = 0x121E26, kGlassAmber = 0xF2C46B;  // look A: a clear dark tint; Save is amber glass
-			// Multi-colour on states (2026-11-20): the same colours the map uses for travel (Drive green, Hover blue, Both violet), Allow amber,
-			// delete red; every other selected control stays teal. The colour follows the choice's own name, so no id table can drift.
-			auto isGlassOn = [&](unsigned f) { return f == kTeal || f == kGlassAmber || f == kCoral || f == roadvisual::kDriveTint || f == roadvisual::kHoverTint || f == roadvisual::kBothTint; };
+			constexpr unsigned kGlassTint = kDockBg, kGlassAmber = kAmber, kGlassEmerald = kEmerald;  // Constellation Slate smoked glass
+			// Multi-colour on states: Drive green, Hover blue, Both violet, Save emerald, Allow/PermSave gold, delete coral, nav/active cyan.
+			auto isGlassOn = [&](unsigned f) { return f == kTeal || f == kGlassAmber || f == kGlassEmerald || f == kCoral || f == roadvisual::kDriveTint || f == roadvisual::kHoverTint || f == roadvisual::kBothTint; };
 			auto lighten = [](unsigned c) { const unsigned r = ((c >> 16) & 255) + (255 - ((c >> 16) & 255)) * 55 / 100, g = ((c >> 8) & 255) + (255 - ((c >> 8) & 255)) * 55 / 100, b = (c & 255) + (255 - (c & 255)) * 55 / 100; return (r << 16) | (g << 8) | b; };
 			auto glassOf = [&](const std::string& word) -> unsigned {
 				if (word == "Drive") return roadvisual::kDriveTint; if (word == "Hover") return roadvisual::kHoverTint; if (word == "Both") return roadvisual::kBothTint;
-				if (word == "Allow") return kGlassAmber; return kTeal; };
+				if (word == "Allow") return kGlassAmber; if (word == "Save") return kGlassEmerald; return kTeal; };
 			auto frame = [&](double x, double y, double w, double h, unsigned fill, double alpha, unsigned edge, double edgeAlpha) {
 				// UI_RULES 3: containers 12 px with a bevel, controls 5 px flat, list rows and hairlines square.
 				const bool container = w >= 200 && h >= 46, row = (w >= 200 && h < 46) || h <= 6 || w <= 6;
 				const double radius = container ? std::min({ 12.0, w * .5, h * .5 }) : row ? 0.0 : std::min({ 5.0, w * .5, h * .5 });
-				const bool surface = container && (fill == 0x141C29 || fill == 0x0B1119 || fill == kRowA || fill == kRowB);
+				const bool surface = container && (fill == kDockBg || fill == kWellBg || fill == 0x141C29 || fill == 0x0B1119 || fill == kRowA || fill == kRowB);
 				if (surface) {
-					panel.NoLine(); panel.Fill(kGlassTint, std::min(alpha, .62)); panel.RoundRect(x, y, w, h, 2 * radius); panel.End();
+					panel.NoLine(); panel.Fill(kGlassTint, std::min(alpha, .78)); panel.RoundRect(x, y, w, h, 2 * radius); panel.End();
 					if (w > 6 && h > 6) {
 						auto cx = [&](double v) { return std::clamp(v, x + radius, x + w - radius); };
 						const double bw = std::min(w * .16, 130.0), lean = std::min(h * .5, 70.0), x0 = x + w * .05;
-						panel.NoLine(); panel.Fill(0xFFFFFF, .06);  // the diagonal glare band
+						panel.NoLine(); panel.Fill(0xFFFFFF, .04);  // subtle glare band
 						panel.Move(cx(x0), y + h - 1); panel.Line(cx(x0 + bw), y + h - 1); panel.Line(cx(x0 + bw + lean), y + 1); panel.Line(cx(x0 + lean), y + 1); panel.End();
 						panel.NoLine();
-						panel.Style(2, kTeal, .05); panel.RoundRect(x + 2, y + 2, w - 4, h - 4, 2 * std::max(0.0, radius - 2));  // faint teal inner glow
-						panel.Style(1, 0xFFFFFF, .24); panel.RoundRect(x + .5, y + .5, w - 1, h - 1, 2 * radius);  // the rim
-						panel.Style(1, 0xFFFFFF, .50); panel.Move(x + radius, y + 1.5); panel.Line(x + w - radius, y + 1.5);  // the bright top edge
-						panel.Style(1, 0xFFFFFF, .10); panel.Move(x + radius, y + h - 1.5); panel.Line(x + w - radius, y + h - 1.5);
+						panel.Style(2, kTeal, .08); panel.RoundRect(x + 2, y + 2, w - 4, h - 4, 2 * std::max(0.0, radius - 2));  // subtle Constellation cyan inner glow
+						panel.Style(1, kDockBorder, .70); panel.RoundRect(x + .5, y + .5, w - 1, h - 1, 2 * radius);  // crisp slate rim
+						panel.Style(1, 0xFFFFFF, .32); panel.Move(x + radius, y + 1.5); panel.Line(x + w - radius, y + 1.5);  // top bevel highlight
+						panel.Style(1, 0xFFFFFF, .08); panel.Move(x + radius, y + h - 1.5); panel.Line(x + w - radius, y + h - 1.5);
 					}
-					if (edgeAlpha > 0) { panel.Style(1, edge, edgeAlpha * .35); panel.RoundRect(x, y, w, h, 2 * radius); }
+					if (edgeAlpha > 0) { panel.Style(1, edge, edgeAlpha * .45); panel.RoundRect(x, y, w, h, 2 * radius); }
 					panel.NoLine();
 					return;
 				}
-				// Controls are glass too: a faint white tint and a lit top edge when idle, tinted teal glass when on (look A, 2026-11-20).
+				// Controls are glass too: subtle dark-slate tint when idle, semantic Constellation glass when active.
 				const bool control = !container && !row && w >= 24 && h >= 18;
-				const bool glassIdle = control && (fill == kRowA || fill == 0x1A2331 || fill == 0x141C29);
+				const bool glassIdle = control && (fill == kRowA || fill == kRowB || fill == kDockBg || fill == kWellBg || fill == 0x1A2331 || fill == 0x141C29);
 				const bool glassOn = control && isGlassOn(fill) && alpha >= .99;
 				if (glassIdle || glassOn) {
-					const unsigned tint = glassOn ? fill : 0xFFFFFF;
-					panel.NoLine(); panel.Fill(tint, glassOn ? .58 : .09); panel.RoundRect(x, y, w, h, 2 * radius); panel.End();
-					const bool typing = edge == kTeal && edgeAlpha > 0;  // a value being typed keeps its teal ring
-					if (typing) panel.Style(1, kTeal, edgeAlpha);
+					const unsigned tint = glassOn ? fill : (fill == kWellBg ? kWellBg : 0xFFFFFF);
+					panel.NoLine(); panel.Fill(tint, glassOn ? .62 : (fill == kWellBg ? .65 : .08)); panel.RoundRect(x, y, w, h, 2 * radius); panel.End();
+					const bool accentEdge = edgeAlpha > 0 && (edge == kTeal || edge == kEmerald || edge == kAmber || edge == kCoral);
+					if (accentEdge) panel.Style(1, edge, edgeAlpha);
 					else if (glassOn) panel.Style(1, lighten(fill), .85);
-					else panel.Style(1, 0xFFFFFF, edgeAlpha > 0 ? .20 : .10);
+					else panel.Style(1, kDockBorder, edgeAlpha > 0 ? .75 : .45);
 					panel.RoundRect(x, y, w, h, 2 * radius);
-					panel.Style(1, 0xFFFFFF, glassOn ? .55 : .28); panel.Move(x + radius + 1, y + 1.5); panel.Line(x + w - radius - 1, y + 1.5);
+					panel.Style(1, 0xFFFFFF, glassOn ? .50 : .20); panel.Move(x + radius + 1, y + 1.5); panel.Line(x + w - radius - 1, y + 1.5);
 					panel.NoLine();
 					return;
 				}
@@ -7045,13 +7046,13 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 			};
 			const double px = PanelX();
 			if (g_f7NodeView) DrawNodeView(panel, c, movie);  // Node view: the network over the dimmed map, under the UI
-			frame(g_ui.barX, g_ui.barY, g_ui.barW, g_ui.barH, 0x141C29, 0.95, 0x3A4658, 1);
-			if(g_contextPanel)frame(px, 12, kPanelW, g_ui.panelBottom - 12, 0x141C29, 0.94, 0x3A4658, 1);
-			if(g_contextPanel)frame(px, 12, kPanelW, 62, 0x0B1119, 0.8, 0, 0);
+			frame(g_ui.barX, g_ui.barY, g_ui.barW, g_ui.barH, kDockBg, 0.95, kDockBorder, 1);
+			if(g_contextPanel)frame(px, 12, kPanelW, g_ui.panelBottom - 12, kDockBg, 0.94, kDockBorder, 1);
+			if(g_contextPanel)frame(px, 12, kPanelW, 62, kWellBg, 0.85, 0, 0);
 			for (const auto& bx : g_ui.boxes) frame(bx.x, bx.y, bx.w, bx.h, bx.fill, bx.alpha, bx.line, bx.lineAlpha);
             for(const auto& polygon:g_ui.polygons)if(polygon.points.size()>2){panel.Style(1,polygon.color,.9);panel.Fill(polygon.color,polygon.alpha);panel.Move(polygon.points.front().first,polygon.points.front().second);for(const auto& p:polygon.points)panel.Line(p.first,p.second);panel.Line(polygon.points.front().first,polygon.points.front().second);panel.End();panel.NoLine();}
 
-			if (g_ed.menu) frame(g_ui.menuX, g_ui.menuY, g_ui.menuW, g_ui.menuH, 0x141C29, 0.97, 0x3A4658, 1);
+			if (g_ed.menu) frame(g_ui.menuX, g_ui.menuY, g_ui.menuW, g_ui.menuH, kDockBg, 0.97, kDockBorder, 1);
 			for (const auto& b : g_ui.buttons) {
 				const unsigned textColor = !b.enabled ? 0x5C6876u : b.active && (b.style == 0 || b.style == 1 || b.style == 5) ? 0x07211Fu : kText;
 				const double tw = TextWidth(b.text);
@@ -7098,30 +7099,37 @@ const Surface* jointUnder = g_ed.view.stems ? DrawStem(lines, c, { at.x, at.y, a
 					Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2, b.active ? 0x260A05u : kCoral, b.w);
 					break;
 				case 8: {  // a dock card: its name, its summary under it
-					frame(b.x, b.y, b.w, b.h, !b.enabled ? 0x1A2331 : kRowA, 1, b.active ? kTeal : 0x3A4658, 1);
+					frame(b.x, b.y, b.w, b.h, !b.enabled ? kWellBg : kRowA, 1, b.active ? kTeal : kDockBorder, 1);
 					double tx = b.x + 12;
 					if (b.swatch) { frame(tx, b.y + 15, 18, 3, b.swatch, 1, 0, 0); tx += 26; }
 					Text(movie, b.text, tx, b.y + 9, b.enabled ? kText : 0x5C6876u, b.w - (tx - b.x) - 30);
 					if (!b.value.empty()) Text(movie, b.value, b.x + 12, b.y + 31, kDim, b.w - 42);
 					break;
 				}
-				case 9:  // a dock value: click it and type (Enter keeps it, Esc cancels); teal while typing
-					frame(b.x, b.y, b.w, b.h, b.active ? 0x141C29 : 0x1A2331, 1, b.active ? kTeal : 0x3A4658, b.active ? 1 : .6);
+				case 9:  // a dock value: recessed Constellation well; cyan ring while typing
+					frame(b.x, b.y, b.w, b.h, kWellBg, 1, b.active ? kTeal : kDockBorder, b.active ? 1 : .75);
 					Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2, !b.enabled ? 0x5C6876u : b.active ? kTeal : kText, b.w);
 					break;
 				case 6:  // the problems badge
 					frame(b.x, b.y, b.w, b.h, kAmber, b.active ? 0.75 : 1, 0, 0);
-					Text(movie, b.text, b.x + 8, b.y + 3, 0x2A1A02, b.w - 16);
+					Text(movie, b.text, b.x + 8, b.y + 3, 0x1A1102, b.w - 16);
 					break;
-				default: {  // a panel button; its key at the right when there is room
-					frame(b.x, b.y, b.w, b.h, !b.enabled ? 0x1A2331 : b.id == kSave && b.active ? kGlassAmber : b.active ? glassOf(b.text) : kRowA, 1, 0x3A4658, b.active ? 0 : 1);
+				default: {  // a panel button; semantic Constellation edges for Save (emerald), Perm Save (gold), Test (cyan)
+					const bool isSaveBtn = b.id == kSave;
+					const bool isPermBtn = b.id == kPermanentSave;
+					const bool isTestBtn = b.id == kDockTest;
+					const unsigned fillC = !b.enabled ? kWellBg : isSaveBtn && b.active ? kGlassEmerald : b.active ? glassOf(b.text) : kRowA;
+					const unsigned edgeC = !b.enabled ? kDockBorder : isSaveBtn ? kEmerald : isPermBtn ? kAmber : isTestBtn ? kTeal : kDockBorder;
+					const double edgeA = b.active ? 0.0 : (isSaveBtn || isPermBtn || isTestBtn ? 0.85 : 1.0);
+					const unsigned txtC = !b.enabled ? 0x5C6876u : b.active ? 0x07131Au : isSaveBtn ? kEmerald : isPermBtn ? kAmber : isTestBtn ? kTeal : textColor;
+					frame(b.x, b.y, b.w, b.h, fillC, 1, edgeC, edgeA);
 					const double kw = TextWidth(b.key);
-					if (b.nav == 2 && b.enabled) { Text(movie, b.text, b.x + 30 + 14, b.y + (b.h - 16) / 2, textColor, b.w - 30 - 20); break; }  // split button: the arrow square, a divider, then the name
+					if (b.nav == 2 && b.enabled) { Text(movie, b.text, b.x + 30 + 14, b.y + (b.h - 16) / 2, txtC, b.w - 30 - 20); break; }  // split button: the arrow square, a divider, then the name
 					if (!b.key.empty() && tw + kw + 16 <= b.w) {
-						Text(movie, b.text, b.x + 8, b.y + (b.h - 16) / 2, textColor, b.w - kw - 12);
+						Text(movie, b.text, b.x + 8, b.y + (b.h - 16) / 2, txtC, b.w - kw - 12);
 						Text(movie, b.key, b.x + b.w - kw - 6, b.y + (b.h - 16) / 2, b.active ? 0x1D4F4A : kDim, kw + 4);
 					}
-					else Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2, textColor, b.w);
+					else Text(movie, b.text, b.x + (b.w - tw) / 2, b.y + (b.h - 16) / 2, txtC, b.w);
 					break;
 				}
 				}

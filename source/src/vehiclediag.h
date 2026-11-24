@@ -22,8 +22,10 @@ namespace vehiclediag
 	// kept in memory through the load without a component (confirmed in game 2026-11-17).
 	void AfterLoadTick();
     void StageBirth(std::uint32_t formId); // creation callback, before the chassis can attach
+    void ReanchorBirth(std::uint32_t formId, float x, float y, float z); // far-dispatch: move birth anchor so PutBackBuildDrops never yanks it back
     bool ReleaseBirth(std::uint32_t formId); // once its flight controller is armed and the game has built its physics vehicle
     bool ReleaseBirthToPlayer(std::uint32_t formId); // KO-2: a vehicle the player took; true when released or never held
+    void EnsureDynamicFor(std::uint32_t formId); // convert a non-birth-held vehicle body from keyframed (flags & 4) to Havok dynamic (2)
     bool Built(std::uint32_t formId); // the game built its physics vehicle (instance) since the last reset
     void DropBirthHold(std::uint32_t formId); // hidden/replaced/deleted: forget the hold, motion untouched
     bool BirthHeld(std::uint32_t formId); // AC-4 (read-only): the vehicle is under its birth hold (not yet released to its pilot)

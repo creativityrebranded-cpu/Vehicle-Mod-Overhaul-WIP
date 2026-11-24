@@ -81,6 +81,19 @@ struct Line {
     // LB-1 (2026-11-12): stretches of a lane that folded at a tight corner and were cut straight (F7 lists them as "lane cut at a corner").
     struct Squeeze { int lane = 0, from = 0, to = 0; Vec at{}; double worstDeg = 0; };
     std::vector<Squeeze> squeezed;
+    // Pre-baked uniform-arclength lane table (2026-11-23): built once per route load/edit, shared copy-on-write via shared_ptr.
+    // Corridor envelope (2026-11-24): [minLat, maxLat] in metres from lane centre (+ = right of travel, - = left) from
+    // authored yellow boxes minus route hazard boxes, baked once per station so spawn/rail/plan share one boundary.
+    struct BakedSample {
+        double u = 0, s = 0;
+        Vec pos{};
+        double curvature = 0, grade = 0;
+        double minLat = -6.0, maxLat = 6.0;
+        bool hazardBlocked = false;
+        bool spawnSafe = true;
+    };
+    struct BakedLane { double stepM = 2.0, totalM = 0.0; std::vector<double> prefixU; std::vector<BakedSample> samples; };
+    std::shared_ptr<std::vector<BakedLane>> baked;
     int Count() const { return int(lane[0].size()); }
     double Span() const { return closed ? double(Count()) : double(Count() - 1); }  // u runs [0, Span)
     double ToLine(double source) const {
@@ -359,9 +372,209 @@ inline Line BuildBase(const trafficdata::Route& r)
     return l;
 }
 
+inline double Direction(const Line& l,int lane);
+inline void BakeLanes(Line& l, double stepM = 2.0, const trafficdata::Route* route = nullptr) {
+    if (l.error || l.Count() < 2 || !(stepM > 0.1)) return;
+    auto table = std::make_shared<std::vector<Line::BakedLane>>(l.lane.size());
+    const int n = l.Count();
+    const int segs = l.closed ? n : n - 1;
+    const int routeTiles = (route && !route->ring && route->points.size() >= 2)
+        ? int(route->points.size()) - (route->closed ? 0 : 1) : 0;
+    auto routeCentreAt = [&](double u) -> Vec {
+        Vec m{}; int cnt = 0;
+        const int seg = std::clamp(int(std::floor(u)), 0, std::max(0, segs - 1));
+        const double f = std::clamp(u - double(seg), 0.0, 1.0);
+        const int nxt = l.closed ? (seg + 1) % n : std::min(n - 1, seg + 1);
+        for (std::size_t li = 0; li < l.lane.size(); ++li) {
+            const auto& lp = l.lane[li];
+            if (int(lp.size()) < n) continue;
+            const auto& a = lp[std::size_t(seg)];
+            const auto& b = lp[std::size_t(nxt)];
+            m.x += a.x + (b.x - a.x) * f;
+            m.y += a.y + (b.y - a.y) * f;
+            m.z += a.z + (b.z - a.z) * f;
+            ++cnt;
+        }
+        if (cnt > 0) { m.x /= cnt; m.y /= cnt; m.z /= cnt; }
+        return m;
+    };
+    for (std::size_t k = 0; k < l.lane.size(); ++k) {
+        const auto& pts = l.lane[k];
+        if (int(pts.size()) < 2) continue;
+        auto& bl = (*table)[k];
+        bl.stepM = stepM;
+        bl.prefixU.resize(std::size_t(segs) + 1, 0.0);
+        for (int i = 0; i < segs; ++i) {
+            const auto& a = pts[std::size_t(i)];
+            const auto& b = pts[std::size_t((i + 1) % n)];
+            bl.prefixU[std::size_t(i) + 1] = bl.prefixU[std::size_t(i)] + std::hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+        }
+        bl.totalM = bl.prefixU.back();
+        if (!(bl.totalM > 0.5)) continue;
+        const int maxSamples = 4096;
+        const int count = std::clamp(int(std::floor(bl.totalM / stepM)) + (l.closed ? 0 : 1), 2, maxSamples);
+        const double actualStep = l.closed ? bl.totalM / double(count) : bl.totalM / double(count - 1);
+        bl.stepM = actualStep;
+        bl.samples.resize(std::size_t(count));
+        int seg = 0;
+        for (int si = 0; si < count; ++si) {
+            const double targetS = std::min(bl.totalM, double(si) * actualStep);
+            while (seg + 1 < segs && bl.prefixU[std::size_t(seg) + 1] < targetS) ++seg;
+            const double s0 = bl.prefixU[std::size_t(seg)], s1 = bl.prefixU[std::size_t(seg) + 1];
+            const double f = s1 > s0 + 1e-9 ? std::clamp((targetS - s0) / (s1 - s0), 0.0, 1.0) : 0.0;
+            const auto& a = pts[std::size_t(seg)];
+            const auto& b = pts[std::size_t((seg + 1) % n)];
+            auto& out = bl.samples[std::size_t(si)];
+            out.u = double(seg) + f;
+            out.s = targetS;
+            out.pos = { a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f };
+        }
+        const double dir = Direction(l, int(k));
+        // Compute curvature, grade, corridor envelope [minLat, maxLat], and spawnSafe per baked station.
+        for (int si = 0; si < count; ++si) {
+            const int prev = l.closed ? (si + count - 1) % count : std::max(0, si - 1);
+            const int next = l.closed ? (si + 1) % count : std::min(count - 1, si + 1);
+            const auto& pa = bl.samples[std::size_t(prev)].pos;
+            const auto& pb = bl.samples[std::size_t(si)].pos;
+            const auto& pc = bl.samples[std::size_t(next)].pos;
+            const double x1 = pb.x - pa.x, y1 = pb.y - pa.y, l1 = std::hypot(x1, y1);
+            const double x2 = pc.x - pb.x, y2 = pc.y - pb.y, l2 = std::hypot(x2, y2);
+            double curv = 0.0;
+            if (l1 > 1e-4 && l2 > 1e-4) {
+                curv = std::fabs(std::atan2(x1 * y2 - y1 * x2, x1 * x2 + y1 * y2));
+            }
+            const double dxy = std::hypot(pc.x - pa.x, pc.y - pa.y);
+            const double grade = dxy > 1e-4 ? std::fabs(pc.z - pa.z) / dxy : 0.0;
+            bool squeezedHere = false;
+            const int uInt = int(std::floor(bl.samples[std::size_t(si)].u));
+            for (const auto& sq : l.squeezed) {
+                if (sq.lane == int(k) && uInt >= sq.from && uInt <= sq.to) { squeezedHere = true; break; }
+            }
+            // Corridor envelope: authored yellow box (exact width, never widened past guardrails) minus hazard boxes.
+            double tx = 0.0, ty = 1.0;
+            if (dxy > 1e-4) {
+                const double sgn = dir >= 0.0 ? 1.0 : -1.0;
+                tx = ((pc.x - pa.x) / dxy) * sgn;
+                ty = ((pc.y - pa.y) / dxy) * sgn;
+            }
+            const double rx = ty, ry = -tx;  // + = right of travel
+            const Vec centre = routeCentreAt(bl.samples[std::size_t(si)].u);
+            const double centreLat = (centre.x - pb.x) * rx + (centre.y - pb.y) * ry;
+            double halfBox = 6.0;
+            if (route) {
+                const int tile = routeTiles > 0 ? std::clamp(int(std::floor(l.ToSource(bl.samples[std::size_t(si)].u))), 0, routeTiles - 1) : -1;
+                if (tile >= 0 && tile < int(route->road.boxes.size()) && route->road.boxes[std::size_t(tile)].width > 0.0) {
+                    halfBox = route->road.boxes[std::size_t(tile)].width * 0.5;
+                } else if (route->road.width > 0.0) {
+                    halfBox = route->road.width * 0.5;
+                } else {
+                    halfBox = std::max(1.0, route->corridor * std::max(1, route->lanes)) * 0.5;
+                }
+            }
+            const double halfRight = std::max(0.5, halfBox - (dir >= 0.0 ? l.edgeRight : l.edgeLeft));
+            const double halfLeft  = std::max(0.5, halfBox - (dir >= 0.0 ? l.edgeLeft  : l.edgeRight));
+            // Respect authored yellow box walls while keeping at least half a lane (+-1.5 m) around the lane centre
+            // so legacy routes whose stored road_boxes are narrower than the edited road width (FW-1) never self-block.
+            double minLat = std::min(-1.5, centreLat - halfLeft);
+            double maxLat = std::max( 1.5, centreLat + halfRight);
+            bool hazardBlocked = false;
+            if (route && !route->hazards.boxes.empty()) {
+                if (routehazard::TouchesAny(route->hazards, pb.x, pb.y, pb.z - 0.2, pb.z + 2.5, 1.35 + routehazard::kPlannerMargin)) {
+                    hazardBlocked = true;
+                }
+                for (double lat = 0.5; lat <= maxLat + 1e-6; lat += 0.5) {
+                    if (routehazard::TouchesAny(route->hazards, pb.x + rx * lat, pb.y + ry * lat, pb.z - 0.2, pb.z + 2.5, 0.15)) {
+                        maxLat = std::min(maxLat, lat - 0.25);
+                        break;
+                    }
+                }
+                for (double lat = -0.5; lat >= minLat - 1e-6; lat -= 0.5) {
+                    if (routehazard::TouchesAny(route->hazards, pb.x + rx * lat, pb.y + ry * lat, pb.z - 0.2, pb.z + 2.5, 0.15)) {
+                        minLat = std::max(minLat, lat + 0.25);
+                        break;
+                    }
+                }
+            }
+            bl.samples[std::size_t(si)].curvature = curv;
+            bl.samples[std::size_t(si)].grade = grade;
+            bl.samples[std::size_t(si)].minLat = minLat;
+            bl.samples[std::size_t(si)].maxLat = maxLat;
+            bl.samples[std::size_t(si)].hazardBlocked = hazardBlocked;
+            bl.samples[std::size_t(si)].spawnSafe = !squeezedHere && !hazardBlocked && curv <= 0.35 && grade <= 0.28;
+        }
+    }
+    l.baked = std::move(table);
+}
+
+// O(1) uniform-arclength lane slice from pre-baked table. Returns count written (0 if unbaked).
+inline int SliceBaked(const Line& l, int lane, double u, int fromStep, int count, Vec* outPts, double* outU = nullptr) {
+    if (!l.baked || lane < 0 || lane >= int(l.baked->size()) || count <= 0 || !outPts) return 0;
+    const auto& bl = (*l.baked)[std::size_t(lane)];
+    const int n = int(bl.samples.size());
+    if (n < 2 || bl.prefixU.empty() || !(bl.stepM > 0.0)) return 0;
+    const double span = l.Span();
+    if (!(span > 0.0)) return 0;
+    if (l.closed) { u = std::fmod(u, span); if (u < 0) u += span; }
+    else u = std::clamp(u, 0.0, span);
+    const auto seg = std::min(std::size_t(u), bl.prefixU.size() - 1);
+    const double s0 = seg + 1 < bl.prefixU.size()
+        ? bl.prefixU[seg] + (bl.prefixU[seg + 1] - bl.prefixU[seg]) * (u - double(seg))
+        : bl.prefixU.back();
+    const double dir = Direction(l, lane);
+    const int baseIdx = int(std::llround(s0 / bl.stepM));
+    for (int i = 0; i < count; ++i) {
+        const int step = fromStep + i;
+        int idx = baseIdx + (dir >= 0.0 ? step : -step);
+        if (l.closed) { idx %= n; if (idx < 0) idx += n; }
+        else idx = std::clamp(idx, 0, n - 1);
+        const auto& sample = bl.samples[std::size_t(idx)];
+        outPts[i] = sample.pos;
+        if (outU) outU[i] = sample.u;
+    }
+    return count;
+}
+
+inline bool BakedSpawnSafe(const Line& l, int lane, double u) {
+    if (!l.baked || lane < 0 || lane >= int(l.baked->size())) return true;
+    const auto& bl = (*l.baked)[std::size_t(lane)];
+    const int n = int(bl.samples.size());
+    if (n < 2 || bl.prefixU.empty() || !(bl.stepM > 0.0)) return true;
+    const double span = l.Span();
+    if (l.closed && span > 0.0) { u = std::fmod(u, span); if (u < 0) u += span; }
+    else u = std::clamp(u, 0.0, span);
+    const auto seg = std::min(std::size_t(u), bl.prefixU.size() - 1);
+    const double s0 = seg + 1 < bl.prefixU.size()
+        ? bl.prefixU[seg] + (bl.prefixU[seg + 1] - bl.prefixU[seg]) * (u - double(seg))
+        : bl.prefixU.back();
+    int idx = int(std::llround(s0 / bl.stepM));
+    if (l.closed) { idx %= n; if (idx < 0) idx += n; }
+    else idx = std::clamp(idx, 0, n - 1);
+    return bl.samples[std::size_t(idx)].spawnSafe;
+}
+
+inline bool BakedCorridor(const Line& l, int lane, double u, double& minLat, double& maxLat) {
+    if (!l.baked || lane < 0 || lane >= int(l.baked->size())) return false;
+    const auto& bl = (*l.baked)[std::size_t(lane)];
+    const int n = int(bl.samples.size());
+    if (n < 2 || bl.prefixU.empty() || !(bl.stepM > 0.0)) return false;
+    const double span = l.Span();
+    if (l.closed && span > 0.0) { u = std::fmod(u, span); if (u < 0) u += span; }
+    else u = std::clamp(u, 0.0, span);
+    const auto seg = std::min(std::size_t(u), bl.prefixU.size() - 1);
+    const double s0 = seg + 1 < bl.prefixU.size()
+        ? bl.prefixU[seg] + (bl.prefixU[seg + 1] - bl.prefixU[seg]) * (u - double(seg))
+        : bl.prefixU.back();
+    int idx = int(std::llround(s0 / bl.stepM));
+    if (l.closed) { idx %= n; if (idx < 0) idx += n; }
+    else idx = std::clamp(idx, 0, n - 1);
+    minLat = bl.samples[std::size_t(idx)].minLat;
+    maxLat = bl.samples[std::size_t(idx)].maxLat;
+    return true;
+}
+
 // Compile transforms into the same sampled lane geometry consumed by the existing controllers.
 inline Line Build(const trafficdata::Route& r) {
-    auto l=BuildBase(r);if(r.road.enabled||l.error||r.lanePlan.transforms.records.empty()||l.Count()<2)return l;
+    auto l=BuildBase(r);if(r.road.enabled||l.error||r.lanePlan.transforms.records.empty()||l.Count()<2){BakeLanes(l, 2.0, &r);return l;}
     if(l.lanes.empty()){l.lanes.push_back(0);if(r.lanes>1)l.lanes.push_back(1);}
     std::vector<double> arc{0};for(int i=0;i<int(l.Span());++i)arc.push_back(arc.back()+std::hypot(l.lane[0][(i+1)%l.Count()].x-l.lane[0][i].x,l.lane[0][(i+1)%l.Count()].y-l.lane[0][i].y,l.lane[0][(i+1)%l.Count()].z-l.lane[0][i].z));
     auto metres=[&](double source){const double u=std::clamp(l.ToLine(source),0.0,l.Span());const auto i=std::min(std::size_t(u),arc.size()-1);return i+1<arc.size()?arc[i]+(arc[i+1]-arc[i])*(u-i):arc.back();};
@@ -374,6 +587,7 @@ inline Line Build(const trafficdata::Route& r) {
         }
         l.basis[lane]=lanevolume::Frames(splinekit::Points(l.lane[lane]),l.closed);if(!l.basis[lane].error.empty()){l.error="invalid transformed lane frame";return l;}
     }
+    BakeLanes(l, 2.0, &r);
     return l;
 }
 inline double Wrap(const Line& l, double u)

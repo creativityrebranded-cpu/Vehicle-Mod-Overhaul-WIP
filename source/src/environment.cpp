@@ -24,7 +24,7 @@ constexpr int kFlights=int(std::size(Slots));
 static_assert(kFlights==5+prefetch::kRayEnvironmentCount);
 constexpr std::uint64_t Solid=0xA5C12671Eull;
 constexpr unsigned long long kStartWindowMs=100;
-constexpr std::size_t kMaxQueries=256;
+constexpr std::size_t kMaxQueries=512;
 struct Query {std::uint64_t key=0,mask=0;float from[3]={},to[3]={};prefetch::RayHit hit;unsigned long long asked=0,done=0,refused=0;bool inFlight=false;};
 std::vector<Query> queries;
 struct Flight {std::uint64_t key=0;float from[3]={},to[3]={};unsigned long long at=0;};
@@ -46,6 +46,10 @@ bool Ray(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t
   for(auto it=queries.begin();it!=queries.end();++it)
    if(!it->inFlight&&now-it->asked>=kStartWindowMs&&(oldest==queries.end()||it->asked<oldest->asked))oldest=it;
   if(oldest==queries.end()){
+   for(auto it=queries.begin();it!=queries.end();++it)
+    if(!it->inFlight&&it->done&&(oldest==queries.end()||it->done<oldest->done))oldest=it;
+  }
+  if(oldest==queries.end()){
    logger::Observe("sensing.ray",owner,3,"reason=query_cache_full cached=%zu query=%llX",queries.size(),static_cast<unsigned long long>(key));
    return false;
   }
@@ -55,7 +59,7 @@ bool Ray(std::uint32_t owner,const float from[3],const float to[3],std::uint64_t
  Query q;q.key=key;q.mask=mask;q.asked=now;std::copy(from,from+3,q.from);std::copy(to,to+3,q.to);queries.push_back(q);return false;
 }
 world::VehicleInfo Vehicle(std::uint32_t id){
- static thread_local world::Snapshot s;if(world::Vehicles(s))for(unsigned i=0;i<s.count&&i<world::kMaxVehicles;++i)if(s.v[i].formId==id)return s.v[i];
+ static thread_local world::Snapshot s;if(world::VehiclesAndHeld(s))for(unsigned i=0;i<s.count&&i<world::kMaxVehicles;++i)if(s.v[i].formId==id)return s.v[i];
  world::VehicleInfo result;
  __try {
   const auto ref=reinterpret_cast<std::uintptr_t(*)(std::uint32_t)>(game::Base()+0x005DE3B0)(id);
@@ -190,7 +194,7 @@ static Site CheckFootprint(std::uint32_t self,const world::VehicleInfo& v,double
   }
  }
  if(pending)return out;
- static thread_local world::Snapshot all;if(!world::Vehicles(all))return out;
+ static thread_local world::Snapshot all;if(!world::VehiclesAndHeld(all))return out;
  for(unsigned i=0;i<all.count&&i<world::kMaxVehicles;++i){const auto&o=all.v[i];if(o.formId&&o.formId!=self&&std::fabs(o.pos[2]-out.ground)<6&&
   std::hypot(o.pos[0]-x,o.pos[1]-y)<std::hypot(w,l)+std::hypot(o.half[0],o.half[1])+1){out.verdict=Verdict::Unsafe;out.reason="Another vehicle occupies the site";return out;}}
  if(!boarding){out.verdict=Verdict::Safe;out.reason="Validated dry spawn footprint and headroom";return out;}

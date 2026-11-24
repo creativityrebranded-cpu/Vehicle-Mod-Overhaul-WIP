@@ -31,9 +31,10 @@ inline constexpr const char* kReadmeBody =
 // Script mode (2026-11-22, the user): shown every time it is switched on, in the same panel as the first-time message.
 inline constexpr const char* kScriptTitle = "Script mode";
 inline constexpr const char* kScriptBody =
-    "Script mode is on. Vehicles follow the route path with no object detection: they do not look for walls, railings or objects.\n\n"
-    "The only obstacles they know are the Hazard boxes you place, other vehicles (from their known positions, kept apart by their own size) and people. "
-    "Place a Hazard box (Hazards tool) wherever something solid is in the way.\n\n"
+    "Script mode is on. Vehicles on wheels are not planned: they drive the centre line of the route path, with no object detection, no swerving and no backing up. "
+    "They do not look for walls, railings or objects.\n\n"
+    "Hazard boxes are the only thing they drive round: place a Hazard box (Hazards tool) wherever something solid is in the way. "
+    "They wait behind other vehicles and people on the line (from their known positions) and never steer round them.\n\n"
     "Use this mode only when a road you built does not work well with the normal autopilot. Press Script mode again to turn it off.";
 
 // The first-time message appears this many editor frames after the editor opens (as the native box: 30 frames, half a second).

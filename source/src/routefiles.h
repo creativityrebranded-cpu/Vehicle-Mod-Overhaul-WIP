@@ -53,11 +53,12 @@ struct Spot {
     // A landing area and its occupancy rules (trafficdata::Place).
     std::string layout = "single", purpose = "stop", full = "circle"; int spaces = 1; double turn = 0, stay = 0; std::vector<std::string> routes;placeaccess::Plan access;
     std::vector<placeaccess::Wire> wires;  // landing wires; the first In / Out mirror `access` (written as before)
+    std::string tag, eventId;              // optional scripted-node metadata (ignored by older builds)
 };
 using Zone = trafficdata::Zone;
 // A junction (trafficdata::Link): `from` (any route of the world, a ring in degrees, a path by point index) at `at` meets the
 // editor route `to` at its start or end; `share` of the laps passing it turn in.
-struct Link { std::string id, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; int fromLane=-1,toLane=-1; };  // toAt: a point index of `to` (0: its start); type: trafficdata::Link
+struct Link { std::string id, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; int fromLane=-1,toLane=-1; std::string tag, eventId; };  // toAt: a point index of `to` (0: its start); type: trafficdata::Link
 struct File {
     std::string worldId;               // the worldspace's editor name, as FVO_WorldName gives it
     std::vector<Route> routes;
@@ -218,20 +219,20 @@ inline std::string Format(const File& f)
     }
     for (const auto& k : f.links)
         t += "[link." + k.id + "]\nfrom = " + k.from + "\nat = " + Num(k.at) + "\nto = " + k.to + "\nto_at = " + (k.toEnd ? std::string("end") : k.toAt > 0 ? Num(k.toAt) : std::string("start")) +
-             "\nshare = " + Num(k.share) + (k.radius>0?"\nradius = "+Num(k.radius):"") + (k.type.empty()?"":"\ntype = "+k.type) + (k.fromLane>=0?"\nfrom_lane = "+std::to_string(k.fromLane):"") + (k.toLane>=0?"\nto_lane = "+std::to_string(k.toLane):"") + "\n\n";
+             "\nshare = " + Num(k.share) + (k.radius>0?"\nradius = "+Num(k.radius):"") + (k.type.empty()?"":"\ntype = "+k.type) + (k.fromLane>=0?"\nfrom_lane = "+std::to_string(k.fromLane):"") + (k.toLane>=0?"\nto_lane = "+std::to_string(k.toLane):"") + (k.tag.empty() ? "" : "\ntag = " + CleanLabel(k.tag)) + (k.eventId.empty() ? "" : "\nevent_id = " + CleanLabel(k.eventId)) + "\n\n";
     for (const auto& p : f.landings)
     {
         std::string who;
         for (const auto& name : p.routes) who += (who.empty() ? "" : ", ") + name;
         t += "[place." + p.id + "]\nworld = " + (p.world.empty() ? w : p.world) + "\npoint = " + Num(p.at.x) + " " + Num(p.at.y) + " " + Num(p.at.z) + "\nradius = " + Num(p.radius) +
              (p.parked ? "\nparked = 1" : "") + "\nlayout = " + p.layout + "\nspaces = " + std::to_string(p.spaces) + "\nturn = " + Num(p.turn) +
-             "\npurpose = " + p.purpose + "\nstay = " + Num(p.stay) + "\nfull = " + p.full + (who.empty() ? "" : "\nroutes = " + who) + (placeaccess::Empty(p.access)?"":"\naccess_plan = "+placeaccess::Write(p.access)) + (placeaccess::Extra(placeaccess::Merge(p.access,p.wires))?"\naccess_wires = "+placeaccess::WriteWires(placeaccess::Merge(p.access,p.wires)):"") + "\n\n";
+             "\npurpose = " + p.purpose + "\nstay = " + Num(p.stay) + "\nfull = " + p.full + (who.empty() ? "" : "\nroutes = " + who) + (placeaccess::Empty(p.access)?"":"\naccess_plan = "+placeaccess::Write(p.access)) + (placeaccess::Extra(placeaccess::Merge(p.access,p.wires))?"\naccess_wires = "+placeaccess::WriteWires(placeaccess::Merge(p.access,p.wires)):"") + (p.tag.empty() ? "" : "\ntag = " + CleanLabel(p.tag)) + (p.eventId.empty() ? "" : "\nevent_id = " + CleanLabel(p.eventId)) + "\n\n";
     }
     for (const auto& p : f.spawns)
         t += "[spawn." + p.id + "]\nworld = " + (p.world.empty() ? w : p.world) + "\npoint = " + Num(p.at.x) + " " + Num(p.at.y) + " " + Num(p.at.z) + "\nheading = " + Num(p.heading) + "\n\n";
     for (const auto& z : f.zones)
         t += "[zone." + z.name + "]\nworld = " + (z.world.empty() ? w : z.world) + "\npoint = " + Num(z.at.x) + " " + Num(z.at.y) + " " + Num(z.at.z) + "\nradius = " + Num(z.radius) +
-             "\nkind = " + (z.slow ? "slow" : "keepout") + "\ntop = " + Num(z.top) + "\nspeed = " + Num(z.speed) + "\n"+RestrictionLine(z.restrictions)+(z.restrictionFloor>-1000000000?"restriction_floor = "+Num(z.restrictionFloor)+"\n":"")+(z.restrictionTop<1000000000?"restriction_top = "+Num(z.restrictionTop)+"\n":"")+"\n";
+             "\nkind = " + (z.slow ? "slow" : "keepout") + "\ntop = " + Num(z.top) + "\nspeed = " + Num(z.speed) + "\n"+RestrictionLine(z.restrictions)+(z.restrictionFloor>-1000000000?"restriction_floor = "+Num(z.restrictionFloor)+"\n":"")+(z.restrictionTop<1000000000?"restriction_top = "+Num(z.restrictionTop)+"\n":"")+(z.tag.empty() ? "" : "tag = " + CleanLabel(z.tag) + "\n") + (z.eventId.empty() ? "" : "event_id = " + CleanLabel(z.eventId) + "\n")+"\n";
     if (f.cityWritten)
         t += "[city." + w + "]\nworld = " + w + "\ntraffic = " + (f.city.on ? "1" : "0") + "\ndensity = " + std::to_string(f.city.density) + "\nlimit = " + std::to_string(f.city.limit) +
              "\noriginals = " + (f.city.originals ? "1" : "0") + "\n" + RestrictionLine(f.city.restrictions) + DefaultsLine(f.city.laneDefaults) + "\n";
@@ -260,11 +261,11 @@ inline bool Parse(const std::string& text, const std::string& name, File& out, s
         e.removed = r.removed; e.ring = r.ring; e.shape = r.shape; e.tilt = r.tilt; e.tiltToward = r.tiltToward;
         f.routes.push_back(e);
     }
-    for (const auto& k : d.links) f.links.push_back({ k.name, k.from, k.to, k.at, k.toEnd, k.share, k.toAt, k.radius, k.type,k.fromLane,k.toLane });
+    for (const auto& k : d.links) f.links.push_back({ k.name, k.from, k.to, k.at, k.toEnd, k.share, k.toAt, k.radius, k.type, k.fromLane, k.toLane, k.tag, k.eventId });
     for (const auto& p : d.places) {
         Spot s;
         s.id = p.name; s.at = p.at; s.radius = p.radius; s.parked = p.parked; s.world = p.world == w ? std::string() : p.world;
-        s.layout = p.layout; s.purpose = p.purpose; s.full = p.full; s.spaces = p.spaces; s.turn = p.turn; s.stay = p.stay; s.routes = p.routes;s.access=p.access;s.wires=p.wires;
+        s.layout = p.layout; s.purpose = p.purpose; s.full = p.full; s.spaces = p.spaces; s.turn = p.turn; s.stay = p.stay; s.routes = p.routes;s.access=p.access;s.wires=p.wires;s.tag=p.tag;s.eventId=p.eventId;
         f.landings.push_back(s);
     }
     for (const auto& q : d.spawns) {

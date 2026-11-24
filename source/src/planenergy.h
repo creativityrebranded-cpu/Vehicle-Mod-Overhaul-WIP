@@ -371,36 +371,6 @@ inline void TraceSensors(Driver& d, const Snapshot& s, const energyplan::BlockTr
 // lane hold or stop line, and one stop rule: along the line ahead, the first point where the car's body would touch a scene solid
 // (in Script mode only other vehicles, people and hazard boxes are in the scene; edge bands are skipped: the path is taken as perfect)
 // limits the speed to sqrt(2 * brake * distance left). It drives the line or waits; it never decides it is stuck.
-inline void ScriptFollow(Result& r, const planscene::Scene& scene, const Snapshot& s, const planrun::Frame& f, double station) {
-    pathfollow::Path path;
-    auto add = [&](double x, double y) {
-        if (path.count && std::hypot(x - path.x[path.count - 1], y - path.y[path.count - 1]) < .3) return;
-        if (path.count < pathfollow::kMaxPoints) { path.x[path.count] = x; path.y[path.count] = y; ++path.count; }
-    };
-    const double endSt = std::min(scene.stopStation, scene.route.back().station);
-    const double ahead = std::clamp(std::fabs(s.car.speed) * 3.0, 20.0, 60.0);
-    double stopIn = 1e9;
-    for (double at = std::max(scene.route.front().station, station - 2.0); at <= std::min(station + ahead, endSt) + 1e-6; at += 1.0) {
-        double x = 0, y = 0;
-        if (!scene.RouteAt(at, 0, x, y)) break;
-        add(x, y);
-        if (at < station + 1.0 || stopIn < 1e9) continue;
-        double ax = 0, ay = 0, bx = 0, by = 0, fz = 0;
-        if (!scene.RouteAt(at - .5, 0, ax, ay) || !scene.RouteAt(at + .5, 0, bx, by) || std::hypot(bx - ax, by - ay) < .05 || !scene.Floor(x, y, fz)) continue;
-        if (scene.Clearance(x, y, std::atan2(bx - ax, by - ay), fz, s.spec, true, true) < .2) stopIn = at - station;
-    }
-    if (path.count < 2) { const double h = s.car.heading; path.count = 2; path.x[0] = s.car.x; path.y[0] = s.car.y; path.x[1] = s.car.x + std::sin(h); path.y[1] = s.car.y + std::cos(h); }
-    const double brake = std::max(.5, f.brake);
-    double v = f.held ? 0.0 : std::max(0.0, f.want);
-    if (endSt < 1e8) v = std::min(v, std::sqrt(2.0 * brake * std::max(0.0, endSt - station - 2.0)));  // an open route's end
-    if (stopIn < 1e9) v = std::min(v, std::sqrt(2.0 * brake * std::max(0.0, stopIn - s.spec.halfLength - 1.5)));
-    r.ok = true; r.why = f.held ? "script_lane_hold" : stopIn < 1e9 ? "script_stop_for_vehicle_person_or_hazard" : "script_follow_route";
-    r.path = path; r.laneCentre = path; r.speed = v; r.speedAhead = v; r.reverse = false; r.hover = false;
-    r.kept = true; r.feasible = 1; r.candidates = 1; r.clearance = stopIn < 1e9 ? stopIn : 1e9; r.field = false;
-    logger::Observe("plan.script", s.vehicle, (stopIn < 1e9 ? 1u : 0u) | (f.held ? 2u : 0u),
-        "speed=%.1f want=%.1f stop_in=%.1f held=%d station=%.1f reason=%s", v, f.want, stopIn < 1e9 ? stopIn : -1.0, int(f.held), station, r.why);
-}
-
 inline void CALLBACK PlanWork(PTP_CALLBACK_INSTANCE inst, void* ctx) {
     std::unique_ptr<PlanJob> job(static_cast<PlanJob*>(ctx)); FreeLibraryWhenCallbackReturns(inst, job->module);
     auto& d = *job->d; const bool budgetJob = job->s.budgeted;
@@ -448,8 +418,6 @@ inline void CALLBACK PlanWork(PTP_CALLBACK_INSTANCE inst, void* ctx) {
         Result r;
         if (scene.route.size() >= 2) {
             double station, lateral, half; scene.Route(s.car.x, s.car.y, station, lateral, half);
-            if (f.script && s.car.mode == 0 && scene.travel != 2 && !f.test.active) ScriptFollow(r, scene, s, f, station);  // Script mode: the route is the plan
-            else {
             const double goal = std::min(station + 30.0, scene.route.back().station - 2.0);
             std::shared_ptr<const planlattice::Field> field; std::uint64_t fieldAt; double gx, gy;
             { std::lock_guard lk(d.lock); field = d.field; fieldAt = d.fieldAt; gx = d.fieldGoalX; gy = d.fieldGoalY; }
@@ -536,7 +504,6 @@ inline void CALLBACK PlanWork(PTP_CALLBACK_INSTANCE inst, void* ctx) {
                 r.speed = std::clamp(r.speed, -wheelguard::crawl, wheelguard::crawl);
                 r.speedAhead = std::clamp(r.speedAhead, -wheelguard::crawl, wheelguard::crawl);
             }
-            }  // not Script mode
         }
         r.vehicle = s.vehicle;
         r.workerMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();

@@ -8,7 +8,7 @@
 
 namespace trafficinitial {
 namespace rules {
-inline constexpr double fallbackStep = 6.0, maxFallback = 18.0, fallbackFraction = .10;
+inline constexpr double fallbackStep = 6.0, maxFallback = 36.0, fallbackFraction = .10;
 // LV-2 (2026-11-20): a vertex is a corner for births only when the road turns at least this much there. A bend of a few degrees (the ring road's
 // ramps and long sweeps have vertices every 20-40 m) is a straight road to a car; blocking +-16 m round each of them left 16 of 61 ring slots
 // with no place (refusal kilometre_slot_no_field_room). Real corners (road_hybrid_test: 90 degrees) keep the whole buffer.
@@ -52,7 +52,8 @@ inline double StationGap(double a,double b,double length,bool closed) {
     const double gap=std::fabs(a-b);
     return closed?std::min(gap,std::max(0.0,length-gap)):gap;
 }
-inline double MinimumGap(double interval) {return interval*rules::gapFraction;}
+// Cap minimum spawn gap at 100 m so sparse/long air routes do not reject valid spawns half a kilometre away (2026-11-23).
+inline double MinimumGap(double interval) {return std::min(interval*rules::gapFraction,100.0);}
 inline bool GapClear(double a,double b,double length,bool closed,double interval) {
     return StationGap(a,b,length,closed)+1e-6>=MinimumGap(interval);
 }
@@ -105,11 +106,80 @@ inline Blocks RoadBlocks(const trafficdata::Route& r,const trafficroute::Line& l
     for(auto [u,radius]:junctions)block(StationAt(arc,line.ToLine(u)),std::max(buffer,radius));
     return blocked;
 }
+inline bool InSqueezedStretch(const trafficroute::Line& line,int lane,double u) {
+    if(line.squeezed.empty()||line.Count()<2)return false;
+    const int n=line.Count();
+    const int seg=int(std::floor(trafficroute::Wrap(line,u)))%n;
+    for(const auto& sq:line.squeezed){
+        if(sq.lane!=lane)continue;
+        if(sq.from<=sq.to){if(seg>=sq.from&&seg<=sq.to)return true;}
+        else{if(seg>=sq.from||seg<=sq.to)return true;}
+    }
+    return false;
+}
+inline bool ClearOfHazards(const trafficdata::Route& r,const trafficroute::Vec& p,double padXY=2.5,double padZ=2.0) {
+    for(const auto& hb:r.hazards.boxes){
+        if(std::fabs(p.z-hb.z)<hb.hz+padZ&&std::hypot(p.x-hb.x,p.y-hb.y)<std::hypot(hb.hx,hb.hy)+padXY)return false;
+    }
+    return true;
+}
 inline bool RoadLaneAvailable(const trafficroute::Line& line,int lane,double u) {
-    const auto segment=std::size_t(u);
+    if(!std::isfinite(u)||line.Span()<=0)return false;
+    u=trafficroute::Wrap(line,u);
+    const auto segment=std::size_t(std::floor(u));
     return segment<std::size_t(line.Span())&&
-        (line.road.empty()||line.road[segment].primitive.kind!=roadplan::Open)&&
+        (line.road.empty()||(segment<line.road.size()&&line.road[segment].primitive.kind!=roadplan::Open))&&
+        !InSqueezedStretch(line,lane,u)&&
         trafficroute::Available(line,lane,u);
+}
+// Autopilot-informed siting check (2026-11-23): verifies that a wheeled vehicle spawned on the lane centerline
+// has a clean forward run-out (low cumulative curvature, no steep grade kinks, no squeezed chords, and clear of
+// route hazard boxes) so the energy planner can immediately drive forward without triggering recover_handoff.
+inline bool AutopilotDrivableSpan(const trafficdata::Route& r,const trafficroute::Line& line,int lane,double u,
+    double padXY=2.5,double padZ=2.0,const char** whyOut=nullptr) {
+    auto fail=[&](const char* w){if(whyOut)*whyOut=w;return false;};
+    if(!trafficroute::BakedSpawnSafe(line,lane,u))return fail("baked_spawn_unsafe");
+    const double dir=trafficroute::Direction(line,lane);
+    auto headingAt=[&](double atU,bool& ok){
+        const auto p0=trafficroute::At(line,lane,atU);
+        const auto p1=trafficroute::At(line,lane,trafficroute::LeadU(line,lane,atU,2.0));
+        if(std::hypot(p1.x-p0.x,p1.y-p0.y)<0.2){ok=false;return 0.0;}
+        ok=true;
+        return std::atan2(p1.x-p0.x,p1.y-p0.y);
+    };
+    auto wrapDiff=[](double a,double b){
+        double d=a-b;
+        while(d>3.141592653589793)d-=6.283185307179586;
+        while(d<-3.141592653589793)d+=6.283185307179586;
+        return std::fabs(d);
+    };
+    const double uBack=trafficroute::LeadU(line,lane,u,6.0,true);
+    const double uMid=trafficroute::LeadU(line,lane,u,14.0,false);
+    const double uFar=trafficroute::LeadU(line,lane,u,28.0,false);
+    // All sample points along the forward run-out must be on available, non-squeezed lane segments clear of hazards.
+    for(double sampleU:{u,uMid,uFar}){
+        if(!RoadLaneAvailable(line,lane,sampleU))return fail("runout_lane_unavailable");
+        if(!ClearOfHazards(r,trafficroute::At(line,lane,sampleU),padXY,padZ))return fail("runout_hazard_box");
+    }
+    // Reject tight corners (radius < ~40 m) and multi-vertex hairpins (e.g. 5x12 deg bends) while allowing smooth ring roads (radius >= ~55 m).
+    bool ok0=false,ok1=false,ok2=false,ok3=false;
+    const double h0=headingAt(uBack,ok0),h1=headingAt(u,ok1),h2=headingAt(uMid,ok2),h3=headingAt(uFar,ok3);
+    if(!ok1)return fail("runout_degenerate_heading");
+    if(ok0&&wrapDiff(h1,h0)>0.35)return fail("runout_tight_bend_back");        // > ~20 deg across 6 m behind spawn
+    if(ok2&&wrapDiff(h2,h1)>0.35)return fail("runout_tight_bend_near");        // > ~20 deg across first 14 m ahead
+    if(ok2&&ok3&&wrapDiff(h3,h2)>0.35)return fail("runout_tight_bend_mid");    // > ~20 deg across 14..28 m ahead
+    if(ok3&&wrapDiff(h3,h1)>0.55)return fail("runout_hairpin_28m");            // > ~31 deg across 28 m forward run-out
+    if(ok0&&ok3&&wrapDiff(h3,h0)>0.65)return fail("runout_hairpin_34m");       // > ~37 deg across full 34 m span (catches hairpins)
+    // Reject steep grade kinks / sudden Z dips along the forward run-out.
+    const auto p0=trafficroute::At(line,lane,u),p1=trafficroute::At(line,lane,uMid),p2=trafficroute::At(line,lane,uFar);
+    const double d01=std::hypot(p1.x-p0.x,p1.y-p0.y),d12=std::hypot(p2.x-p1.x,p2.y-p1.y);
+    if(d01>1.0&&d12>1.0){
+        const double g1=(p1.z-p0.z)/d01,g2=(p2.z-p1.z)/d12;
+        if(std::fabs(g1)>0.35||std::fabs(g2)>0.35)return fail("runout_steep_grade");
+        if(std::fabs(g2-g1)>0.20)return fail("runout_grade_kink");
+    }
+    (void)dir;
+    return true;
 }
 inline unsigned CoverageRank(unsigned index,unsigned count) {
     // Reverse the significant bits: for eight stations the order is 0,4,2,6,1,5,3,7.
@@ -144,9 +214,12 @@ inline std::vector<Slot> RoadByKilometre(const trafficdata::Route& r,int count,c
             const auto a=trafficroute::At(line,lane,u),b=trafficroute::At(line,lane,u+trafficroute::Direction(line,lane)*.001);
             return Backup{a,std::atan2(b.x-a.x,b.y-a.y),u};
         };
+        const bool isDrive=r.road.enabled||r.travel==routepolicy::Travel::Drive;
         const auto eligible=[&](int lane,double metres){
-            return RoadLaneAvailable(line,lane,AtStation(arc,metres))&&
-                std::none_of(blocks.begin(),blocks.end(),[&](const auto& b){return metres>b.first&&metres<b.second;});
+            const double u=AtStation(arc,metres);
+            if(!RoadLaneAvailable(line,lane,u)||!ClearOfHazards(r,trafficroute::At(line,lane,u)))return false;
+            if(std::any_of(blocks.begin(),blocks.end(),[&](const auto& b){return metres>b.first&&metres<b.second;}))return false;
+            return !isDrive||AutopilotDrivableSpan(r,line,lane,u);
         };
         const auto nominal=seed(preferred,centre);
         Slot slot{nominal.at,nominal.heading,r.name,preferred,nominal.u,{},interval,CoverageRank(index,count),false};

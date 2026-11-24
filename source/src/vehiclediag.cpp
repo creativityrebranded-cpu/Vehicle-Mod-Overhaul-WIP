@@ -18,6 +18,7 @@
 #include "vehiclehits.h"
 #include "vehicleworld.h"
 #include "npcvehicles.h"
+#include "navmap.h"
 #include "runtimeforms.h"
 
 #include <Windows.h>
@@ -45,7 +46,7 @@ namespace vehiclediag
 		constexpr float kNear = 60.0f;    // m
 		constexpr unsigned kMaxLines = 8;
 
-		struct Comp { uptr component = 0; unsigned updates = 0; ULONGLONG at = 0; };  // at: last native update (GetTickCount64)
+		struct Comp { uptr component = 0; uptr read = 0; uptr write = 0; std::uint32_t bodyId = 0xFFFFFF; unsigned updates = 0; ULONGLONG at = 0; };  // at: last native update (GetTickCount64)
 		std::mutex g_lock;
 		std::unordered_map<std::uint32_t, Comp> g_comps;          // vehicle form id -> its component and update count
 		hookcost::KeyedCounter<> g_steps;               // vehicle instance -> physics steps
@@ -369,6 +370,16 @@ namespace vehiclediag
 		std::vector<BuildWatch> g_buildWatch;
         void ApplyBirthStage(std::uint32_t id);
 		void WatchBuild(std::uint32_t id, const float before[3]);
+		void NoteBuiltComponent(std::uint32_t id, uptr component, uptr read, uptr write, std::uint32_t bodyId)
+		{
+			std::lock_guard lk(g_lock);
+			g_comps[id].component = component;
+			if (read && write && (bodyId & 0xFFFFFF) != 0xFFFFFF) {
+				g_comps[id].read = read;
+				g_comps[id].write = write;
+				g_comps[id].bodyId = bodyId;
+			}
+		}
 		void BuilderDetour(uptr component)
 		{
 			const BuildTrace saved = t_build;
@@ -387,9 +398,9 @@ namespace vehiclediag
 			if (hadPos) WatchBuild(id, before);
 			uptr instance = 0;
 			__try { instance = At<uptr>(component, 0x10); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-			if (id && instance) NoteBuilt(id);
 			const BuildTrace t = t_build;
 			t_build = saved;
+			if (id && instance) { NoteBuilt(id); NoteBuiltComponent(id, component, t.chassis.read, t.chassis.write, t.chassis.id); }
 			logger::Write("OBS system=chassis.build vehicle=%08X event=end instance=%p checked=%d rejected=%d body=%08X flags=%X converted=%d",id,reinterpret_cast<void*>(instance),t.checked,t.finalRejected,t.chassis.id,t.chassis.flags,t.converted);
 			if (g_buildLogs.fetch_add(1, std::memory_order_relaxed) >= 300) return;
 			if (!t.checked) {
@@ -731,7 +742,7 @@ namespace vehiclediag
 		void GuardTick()
 		{
 			static world::Snapshot snap;
-			if (!world::Vehicles(snap)) return;
+			if (!world::VehiclesAndHeld(snap)) return;
 			std::vector<std::pair<std::uint32_t, uptr>> comps;
 			{
 				std::lock_guard lk(g_lock);
@@ -894,6 +905,12 @@ namespace vehiclediag
         {float at[3]={};if(RefPosOf(id,at)){std::lock_guard lock(g_builtLock);g_birthAt[id]={at[0],at[1],at[2]};}}
         ApplyBirthStage(id);
     }
+    void ReanchorBirth(std::uint32_t id, float x, float y, float z){
+        if(!id)return;
+        std::lock_guard lock(g_builtLock);
+        g_birthAt[id]={x,y,z};
+        g_buildWatch.erase(std::remove_if(g_buildWatch.begin(),g_buildWatch.end(),[id](const BuildWatch& w){return w.id==id;}),g_buildWatch.end());
+    }
     // A hidden, replaced or deleted traffic vehicle leaves the hold list at once, motion untouched (its physics object can be
     // freed and reused by something else).
     void DropBirthHold(std::uint32_t id){g_birthHolds.Remove(id);std::lock_guard lock(g_builtLock);g_birthAt.erase(id);}
@@ -908,6 +925,42 @@ namespace vehiclediag
     bool ReleaseBirthFor(std::uint32_t id,bool playerTook);
     bool ReleaseBirth(std::uint32_t id){return ReleaseBirthFor(id,false);}
     bool ReleaseBirthToPlayer(std::uint32_t id){return g_birthHolds.Get(id)?ReleaseBirthFor(id,true):true;}
+    static void EnsureBodyDynamic(uptr read, uptr write, std::uint32_t bodyId){
+        if(!read||!write||(bodyId&0xFFFFFF)==0xFFFFFF)return;
+        __try{
+            const uptr body=reinterpret_cast<uptr (*)(uptr,std::uint32_t)>((*reinterpret_cast<void***>(read))[0x70/8])(read,bodyId);
+            if(!body||At<std::uint32_t>(body,0x50)!=bodyId)return;
+            if((At<std::uint32_t>(body,0x54)&4)!=0){  // still keyframed (flags 8E) -> convert to Havok dynamic (2)
+                using Set_t=void (*)(uptr,std::uint32_t,std::uint32_t,int,int,int,int);
+                reinterpret_cast<Set_t>((*reinterpret_cast<void***>(write))[0xD8/8])(write,bodyId,2,0,0,0,0);
+            }
+        }__except(EXCEPTION_EXECUTE_HANDLER){}
+    }
+    static bool BodyIsKeyframed(uptr read, std::uint32_t bodyId){
+        if(!read||(bodyId&0xFFFFFF)==0xFFFFFF)return false;
+        __try{
+            const uptr body=reinterpret_cast<uptr (*)(uptr,std::uint32_t)>((*reinterpret_cast<void***>(read))[0x70/8])(read,bodyId);
+            return body&&At<std::uint32_t>(body,0x50)==bodyId&&(At<std::uint32_t>(body,0x54)&4)!=0;
+        }__except(EXCEPTION_EXECUTE_HANDLER){return false;}
+    }
+    void EnsureDynamicFor(std::uint32_t id){
+        if(!id||BirthHeld(id))return;
+        uptr r=0,w=0;std::uint32_t bid=0xFFFFFF;
+        {std::lock_guard lk(g_lock);if(const auto it=g_comps.find(id);it!=g_comps.end()){r=it->second.read;w=it->second.write;bid=it->second.bodyId;}}
+        if(!BodyIsKeyframed(r,bid))return;
+        logger::Observe("vehicle.dynamic",id,bid,"event=converting_keyframed_body body=%08X reason=ensure_dynamic_for_driven",bid);
+        // Never mutate Havok motion type from the main thread; dispatch through the physics-safe lifecycle service.
+        lifecycle::Post("ensure-dynamic:"+std::to_string(id),id,[=]()->lifecycle::Work {
+            const auto owned=lifecycle::Keep(runtimeforms::LookupChecked(id),id);if(!owned)return {};
+            return [=]()->std::uint64_t {
+                if(!lifecycle::InService()||BirthHeld(id))return 0;
+                uptr sr=0,sw=0;std::uint32_t sbid=0xFFFFFF;
+                {std::lock_guard lk(g_lock);if(const auto it=g_comps.find(id);it!=g_comps.end()){sr=it->second.read;sw=it->second.write;sbid=it->second.bodyId;}}
+                EnsureBodyDynamic(sr,sw,sbid);
+                return 1;
+            };
+        });
+    }
     bool ReleaseBirthFor(std::uint32_t id,bool playerTook){
         const bool control=playerTook||vehicleflight::BirthControlReady(id),built=control&&Built(id);
         logger::Observe("chassis.birth-handoff",id,unsigned(control)|(unsigned(built)<<1)|(unsigned(playerTook)<<2),"controller_ready=%d built=%d build_checked=%d reason=%s",control,built,control,playerTook?"player_took":"traffic_pilot");
@@ -918,8 +971,29 @@ namespace vehiclediag
             if(!at){at=now;logger::Write("Traffic birth hold: vehicle %08X stays frozen until the game builds its physics vehicle (released after the build)",id);}
             return false;
         }
+        static std::unordered_map<std::uint32_t,ULONGLONG> floorWaitAt;
+        if(!playerTook){
+            const ULONGLONG now=GetTickCount64();
+            const uptr ref=runtimeforms::LookupChecked(id);
+            bool hasFloor=true;
+            if(ref){
+                const auto vp=At<game::Vec3>(ref,off::kRefPosition);
+                bool farFromPlayer=false;
+                if(const uptr pl=*reinterpret_cast<uptr*>(game::Base()+addr::kPlayerCharacterPtr)){
+                    const auto pp=At<game::Vec3>(pl,off::kRefPosition);
+                    farFromPlayer=std::hypot(double(vp.x)-double(pp.x),double(vp.y)-double(pp.y))>200.0;
+                }
+                // Beyond ~200 m Starfield does not load terrain into navmap; unloaded-road support handles far cars.
+                hasFloor=farFromPlayer||navmap::At(vp.x,vp.y,double(vp.z)+2.0).haveGround;
+            }
+            if(!hasFloor){
+                auto& since=floorWaitAt[id];
+                if(!since){since=now;logger::Observe("chassis.birth-handoff",id,0x10u,"controller_ready=1 built=1 floor_ready=0 reason=waiting_for_measured_floor");}
+                if(now-since<3000)return false;
+            }
+        }
         const auto held=g_birthHolds.Get(id);
-        if(!held){lifecycle::Forget("birth-release:"+std::to_string(id));return true;}
+        if(!held){floorWaitAt.erase(id);lifecycle::Forget("birth-release:"+std::to_string(id));return true;}
         const auto result=lifecycle::Poll("birth-release:"+std::to_string(id),id,[=]()->lifecycle::Work {
             const auto owned=lifecycle::Keep(runtimeforms::LookupChecked(id),id);if(!owned)return {};
             return [=]()->std::uint64_t {
@@ -927,10 +1001,16 @@ namespace vehiclediag
                 const auto physics=AcquirePhysics(reinterpret_cast<uptr>(owned.get()));
                 if(!physics||!g_setMotion||playerTook!=trafficpool::PlayerOwnsHandoff(id)||!g_birthHolds.BeginRelease(*held))return 0;
                 const bool released=SetSceneMotion(physics,kSceneDynamic);
+                {
+                    uptr r=0,w=0;std::uint32_t bid=0xFFFFFF;
+                    {std::lock_guard lk(g_lock);if(const auto it=g_comps.find(id);it!=g_comps.end()){r=it->second.read;w=it->second.write;bid=it->second.bodyId;}}
+                    EnsureBodyDynamic(r,w,bid);
+                }
                 g_birthHolds.FinishRelease(*held,released);return released?1:0;
             };
         });
-        return result&&*result;
+        if(result&&*result){floorWaitAt.erase(id);return true;}
+        return false;
     }
 	void NoteBeforeLoad()
 	{

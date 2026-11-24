@@ -9,6 +9,7 @@
 #include "game.h"
 #include "log.h"
 #include "runtimeforms.h"
+#include "simtier.h"
 
 #include <Windows.h>
 
@@ -285,6 +286,7 @@ namespace world
 		struct Order { std::uint32_t id; uptr r, root; bool required; ULONGLONG age; bool held; };
 		static std::vector<Order> order;
 		order.clear();
+		const auto playerPos = player ? At<game::Vec3>(player, off::kRefPosition) : game::Vec3{};
 		for (std::uint32_t i = 0; i < g_idCount; ++i) {
 			const std::uint32_t id = g_ids[i];
 			const uptr r = Lookup(id);
@@ -295,8 +297,22 @@ namespace world
 			const uptr root = Root(r);
 			// A relocated pair's cached reading (position, bodies) is the old place: read it now, whatever the frame budget says.
 			const bool relocated = t != g_track.end() && relocrebase::Judge(t->second.relocSeen, relocconsumers::Poll(id), id) == relocrebase::Verdict::Apply;
-			const bool required = r == driven || id == g_services.owned() || g_services.inUse(id) || moving || c == g_cache.end() ||
-				!c->second.have || c->second.root != root || relocated;
+			const bool playerOwned = r == driven || id == g_services.owned();
+			const bool cachedSameRoot = c != g_cache.end() && c->second.have && c->second.root == root && !relocated;
+			bool farTraffic = false;
+			if (!playerOwned && cachedSameRoot && player) {
+				if (const auto* ctxPrev = simtier::Context().Find(id)) {
+					farTraffic = ctxPrev->tier == simtier::Tier::FarRail;
+				} else {
+					const auto rp = At<game::Vec3>(r, off::kRefPosition);
+					const double nearCut = std::max(60.0, simtier::Context().colliderRadiusM - simtier::kDefaultBandM);
+					farTraffic = std::hypot(double(rp.x) - playerPos.x, double(rp.y) - playerPos.y) > nearCut;
+				}
+			}
+			// Far (>140 m) non-player vehicles with an unchanged 3D root only need a full scene/body walk every 250 ms
+			// (position, heading and velocity are still read every frame).
+			const bool required = playerOwned || !cachedSameRoot ||
+				(farTraffic ? (now - c->second.sampledAt >= 250) : (g_services.inUse(id) || moving));
 			order.push_back({ id, r, root, required, c == g_cache.end() ? 0 : c->second.sampledAt, false });
 		}
 		g_heldIds.clear();
@@ -478,6 +494,21 @@ namespace world
 			}
 		}
 		Write(s);
+		{
+			static game::Limits cachedLimits{};
+			static ULONGLONG limitsAt = 0;
+			if (!limitsAt || now - limitsAt >= 5000) { limitsAt = now; cachedLimits = game::ReadLimits(); }
+			auto& ctx = simtier::Context();
+			ctx.Begin(s.frame, player != 0, playerPos.x, playerPos.y, playerPos.z,
+				double(cachedLimits.loadedColliderMetres), double(cachedLimits.physicsMetres));
+			for (std::uint32_t i = 0; i < s.count && i < kMaxVehicles; ++i) {
+				const auto& v = s.v[i];
+				const bool has3D = v.ref && Root(v.ref) != 0;
+				const bool playerOwned = v.who == VehicleInfo::Who::Player || v.formId == g_services.owned();
+				ctx.Add(v.formId, v.ref, v.pos, v.vel, has3D, playerOwned);
+			}
+			ctx.Finish();
+		}
         LARGE_INTEGER finished{};QueryPerformanceCounter(&finished);
         const double scanMs=1000.0*double(scanEnd.QuadPart-scanStart.QuadPart)/scanFrequency.QuadPart;
         const double sampleMs=1000.0*double(finished.QuadPart-scanEnd.QuadPart)/scanFrequency.QuadPart;
@@ -488,6 +519,7 @@ namespace world
 	void Reset()
 	{
 		g_cache.clear();
+		simtier::Context().Reset();
 		bodymass::observations.Reset();
 		g_track.clear();
 		g_idCount = 0;
@@ -519,7 +551,7 @@ namespace world
 		float* distanceOut)
 	{
 		static thread_local Snapshot s;
-		if (!Vehicles(s)) return false;
+		if (!VehiclesAndHeld(s)) return false;
 		const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
 		if (len < 1e-3f) return false;
 		const float rSelf = std::hypot(half[0], half[1]);

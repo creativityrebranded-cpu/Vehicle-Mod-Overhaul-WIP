@@ -18,6 +18,7 @@ namespace vehiclekeep
 	cameravisibility::Evidence TrafficCameraEvidence(unsigned id,unsigned base,double x,double y,double z,bool driver);
 	void Tick();   // main thread
 	void WantFromBirth(std::uint32_t id);  // a traffic vehicle to hold loaded from now on, in view or not, up to [view] holdFromBirth
+	bool HoldFullLodNow(std::uint32_t id); // immediately grant Full LOD on the service/main thread before far-slot dispatch (2026-11-23)
 	bool InCameraView(double x, double y, double z);  // inside the camera's view cone now; true when the camera cannot be read
 #ifndef FVO_RELEASE
 	bool ReadCameraPose(float origin[3], float forward[3]);  // existing read-only view used by diagnostics

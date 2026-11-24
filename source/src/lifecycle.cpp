@@ -16,7 +16,7 @@ constexpr unsigned kService=0x05E71728,kOwner=0x05F43DC8,kThreading=0x058D585E,k
 // Main (DAT_145E71710) +0x44C: "Is loading screen open", cleared by EndLoadingScreen FUN_14057F430. While set, the
 // main loop FUN_14189D520 takes the reduced step FUN_1418891E0 instead of FUN_141888410 (work log 15:45 trace).
 constexpr unsigned kMain=0x05E71710,kMainLoadingOpen=0x44C,kReducedStep=0x018891E0;
-constexpr double kCoverBudgetMs=3.0; // per reduced step; frames behind the screen already reach 600 ms (log lines 261, 532)
+constexpr double kCoverBudgetMs=16.0; // per reduced step behind loading screen (raised from 3.0 ms, 2026-11-23, for async sliding-window spawn throughput)
 CoverList cover;
 thread_local bool inCover=false;
 thread_local const char* tCurrentKey=nullptr;  // the request being submitted, for crash::Action

@@ -9,6 +9,8 @@
 #include "trafficpair.h"
 #include "modeladmission.h"
 #include "vehiclekeep.h"
+#include "loadedarea.h"
+#include "vehiclelifecycle.h"
 #include "camera_visibility.h"
 #include "traffic/traffic_api.h"
 #include "traffic/birth_api.h"
@@ -628,7 +630,9 @@ namespace
 		}
 		return n;
 	}
-	int ApiVehicles(FvoTrafficVehicle* out, int max) {return ReadTrafficVehicles(out,max,false);}
+	// Include Full-LOD far-dispatched vehicles (`heldFar`): their Havok bodies are live and stepped,
+	// so traffic handoff and health must see them instead of stalling at handoff phase 1 / no_physics_body.
+	int ApiVehicles(FvoTrafficVehicle* out, int max) {return ReadTrafficVehicles(out,max,true);}
 	int ApiGround(double x, double y, double zQuery, double* nav, double* baked)
 	{
 		int known = 0;
@@ -641,7 +645,7 @@ namespace
 	// How old a birth's site check may be when the game makes the reference. In play 250 ms. Behind the loading screen the
 	// main loop's reduced steps take up to 600 ms each (15:32 run, log lines 261 and 532) and the commands run after them
 	// (lifecycle_cover.h), so 2 s there; nothing can be seen move behind the screen.
-	unsigned long long ProofLimitMs(int screen){return screen==3?2000:250;}
+	unsigned long long ProofLimitMs(int screen){return screen==3?6000:250;}
 	std::string MutationKey(const char* operation,unsigned id,double x=0,double y=0,double z=0,double heading=0) {
 		char key[180];sprintf_s(key,"%s:%08X:%a:%a:%a:%a",operation,id,x,y,z,heading);return key;
 	}
@@ -655,10 +659,9 @@ namespace
 		switch(request.window){
 		case FvoBirthWindow::Loading:return screen==3;
 		case FvoBirthWindow::Panel:return screen==2&&trafficarrival::panel.load();
-		// The live road fill (2026-11-20): a fleet birth in play, in every build (the player build must fill the road too). The name is historic.
-		case FvoBirthWindow::Diagnostic:return screen==1&&request.source==FvoBirthSource::Fleet;
-        case FvoBirthWindow::FleetShortfall:
-            return screen==1&&request.source==FvoBirthSource::Fleet&&request.slot>=0;
+		// Live mid-game fleet spawning disabled (2026-11-23, user: "completely turned off"): births run only behind cover (loading screen or X panel).
+		case FvoBirthWindow::Diagnostic:return false;
+        case FvoBirthWindow::FleetShortfall:return false;
 #ifndef FVO_RELEASE
         case FvoBirthWindow::FactoryConcealed:
             return screen==1&&playclock::Running()&&
@@ -1608,6 +1611,7 @@ namespace
 			const int known = ApiGround(d.x, d.y, d.z, &nav, &baked);
 			const double above = known ? d.z - (known & 2 ? baked : nav) : std::nan("");
 			const int sit = ApiSitState(id);
+			if (!linked && sit == 0) vehiclelifecycle::OnDriverUnseated(id);
 			const auto seen = trafficpair::JudgeShown(linked != 0, vehicle3D, distance, sit, std::isfinite(above) && above > 4);
 			++counts[int(seen)];
 			if (made != g_madeDrivers.end() && vehicle) NotePairHealth(vehicle, id, seen, now);
@@ -1621,8 +1625,8 @@ namespace
 			if (reportAfter && lasted >= reportAfter && !w.told && g_watchLines < kWatchLineBudget) {
 				w.told = true; ++g_watchLines;
 				logger::Write("Driver watch: driver %08X %s for %.0f s%s: vehicle %08X model %08X at (%.0f, %.0f, %.0f), %.1f m away, %s; job %d, made by traffic %d, sight %d, %.0f m from the player, driver at (%.0f, %.0f, %.0f), %.1f m above the ground, driver cell state %d, sit %d",
-					id, trafficpair::SeenName(seen), lasted / 1000.0, requestRetirement ? ", retirement requested" : "", vehicle, v.baseId, v.x, v.y, v.z, distance, vehicle3D ? "model loaded" : "no model",
-					job ? 1 : 0, made != g_madeDrivers.end() ? 1 : 0, ExposureAt(d.x, d.y, d.z), std::hypot(d.x - pl.x, d.y - pl.y), d.x, d.y, d.z, above, CellStateOf(id), sit);
+					id, trafficpair::SeenName(seen), lasted / 1000.0, requestRetirement ? ", retirement requested" : "", vehicle, v.baseId, v.x, v.y, v.z, std::isfinite(distance) ? distance : -1.0, vehicle3D ? "model loaded" : "no model",
+					job ? 1 : 0, made != g_madeDrivers.end() ? 1 : 0, ExposureAt(d.x, d.y, d.z), std::hypot(d.x - pl.x, d.y - pl.y), d.x, d.y, d.z, std::isfinite(above) ? above : -1.0, CellStateOf(id), sit);
 			}
 			if (requestRetirement && !w.requested && g_retirementReport && (!linked||linked==made->second)) {
 				w.requested=true;++retireRequests;
@@ -2137,6 +2141,15 @@ extern "C" __declspec(dllexport) unsigned FVO_TrafficBirthRequestV2(const FvoTra
     if(!request||!request->base||!request->grant||request->vehicle||request->source!=FvoBirthSource::Fleet||
        (request->start&&(!proof||!roadclearance::Matches(*proof,*request))))return 0;
     return RequestVehicle(*request,state,proof?std::optional{*proof}:std::nullopt);
+}
+// Covered near-stage -> far-slot dispatch (2026-11-23): re-anchor BirthHold, arm StepDetour physics-thread COM+body shift,
+// grant Full LOD (persistent cell), and update ref + 3D + seated driver (no Bethesda MoveTo).
+extern "C" __declspec(dllexport) int FVO_TrafficDispatchFarV1(unsigned vehicle,unsigned driver,double x,double y,double z){
+    if(!vehicle||!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z))return 0;
+    vehiclediag::ReanchorBirth(vehicle,float(x),float(y),float(z));
+    vehicleflight::ArmFarDispatch(vehicle,driver,x,y,z);
+    vehiclekeep::HoldFullLodNow(vehicle);
+    return loadedarea::DispatchFar(vehicle,driver,float(x),float(y),float(z))?1:0;
 }
 #ifndef FVO_RELEASE
 extern "C" __declspec(dllexport) FvoFactorySiteStatusV1 FVO_TrafficFactorySiteV1(

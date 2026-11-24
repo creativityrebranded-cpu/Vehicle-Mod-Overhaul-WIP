@@ -116,6 +116,7 @@ namespace game
 		const std::uint32_t cells = std::min(l.maxPlayableCoord * 2 / 100, (l.blockSize + l.mergeZone) * 8);
 		l.borderMetres = static_cast<float>(cells / 2) * off::kCellSize - 50.0f;
 		l.physicsMetres = static_cast<float>(l.havokCellExtents) * 50.0f;
+		l.loadedColliderMetres = ClampLoadedColliderMetres(l.physicsMetres);
 		return l;
 	}
 }

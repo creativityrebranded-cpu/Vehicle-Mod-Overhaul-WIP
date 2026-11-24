@@ -117,7 +117,7 @@ struct Exit { std::string name, route; double at = 0; };  // ring: degrees round
 // in the middle of the branch; vehicles join or leave the branch there by the share, as at the main route.
 // type (2026-10-30): how traffic uses it. Empty or both: either way, as every link before types. exit: `from` traffic turns onto
 // `to`, never back. merge: `to` traffic turns onto `from`, never back. crossing: no turning; they pass and one gives way.
-struct Link { std::string name, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; int fromLane=-1,toLane=-1; };
+struct Link { std::string name, from, to; double at = 0; bool toEnd = false; double share = 0.2; double toAt = 0; double radius=0; std::string type; int fromLane=-1,toLane=-1; std::string tag, eventId; };
 // parked = 1 (2026-10-29, map route editor "Bake parking"): a REV-8 is baked here (FVO_EditorPlacements.esm); the cold-start pool
 // gives it a driver when a route needs one (core never creates a vehicle at such a spot).
 // Landing areas (2026-10-30, Traffic Manager V1): layout = single, row, bays (two facing rows) or ring; spaces; turn in degrees
@@ -129,6 +129,7 @@ struct Place {
     int spaces = 1; double turn = 0, stay = 0;
     std::vector<std::string> routes;placeaccess::Plan access;
     std::vector<placeaccess::Wire> wires;  // landing wires (In / Out); the first of each mirrors `access`
+    std::string tag, eventId;              // optional scripted-node metadata (ignored by older builds)
 };
 constexpr double kSpaceGap = 14.0;  // m between the middles of two spaces
 // Where each space of a landing area is.
@@ -160,7 +161,7 @@ inline bool RouteMayPark(const Place& p, const std::string& route, const std::st
     return p.purpose != "depot";
 }
 // A keep-out zone (traffic stays above `top`) or a slow zone (speed limit inside): a circle on the map.
-struct Zone { std::string name, world; Vec at; double radius = 100, top = 0, speed = 10; bool slow = false;trafficconstraints::Rules restrictions;double restrictionFloor=-1000000000,restrictionTop=1000000000; };
+struct Zone { std::string name, world; Vec at; double radius = 100, top = 0, speed = 10; bool slow = false;trafficconstraints::Rules restrictions;double restrictionFloor=-1000000000,restrictionTop=1000000000; std::string tag, eventId; };
 // A city's settings (2026-10-30, Traffic Manager V1): traffic on or off, density in percent of every route's count, the most
 // vehicles at once, and whether the routes of other files fly.
 struct City { std::string world; bool on = true, originals = true; int density = 100, limit = fvolimits::kVehicles;trafficconstraints::Rules restrictions;laneplan::Plan laneDefaults; };
@@ -467,6 +468,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data, b
                 std::string w;
                 while (names >> w) p.routes.push_back(w);
             }
+            p.tag = Trim(get("tag")); p.eventId = Trim(get("event_id"));
             data.places.push_back(p);
         }
         else if (kind == "spawn") {
@@ -526,6 +528,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data, b
             if(k.from==k.to&&(k.fromLane<0||k.toLane<0||k.fromLane==k.toLane||((k.fromLane^k.toLane)&1)||k.toEnd||k.at==k.toAt||k.radius<=0)){bad(sec,"lanes","same-route connection needs distinct same-direction lanes, anchors and positive radius");continue;}
             if (k.type == "both") k.type.clear();
             if (!k.type.empty() && k.type != "exit" && k.type != "merge" && k.type != "crossing") { bad(sec, "type", "both, exit, merge or crossing; read as both"); k.type.clear(); }
+            k.tag = Trim(get("tag")); k.eventId = Trim(get("event_id"));
             data.links.push_back(k);
         }
         else if (kind == "zone") {
@@ -542,6 +545,7 @@ inline void Read(const std::string& text, const std::string& file, Data& data, b
             z.radius = std::clamp(z.radius, 10.0, 2000.0); z.speed = std::clamp(z.speed, 2.0, 80.0);
             z.restrictions=trafficconstraints::Read(get("restrictions"));num(sec,kv,"restriction_floor",z.restrictionFloor);num(sec,kv,"restriction_top",z.restrictionTop);
             if(!std::isfinite(z.restrictionFloor)||!std::isfinite(z.restrictionTop)||z.restrictionFloor>z.restrictionTop){bad(sec,"restriction height","finite ordered height band required");z.restrictions.unsupported="invalid restriction height band: "+get("restrictions");}
+            z.tag = Trim(get("tag")); z.eventId = Trim(get("event_id"));
             data.zones.push_back(z);
         }
         else if (kind == "city") {

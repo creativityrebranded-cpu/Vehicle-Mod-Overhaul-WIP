@@ -20,6 +20,9 @@ namespace vehicleflight
 	void BeginFrame(); // revoke previous-frame command ownership before decision systems run
 	void Tick();     // per frame, main thread (frame task)
 	void LoadReset(); // discard hover/body state before a different save replaces the rover
+	void ArmFarDispatch(std::uint32_t vehicleId, std::uint32_t driverId, double x, double y, double z);
+	bool HasPendingFarDispatch(std::uint32_t vehicleId);
+	bool FleetRailActive(std::uint32_t vehicleId);
 	bool Active();
     bool RouteTripActive(std::uint32_t vehicleId);
     bool BirthControlReady(std::uint32_t vehicleId);

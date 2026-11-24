@@ -53,6 +53,12 @@ namespace loadedarea
 	// Fleet rail outside the attached cells (2026-11-21): queue a move of the chassis reference to (x, y, z) even inside its listed
 	// cell, refiling it when the point is in another existing cell, and carry its seated driver. Same service path as RefileRelocated.
 	bool StepReference(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z);
+	// Covered near-stage -> far-slot dispatch (2026-11-23): atomically move Havok chassis body, reference, 3D root, and seated driver
+	// to a far route slot via our service path (no Bethesda MoveTo), after Full LOD is set.
+	bool DispatchFar(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z);
+	// Post-dismount Havok cell re-sync (2026-11-23): if a far-dispatched actor is genuinely unseated (VehicleOf == 0)
+	// and stands outside its listed grid cell, refile it inside lifecycle::InService() so it has real Havok collision.
+	bool RefileUnseatedActor(std::uint32_t actorId);
 	struct RelocationSettle {
 		bool refKnown = false, listedGrid = false, inDestinationCell = false, atTarget = false;
 		float gap = 0;             // m between the chassis reference and (x, y, z)

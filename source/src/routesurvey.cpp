@@ -33,7 +33,7 @@ namespace {
 using uptr = std::uintptr_t;
 constexpr double kRadius = 220.0;     // m round the player: the loaded area (handbook: ~250 m)
 constexpr double kMoveAgain = 120.0;  // m the player moves before the next sweep
-constexpr double kFrameMs = 6.0;      // ms of rays a frame (the first sweep runs right after the load)
+constexpr double kFrameMs = 1.5;      // ms of rays a frame (spreads sweeps smoothly without frame hitches)
 constexpr double kAcross = 4.0;       // m: WM-1 down rays across the lane line every metre out to this (was kTrack 1.0, the wheel tracks)
 constexpr double kAbove = 3.0, kBelow = 4.0;  // m: each ray from over the authored line to under it (authored floors sit up to 1.4 m off)
 constexpr std::uint64_t kMask = 0x22806;      // the editor's ray layers (F7 tile check)

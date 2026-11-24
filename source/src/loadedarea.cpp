@@ -7,7 +7,9 @@
 #include "hook.h"
 #include "log.h"
 #include "mapguard.h"
+#include "probeguard.h"
 #include "npcvehicles.h"
+#include "trafficpool.h"
 #include "vehiclediag.h"
 #include "vehicleflight.h"
 #include "vehicleworld.h"
@@ -157,7 +159,9 @@ namespace loadedarea
 			if (!g_idCount.load(std::memory_order_acquire)) return false;
 			if (InBodySet(body)) return true;
 			const std::uint32_t owner = OwnerOf(world, body);
-			if (!owner || !Listed(owner)) return false;
+			// Exempt both active pilots (Listed) and every FVO-created traffic vehicle (MadeVehicle) so Starfield's
+			// LoadedAreaBound (FUN_140D500B0) never grabs a parked or retiring vehicle beyond 250 m and dumps it at the cell edge.
+			if (!owner || (!Listed(owner) && !trafficpool::MadeVehicle(owner))) return false;
 			g_lastId.store(owner, std::memory_order_relaxed);
 			return true;
 		}
@@ -566,12 +570,13 @@ namespace loadedarea
 			}
 			g_driverSynced.fetch_add(1, std::memory_order_relaxed);
 		}
-		struct Crossing { std::uint32_t id, driverId; float to[3]; std::uint64_t poseGeneration; bool always = false; };
-		constexpr int kMaxCrossings = 16;
+		struct Crossing { std::uint32_t id, driverId; float to[3]; std::uint64_t poseGeneration; bool always = false; bool moveBody = false; };
+		constexpr int kMaxCrossings = 64;
 		Crossing g_crossings[kMaxCrossings];
 		int g_crossingCount = 0;
 		void SyncOne(std::uint32_t id, std::uint32_t driverId, uptr world, ULONGLONG now)
 		{
+			if (vehicleflight::HasPendingFarDispatch(id)) return;
 			const auto generation=npcvehicles::PoseGeneration(id);
 			if(!generation)return;
 			const uptr component = vehiclediag::ComponentOf(id);
@@ -615,6 +620,23 @@ namespace loadedarea
 					g_crossHeld.fetch_add(1, std::memory_order_relaxed);
 					return;
 				}
+				const float syncDist = std::sqrt(dx * dx + dy * dy + dz * dz);
+				if (syncDist > 5.0f) {
+					struct SnapTrack { std::uint32_t id = 0; ULONGLONG firstAt = 0, pauseUntil = 0; int count = 0; };
+					static SnapTrack g_snapTrack[32]{};
+					SnapTrack* tr = nullptr;
+					for (auto& e : g_snapTrack) { if (e.id == id) { tr = &e; break; } if (!tr && !e.id) tr = &e; }
+					if (!tr) tr = &g_snapTrack[id % 32];
+					if (tr->id != id) *tr = SnapTrack{ id, 0, 0, 0 };
+					if (now < tr->pauseUntil) return;
+					if (!tr->firstAt || now - tr->firstAt > 30000) { tr->firstAt = now; tr->count = 0; }
+					if (++tr->count >= 3) {
+						tr->pauseUntil = now + 10000;
+						logger::Observe("stream.sync", id, 0x20u, "event=rubber_band snaps=%d dist=%.1f reason=repeated_large_sync_snap_paused", tr->count, syncDist);
+						tr->count = 0; tr->firstAt = 0;
+						return;
+					}
+				}
 				reinterpret_cast<void (*)(uptr, float*)>(game::Base() + kSetRefPosition)(ref, target);
 				CarryDriver(ref, driverId, dx, dy, dz);
 				if (const uptr loaded = At<uptr>(ref, off::kRefLoadedData)) if (const uptr root = At<uptr>(loaded, off::kLoadedData3D)) {
@@ -635,24 +657,57 @@ namespace loadedarea
 		// In the service: the engine's own sequence from FUN_140B52E30. Set the position; if the cell at it exists and is not the listed
 		// one, refile the reference there with FUN_140B48CA0(ref, 0, ws, 0, 1, 1, 1). No cell there: nothing changes. The model and a
 		// seated driver follow by the same amount, as SyncOne does.
-		std::uint64_t Refile(uptr ref, std::uint32_t id, std::uint32_t driverId, float x, float y, float z, bool always = false)
+		std::uint64_t Refile(uptr ref, std::uint32_t id, std::uint32_t driverId, float x, float y, float z, bool always = false, bool moveBody = false)
 		{
 			__try {
 				if (At<std::uint32_t>(ref, kRefFormId) != id) return 0;
 				int cx = 0, cy = 0; uptr ws = 0;
-				if (!ListedGrid(ref, cx, cy, ws) || (!always && cellfit::Inside(cx, cy, x, y))) return 0;  // moved already, or off the grid now
-				const uptr cell = reinterpret_cast<uptr (*)(uptr, float, float, uptr, char)>(game::Base() + kCellAt)(0, x, y, ws, 0);
-				// No cell there: FUN_140B52E30 only sets the position, and so does this. Doing nothing left the reference at the edge while its body flew on
-				// (2026-10-31: FF1003EE 147 m, FF1003BB 165 m behind), its driver with it. The cell loads later and the next sync refiles it.
-				if (!cell) {
+				const bool grid = ListedGrid(ref, cx, cy, ws);
+				if (!moveBody && !always && (!grid || cellfit::Inside(cx, cy, x, y))) return 0;  // moved already, or off the grid now
+				bool movedBody = false, movedCom = false;
+				if (moveBody) {
+					if (const uptr component = vehiclediag::ComponentOf(id)) {
+						const uptr instance = At<uptr>(component, 0x10);
+						const uptr read = instance ? At<uptr>(instance, 0x28) : 0;
+						const std::uint32_t bodyId = instance ? At<std::uint32_t>(instance, 0x20) : kNoBody;
+						if (read && bodyId != kNoBody) {
+							const uptr rvt = At<uptr>(read, 0);
+							const uptr body = rvt ? reinterpret_cast<uptr(*)(uptr, std::uint32_t)>(At<uptr>(rvt, 0x70))(read, bodyId) : 0;
+							if (body && At<std::uint32_t>(body, 0x50) == bodyId) {
+								float* bp = reinterpret_cast<float*>(body + 0x30);
+								const double bdx = double(x) - double(bp[0]), bdy = double(y) - double(bp[1]), bdz = double(z) - double(bp[2]);
+								const uptr motion = reinterpret_cast<uptr(*)(uptr, std::uint32_t)>(At<uptr>(rvt, 0xD0))(read, At<std::uint32_t>(body, 0x80));
+								if (motion && At<std::uint32_t>(motion, 0x48) == bodyId) {
+									double* com = reinterpret_cast<double*>(motion + 0x10);
+									if (std::isfinite(com[0]) && std::isfinite(com[1]) && std::isfinite(com[2])) {
+										com[0] += bdx; com[1] += bdy; com[2] += bdz;
+										movedCom = true;
+									}
+								}
+								bp[0] = x; bp[1] = y; bp[2] = z;
+								movedBody = true;
+							}
+						}
+					}
+					logger::Observe("traffic.dispatch-body", id, unsigned(movedBody) | (unsigned(movedCom) << 1) | (unsigned(grid) << 2),
+						"driver=%08X moved_body=%d moved_com=%d grid=%d to=%.1f,%.1f,%.1f", driverId, movedBody ? 1 : 0, movedCom ? 1 : 0, grid ? 1 : 0, x, y, z);
+				}
+				const uptr cell = grid ? reinterpret_cast<uptr (*)(uptr, float, float, uptr, char)>(game::Base() + kCellAt)(0, x, y, ws, 0) : 0;
+				// Persistent-cell refs (grid == false, e.g. Full LOD far-dispatch) do not use kRefile: kSetRefPosition (0x140b4e410)
+				// natively removes and re-inserts them in the worldspace persistent spatial index (FUN_140bbec70 / FUN_140bbea20).
+				if (grid && !cell) {
 					g_crossNoCell.fetch_add(1, std::memory_order_relaxed);
 					logger::Observe("stream.sync", id, 6, "driver=%08X reason=no_cell_position_only pos=%.2f,%.2f,%.2f listed=%d,%d", driverId, x, y, z, cx, cy);
 				}
 				const float* rp = reinterpret_cast<const float*>(ref + off::kRefPosition);
 				const float dx = x - rp[0], dy = y - rp[1], dz = z - rp[2];
+				if (moveBody) {
+					float* rot = reinterpret_cast<float*>(ref + off::kRefRotation);
+					if (std::isfinite(rot[2])) { rot[0] = 0.0f; rot[1] = 0.0f; }
+				}
 				float target[3] = { x, y, z };
 				reinterpret_cast<void (*)(uptr, float*)>(game::Base() + kSetRefPosition)(ref, target);
-				if (cell && cell != At<uptr>(ref, off::kRefParentCell))
+				if (grid && cell && cell != At<uptr>(ref, off::kRefParentCell))
 					reinterpret_cast<void (*)(uptr, uptr, uptr, uptr, char, char, char)>(game::Base() + kRefile)(ref, 0, ws, 0, 1, 1, 1);
 				CarryDriver(ref, driverId, dx, dy, dz);
 				if (const uptr loaded = At<uptr>(ref, off::kRefLoadedData)) if (const uptr root = At<uptr>(loaded, off::kLoadedData3D)) {
@@ -680,11 +735,16 @@ namespace loadedarea
 					if (!owned) return {};
 					return [=]() -> std::uint64_t {
 						if (!lifecycle::InService()) return 0;
-						if(c.poseGeneration!=npcvehicles::PoseGeneration(c.id)){
-							logger::Observe("stream.sync",c.id,7,"driver=%08X reason=relocation_revoked_refile",c.driverId);
+						if (probeguard::ProcgenHold(GetTickCount64(), mapguard::LastProcgen())) return 0;
+						if (c.poseGeneration && c.poseGeneration != npcvehicles::PoseGeneration(c.id)) {
+							logger::Observe("stream.sync", c.id, 7, "driver=%08X reason=relocation_revoked_refile", c.driverId);
 							return 0;
 						}
-						return Refile(reinterpret_cast<uptr>(owned.get()), c.id, c.driverId, c.to[0], c.to[1], c.to[2], c.always);
+						// If this is an unseated actor re-sync (poseGeneration == 0), re-verify the actor is still unseated
+						// inside the service before calling kSetRefPosition/kRefile so we never pull a seated driver out.
+						const uptr ownedRef = reinterpret_cast<uptr>(owned.get());
+						if (!c.poseGeneration && npcvehicles::LooksLikeActor(ownedRef) && npcvehicles::VehicleOf(ownedRef) != 0) return 0;
+						return Refile(ownedRef, c.id, c.driverId, c.to[0], c.to[1], c.to[2], c.always);
 					};
 				});
 			}
@@ -729,15 +789,17 @@ namespace loadedarea
 				auto& watch=watched[id];
 				if(watch.key!=key)watch=CrossingWatch{key};
 				if(now<watch.retryAt)continue;
-				// The deadlock's case is a non-actor (16:07: a cell job moving a non-actor outside its cell). Those go to the right cell; the mover would take a seated actor out of its seat.
+				// Non-actors always refile (16:07 deadlock); unseated actors also refile so any legitimately dismounted
+				// far-dispatched driver snaps its Havok character controller into its current cell instead of becoming a ghost.
 				const uptr ref = g_lookup ? g_lookup(id) : 0;
 				const bool actor = ref && npcvehicles::LooksLikeActor(ref);
-				const auto generation=npcvehicles::PoseGeneration(id);
-				const bool alreadyQueued=std::any_of(g_crossings,g_crossings+g_crossingCount,[=](const Crossing& c){return c.id==id;});
-				const bool queued = ref && !actor && generation && !alreadyQueued && g_crossingCount < kMaxCrossings;
+				const bool unseatedActor = actor && npcvehicles::VehicleOf(ref) == 0;
+				const auto generation = npcvehicles::PoseGeneration(id);
+				const bool alreadyQueued = std::any_of(g_crossings, g_crossings + g_crossingCount, [=](const Crossing& c) { return c.id == id; });
+				const bool queued = ref && (( !actor && generation ) || unseatedActor) && !alreadyQueued && g_crossingCount < kMaxCrossings;
 				if (queued) {
-					g_crossings[g_crossingCount++] = { id, 0, { m.pos[0], m.pos[1], m.pos[2] }, generation };
-					watch.retryAt=now+1000;
+					g_crossings[g_crossingCount++] = { id, 0, { m.pos[0], m.pos[1], m.pos[2] }, unseatedActor ? 0 : generation, unseatedActor };
+					watch.retryAt = now + 1000;
 				}
 				if(watch.reported)continue;
 				watch.reported=true;
@@ -815,12 +877,72 @@ namespace loadedarea
 	}
 	bool StepReference(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z)
 	{
+		if (probeguard::ProcgenHold(GetTickCount64(), mapguard::LastProcgen())) return false;
 		const auto generation = npcvehicles::PoseGeneration(vehicleId);
 		if (!generation || !g_lookup || !std::isfinite(x + y + z)) return false;
 		if (std::any_of(g_crossings, g_crossings + g_crossingCount, [=](const Crossing& c) { return c.id == vehicleId; })) return false;
 		if (g_crossingCount >= kMaxCrossings) return false;
-		g_crossings[g_crossingCount++] = { vehicleId, driverId, { x, y, z }, generation, true };
+		g_crossings[g_crossingCount++] = { vehicleId, driverId, { x, y, z }, generation, true, false };
 		return true;
+	}
+	bool DispatchFar(std::uint32_t vehicleId, std::uint32_t driverId, float x, float y, float z)
+	{
+		if (!vehicleId || !g_lookup || !std::isfinite(x + y + z)) return false;
+		const uptr ref = g_lookup(vehicleId);
+		if (!ref) return false;
+		char key[48]; sprintf_s(key, "fardisp:%08X", vehicleId);
+		return lifecycle::Post(key, vehicleId, [=]() -> lifecycle::Work {
+			const auto owned = lifecycle::Keep(ref, vehicleId);
+			if (!owned) return {};
+			return [=]() -> std::uint64_t {
+				if (!lifecycle::InService()) return 0;
+				return Refile(reinterpret_cast<uptr>(owned.get()), vehicleId, driverId, x, y, z, true, true);
+			};
+		});
+	}
+	static bool ReadRefPosSafe(uptr ref, float out[3])
+	{
+		__try {
+			const float* rp = reinterpret_cast<const float*>(ref + off::kRefPosition);
+			if (!std::isfinite(rp[0]) || !std::isfinite(rp[1]) || !std::isfinite(rp[2])) return false;
+			out[0] = rp[0]; out[1] = rp[1]; out[2] = rp[2];
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+	}
+	bool RefileUnseatedActor(std::uint32_t actorId)
+	{
+		if (!actorId || !g_lookup) return false;
+		if (probeguard::ProcgenHold(GetTickCount64(), mapguard::LastProcgen())) return false;
+		static std::unordered_map<std::uint32_t, ULONGLONG> lastTried;
+		const ULONGLONG now = GetTickCount64();
+		auto& at = lastTried[actorId];
+		if (at && now - at < 5000) return false;
+		const uptr ref = g_lookup(actorId);
+		if (!ref || !npcvehicles::LooksLikeActor(ref) || npcvehicles::VehicleOf(ref) != 0) return false;
+		Misfiled m{ actorId, 0, 0, 0, 0, {} };
+		const bool misfiled = ReadMisfiled(actorId, m);
+		if (!misfiled) {
+			// Persistent-cell / FarCell unseated actor: ReadMisfiled returns false because it has no grid cell,
+			// yet its Havok character controller can still ghost at an old location. Read its current ref position
+			// and resync via kSetRefPosition inside the service.
+			if (!ReadRefPosSafe(ref, m.pos)) return false;
+		}
+		at = now;
+		char key[48]; sprintf_s(key, "actor-refile:%08X", actorId);
+		return lifecycle::Post(key, actorId, [=]() -> lifecycle::Work {
+			const auto owned = lifecycle::Keep(ref, actorId);
+			if (!owned) return {};
+			return [=]() -> std::uint64_t {
+				if (!lifecycle::InService()) return 0;
+				if (probeguard::ProcgenHold(GetTickCount64(), mapguard::LastProcgen())) return 0;
+				const uptr ownedRef = reinterpret_cast<uptr>(owned.get());
+				if (!npcvehicles::LooksLikeActor(ownedRef) || npcvehicles::VehicleOf(ownedRef) != 0) return 0;
+				const auto ok = Refile(ownedRef, actorId, 0, m.pos[0], m.pos[1], m.pos[2], true, false);
+				logger::Write("OBS system=stream.actor_refile actor=%08X persistent=%d from=%d,%d to=%d,%d pos=%.1f,%.1f,%.1f ok=%llu",
+					actorId, misfiled ? 0 : 1, m.cx, m.cy, m.px, m.py, m.pos[0], m.pos[1], m.pos[2], static_cast<unsigned long long>(ok));
+				return ok;
+			};
+		});
 	}
 	bool RelocationSettled(std::uint32_t vehicleId, float x, float y, float z, RelocationSettle& out)
 	{

@@ -577,22 +577,39 @@ namespace hoverui
 			g_ui.gearShown = gear;
 		}
 
-		// The Hover key box turns a very slight blue while hovering: a flash.geom.ColorTransform on its PCButton_mc
-		// (the button itself only tints the inner ButtonInstance_mc, so this one stays).
-		void TintHover(bool on)
+		// Constellation Drive HUD semantic tint palette (2026-11-24, user approved):
+		// 0=Ivory (idle), 1=Cyan (Hover), 2=Gold (Auto/Cruise/Gear), 3=Emerald (Healthy), 4=Coral (Low health warning).
+		void ApplyConstellationTint(uptr movie, const Value& button, int tintMode)
 		{
-			if (g_ui.hoverTint == int(on) || !IsObject(g_ui.buttons[kHover])) return;
+			if (!IsObject(button)) return;
 			Value pc, tr, ct;
-			if (GetMember(g_ui.buttons[kHover], "PCButton_mc", &pc) && IsObject(pc) && GetMember(pc, "transform", &tr) && IsObject(tr)) {
-				const Value args[8] = { Num(on ? 0.80 : 1.0), Num(on ? 0.88 : 1.0), Num(1.0), Num(1.0), Num(0.0), Num(0.0), Num(0.0), Num(0.0) };
-				if (CreateObject(g_ui.movie, &ct, "flash.geom.ColorTransform", args, 8)) {
+			if (GetMember(button, "PCButton_mc", &pc) && IsObject(pc) && GetMember(pc, "transform", &tr) && IsObject(tr)) {
+				double rm = 0.95, gm = 0.94, bm = 0.91, ro = 0.0, go = 0.0, bo = 0.0;
+				switch (tintMode) {
+				case 1: rm = 0.38; gm = 0.80; bm = 1.00; ro =  6.0; go = 24.0; bo = 42.0; break;  // Constellation Cyan (#38BDF8)
+				case 2: rm = 1.00; gm = 0.76; bm = 0.22; ro = 24.0; go = 12.0; bo =  0.0; break;  // Constellation Gold (#F59E0B)
+				case 3: rm = 0.35; gm = 0.92; bm = 0.68; ro =  0.0; go = 18.0; bo = 10.0; break;  // Constellation Emerald (#10B981)
+				case 4: rm = 1.00; gm = 0.40; bm = 0.40; ro = 32.0; go =  0.0; bo =  0.0; break;  // Constellation Coral (#EF4444)
+				default: break;
+				}
+				const Value args[8] = { Num(rm), Num(gm), Num(bm), Num(1.0), Num(ro), Num(go), Num(bo), Num(0.0) };
+				if (CreateObject(movie, &ct, "flash.geom.ColorTransform", args, 8)) {
 					SetMember(tr, "colorTransform", Arg(ct));
-					g_ui.hoverTint = int(on);
 				}
 			}
 			Release(ct);
 			Release(tr);
 			Release(pc);
+		}
+
+		// The Hover key box turns Constellation Cyan while hovering (and Gear pill stays Constellation Gold).
+		void TintHover(bool on)
+		{
+			if (g_ui.hoverTint != int(on) && IsObject(g_ui.buttons[kHover])) {
+				ApplyConstellationTint(g_ui.movie, g_ui.buttons[kHover], on ? 1 : 0);
+				ApplyConstellationTint(g_ui.movie, g_ui.buttons[kGear], 2);
+				g_ui.hoverTint = int(on);
+			}
 		}
 
 		bool IsOurExtra(void* object);
@@ -1626,21 +1643,16 @@ namespace hoverui
 			e.shown = on;
 		}
 
-		// The status box turns the slight hover blue while it shows a state.
+		// Semantic Constellation tinting for MonoEl status/action boxes (cached via e.tint).
+		void MonoTintMode(uptr movie, MonoEl& e, int mode)
+		{
+			if (e.tint == mode || !IsObject(e.button)) return;
+			ApplyConstellationTint(movie, e.button, mode);
+			e.tint = mode;
+		}
 		void MonoTint(uptr movie, MonoEl& e, bool on)
 		{
-			if (e.tint == int(on) || !IsObject(e.button)) return;
-			Value pc, tr, ct;
-			if (GetMember(e.button, "PCButton_mc", &pc) && IsObject(pc) && GetMember(pc, "transform", &tr) && IsObject(tr)) {
-				const Value args[8] = { Num(on ? 0.80 : 1.0), Num(on ? 0.88 : 1.0), Num(1.0), Num(1.0), Num(0.0), Num(0.0), Num(0.0), Num(0.0) };
-				if (CreateObject(movie, &ct, "flash.geom.ColorTransform", args, 8)) {
-					SetMember(tr, "colorTransform", Arg(ct));
-					e.tint = int(on);
-				}
-			}
-			Release(ct);
-			Release(tr);
-			Release(pc);
+			MonoTintMode(movie, e, on ? 1 : 0);
 		}
 
         inlinehints::View CurrentHints()
@@ -2120,9 +2132,9 @@ namespace hoverui
             (void)seatText;(void)pullKey;
             ElSet(g_ex.fPass,false," ","");   // folded into the one vehicle prompt (the Board vehicle slot)
             ElSet(g_ex.fEject,false," ","");
-			// The Auto prompt (the trip itself is in the status card): "Auto", or "Auto off" (tinted) while it flies.
+			// The Auto prompt: Constellation Gold while Auto/Cruise is active, warm ivory when idle.
 			ElSet(g_ex.vLine, inVehicle && !autoKey.empty() && (!ed||selection==kSelLine), autoText.c_str(), autoKey);
-			MonoTint(g_ex.movie, g_ex.vLine, autoOn);
+			MonoTintMode(g_ex.movie, g_ex.vLine, autoOn ? 2 : 0);
 			ElSet(g_ex.vTarget, inVehicle && !ScannerOpen() && !target.empty(), targetHelp.c_str(), target);
 			MonoTint(g_ex.movie, g_ex.vTarget, true);
 			ElSet(g_ex.vRows, false, " ", rowsBox);  // the card counts the escorts; the scanner lists them
@@ -2173,10 +2185,27 @@ namespace hoverui
             if(ed&&selection==(inVehicle?kSelRows:3)&&card[0].empty())card[0]=inVehicle?"GEAR 2":"FOLLOW 42 m";
 			auto& cardEls = inVehicle ? g_ex.vCard : g_ex.fCard;
 			auto& otherEls = inVehicle ? g_ex.fCard : g_ex.vCard;
+			auto lowPctLine = [](const std::string& s) {
+				for (std::size_t p = s.find('%'); p != std::string::npos; p = s.find('%', p + 1)) {
+					std::size_t q = p;
+					while (q > 0 && s[q - 1] >= '0' && s[q - 1] <= '9') --q;
+					if (q < p) {
+						const int val = std::atoi(s.substr(q, p - q).c_str());
+						if (val < 35) return true;
+					}
+				}
+				return false;
+			};
 			for (int i = 0; i < Extras::kCardLines; ++i) {
 				const bool on = !card[i].empty();
 				ElSet(cardEls[i], on, " ", on ? card[i] : std::string());
-				if (on) MonoTint(g_ex.movie, cardEls[i], i == 0 && (autoOn || g_hovering));
+				if (on) {
+					int mode = 0;
+					if (i == 0) mode = g_hovering ? 1 : (autoOn ? 2 : 0);          // Cyan = Hover, Gold = Auto/Cruise
+					else if (i == 1 || i == 2) mode = lowPctLine(card[i]) ? 4 : 3; // Coral = <35% health, Emerald = healthy
+					else if (i == 3) mode = 2;                                      // Gold = active route/trip status
+					MonoTintMode(g_ex.movie, cardEls[i], mode);
+				}
 				ElSet(otherEls[i], false, " ", std::string());
 			}
 			// Places: the on-foot panel in RightMeters_mc's coordinates; the extras in the rover widget's, beside the

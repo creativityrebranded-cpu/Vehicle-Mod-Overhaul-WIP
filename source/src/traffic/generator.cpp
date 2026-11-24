@@ -164,6 +164,7 @@ namespace generator
             bool observed = false, retired = false, routeWaitTold = false;
             std::wstring storedKey;     // archived row's exact original name, including legacy spot keys
             FvoPoolSpot birth{}; bool reserved = false;
+            FvoPoolSpot farTarget{}; bool hasFarTarget = false, farDispatched = false;
             FvoRoadProofV1 roadProof{};
             bool staged = false;
             bool armed = false; ULONGLONG bornAt = 0, fallCheckAt = 0;
@@ -288,6 +289,7 @@ namespace generator
         std::atomic<double> g_fleetViewerSpeed{0};
         // A refused live birth delays only its own slot. The core's own reason comes from FVO_TrafficBirthRefusalV1 and is logged in the add-on's own line.
         FvoBirthRefusalFnV1 g_birthRefusal=nullptr;
+        int (*g_farDispatch)(unsigned,unsigned,double,double,double)=nullptr;
         bool CoreRefusal(std::uint64_t grant,int slot,FvoBirthRefusalV1& out){out={};out.size=sizeof out;return g_birthRefusal&&grant&&g_birthRefusal(grant,slot,&out)==1;}
         void LogRefusal(const char* where,int slot,unsigned base,std::uint64_t grant,const FvoBirthRefusalV1* r){
             Log("OBS system=traffic.live vehicle=00000000 event=create_refused where=%s slot=%d base=%08X grant=%llu core_known=%d stage=%s reason=%s retry=this_slot_only",
@@ -684,7 +686,7 @@ namespace generator
             SaveRetiringSaved();Log("OBS system=traffic.census vehicle=%08X event=retiring_cleared reason=%s",id,why);
         }
         // A failed lookup is not proof the reference is gone (2026-10-31 18:59 run: FF016B4E read as gone at 19:02:53, built again at 19:04:23 and stayed parked with no driver).
-        constexpr ULONGLONG kDoomedMissingMs=300000,kDeleteRetryMs=5000,kDeleteRetryMaxMs=60000;
+        constexpr ULONGLONG kDoomedMissingMs=15000,kDeleteRetryMs=5000,kDeleteRetryMaxMs=60000;
         constexpr int kDeleteGiveUp=6;
         ULONGLONG g_clock=0;  // this update's time
         // Step 9, Retirement: the only remover. Every removal in the addon comes here with its reason; each caller has already waited for a cover
@@ -2955,6 +2957,7 @@ namespace generator
     void SetHealthSources(int (*sample)(unsigned,FvoPairHealthSampleV1*),void (*spot)(unsigned)){g_healthSample=sample;g_spotRequest=spot;}  // CH-1/CH-4, optional
     void SetPlayClock(unsigned (*fn)()){g_playClock=fn;Log("OBS system=traffic.window vehicle=00000000 event=play_clock_source available=%d reason=%s",int(fn!=nullptr),fn?"core_FVO_PlayClockV1":"older_core_presentation");}
     void SetBirthRefusal(FvoBirthRefusalFnV1 refusal){g_birthRefusal=refusal;}
+    void SetFarDispatch(int (*fn)(unsigned vehicle, unsigned driver, double x, double y, double z)){g_farDispatch=fn;}
     void SetPhysicalFleet(FvoFleetRailAssignV1Fn assign,FvoFleetRailReleaseV1Fn release,
                           FvoFleetRailStateV1Fn state,FleetPath path){
         const bool ready=assign&&release&&state&&path;
@@ -3067,11 +3070,24 @@ namespace generator
             const bool localRoad=p.bornAt&&i<int(g_initialRoads.size())&&g_initialRoads[i];
             const bool handoffReady=[&]{
                 FvoTrafficRef driver{};
-                return Info(p.vehicle,hv)&&hv.has3D&&HasBody(p.vehicle,snap)&&Aboard(p.driver,p.vehicle)&&
-                    trafficpair::Sitting(engineport::Forward<&FvoTrafficApi::sitState>(g_api,"sitState","generator",0u,p.driver))&&
+                if(!Info(p.vehicle,hv)||!hv.has3D||!HasBody(p.vehicle,snap)||!Aboard(p.driver,p.vehicle))return false;
+                // Far-dispatched pairs were already proven seated with 3D inside the attached grid before DispatchFar;
+                // beyond ~240 m Starfield unloads the NPC driver's 3D (sitState -> 0) while keeping Aboard + Full-LOD vehicle.
+                if(p.farDispatched)return true;
+                return trafficpair::Sitting(engineport::Forward<&FvoTrafficApi::sitState>(g_api,"sitState","generator",0u,p.driver))&&
                     (!localRoad||(Info(p.driver,driver)&&driver.usable&&driver.has3D&&!driver.dead));
             }();
-            const bool roadPose=!localRoad||
+            // Covered near-stage -> far-slot dispatch (2026-11-23): once built & seated inside the attached cell grid,
+            // grant Full LOD and move Havok body + ref + 3D + seated driver atomically to the far route slot.
+            if(p.hasFarTarget&&!p.farDispatched&&handoffReady&&g_farDispatch){
+                if(g_farDispatch(p.vehicle,p.driver,p.farTarget.x,p.farTarget.y,p.farTarget.z)){
+                    p.farDispatched=true;p.hasFarTarget=false;p.birth=p.farTarget;
+                    Log("OBS system=traffic.dispatch vehicle=%08X driver=%08X slot=%d to=%.1f,%.1f,%.1f",
+                        p.vehicle,p.driver,i,p.farTarget.x,p.farTarget.y,p.farTarget.z);
+                }
+                continue;  // let the async Refile land before releasing birth hold
+            }
+            const bool roadPose=!localRoad||p.farDispatched||
                 (std::isfinite(hv.x)&&std::isfinite(hv.y)&&std::isfinite(hv.z)&&std::hypot(hv.x-p.birth.x,hv.y-p.birth.y)<1.5&&hv.z-p.birth.z<1.5&&p.birth.z-hv.z<4.0);  // settling onto the road under the birth height (hull-bottom offset, 2026-11-04: -1.6 m) is on the road; deeper is a fall
             // Load cleanup (2026-11-04): a deferral is decided after 10 s instead of holding the pair forever. Settled at its spot
             // up to 8 m under the route = on the real road under an authored height that is off (spot 38: route 4.2 m over it):
@@ -3385,7 +3401,7 @@ namespace generator
                 // In play only replace a real shortfall within the existing native
                 // service envelope. Ring order does not reject any candidate.
                 if(live&&(distance>spawnflow::rules::liveRadius||(g_flowPose&&distance<kFlowEdgeMinM)))continue;
-                if(g_flowPose&&!live&&distance>spawnflow::rules::liveRadius)continue;  // flow, covered: only where the game loads the car (17:36 run: 23 made beyond it never got a model)  // flow: in play a car appears only at the loaded edge
+                // Under cover (loading screen / X panel), all route slots across the city are eligible (no 240 m cutoff; 2026-11-23).
                 order.push_back({i,distance,FleetRing(distance,reach)});
             }
         }
@@ -3501,8 +3517,23 @@ namespace generator
             if(road.interval>0)Log("OBS system=traffic.spawn event=road_station slot=%d station_m=%.1f nominal_interval_m=%.1f coverage_rank=%u attempt=%d",i,road.station,road.interval,order[std::size_t(k)].coverage,attempt);
             int slot=0;while(slots.count(slot))++slot;
             // Step 6, Birth reads Siting's pose (card C1) through the core's birth listener (required with the fleet exports).
+            // Covered far slots (> 200 m from player, outside Starfield's attached cell grid): stage inside the attached cell grid
+            // so 3D + Havok + seating complete immediately, then FVO_TrafficDispatchFarV1 moves the built/seated pair to `at` with Full LOD.
+            FvoPoolSpot farTarget{};
+            bool useFarStage=false;
+            FvoPoolSpot birthPose=at;
+            if(window.cover&&std::hypot(at.x-pp.x,at.y-pp.y)>200.0){
+                if(!g_farDispatch){g_passRefused.insert(i);continue;}  // older core: never spawn dead ghosts in unloaded cells
+                farTarget=at;useFarStage=true;
+                // Stage 15 m underground (occluded by solid terrain/deck, still well inside Starfield's 30 m seating snap
+                // radius so drivers seat on try 1) with wide golden-angle spacing (22-62 m) so staged hulls never overlap.
+                const double rad=22.0+double(i%6)*8.0;
+                const double ang=double(i)*2.399963229728653;
+                birthPose={pp.x+std::cos(ang)*rad,pp.y+std::sin(ang)*rad,pp.z-15.0,at.heading};
+                clearance={};  // staged underground behind cover until DispatchFar moves the built/seated pair to farTarget
+            }
             request.sited=site==1;
-            const auto grant=SpeakBirth(budget,request,FvoBirthSource::Fleet,i,base,0,at);
+            const auto grant=SpeakBirth(budget,request,FvoBirthSource::Fleet,i,base,0,birthPose);
             if(!grant)break;
             if(!window.cover){
                 Log("OBS system=traffic.live vehicle=00000000 event=grant slot=%d model=%08X distance=%.0f resident=%d cap=%d at=%.2f,%.2f,%.2f reason=%s",
@@ -3511,8 +3542,8 @@ namespace generator
             const auto birthWindow=BirthWindow(screen,window,FvoBirthSource::Fleet);
             p.vehicleIssued=false;
             const auto reserved=p.reserved;const auto previousBirth=p.birth;
-            p.birth=at;p.reserved=true;
-            const auto reply=ListenBirth(grant,FvoBirthSource::Fleet,birthWindow,i,base,0,at,p.vehicleIssued,clearance.epoch?&clearance:nullptr);
+            p.birth=birthPose;p.reserved=true;
+            const auto reply=ListenBirth(grant,FvoBirthSource::Fleet,birthWindow,i,base,0,birthPose,p.vehicleIssued,clearance.epoch?&clearance:nullptr);
             p.vehicle=reply.id;
             if(!p.vehicle&&!reply.pending){
                 p.reserved=reserved;p.birth=previousBirth;
@@ -3522,14 +3553,14 @@ namespace generator
                 if(!window.cover){FvoBirthRefusalV1 r;const bool known=CoreRefusal(grant,i,r);LogRefusal("request",i,base,grant,known?&r:nullptr);}
                 continue;
             }
-            p.base=base;p.birth=at;p.reserved=p.staged=true;p.at=now;p.bornAt=now;p.armed=false;p.vehiclePending=!p.vehicle;g_madeThisWindow.insert(i);
+            p.base=base;p.birth=birthPose;p.farTarget=farTarget;p.hasFarTarget=useFarStage;p.farDispatched=false;p.reserved=p.staged=true;p.at=now;p.bornAt=now;p.armed=false;p.vehiclePending=!p.vehicle;g_madeThisWindow.insert(i);
             p.roadProof=clearance;
             p.spotKey=spotKey;p.bothLoadedOnce=p.brokenEvidenceJudged=p.bodyJudged=p.releaseAttempted=p.releaseJudged=p.driveJudged=false;
             p.seatJudged=p.seatTested=false;p.seatPlayMs=p.seatCheckAt=0;
             p.hPosAt=0;p.uncontrolledFall=false;p.fallRetirementPending=false;
             p.proving=true;p.proveSlot=slot;p.proveSince=p.proveTick=now;p.seatedSince=0;slots.insert(slot);++waiting;
             g_createdAt=now;
-            p.driverSource=FvoBirthSource::Fleet;p.driverAt=at;p.driverIssued=false;
+            p.driverSource=FvoBirthSource::Fleet;p.driverAt=birthPose;p.driverIssued=false;
             const auto driver=p.vehicle?ListenBirth(grant,p.driverSource,birthWindow,i,kDriverBase,p.vehicle,p.driverAt,p.driverIssued):BirthReply{};
             p.driver=driver.id;p.driverPending=p.vehiclePending||driver.pending;
             p.st=(p.driver||p.vehiclePending||p.driverPending)?St::Created:St::Failed;
@@ -3699,9 +3730,9 @@ namespace generator
         }
         const bool panelCover=presentation!=2||!g_rushFill||XPanelCovered();
         const bool preparing=g_rushFill&&GetTickCount64()-g_rushAt.load()<spawnrule::kResetLimitMs;
-        // LV-3: the play rule (spawnrule::LiveOpen) after any cover or map has been gone long enough; the lab test switch is its own, separate window flag.
+        // Live mid-game road fill disabled (2026-11-23, user: "completely turned off"): spawning runs only behind cover (loading screen or X panel).
         if(presentation!=1||!g_lastCoveredAt)g_lastCoveredAt=now;
-        const bool liveRoad=spawnrule::LiveOpen(presentation,false,now-g_lastCoveredAt);
+        const bool liveRoad=false;
         const auto window=spawnflow::WindowNow(presentation,preparing,false,liveRoad,panelCover);
         {   static bool liveWasOpen=false;
             if(window.live!=liveWasOpen){liveWasOpen=window.live;Log("OBS system=traffic.live vehicle=00000000 event=window state=%s settle_ms=%llu fleet_cap=%d stretch_m=%.0f demand=%s",window.live?"open":"closed",spawnrule::kLiveSettleMs,int(g_initialScene.size()),spawnflow::rules::liveRadius,"physical_shortfall");}
@@ -3732,7 +3763,7 @@ namespace generator
                 const bool stuck=haveCar&&away>spawnflow::rules::liveRadius&&(fleetMode==3||(p.proving&&!v.has3D));
                 if(!stuck)p.flowStuckSince=0;else if(!p.flowStuckSince)p.flowStuckSince=now;
                 const bool stuckLong=stuck&&now-p.flowStuckSince>=kFlowStuckMs;
-                if(presentation==1&&haveCar&&((!p.proving&&!p.staged&&!p.handoffPending&&Driving(p)&&away>kFlowReturnM)||stuckLong)){
+                if(liveRoad&&presentation==1&&haveCar&&((!p.proving&&!p.staged&&!p.handoffPending&&Driving(p)&&away>kFlowReturnM)||stuckLong)){
                     const auto order=DecideRetirement(p,p.driver,"returned_to_flow");
                     if(order.decision.now){
                         if(g_fleetRelease)g_fleetRelease(p.vehicle);

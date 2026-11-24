@@ -76,6 +76,7 @@ namespace generator
     void SetCameraEnvelopeAhead(int (*fn)(double x,double y,double z,double seconds,double radius));  // optional, for deep falls
     void SetCameraEvidence(cameravisibility::Reader reader,cameravisibility::ForecastReader forecast);
     void SetBirthRefusal(FvoBirthRefusalFnV1 refusal);  // core FVO_TrafficBirthRefusalV1: the core's own reason for a refused birth
+    void SetFarDispatch(int (*fn)(unsigned vehicle, unsigned driver, double x, double y, double z));  // core FVO_TrafficDispatchFarV1: Full LOD + Havok/Refile far dispatch
     void SetRemovalPrediction(bool on);  // CP-1: settings.ini [traffic] removeByCameraPrediction (Retirement also removes by camera prediction)
     void SetSpotTest(int (*fn)(unsigned vehicle));  // ST-B: the core's FVO_SpotTestV1 (null: an older core, no spot-test fact)
     void SetRelocation(FvoRelocationStatusFn fn);   // the core's FVO_TrafficRelocationV1 (null: an older core, no relocation receipts)

@@ -35,6 +35,7 @@ constexpr int kDockPlaceTool = 22100, kDockReadme = 22101, kDockHelp = 22102, kD
 constexpr int kDockProbView = 22120, kDockProbFilter = 22130, kDockFixSafe = 22140;  // view + 0 grouped, 1 items; filter + 0..3
 constexpr int kDockNodeMake = 22150, kDockNodeClear = 22151, kDockNodeRemove = 22152, kDockWireAddIn = 22160, kDockWireAddOut = 22161;
 constexpr int kDockProbShow = 22200, kDockProbFix = 22300, kDockWire = 22400;  // + problem row (< 100); + wire * 4 + op (< 64 wires)
+constexpr int kDockLookSpacing = 22500, kDockLookPace = 22510;  // Design-by-Look cinematic presets (trafficlook.h)
 constexpr int kDockProbTile = 23000;  // + tile: a warning tile's row opens that tile
 // In nodeview.inl (included after this file): the Nodes view and the landing wires, read and pressed from the bar.
 int F7WireButton(int wire, int op); int NodePickCount(); void NodePicksClear(); std::string NodeWireText(); bool NodeViewDelete(); bool MakeRouteFromPicks();
@@ -529,6 +530,8 @@ bool DockAction(int id, const routemap::Camera& c) {
         if (level == f7dock::City) { DockGo(f7dock::City, "door"); return true; }
         if (!r) return true;
         if (level == f7dock::Route) { DockGo(f7dock::Route, "breadcrumb"); return true; }
+        if (level == f7dock::Tile && !r->ring && DockTiles(*r) > 0) { DockSelectOne(f7dock::Tiles, std::clamp(g_dock.tiles.primary, 0, DockTiles(*r) - 1), "rail"); return true; }
+        if (level == f7dock::Point && !r->ring && !r->points.empty()) { DockSelectOne(f7dock::Points, std::clamp(g_dock.points.primary, 0, int(r->points.size()) - 1), "rail"); return true; }
         if (level == f7dock::Arrive && !r->closed) { if (r->end.end != routeend::Arrive) DockAction(kDockEnd + routeend::Arrive, c); DockGo(f7dock::Arrive, "door"); return true; }
         if (level == f7dock::Types) { DockGo(f7dock::Types, "door"); return true; }
         if (level == f7dock::Problems) { DockGo(f7dock::Problems, "door"); return true; }
@@ -572,6 +575,29 @@ bool DockAction(int id, const routemap::Camera& c) {
         const int f = (id - kDockField) / 4, part = (id - kDockField) % 4;
         if (part == 0) { DockBeginEntry(f, std::size_t(f) < g_dock.shownValues.size() ? g_dock.shownValues[std::size_t(f)] : std::string()); return true; }
         DockApply(f, part == 1 ? -kDockStep[f] : kDockStep[f], true); return true;
+    }
+    if (id >= kDockLookSpacing && id < kDockLookSpacing + 4) {
+        if (!r || !EnsureDraft()) return true;
+        auto t = g_ed.draft->Value();
+        const int preset = id - kDockLookSpacing;
+        const double lenM = std::max(100.0, trafficdata::TrafficLength(t));
+        trafficlook::ApplySpacing(t.schedule, preset, t.speed, DockLanes(*r), lenM);
+        g_ed.draft->Edit(t);
+        const auto lk = trafficlook::EvaluateRoadLook(t.schedule, t.speed, DockLanes(*r), lenM);
+        Status(std::string("Spacing: ") + trafficlook::SpacingName(preset) + " -> " + trafficlook::FormatLookLine(lk) + " (Save keeps it)");
+        DockTrace("look", "spacing", preset, lk.cars);
+        return true;
+    }
+    if (id >= kDockLookPace && id < kDockLookPace + 3) {
+        if (!r || !EnsureDraft()) return true;
+        auto t = g_ed.draft->Value();
+        const int preset = id - kDockLookPace;
+        const bool isSky = t.travel == routepolicy::Travel::Hover;
+        t.speed = trafficlook::PaceSpeed(preset, isSky);
+        g_ed.draft->Edit(t);
+        Status(std::string("Pace: ") + trafficlook::PaceName(preset) + " (" + std::to_string(int(t.speed)) + " m/s; Save keeps it)");
+        DockTrace("look", "pace", preset, int(t.speed));
+        return true;
     }
     if (id >= kDockTravel && id < kDockTravel + 3) {
         if (!EnsureDraft()) return true; auto t = g_ed.draft->Value(); t.travel = routepolicy::Travel(id - kDockTravel); g_ed.draft->Edit(t);
@@ -936,15 +962,23 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     case f7dock::Hazards: h = rowsH(7); break;  // 7 rows in the Hazard box column (was 6: the Box row fell below the dock, 2026-11-21 screenshot)
     default: h = rowsH(3); break;
     }
-    // The save column for this menu: the route's (Test .. Permanent Delete, then Delete point / route), or a place's (Done, Save, Cancel, Remove).
+    // Constellation Dock v2 (2026-11-24): unified bottom command strip replaces the tall right save column,
+    // and a left domain rail gives 1-click jumps between Route, Tile, Point, Hazards, Places, and Problems.
+    constexpr double kCmdBarH = 38.0, kRailW = 108.0;
     const bool placeMenu = f7dock::PlaceLevel(level) || level == f7dock::Nodes;
-    const int saveRows = placeMenu ? (f7dock::PlaceSelected(level) ? 4 : 2) : 6 + (level == f7dock::Point || (level == f7dock::Route && r) ? 1 : 0);
-    h = std::max(h, 10 + saveRows * kSaveStep + 6);
+    const bool showRail = r != nullptr && !placeMenu && level != f7dock::Routes && level != f7dock::City && level != f7dock::Nodes;
+    const int saveRows = 1;
+    h += kCmdBarH;
+    if (showRail) h = std::max(h, 42.0 + 6 * 28.0 + 12.0 + kCmdBarH);
     // The bar keeps its 1320 px cap (2026-11-11, user: "I wanted smarter layout not longer bar"); the Route menu shows one group at a time.
     const double w = std::min(1320.0, g_ui.width - 24);
     const editorcontext::Rect d{ (g_ui.width - w) / 2, g_ui.height - 12 - h, w, h };
     g_dock.rect = d; g_contextRects.push_back(d); g_f7AreaRect[1] = d;
-    g_ui.boxes.push_back({ d.x, d.y, d.w, d.h, 0x141C29, .97, 0x3A4658, 1 });
+    g_ui.boxes.push_back({ d.x, d.y, d.w, d.h, kDockBg, .97, kDockBorder, 1 });
+    const double cmdY = d.y + d.h - kCmdBarH;
+    const double contentBottom = cmdY;
+    g_ui.boxes.push_back({ d.x + 1, cmdY, d.w - 2, kCmdBarH - 1, kWellBg, .92, 0, 0 });
+    g_ui.boxes.push_back({ d.x + 1, cmdY, d.w - 2, 1, kDockBorder, .9, 0, 0 });
     // Breadcrumbs: going up has the up look; the last is where you are.
     double x = d.x + 12; const double y0 = d.y + 10;
     auto crumb = [&](int lvl, const std::string& label, bool last) { const double bw = TextWidth(label) + (last ? 20 : 58); DockButton(DockLevelId(lvl), x, y0, bw, 26, label, last, true, 0, last ? 0 : 2); x += bw; if (!last) { DockText(">", x + 5, y0 + 5, 12, kDim); x += 20; } };
@@ -972,10 +1006,8 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
         if (level == f7dock::Extras) crumb(f7dock::Extras, "Actions", true);
         if (level == f7dock::Hazards) crumb(f7dock::Hazards, "Hazard", true);
     }
-    // The save column, always at the right edge.
-    const double sx = d.x + d.w - 12 - kSaveW; double sy = d.y + 10;
-    // R5: Readme, at the end of the header row, for the menu that is open.
-    const double readmeX = sx - 12 - 84;
+    // R5: Readme, Help, Script at the right of the header row (full dock width now that actions live in the bottom strip).
+    const double readmeX = d.x + d.w - 12 - 84;
     DockButton(kDockReadme, readmeX, y0, 84, 26, "Readme", g_dock.readme, !DockReadme(level).empty(), 0);
     const double helpX = readmeX - 8 - 70;
     DockButton(kDockHelp, helpX, y0, 70, 26, "Help", g_dock.help, !DockHelp(level, g_dock.routeGroup).empty(), 0);
@@ -984,7 +1016,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     const double scriptX = helpX - 8 - 120;
     DockButton(kDockScript, scriptX, y0, 120, 26, scriptOn ? "Script mode: on" : "Script mode", scriptOn, true, 0);
     const double headRight = scriptX - 8;
-    if (nSel > 1) { const std::string what = std::to_string(nSel) + (level == f7dock::Point ? " points" : " tiles") + " selected: edits apply to all"; DockText(what, x + 12, y0 + 5, TextWidth(what) + 4, 0xFFE15A); x += TextWidth(what) + 24; DockButton(kDockSelOne, x, y0, 104, 26, "Select one", false, true, 0); x += 112; }
+    if (nSel > 1) { const std::string what = std::to_string(nSel) + (level == f7dock::Point ? " points" : " tiles") + " selected: edits apply to all"; DockText(what, x + 12, y0 + 5, TextWidth(what) + 4, kAmber); x += TextWidth(what) + 24; DockButton(kDockSelOne, x, y0, 104, 26, "Select one", false, true, 0); x += 112; }
     else if (level == f7dock::Point || level == f7dock::Tile) { DockButton(level == f7dock::Point ? kDockSelAllPoints : kDockSelAllTiles, x + 8, y0, 104, 26, level == f7dock::Point ? "All points" : "All tiles", false, true, 0); x += 120; }
     if (level == f7dock::Problems && r) {  // R6: the view, the filters with their counts, and Fix all safe, in the header row
         x += 12; DockButton(kDockProbView, x, y0, 84, 26, "Grouped", g_dock.probView == 0, true, 5); x += 86; DockButton(kDockProbView + 1, x, y0, 70, 26, "Items", g_dock.probView == 1, true, 5); x += 82;
@@ -999,26 +1031,58 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     else if (placeMenu) {}
     else if (g_ed.draft) DockText("Editing, not saved yet", x + 12, y0 + 5, std::max(0.0, std::min(220.0, headRight - x - 12)), kAmber);
     else if (r) { char b[64]; std::snprintf(b, sizeof b, "%d pts", n); DockText(b, x + 12, y0 + 5, std::max(0.0, std::min(120.0, headRight - x - 12)), kDim); }
-    auto save = [&](int id, const std::string& label, bool enabled, bool active = false, int style = 0) { DockButton(id, sx, sy, kSaveW, 26, label, active, enabled, style); sy += kSaveStep; };
-    if (placeMenu) {
-        if (f7dock::PlaceSelected(level)) save(kPlaceDone, "Done", true, true);
-        save(kSave, "Save", true, !f7dock::PlaceSelected(level)); save(kCancel, "Cancel", true);
-        if (f7dock::PlaceSelected(level)) save(kDeletePoint, level == f7dock::Zone ? "Remove zone" : level == f7dock::Junction ? "Remove junction" : "Remove landing", true, false, 7);
+    // Unified Bottom Command Strip: left = Test / Update (or Done), right = Cancel, Save, Perm Save, Perm Delete, Delete.
+    {
+        const double cy = cmdY + 6;
+        double lx = d.x + 12, rx = d.x + d.w - 12;
+        auto cmdLeft = [&](int id, const std::string& label, double bw, bool enabled, bool active = false, int style = 0) {
+            DockButton(id, lx, cy, bw, 26, label, active, enabled, style); lx += bw + 8;
+        };
+        auto cmdRight = [&](int id, const std::string& label, double bw, bool enabled, bool active = false, int style = 0) {
+            rx -= bw; DockButton(id, rx, cy, bw, 26, label, active, enabled, style); rx -= 8;
+        };
+        if (placeMenu) {
+            if (f7dock::PlaceSelected(level)) cmdLeft(kPlaceDone, "Done", 90, true, true);
+            if (f7dock::PlaceSelected(level)) cmdRight(kDeletePoint, level == f7dock::Zone ? "Remove zone" : level == f7dock::Junction ? "Remove junction" : "Remove landing", 148, true, false, 7);
+            cmdRight(kSave, "Save", 92, true, !f7dock::PlaceSelected(level));
+            cmdRight(kCancel, "Cancel", 86, true);
+        } else {
+            cmdLeft(kDockTest, "Test (T)", 96, r != nullptr);
+            cmdLeft(kDockUpdateRoute, "Update Route", 132, r && !r->ring && tiles > 0);
+            if (level == f7dock::Point) cmdRight(kDeletePoint, nSel > 1 ? "Delete " + std::to_string(nSel) + " pts" : "Delete point", 136, true, false, 7);
+            else if (level == f7dock::Route && r) { const bool armed = GetTickCount64() - g_ed.confirmDeleteAt < 3000; cmdRight(kDeleteRoute, armed ? "Click confirm" : "Delete route", 136, true, armed, 7); }
+            cmdRight(kPermanentDelete, "Perm Delete", 118, r && g_ed.permanentFiles.count(r->name), false, 7);
+            cmdRight(kPermanentSave, "Perm Save", 108, r != nullptr);
+            cmdRight(kSave, "Save", 92, true, g_ed.draft.has_value());
+            cmdRight(kCancel, "Cancel", 84, g_ed.draft.has_value());
+        }
     }
-    else {
-        save(kDockTest, "Test", r != nullptr); save(kDockUpdateRoute, "Update Route", r && !r->ring && tiles > 0); save(kCancel, "Cancel", g_ed.draft.has_value()); save(kSave, "Save", true, g_ed.draft.has_value());
-        save(kPermanentSave, "Permanent Save", r != nullptr); save(kPermanentDelete, "Permanent Delete", r && g_ed.permanentFiles.count(r->name));
-        if (level == f7dock::Point) DockButton(kDeletePoint, sx, sy, kSaveW, 26, nSel > 1 ? "Delete " + std::to_string(nSel) + " points" : "Delete point", false, true, 7);
-        if (level == f7dock::Route && r) { const bool armed = GetTickCount64() - g_ed.confirmDeleteAt < 3000; DockButton(kDeleteRoute, sx, sy, kSaveW, 26, armed ? "Click to confirm" : "Delete route", armed, true, 7); }
+    // Left Domain Rail (Constellation Dock v2): 1-click switching between Route, Tile, Point, Hazards, Places, Problems.
+    double top = d.y + 42;
+    const double railSpace = showRail ? kRailW + 14 : 0;
+    const double bodyX = d.x + 12 + railSpace;
+    const double area = d.w - 24 - railSpace;
+    if (showRail) {
+        double ry = top;
+        g_ui.boxes.push_back({ d.x + 12 + kRailW + 6, top - 2, 1, contentBottom - top - 4, kDockBorder, .85, 0, 0 });
+        auto railBtn = [&](int targetLvl, const std::string& label, bool enabled, int style = 5) {
+            DockButton(DockLevelId(targetLvl), d.x + 12, ry, kRailW, 24, label, level == targetLvl, enabled, style);
+            ry += 28;
+        };
+        railBtn(f7dock::Route, "Route", true);
+        railBtn(f7dock::Tile, "Tile / Box", !r->ring && tiles > 0);
+        railBtn(f7dock::Point, "Point", !r->ring && n > 0);
+        railBtn(f7dock::Hazards, "Hazards", !r->ring);
+        railBtn(f7dock::Places, "Places", true);
+        const int probCnt = int(problems.size());
+        railBtn(f7dock::Problems, probCnt > 0 ? "Health (" + std::to_string(probCnt) + ")" : "Health", true, probCnt > 0 && level != f7dock::Problems ? 6 : 5);
     }
-    // Pickers: each in its own teal frame, everything in it moves you to another point or tile.
-    double top = d.y + 42; const double area = d.w - 24 - kSaveW - 12;
     if (pickers) {
-        double px = d.x + 12;
+        double px = bodyX;
         auto picker = [&](int kind, const char* label, int count, int current) {
             const std::string of = "of " + std::to_string(count); const double pw = 8 + 50 + 30 + 68 + 34 + TextWidth(of) + 10;
             g_ui.boxes.push_back({ px - 6, top - 3, pw, 32, kTeal, .05, kTeal, .6 });
-            DockText(label, px + 2, top + 5, 48, current >= 0 ? kTeal : 0xCDD6DF); px += 50;
+            DockText(label, px + 2, top + 5, 48, current >= 0 ? kTeal : 0xA3B1C6); px += 50;
             DockButton(kind == f7dock::Point ? kDockNavPointPrev : kDockNavTilePrev, px, top, 28, 26, "<", false, count > 0, 0, 1); px += 30;
             const bool typing = g_dock.entry.field == kDockPickerEntry + kind;
             DockButton(kind == f7dock::Point ? kDockPickPoint : kDockPickTile, px, top, 66, 26, typing ? g_dock.entry.text + "_" : current >= 0 ? std::to_string(current + 1) : "-", current >= 0 || typing, count > 0, 9, 1); px += 68;
@@ -1034,7 +1098,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
     int cols = 2;
     switch (level) { case f7dock::Routes: case f7dock::Types: cols = 4; break; case f7dock::Route: cols = 2; break; case f7dock::Tile: case f7dock::Point: case f7dock::Places: case f7dock::Landing: case f7dock::Access: case f7dock::Junction: case f7dock::Extras: case f7dock::TrafficLevels: case f7dock::Hazards: cols = 3; break; default: cols = 2; break; }
     if (level == f7dock::Point && (!r || r->ring)) cols = 2;
-    const double gap = 10, cw = (area - left - gap * (cols - 1)) / cols; auto cx = [&](int i) { return d.x + 12 + left + i * (cw + gap); };
+    const double gap = 10, cw = (area - left - gap * (cols - 1)) / cols; auto cx = [&](int i) { return bodyX + left + i * (cw + gap); };
     // Labels take about a third of the column, between 92 and 132 px (10 to 14 letters), so a label never squeezes its values.
     const double labelW = std::clamp(std::floor(cw * 0.36), 92.0, 132.0);
     { static std::string told; char key[96]; std::snprintf(key, sizeof key, "%d/%d/%.0f/%.0f/%.0f", level, cols, d.w, cw, labelW);
@@ -1152,7 +1216,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
             if (!edit) note(x0, y, "Stored by a newer version: kept, not editable", kAmber); });
     }
     else if (level == f7dock::Wires && bay) {  // R3: the landing's wires (was the side panel F7WirePanel), one row each
-        double y = top; const double x0 = d.x + 12, tw = std::min(420.0, area - 3 * 116 - 12);
+        double y = top; const double x0 = bodyX, tw = std::min(420.0, area - 3 * 116 - 12);
         DockText("Wires of " + bay->id, x0, y, area, kTeal); y += 20;
         const int shownWires = std::min<int>(4, int(wires.size()));
         for (int i = 0; i < shownWires; ++i) { const auto& one = wires[std::size_t(i)];
@@ -1225,7 +1289,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
                 y += 30; ++shownRows;
             }
         }
-        if (g_dock.probShown >= 0 && g_dock.probShown < int(problems.size())) DockText(f7layers::Fit(problems[std::size_t(g_dock.probShown)].text, area, f7layers::kLetterPx), d.x + 12, d.y + d.h - 20, area, 0xFFE15A);
+        if (g_dock.probShown >= 0 && g_dock.probShown < int(problems.size())) DockText(f7layers::Fit(problems[std::size_t(g_dock.probShown)].text, area, f7layers::kLetterPx), bodyX, contentBottom - 20, area, kAmber);
     }
     else if (level == f7dock::Arrive) {
         const auto p = r->end.hasPlace ? r->end.place : DockArriveDefault(*r);
@@ -1301,19 +1365,25 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
           sums[4] = "Size, colour, actions";
           const double tw = (area - 4 * 6) / kDockRouteGroups;
           for (int k = 0; k < kDockRouteGroups; ++k) {
-              const double tx = d.x + 12 + k * (tw + 6);
+              const double tx = bodyX + k * (tw + 6);
               DockButton(kDockRouteGroup + k, tx, top, tw, kDockTabH, f7layers::Fit(names[k], tw - 24, f7layers::kLetterPx), k == g_dock.routeGroup, true, 8, 0, f7layers::Fit(sums[k], tw - 24, f7layers::kLetterPx));
           }
           top += kDockTabH + 8; }
         const int group = g_dock.routeGroup;
+        const double routeLenM = std::max(100.0, trafficdata::TrafficLength(*r));
+        const bool routeIsSky = r->travel == routepolicy::Travel::Hover;
+        const int paceNow = trafficlook::DetectPace(r->speed, routeIsSky);
+        const int spacingNow = trafficlook::DetectSpacing(r->schedule, r->speed, lanes, routeLenM);
+        const auto roadLook = trafficlook::EvaluateRoadLook(r->schedule, r->speed, lanes, routeLenM);
         auto left = [&](const std::function<void(double, double, double, double&)>& body) { const double x0 = cx(0); double y = top; body(x0, x0 + labelW, cw - labelW, y); };
         auto right = [&](const std::function<void(double, double, double, double&)>& body) { const double x0 = cx(1); double y = top; body(x0, x0 + labelW, cw - labelW, y); };
         if (group == 0) {
             left([&](double x0, double vx, double vw, double& y) {
                 act(x0, vx, vw, y, "Name", routeName, kRename, "Edit", 0);
                 step(x0, vx, vw, y, "Want speed", FSpeed, fmt("%.0f m/s", r->speed));
-                pick(x0, vx, vw, y, "Travel", { { kDockTravel + 0, "Both", r->travel == routepolicy::Travel::Both }, { kDockTravel + 1, "Drive", r->travel == routepolicy::Travel::Drive }, { kDockTravel + 2, "Hover", r->travel == routepolicy::Travel::Hover } }); });
+                pick(x0, vx, vw, y, "Pace", { { kDockLookPace + 0, "Stroll", paceNow == 0 }, { kDockLookPace + 1, "City", paceNow == 1 }, { kDockLookPace + 2, "Express", paceNow == 2 } }); });
             right([&](double x0, double vx, double vw, double& y) {
+                pick(x0, vx, vw, y, "Travel", { { kDockTravel + 0, "Both", r->travel == routepolicy::Travel::Both }, { kDockTravel + 1, "Drive", r->travel == routepolicy::Travel::Drive }, { kDockTravel + 2, "Hover", r->travel == routepolicy::Travel::Hover } });
                 if (!r->ring) pick(x0, vx, vw, y, "Path", { { kLoopOn, "Loop", r->closed }, { kLoopOff, "Open", !r->closed, 0 } });
                 if (!r->ring && !r->closed) pick(x0, vx, vw, y, "Line end", { { kDockEnd + 0, "Pass", r->end.end == routeend::Pass }, { kDockEnd + 1, "Stop", r->end.end == routeend::Stop }, { kDockEnd + 2, "Arrive", r->end.end == routeend::Arrive, 1 } });
                 if (r->ring) note(x0, y, "A ring is always a loop."); });
@@ -1337,18 +1407,18 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
         }
         else if (group == 3) {
             left([&](double x0, double vx, double vw, double& y) {
-                act(x0, vx, vw, y, "Traffic level", routeschedule::LevelName(r->schedule.trafficLevel), DockLevelId(f7dock::TrafficLevels), "Set", 1);
-                act(x0, vx, vw, y, "Types", r->exclude.empty() ? "All" : std::to_string(out) + " out", kDockLevelBase + f7dock::Types, "Open", 1);
-                { const int items = ItemsWarningCount(); std::string what = problemCount ? std::to_string(problemCount) + (problemCount == 1 ? " problem" : " problems") : std::string("None found");
-                  if (items) what += ", " + std::to_string(items) + " items"; act(x0, vx, vw, y, "Problems", what, kDockLevelBase + f7dock::Problems, "Open", 1); } });  // RI-3, R6
+                pick(x0, vx, vw, y, "Spacing", { { kDockLookSpacing + 0, "Sparse", spacingNow == 0 }, { kDockLookSpacing + 1, "Calm", spacingNow == 1 }, { kDockLookSpacing + 2, "Lively", spacingNow == 2 }, { kDockLookSpacing + 3, "Busy", spacingNow == 3 } });
+                act(x0, vx, vw, y, "Fine bands", routeschedule::LevelName(r->schedule.trafficLevel), DockLevelId(f7dock::TrafficLevels), "Edit", 1);
+                act(x0, vx, vw, y, "Types", r->exclude.empty() ? "All" : std::to_string(out) + " out", kDockLevelBase + f7dock::Types, "Open", 1); });
             right([&](double x0, double vx, double vw, double& y) { (void)vx; (void)vw;
+                note(x0, y, trafficlook::FormatLookLine(roadLook), kTeal);
                 if (!r->end.endUnsupported.empty()) note(x0, y, "Stored line end unreadable: kept", kAmber);
                 int warn = 0, done = 0, all = 0; const auto& tline = EditorLine(*r);  // FPS-1: the line once, not twice per tile a frame
                 for (int t = 0; t < DockTiles(*r); ++t) { if (DockOldShape(*r, t)) continue; ++all; if (DockCheckOf(*r, tline, t)) ++done; if (DockWarns(*r, tline, t)) ++warn; }
                 if (warn) note(x0, y, std::to_string(warn) + " tile" + (warn == 1 ? "" : "s") + " warn: red on the map", kClearanceRed);
                 else if (done < all) note(x0, y, "Checking tiles " + std::to_string(done) + " / " + std::to_string(all));
-                else note(x0, y, "Tiles clear.");
-                if (defaults) note(x0, y, std::to_string(defaults) + " tile" + (defaults == 1 ? " uses" : "s use") + " the default box: Update Route writes them"); });
+                else note(x0, y, "Tiles clear.", kEmerald);
+                if (defaults) note(x0, y, std::to_string(defaults) + " tile" + (defaults == 1 ? " uses" : "s use") + " default box: Update Route writes them"); });
         }
         else {
             left([&](double x0, double vx, double vw, double& y) {  // R4
@@ -1361,19 +1431,19 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
             right([&](double x0, double vx, double vw, double& y) { act(x0, vx, vw, y, "Actions", "Copy, mirror, reverse", DockLevelId(f7dock::Extras), "Open", 1); });
         }
         // LEDGER LINE: the plan's own account of the first planned car on this route (planview.h), read-only, under any group.
-        if (!ledger.empty()) DockText(ledger, d.x + 12, d.y + d.h - 22, area, kDim);
+        if (!ledger.empty()) DockText(ledger, bodyX, contentBottom - 20, area, kDim);
         { static int toldGroup = -1; if (toldGroup != group) { toldGroup = group; logger::Write("OBS system=f7.dock event=route_group group=%d column_w=%.0f label_w=%.0f reason=open_group_only_two_columns", group, cw, labelW); } }
     }
     else if (level == f7dock::Tile) {
         const int t = g_dock.tiles.primary; const int lanes = DockLanes(*r); g_roadDivider = std::clamp(g_roadDivider, 0, std::max(0, lanes - 2));
-        g_ui.boxes.push_back({ d.x + 12, top, kCubeW, d.y + d.h - top - 6, 0x0B1119, .35 });
-        DockCube(*r, { d.x + 12, top, kCubeW, d.y + d.h - top - 6 });
+        g_ui.boxes.push_back({ bodyX, top, kCubeW, contentBottom - top - 6, kWellBg, .55, kDockBorder, .7 });
+        DockCube(*r, { bodyX, top, kCubeW, contentBottom - top - 6 });
         {  // the tile's warning under the cube: why, never a refusal
             int warn = 0; const auto& tline = EditorLine(*r); for (int k : g_dock.tiles.items) if (DockWarns(*r, tline, k)) ++warn;  // FPS-1: the line once
             const auto* chk = DockCheckOf(*r, tline, t); std::string text = DockWarning(*r, tline, t); unsigned color = kDim;
             if (!text.empty()) { color = kClearanceRed; } else if (chk) text = chk->solid ? "Solids inside, allowed" : "Box clear, floor on a surface"; else if (!DockOldShape(*r, t)) text = "Checking this tile...";
             if (g_dock.tiles.Many() && warn) { text = std::to_string(warn) + " of " + std::to_string(g_dock.tiles.Count()) + " tiles warn. " + text; color = kClearanceRed; }
-            if (!text.empty()) DockText(text, d.x + 14, d.y + d.h - 22, kCubeW + 10 + (area - kCubeW) / 3, color);
+            if (!text.empty()) DockText(text, bodyX + 2, contentBottom - 20, kCubeW + 10 + (area - kCubeW) / 3, color);
         }
         const auto box = DockBox(*r, t); const auto tl = roadplan::DividerAt(r->road, std::size_t(g_roadDivider), std::size_t(t));
         auto mix = [&](int f, const std::string& s) { return DockMixed(f, *r) ? std::string("mixed") : s; };
@@ -1435,7 +1505,7 @@ void DockLayout(const trafficdata::Route* shown, const routemap::Camera& c) {
             }
             const double rh = 40 + out.size() * lineH + 8, rx = d.x + d.w - rw, ry = d.y - 10 - rh;
             const editorcontext::Rect box{ rx, ry, rw, rh }; g_dock.readmeRect = box; g_contextRects.push_back(box);
-            g_ui.boxes.push_back({ rx, ry, rw, rh, 0x141C29, .97, 0x3A4658, 1 });
+            g_ui.boxes.push_back({ rx, ry, rw, rh, kDockBg, .97, kDockBorder, 1 });
             { std::string title = level == f7dock::Extras ? "actions" : f7dock::LevelName(level); if (!title.empty()) title[0] = char(std::toupper(static_cast<unsigned char>(title[0]))); DockText((helpOpen ? "Help: " : "Readme: ") + title, rx + 14, ry + 12, rw - 110, kTeal); }
             DockButton(helpOpen ? kDockHelp : kDockReadme, rx + rw - 84, ry + 8, 70, 24, "Close", false, true, 0);
             double ly = ry + 40; for (const auto& [t, col] : out) { DockText(t, rx + 14, ly, rw - 28, col); ly += lineH; }

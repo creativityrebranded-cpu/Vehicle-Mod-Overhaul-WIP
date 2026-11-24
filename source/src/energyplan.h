@@ -1063,7 +1063,8 @@ inline Result Plan(const bicycle::State& s, const bicycle::Spec& k, double want,
             }
         } else if (cmd.mode == recovery::Mode::Follow) only([&](int i) {
             return (centre(cands[i]) && std::strcmp(cands[i].kind, "follow lane") == 0) ||
-                std::strcmp(cands[i].kind, "kept") == 0;
+                std::strcmp(cands[i].kind, "kept") == 0 ||
+                (std::isfinite(w.stopStation) && std::strcmp(cands[i].kind, "stop") == 0);
         }, "follow_mode_lane_centre_only");
         else if (cmd.mode == recovery::Mode::Stand) only([](int) { return false; }, "stand_mode");
         else if (cmd.mode == recovery::Mode::Recover && cmd.step == recovery::Command::Step::Hover) only([&](int i) { return cands[i].count && cands[i].seg[0].mode == 1; }, "recover_hover_only");

@@ -9,10 +9,11 @@
 #include <cstdint>
 
 namespace planowner {
-enum class Owner : std::uint8_t { None, Traffic, Cruise, Job, Combat, Player, Count };
-inline const char* Name(Owner o) { constexpr const char* n[]{ "none", "traffic", "cruise", "job", "combat", "player" }; return n[int(o)]; }
+enum class Owner : std::uint8_t { None, Traffic, Cruise, Job, Combat, Player, Parked, Count };
+inline const char* Name(Owner o) { constexpr const char* n[]{ "none", "traffic", "cruise", "job", "combat", "player", "parked" }; return n[int(o)]; }
 // Who may take a vehicle from whom: a higher owner takes it; the same owner refreshes its claim. The player always wins.
-inline int Strength(Owner o) { constexpr int s[]{ 0, 1, 2, 3, 4, 5 }; return s[int(o)]; }
+// Parked (managed stationary vehicle) has strength 0 so any active owner (Traffic, Cruise, Job, Combat, Player) claims it cleanly.
+inline int Strength(Owner o) { constexpr int s[]{ 0, 1, 2, 3, 4, 5, 0 }; return s[int(o)]; }
 
 constexpr int kMax = 512;
 constexpr double kStale = 2.0;  // s without a refresh: the claim lapses (the pilot stopped, the vehicle unloaded)

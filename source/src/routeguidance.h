@@ -89,7 +89,7 @@ inline bool Capture(int pilot, void* user, std::uint64_t now) {
     frames[pilot] = {out, now,policy,user,coordinated,nullptr,rules.rules,corridor,repaired}; return true;
 }
 inline const FvoLaneGuidanceV1* Get(int pilot, std::uint64_t now) {
-    return pilot >= 0 && pilot < 257 && frames[pilot].at && now >= frames[pilot].at && now - frames[pilot].at <= 200 ? &frames[pilot].lane : nullptr;
+    return pilot >= 0 && pilot < 257 && frames[pilot].at && now >= frames[pilot].at && now - frames[pilot].at <= 800 ? &frames[pilot].lane : nullptr;
 }
 // A late lane command (no explicit refusal, last accepted <= `graceMs` ago): the last accepted lane, so a car mid-road is not
 // held for one missed refresh (2026-11-04 review: one car hit "expired_lane_command" 35 times). Returns the age in `ageMs`.

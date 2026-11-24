@@ -46,9 +46,13 @@
 #include "hookcost.h"
 #include "vehiclediag.h"
 #include "vehiclekeep.h"
+#include "simtier.h"
+#include "vehiclelifecycle.h"
 #include "bindings.h"
 #include "passenger.h"
 #include "features.h"
+#include "scriptdrive.h"
+#include "centrewell.h"
 #include "overrides.h"
 #include "profileclass.h"
 #include "railtyres.h"
@@ -435,6 +439,16 @@ namespace vehicleflight
         // forward and a straight back-up in reverse.
         struct FollowPath { pathfollow::Path path; bool reverse = false, laneCentre = false; ULONGLONG at = 0; ULONGLONG logAt = 0; };
         FollowPath g_planPath[1 + prefetch::kSlotPilotCount];
+        // CW-1 step 3 (centre-line well, notes/centreline-well-20261122/PLAN.md): each lane car's lateral plan, made at its World gather and
+        // driven every update. Kept sides live here; `recovering` hands the car to the energy plan's backing-up families while no forward fit
+        // exists (decision D3 default, design section 8). Never in Script mode.
+        struct WellState {
+            std::uint32_t vehicle = 0; centrewell::Memory mem; pathfollow::Path path; bool centre = true;
+            double speed = 0, at = -1, maxOffset = 0; int blockAt = -1; const char* why = "";
+            double blockedStandSince = -1, offRoadSince = -1, clearSince = -1; bool recovering = false; double recoverSince = -1;
+            double logAt = -1; const char* loggedWhy = ""; int loggedBlock = -2; bool loggedRecover = false;
+        };
+        WellState g_well[1 + prefetch::kSlotPilotCount];
         std::mutex g_followLock;
         // ED-1: the energy plan's stretch to follow (world points already).
         void NoteFollowPath(int idx, const pathfollow::Path& path, bool reverse, bool laneCentre) {
@@ -447,6 +461,10 @@ namespace vehicleflight
         double g_railHalfW[1 + prefetch::kSlotPilotCount] = {}, g_railLaneHalf[1 + prefetch::kSlotPilotCount] = {};
         float g_railRoadN[1 + prefetch::kSlotPilotCount][3] = {};
         ULONGLONG g_railRoadNAt[1 + prefetch::kSlotPilotCount] = {};
+        double g_railFloorZ[1 + prefetch::kSlotPilotCount] = {};
+        ULONGLONG g_railFloorZAt[1 + prefetch::kSlotPilotCount] = {};
+        corridorwall::Barrier g_railWall[1 + prefetch::kSlotPilotCount] = {};
+        ULONGLONG g_railWallAt[1 + prefetch::kSlotPilotCount] = {};
         unsigned g_pathPhase[1 + prefetch::kSlotPilotCount] = {}, g_pathRaysAsked[1 + prefetch::kSlotPilotCount] = {}, g_pathRayHits[1 + prefetch::kSlotPilotCount] = {},
             g_pathRayFaces[1 + prefetch::kSlotPilotCount] = {};
         bool g_pathRayMode[1 + prefetch::kSlotPilotCount] = {};
@@ -607,6 +625,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         // planHover (step 4): the plan's Mode decides; the old selector's answer is kept to log disagreements, and the plan's last mode is
         // what the lane driver is given on the next update (the plan is committed with its own latch, so it cannot flicker).
         bool g_planFlies[1 + prefetch::kSlotPilotCount] = {};
+        bool g_driveOnlyLane[1 + prefetch::kSlotPilotCount] = {};  // NH-1 / 2026-11-23: drive-only lane never hovers or climbs
         double g_planStepAt[1 + prefetch::kSlotPilotCount] = {};  // when planrun::Step last ran for this pilot (a plan older than 1 s is not fresh)
         double g_hoverLogAt[1 + prefetch::kSlotPilotCount] = {};
         ULONGLONG g_planHudAt = 0;
@@ -757,11 +776,14 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			bool railOn = false;
 			bool railTyres = false;  // TY-1: the tyres move it (pedals + steer); the rail step only measures, writes no velocity or spin
 			float railVx = 0, railVy = 0, railYaw = 0;  // m/s world, rad/s about world up (+ = turn left)
+			float railAim = 0, railMaxYaw = 1.6f; bool railAimValid = false;  // 60 Hz closed-loop heading target (prevents open-loop fishtail)
+			corridorwall::Barrier railWall{};  // 60 Hz virtual guardrail from authored road/yellow-box edges
 			ULONGLONG railUntil = 0;
 			unsigned railSteps = 0, railFaults = 0;
 			bool railAir = false;  // the rail's jump is on (the game's vertical boost): the vertical motion stays the game's
 			double railCommand = -1;
-			float railRoad[3] = { 0, 0, 1 }; ULONGLONG railRoadAt = 0;  // the road's up vector from the lane's grade (railforce road plane)  // the rail's own commanded speed (railforce.h); < 0: not started
+			float railRoad[3] = { 0, 0, 1 }; ULONGLONG railRoadAt = 0;  // the road's up vector from the lane's grade (railforce road plane)
+			double railFloorZ = 0; ULONGLONG railFloorAt = 0;  // authored road floor Z for unloaded-collision support beyond ~240 m
 			// Rail probes (2026-11-05, "the old print everywhere trick"): what each part did to this car's speed. Written by the physics
 			// threads without the lock (speeds in mm/s); read and reset by the rail step's 4 Hz probe line.
 			std::atomic<std::uintptr_t> railMotion{0};       // the body's motion record (velocity at +0x60) the rail last wrote
@@ -1126,6 +1148,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         // the game's own wake, as its vehicle component update FUN_14131D5F0 does it every frame: on the instance's read interface
         // (instance+0x28) vt+0x58 says the body is valid, vt+0xB8 its activation state; when that is not 1 (active), the instance's world
         // (instance+0x30) vt+0x140 (body, 1) activates it. Main thread only (where the game calls it). Returns the state before (-1: not done).
+        std::atomic<std::uintptr_t> g_wakeQueue[kPilots]{};  // 2026-11-23: off-thread Fly() queues WakeBody for main-thread Tick()
         int WakeBody(std::uintptr_t instance)
         {
             if (!instance || !routesurvey::OnMainThread()) return -1;
@@ -1813,7 +1836,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         // Applies a rail target inside the same native chassis callback for both traffic and the test.
         // POD frame: SEH protects the body handles, which can disappear when cells change.
         const char* WriteRailPose(std::uintptr_t vehicle, std::uint32_t bodyId,
-                                  const FvoFleetRailPoint& position, const FvoFleetRailPoint& velocity)
+                                  const FvoFleetRailPoint& position, const FvoFleetRailPoint& velocity,
+                                  double tangentX = 0.0, double tangentY = 0.0, double feedYawRate = 0.0)
         {
             __try {
                 const Body body = FindBody(vehicle, 0, 0, 0, true);
@@ -1832,6 +1856,34 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 centre[0] += dx; centre[1] += dy; centre[2] += dz;
                 pose[0] += float(dx); pose[1] += float(dy); pose[2] += float(dz);
                 speed[0] = float(velocity.x); speed[1] = float(velocity.y); speed[2] = float(velocity.z);
+                // Align the Havok rigid body upright (including inverted-car righting when U[2] < 0.2)
+                // and along the energy-optimal velocity/curvature heading with feedforward yaw rate.
+                alignas(16) float spin[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                const float* F = reinterpret_cast<const float*>(body.body + 0x10);
+                const float* U = reinterpret_cast<const float*>(body.body + 0x20);
+                if (std::isfinite(U[0]) && std::isfinite(U[1]) && std::isfinite(U[2])) {
+                    if (U[2] < 0.2f && std::isfinite(F[0]) && std::isfinite(F[1])) {
+                        // Inverted or on its side: roll around local forward axis so U[0]=U[1]=0 never deadlocks upside-down.
+                        const float fLen = std::hypot(F[0], F[1]);
+                        if (fLen > 0.1f) {
+                            spin[0] = (F[0] / fLen) * 2.5f;
+                            spin[1] = (F[1] / fLen) * 2.5f;
+                        } else {
+                            spin[0] = 2.5f;
+                        }
+                    } else {
+                        spin[0] = std::clamp(U[1] * 4.0f, -2.0f, 2.0f);
+                        spin[1] = std::clamp(-U[0] * 4.0f, -2.0f, 2.0f);
+                    }
+                }
+                const double tLen = std::hypot(tangentX, tangentY);
+                if (tLen > 0.05 && std::isfinite(F[0]) && std::isfinite(F[1])) {
+                    const double tx = tangentX / tLen, ty = tangentY / tLen;
+                    const double yawErr = std::atan2(double(F[0]) * ty - double(F[1]) * tx,
+                                                     double(F[0]) * tx + double(F[1]) * ty);
+                    if (std::isfinite(yawErr)) spin[2] = float(std::clamp(yawErr * 5.0 + feedYawRate, -3.5, 3.5));
+                }
+                RailSetSpin(body, spin);
                 return nullptr;
             }
             __except (EXCEPTION_EXECUTE_HANDLER) { return "fault_while_writing"; }
@@ -1903,11 +1955,11 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
         }
 
-        // AC-1 (2026-11-21): the fleet rail no longer drives cars (it took a car away from the autopilot and pushed it along its own path
-        // with no avoidance: 19:27 run, FF105ACC glided beside the player). It only reports a mode to the add-on: Auto (1) while the engine
-        // steps the car, Rail (2) while the autopilot moves it virtually (the core owns its motion, as published add-ons read it), else
-        // Awaiting (3).
-        constexpr bool kFleetRailDrives = false;
+        // Distance-gated FleetRail (2026-11-23): beyond the player's loaded Havok physics radius (~220 m, where road colliders
+        // are unloaded), FleetRailStep glides live Full-LOD bodies kinematically along their authored lane spline inside StepDetour
+        // (with corner speed, leader headway, smooth entry blend, and 1.5 s exit ramp), freeing PilotsTick CPU for near cars.
+        // Inside (farRadius - 20 m), cars ALWAYS run full dynamic energyplan driving (never gliding beside the player as in AC-1).
+        constexpr bool kFleetRailDrives = true;
         std::unordered_map<unsigned, ULONGLONG> g_virtualAt;  // vehicle -> when the autopilot last moved it virtually (under g_fleetRailLock)
         // The game's physics radius (havok cell extents x 50 m, game::ReadLimits), read every 5 s; 0 = unknown.
         double PhysicsRadius() {
@@ -1951,6 +2003,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             ox = pt.x; oy = pt.y; oz = pt.z; yaw = std::atan2(q.x - pt.x, q.y - pt.y); used = v; return true;
         }
         bool FarYaw(std::uintptr_t vehicle, double yaw) { __try { reinterpret_cast<float*>(vehicle + off::kRefRotation)[2] = float(yaw); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+        bool FarLevelYaw(std::uintptr_t vehicle, double yaw) { __try { float* r = reinterpret_cast<float*>(vehicle + off::kRefRotation); r[0] = 0.0f; r[1] = 0.0f; r[2] = float(yaw); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
         bool FleetRailOwns(unsigned vehicle)
         {
             if (!g_fleetRailCount.load(std::memory_order_acquire) || !trafficprofile::FleetRailAllowed()) return false;
@@ -1990,18 +2043,112 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     logger::Write("OBS system=traffic.fleet_rail event=entry_blend vehicle=%08X offset_m=%.2f speed=%.1f target_speed=%.1f",
                         id, std::hypot(car.offset.x, car.offset.y, car.offset.z), car.railSpeed, car.speed);
                 }
-                const double want = std::min(car.speed, car.path.CornerSpeed(car.station));
+                double want = std::min(car.speed, car.path.CornerSpeed(car.station));
+                // Structural car-to-car headway spacing on FleetRail so faster cars never stack nose-to-tail.
+                // Only yield to cars moving in the SAME direction (dot > 0.5) and within the same lane (lat < 2.8 m)
+                // so opposing traffic on narrow 2-way roads never head-on deadlocks.
+                {
+                    const auto curPt = car.path.At(car.station);
+                    const auto fwdPt = car.path.At(car.path.Advance(car.station, 3.0));
+                    const double fLen = std::hypot(fwdPt.x - curPt.x, fwdPt.y - curPt.y);
+                    if (fLen > 0.1) {
+                        const double ftx = (fwdPt.x - curPt.x) / fLen, fty = (fwdPt.y - curPt.y) / fLen;
+                        for (const auto& [otherId, other] : g_fleetRails) {
+                            if (otherId == id) continue;
+                            if (other.mode != fleetrail::Mode::Rail || other.railSpeed < 0.5) continue;
+                            const double odx = other.position.x - curPt.x;
+                            const double ody = other.position.y - curPt.y;
+                            const double odz = other.position.z - curPt.z;
+                            if (std::fabs(odz) > 4.5) continue;
+                            const double fwd = odx * ftx + ody * fty;
+                            if (fwd <= 0.5 || fwd >= 24.0) continue;
+                            const double lat = std::fabs(-odx * fty + ody * ftx);
+                            if (lat >= 2.8) continue;
+                            // Direction check: ignore opposing-lane traffic.
+                            if (other.path.End() > 1.0) {
+                                const auto oCur = other.path.At(other.station);
+                                const auto oFwd = other.path.At(other.path.Advance(other.station, 3.0));
+                                const double oLen = std::hypot(oFwd.x - oCur.x, oFwd.y - oCur.y);
+                                if (oLen > 0.1) {
+                                    const double dot = ((oFwd.x - oCur.x) / oLen) * ftx + ((oFwd.y - oCur.y) / oLen) * fty;
+                                    if (dot < 0.5) continue;
+                                }
+                            }
+                            const double gapCap = fwd <= 9.0 ? 0.0 : car.speed * ((fwd - 9.0) / 15.0);
+                            want = std::min(want, std::max(0.0, gapCap));
+                        }
+                    }
+                }
                 const double railSpeed = fleetrail::Approach(car.railSpeed, want, dt);
                 const double station = car.path.Advance(car.station, railSpeed * dt);
                 const double w0 = fleetrail::BlendWeight(car.blendT), w1 = fleetrail::BlendWeight(car.blendT + dt);
+                const auto herePt = car.path.At(station);
+                const auto aheadPt = car.path.At(car.path.Advance(station, 4.0));
+                const auto farPt = car.path.At(car.path.Advance(station, 8.0));
+                // Clamp far-rail lateral rejoin offset inside the corridor envelope so cars never drift into guardrails.
+                if (w1 > 0.01) {
+                    const double segLen = std::hypot(aheadPt.x - herePt.x, aheadPt.y - herePt.y);
+                    if (segLen > 0.1) {
+                        const double ux = (aheadPt.x - herePt.x) / segLen, uy = (aheadPt.y - herePt.y) / segLen;
+                        const double rx = uy, ry = -ux;
+                        const double latOff = car.offset.x * rx + car.offset.y * ry;
+                        constexpr double kMaxRailLat = 2.5;
+                        if (std::fabs(latOff) > kMaxRailLat) {
+                            const double excess = latOff - std::clamp(latOff, -kMaxRailLat, kMaxRailLat);
+                            car.offset.x -= excess * rx;
+                            car.offset.y -= excess * ry;
+                            archproof::State().corridorRailClamped.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
                 const auto Shifted = [&](FvoFleetRailPoint p, double w) {
                     return FvoFleetRailPoint{p.x + car.offset.x * w, p.y + car.offset.y * w, p.z + car.offset.z * w};
                 };
-                const auto target = Shifted(car.path.At(station), w1);
+                const auto target = Shifted(herePt, w1);
                 const auto previous = Shifted(car.path.At(car.station), w0);
                 const FvoFleetRailPoint velocity{(target.x - previous.x) / dt,
                     (target.y - previous.y) / dt, (target.z - previous.z) / dt};
-                if (const char* fault = WriteRailPose(vehicle, body, target, velocity)) {
+                // Energy-optimal alignment: match velocity direction (including rejoin blend) + curvature feedforward yaw rate.
+                double alignX = aheadPt.x - herePt.x, alignY = aheadPt.y - herePt.y;
+                const double vHoriz = std::hypot(velocity.x, velocity.y);
+                if (vHoriz > 1.5) {
+                    const double aLen = std::hypot(alignX, alignY);
+                    if (aLen > 0.1) {
+                        alignX = 0.65 * (velocity.x / vHoriz) + 0.35 * (alignX / aLen);
+                        alignY = 0.65 * (velocity.y / vHoriz) + 0.35 * (alignY / aLen);
+                    } else {
+                        alignX = velocity.x; alignY = velocity.y;
+                    }
+                }
+                double feedYawRate = 0.0;
+                {
+                    const double d1 = std::hypot(aheadPt.x - herePt.x, aheadPt.y - herePt.y);
+                    const double d2 = std::hypot(farPt.x - aheadPt.x, farPt.y - aheadPt.y);
+                    if (d1 > 0.5 && d2 > 0.5) {
+                        const double a1 = std::atan2(aheadPt.y - herePt.y, aheadPt.x - herePt.x);
+                        const double a2 = std::atan2(farPt.y - aheadPt.y, farPt.x - aheadPt.x);
+                        const double dAng = std::remainder(a2 - a1, 6.283185307179586);
+                        feedYawRate = std::clamp(railSpeed * (dAng / 4.0), -1.8, 1.8);
+                    }
+                }
+                if (const char* fault = WriteRailPose(vehicle, body, target, velocity, alignX, alignY, feedYawRate)) {
+                    if (std::strcmp(fault, "step_over_25m") == 0) {
+                        // Auto-reseed station from the body's actual position only if the nearest path point is within
+                        // 24 m (prevents an infinite re-seed loop if the car genuinely fell > 25 m off the road).
+                        FvoFleetRailPoint curPose{}, curVel{};
+                        if (ReadRailBody(vehicle, body, curPose, curVel)) {
+                            const double projS = car.path.Project(curPose.x, curPose.y, curPose.z);
+                            const auto projPt = car.path.At(projS);
+                            if (std::hypot(projPt.x - curPose.x, projPt.y - curPose.y, projPt.z - curPose.z) <= 24.0) {
+                                car.station = projS;
+                                car.position = curPose;
+                                car.blendReady = false;
+                                car.fault = "";
+                                car.lastStep = GetTickCount64();
+                                return true;
+                            }
+                        }
+                    }
                     if (car.fault != fault)
                         logger::Write("OBS system=traffic.fleet_rail event=engine_result vehicle=%08X mode=awaiting reason=%s", id, fault);
                     car.fault = fault;
@@ -2167,6 +2314,122 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             }
 		}
 #endif
+		// Multi-vehicle far-dispatch pose substitution inside StepDetour (2026-11-23):
+		// Shifts both hknpMotion + 0x10 (COM) and hknpBody + 0x30 (pos) and zeroes linear velocity on the physics thread
+		// right before Havok integrates the vehicle's first step, so Havok commits the far route position instead of
+		// overwriting a pre-step service-thread write back to the near-stage spawn point.
+		namespace fardisp {
+			constexpr int kMaxSlots = 128;
+			struct Slot {
+				std::uint32_t vehicleId = 0, driverId = 0, bodyId = 0;
+				std::uintptr_t instance = 0;
+				double x = 0, y = 0, z = 0;
+				bool active = false;
+			};
+			std::mutex g_lock;
+			Slot g_slots[kMaxSlots];
+			std::atomic<int> g_count{ 0 };
+
+			void ReadBinding(std::uint32_t vehicleId, std::uintptr_t& outInst, std::uint32_t& outBody)
+			{
+				outInst = 0; outBody = 0;
+				const auto comp = vehiclediag::ComponentOf(vehicleId);
+				if (!comp) return;
+				__try {
+					outInst = At<std::uintptr_t>(comp, 0x10);
+					outBody = outInst ? At<std::uint32_t>(outInst, 0x20) : 0;
+				} __except (EXCEPTION_EXECUTE_HANDLER) { outInst = 0; outBody = 0; }
+			}
+
+			bool ApplyPose(std::uintptr_t vehicle, std::uint32_t bodyId, double x, double y, double z)
+			{
+				__try {
+					const Body b = FindBody(vehicle, 0, 0, 0, true);
+					if (!b.body || !b.motion || b.id != bodyId || At<std::uint32_t>(b.body, 0x50) != b.id) return false;
+					if (At<std::uint32_t>(b.motion, 0x48) != b.id) return false;
+					double* com = reinterpret_cast<double*>(b.motion + 0x10);
+					float* bp = reinterpret_cast<float*>(b.body + 0x30);
+					float* vel = reinterpret_cast<float*>(b.motion + 0x60);
+					if (!std::isfinite(com[0]) || !std::isfinite(com[1]) || !std::isfinite(com[2]) ||
+						!std::isfinite(bp[0]) || !std::isfinite(bp[1]) || !std::isfinite(bp[2])) return false;
+					const double dx = x - double(bp[0]), dy = y - double(bp[1]), dz = z - double(bp[2]);
+					com[0] += dx; com[1] += dy; com[2] += dz;
+					bp[0] = float(x); bp[1] = float(y); bp[2] = float(z);
+					vel[0] = 0.0f; vel[1] = 0.0f; vel[2] = 0.0f;
+					alignas(16) float zeroSpin[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+					RailSetSpin(b, zeroSpin);
+					return true;
+				}
+				__except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+			}
+
+			void Arm(std::uint32_t vehicleId, std::uint32_t driverId, double x, double y, double z)
+			{
+				if (!vehicleId || !std::isfinite(x + y + z)) return;
+				std::uintptr_t inst = 0; std::uint32_t bid = 0;
+				ReadBinding(vehicleId, inst, bid);
+				std::lock_guard lk(g_lock);
+				int freeIdx = -1;
+				for (int i = 0; i < kMaxSlots; ++i) {
+					if (g_slots[i].active && g_slots[i].vehicleId == vehicleId) {
+						g_slots[i] = { vehicleId, driverId, bid, inst, x, y, z, true };
+						return;
+					}
+					if (!g_slots[i].active && freeIdx < 0) freeIdx = i;
+				}
+				if (freeIdx >= 0) {
+					g_slots[freeIdx] = { vehicleId, driverId, bid, inst, x, y, z, true };
+					g_count.fetch_add(1, std::memory_order_release);
+				}
+			}
+
+			bool HasPending(std::uint32_t vehicleId)
+			{
+				if (!vehicleId || g_count.load(std::memory_order_acquire) <= 0) return false;
+				std::lock_guard lk(g_lock);
+				for (int i = 0; i < kMaxSlots; ++i)
+					if (g_slots[i].active && g_slots[i].vehicleId == vehicleId) return true;
+				return false;
+			}
+
+			void Clear()
+			{
+				std::lock_guard lk(g_lock);
+				for (auto& s : g_slots) s = {};
+				g_count.store(0, std::memory_order_release);
+			}
+
+			void OnStep(std::uintptr_t vehicle, std::uint32_t bodyId)
+			{
+				if (g_count.load(std::memory_order_acquire) <= 0 || (!vehicle && !bodyId)) return;
+				double tx = 0, ty = 0, tz = 0;
+				std::uint32_t vid = 0, did = 0;
+				bool found = false;
+				{
+					std::unique_lock lk(g_lock, std::try_to_lock);
+					if (!lk.owns_lock()) return;
+					for (int i = 0; i < kMaxSlots; ++i) {
+						if (!g_slots[i].active) continue;
+						if (!g_slots[i].instance && !g_slots[i].bodyId)
+							ReadBinding(g_slots[i].vehicleId, g_slots[i].instance, g_slots[i].bodyId);
+						if ((g_slots[i].instance && g_slots[i].instance == vehicle) ||
+							(g_slots[i].bodyId && g_slots[i].bodyId == bodyId)) {
+							vid = g_slots[i].vehicleId;
+							did = g_slots[i].driverId;
+							tx = g_slots[i].x; ty = g_slots[i].y; tz = g_slots[i].z;
+							g_slots[i].active = false;
+							g_count.fetch_sub(1, std::memory_order_release);
+							found = true;
+							break;
+						}
+					}
+				}
+				if (!found) return;
+				const bool ok = ApplyPose(vehicle, bodyId, tx, ty, tz);
+				logger::Observe("traffic.dispatch-step", vid, ok ? 1u : 0u,
+					"driver=%08X body=%08X moved=%d to=%.1f,%.1f,%.1f", did, bodyId, ok ? 1 : 0, tx, ty, tz);
+			}
+		}
 		std::uint64_t StepDetour(std::uintptr_t vehicle, std::uintptr_t world, float seconds)
 		{
 			StepTiming timing;const auto massEpoch=bodymass::observations.Epoch();
@@ -2177,6 +2440,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			// This hook sees every vehicle. Unowned steps must never default to the player's controller.
 			vehiclediag::NoteStep(vehicle);
 			const auto body=PhysicsBodyId(vehicle);const auto now=GetTickCount64();
+			fardisp::OnStep(vehicle, body);
             ObserveChassisMass(vehicle,now,massEpoch);
 #ifdef FVO_RELEASE
             const bool railOwnsStep = FleetRailStep(vehicle, body, seconds);
@@ -2322,7 +2586,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			}
 			if (!g_sh.active && g_sh.railOn) {
 				if (GetTickCount64() > g_sh.railUntil || !vehicle) { g_sh.railOn = false; return result; }
-				const float gx = g_sh.px, gy = g_sh.py, gz = g_sh.pz, tvx = g_sh.railVx, tvy = g_sh.railVy, tyaw = g_sh.railYaw;
+				const float gx = g_sh.px, gy = g_sh.py, gz = g_sh.pz, tvx = g_sh.railVx, tvy = g_sh.railVy;
+				float tyaw = g_sh.railYaw;
 				lk.unlock();
 				const auto gb = FindBody(vehicle, gx, gy, gz);
 				alignas(16) float spin[4] = {};
@@ -2338,14 +2603,14 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					const float* U = reinterpret_cast<const float*>(gb.body + 0x20);
 					g_sh.railMotion.store(gb.motion, std::memory_order_relaxed);
 					g_sh.probeMeasured = std::hypot(double(gv[0]), double(gv[1])); g_sh.probeTarget = std::hypot(double(tvx), double(tvy));
-					const bool roadFresh = GetTickCount64() - g_sh.railRoadAt < 300;
+					const bool roadFresh = GetTickCount64() - g_sh.railRoadAt < 1000;
 					const railforce::V3 road{ g_sh.railRoad[0], g_sh.railRoad[1], g_sh.railRoad[2] };
 					const auto o = railforce::Step({ gv[0], gv[1], gv[2] }, { tvx, tvy, 0 }, { F[0], F[1], F[2] }, { U[0], U[1], U[2] }, dt, g_sh.railAir, g_sh.railCommand, roadFresh ? &road : nullptr);
 					g_sh.probeRoadZ = roadFresh ? road.z : -1;
 					g_sh.probeWrote = o.tipped ? g_sh.probeMeasured : std::hypot(o.v.x, o.v.y); g_sh.probeNz = U[2]; g_sh.probeSlip = o.slip; g_sh.probeGrounded = o.grounded; g_sh.probeTipped = o.tipped;
 					g_sh.probeRailSteps.fetch_add(1);
 					{ WheelRead wr; if (ReadWheels(g_sh.instance.load(), wr)) { g_sh.probeWheels = wr.count; g_sh.probeWheelsTouching = wr.touching; g_sh.probeWheelZ = wr.z; g_sh.probeWheelUp = wr.up; } else g_sh.probeWheels = -1; }
-					if (GetTickCount64() - g_sh.probeAt >= 1000) {  // PF-1: every 1 s (was 250 ms; 11% of the log)
+					if (GetTickCount64() - g_sh.probeAt >= 5000) {  // PF-2: every 5 s (cuts physics-thread log I/O 5x)
 						g_sh.probeAt = GetTickCount64();
 						const unsigned ns = g_sh.probeNativeSteps.exchange(0), dc = g_sh.probeDampCalls.exchange(0), cc = g_sh.probeClampCalls.exchange(0), rsN = g_sh.probeRailSteps.exchange(0), gcl = g_sh.probeGuardClears.exchange(0);
 						const double nd = g_sh.probeNativeDrop.exchange(0) / 1000.0, dd = g_sh.probeDampDrop.exchange(0) / 1000.0, cd = g_sh.probeClampDrop.exchange(0) / 1000.0;
@@ -2359,23 +2624,98 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 						g_sh.lastStepAt = GetTickCount64(); g_sh.lastStepInstance = g_sh.instance.load(); ++g_sh.railFaults;
 						return result;
 					}
-					if (g_sh.railTyres) {
+					const bool unloadedRoadHold = g_sh.probeWheels >= 0 && g_sh.probeWheelsTouching == 0 && !g_sh.railAir &&
+						g_sh.railFloorAt != 0 && std::isfinite(g_sh.railFloorZ);
+					const bool unloadedVoidArrest = g_sh.probeWheels >= 0 && g_sh.probeWheelsTouching == 0 && !g_sh.railAir &&
+						!unloadedRoadHold && (gv[2] < -10.0f || (g_sh.pz < -220.0 && gv[2] < -4.0f));
+					if (g_sh.railTyres && !unloadedRoadHold && !unloadedVoidArrest) {
 						if (o.grounded && g_sh.probeWheels > 0 && g_sh.probeWheelsTouching > 0) {
 							const auto dv = railforce::TyreAssist({gv[0],gv[1],gv[2]}, {tvx,tvy,0},
 								roadFresh ? road : railforce::V3{U[0],U[1],U[2]}, dt);
 							gv[0] += float(dv.x); gv[1] += float(dv.y); gv[2] += float(dv.z);
 						}
-						for (int k = 0; k < 3; ++k) g_sh.v[k] = gv[k];
 						const float* tp = reinterpret_cast<const float*>(gb.body + 0x30);
+						bool needSpinWrite = false;
+						// 60 Hz virtual guardrail barrier: zero outward lateral velocity if the car reaches the corridor wall.
+						if (g_sh.railWall.valid) {
+							const auto wall = corridorwall::Enforce60Hz(g_sh.railWall, double(tp[0]), double(tp[1]), double(gv[0]), double(gv[1]));
+							if (wall.arrested) {
+								gv[0] = float(wall.vx); gv[1] = float(wall.vy);
+								spin[2] = float(wall.yawNudge);
+								needSpinWrite = true;
+								archproof::State().corridorPhysWallArrest.fetch_add(1, std::memory_order_relaxed);
+							}
+						}
+						// 60 Hz closed-loop heading overshoot brake for TY-1 tyre mode (prevents fishtail between slow plan ticks).
+						if (!needSpinWrite && g_sh.railAimValid && std::isfinite(g_sh.railAim)) {
+							const float* liveF = reinterpret_cast<const float*>(gb.body + 0x10);
+							if (std::isfinite(liveF[0]) && std::isfinite(liveF[1]) && std::hypot(double(liveF[0]), double(liveF[1])) > 0.1) {
+								const double liveH = std::atan2(double(liveF[0]), double(liveF[1]));
+								const double eLive = Wrap(double(g_sh.railAim) - liveH);
+								double dampedZ = double(spin[2]);
+								if (corridorwall::DampTyreYaw60Hz(eLive, double(spin[2]), double(g_sh.railMaxYaw), dampedZ)) {
+									spin[2] = float(dampedZ);
+									needSpinWrite = true;
+									archproof::State().corridorTyreYawDamped.fetch_add(1, std::memory_order_relaxed);
+								}
+							}
+						}
+						for (int k = 0; k < 3; ++k) g_sh.v[k] = gv[k];
 						g_sh.px = tp[0]; g_sh.py = tp[1]; g_sh.pz = tp[2];
+						if (needSpinWrite) {
+							lk.unlock();
+							RailSetSpin(gb, spin);
+							lk.lock();
+						}
 						++g_sh.railSteps;
 						g_sh.lastStepAt = GetTickCount64(); g_sh.lastStepInstance = g_sh.instance.load(); ++g_sh.steps; g_sh.testSteps.fetch_add(1, std::memory_order_relaxed);
 						return result;
 					}
 					if (std::isfinite(o.v.x) && std::isfinite(o.v.y) && std::isfinite(o.v.z)) { gv[0] = float(o.v.x); gv[1] = float(o.v.y); gv[2] = float(o.v.z); }
+					// Unloaded-road support for far dynamic drive cars (beyond Starfield's ~240 m Havok collision grid):
+					// when no wheel touches a collider and we have the authored road floor Z, hold the chassis on the
+					// road plane so gravity does not drop it through the unloaded cell (e.g. z = -5000).
+					if (unloadedRoadHold) {
+						const float* curPos = reinterpret_cast<const float*>(gb.body + 0x30);
+						const double targetZ = g_sh.railFloorZ + 0.55;
+						if (double(curPos[2]) <= targetZ + 1.5) {
+							gv[2] = float(std::clamp((targetZ - double(curPos[2])) * 4.0, -4.0, 8.0));
+							spin[0] = 0.0f; spin[1] = 0.0f;
+						}
+					} else if (unloadedVoidArrest) {
+						// Even if railFloorAt was not yet set or cleared, never let a wheel-less drive car plunge into the void.
+						gv[2] = 0.0f;
+						spin[0] = 0.0f; spin[1] = 0.0f;
+					}
+					if (g_sh.railWall.valid) {
+						const float* wPos = reinterpret_cast<const float*>(gb.body + 0x30);
+						const auto wall = corridorwall::Enforce60Hz(g_sh.railWall, double(wPos[0]), double(wPos[1]), double(gv[0]), double(gv[1]));
+						if (wall.arrested) {
+							gv[0] = float(wall.vx); gv[1] = float(wall.vy);
+							tyaw = float(wall.yawNudge);
+							archproof::State().corridorPhysWallArrest.fetch_add(1, std::memory_order_relaxed);
+						}
+					}
 					for (int k = 0; k < 3; ++k) g_sh.v[k] = gv[k];  // the wheel stage reads this (was stale on the rail: -8 m/s read while still)
 				}
-				spin[2] = tyaw;  // pitch and roll spin stay the game's (suspension, slopes)
+				// Close the heading loop at 60 Hz using live body forward F so slow 2-5 Hz planning cadences
+				// can never hold a stale open-loop yaw rate past railAim (eliminates Nyquist fishtail oscillation).
+				float appliedSpinZ = tyaw;
+				if (g_sh.railAimValid && std::isfinite(g_sh.railAim)) {
+					const float* liveF = reinterpret_cast<const float*>(gb.body + 0x10);
+					if (std::isfinite(liveF[0]) && std::isfinite(liveF[1]) && std::hypot(double(liveF[0]), double(liveF[1])) > 0.1) {
+						const double liveH = std::atan2(double(liveF[0]), double(liveF[1]));
+						const double eLive = Wrap(double(g_sh.railAim) - liveH);  // + = aim is right of nose; spin[2] + = turn left
+						const double mYaw = std::clamp(double(g_sh.railMaxYaw), 0.25, 1.6);
+						if ((tyaw > 0.0f && eLive > 0.02) || (tyaw < 0.0f && eLive < -0.02)) {
+							appliedSpinZ = float(std::clamp(-eLive * 2.5, -mYaw, mYaw));
+						} else {
+							const double liveCap = std::min(mYaw, std::max(0.25, std::fabs(eLive) * 3.0 + 0.15));
+							appliedSpinZ = float(std::clamp(double(tyaw), -liveCap, liveCap));
+						}
+					}
+				}
+				spin[2] = appliedSpinZ;  // pitch and roll spin stay the game's (suspension, slopes)
 				const float* bp = reinterpret_cast<const float*>(gb.body + 0x30);
 				g_sh.px = bp[0]; g_sh.py = bp[1]; g_sh.pz = bp[2];
 				lk.unlock();
@@ -3154,10 +3494,14 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			if (g_peopleFrame == g_flightFrame) return g_people;
 			g_peopleFrame = g_flightFrame;
 			g_people.clear();
+			const auto pl = Ptr(addr::kPlayerCharacterPtr);
+			const auto pp = pl ? At<game::Vec3>(pl, off::kRefPosition) : game::Vec3{};
 			for (const auto r : modscene::LoadedRefs()) {
 				if (!r || !npcvehicles::LooksLikeActor(r) || npcvehicles::IsDead(r)) continue;
-				const auto aboard = EngineFn<std::uintptr_t (*)(std::uintptr_t)>(addr::kPlayerVehicle)(r);
 				const auto p = At<game::Vec3>(r, off::kRefPosition);
+				// Beyond ~260 m, far cars run on FleetRailStep (not energyplan), so distant actors need no per-frame seat query.
+				if (pl && std::hypot(double(p.x) - pp.x, double(p.y) - pp.y) > 260.0) continue;
+				const auto aboard = EngineFn<std::uintptr_t (*)(std::uintptr_t)>(addr::kPlayerVehicle)(r);
 				g_people.push_back({ r, aboard, p.x, p.y, p.z });
 			}
 			return g_people;
@@ -4059,6 +4403,12 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 
 		void AskSamples(int idx, const game::Vec3& pos, double heading, double vx, double vy)
 		{
+			if (idx >= 1) {
+				if (const auto pl = Ptr(addr::kPlayerCharacterPtr)) {
+					const auto pp = At<game::Vec3>(pl, off::kRefPosition);
+					if (std::hypot(double(pos.x) - double(pp.x), double(pos.y) - double(pp.y)) > 240.0) return;
+				}
+			}
 			State& g = g_gs[idx];
 			const double speed = std::hypot(vx, vy);
 			double dx = std::sin(heading), dy = std::cos(heading);
@@ -4143,6 +4493,12 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 
 		void AskCorridors(int idx, const game::Vec3& pos, double heading, double speed)
 		{
+			if (idx >= 1) {
+				if (const auto pl = Ptr(addr::kPlayerCharacterPtr)) {
+					const auto pp = At<game::Vec3>(pl, off::kRefPosition);
+					if (std::hypot(double(pos.x) - double(pp.x), double(pos.y) - double(pp.y)) > 240.0) return;
+				}
+			}
 			State& g = g_gs[idx];
 			const double offs[3] = { 0.0, -kAvoidSide, kAvoidSide };
 			const double dist[3] = { std::max(12.0, speed * 0.8), std::max(25.0, speed * 1.6), std::max(40.0, speed * 2.6) };
@@ -4671,7 +5027,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             b.sensor = by;
 #endif
 			if (lr != 1 || !radar::BoxFrom(L, hx, hy, hz, b)) {  // no box: keep the hit point so nothing is lost
-				++st.stats.lookupFailed; b.big = true; b.hitX = hx; b.hitY = hy; b.hitZ = hz; b.cx = hx; b.cy = hy; b.dynamic = true;  // re-looked-up on its next hit
+				++st.stats.lookupFailed; b.big = true; b.hitX = hx; b.hitY = hy; b.hitZ = hz; b.cx = hx; b.cy = hy; b.dynamic = false;  // 2026-11-23: do not re-lookup a failing static body every ray hit
 				static ULONGLONG failLog = 0; if (GetTickCount64() - failLog > 2000) { failLog = GetTickCount64();
 					logger::Write("OBS system=world.radar vehicle=%08X pilot=%d event=lookup_failed by=%s body=%08X layer=%u shape_type=%d result=%d owner=%08X pos=%.1f,%.1f,%.1f reason=%s",
 						self, idx, by, body, layer, L.shapeType, lr, owner, hx, hy, hz, lr < 0 ? "fault_guarded" : "no_body_or_no_box_function_kept_as_point"); }
@@ -5318,7 +5674,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			else { in.vx = v[0]; in.vy = v[1]; in.vz = v[2]; }
 			if (const auto selfId = vehicle ? At<std::uint32_t>(vehicle, off::kFormId) : 0u) world::NoteFlownVelocity(selfId, v);  // VL-1: the body's velocity for the Vehicle List
 			in.groundUnder = groundZ; in.groundOk = groundOk; in.above = above;
-			in.gx = goal.x; in.gy = goal.y; in.gz = goal.z; in.stop = std::max(goal.stop, 1.0);
+			in.gx = goal.x; in.gy = goal.y; in.gz = std::isfinite(goal.z) ? goal.z : pos.z; in.stop = std::max(goal.stop, 1.0);
+			if (idx >= 0 && idx < int(sizeof g_driveOnlyLane / sizeof g_driveOnlyLane[0])) g_driveOnlyLane[idx] = false;
 			in.keepGoing = goal.keepGoing; in.hold = goal.hold; in.cruise = goal.cruise; in.cruiseSpeed = goal.cruiseSpeed;
 			if (goal.keepGoing && !goal.cruise && !goal.hold) { in.targetVx = g_pvx; in.targetVy = g_pvy; }
 			const auto& nv = PilotNavOf(idx);
@@ -5482,6 +5839,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					else if (!in.groundOk)
 						logger::Observe("traffic.surface", self, 1, "event=addon_ground pilot=%d floor=%.2f z=%.2f game=unmeasured", idx, floorZ, in.z);
 					in.groundOk = true; in.groundUnder = floorZ; in.above = in.z - floorZ;
+					if (idx >= 0 && idx < int(sizeof g_railFloorZ / sizeof g_railFloorZ[0])) { g_railFloorZ[idx] = floorZ; g_railFloorZAt[idx] = GetTickCount64(); }
 				}
 			}
 			const bool preciseDrive=in.onWheels;  // a car on its wheels (the lane grace below)
@@ -5492,11 +5850,12 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			if(authoredLane&&idx>=0&&idx<257){const auto& rp=routeguidance::frames[idx].repaired;  // LF-1: the line repair, traced
 				if(rp.removed||rp.rounded)logger::Observe("lane.repair",self,authoredLane->identity^(std::uint64_t(rp.removed)<<40)^(std::uint64_t(rp.rounded)<<48),
 					"event=repaired pilot=%d removed=%d rounded=%d worst_turn_deg=%.0f points=%d reason=no_fold_no_kink_in_the_line_a_car_follows",idx,rp.removed,rp.rounded,rp.worstTurnDeg,authoredLane->count);}
-            // One owner for Drive lanes (2026-11-04): a lane command a little late keeps the last lane for up to 2 s instead
-            // of dropping the car to the coordinator hold for one missed refresh.
-            if(!authoredLane&&preciseDrive){std::uint64_t age=0;authoredLane=routeguidance::Grace(idx,GetTickCount64(),2000,&age);
-                if(authoredLane&&authoredLane->travel==1)logger::Observe("traffic.lane",self,authoredLane->identity^0x200,"event=grace pilot=%d age_ms=%llu reason=late_lane_command_last_lane_kept",idx,(unsigned long long)age);
-                else authoredLane=nullptr;}
+            // One owner for traffic lanes (2026-11-23): a lane command a little late keeps the last lane for up to 4 s
+            // across all travel modes (drive, both, hover) when there is no explicit refusal, so post-load bursts never
+            // slam cars into coordinator_hold (expired_lane_command).
+            if(!authoredLane){std::uint64_t age=0;authoredLane=routeguidance::Grace(idx,GetTickCount64(),4000,&age);
+                if(authoredLane)logger::Observe("traffic.lane",self,authoredLane->identity^0x200,"event=grace pilot=%d age_ms=%llu travel=%d reason=late_lane_command_last_lane_kept",idx,(unsigned long long)age,int(authoredLane->travel));}
+            (void)preciseDrive;
             // GD-1 (Route, design section 4): an NPC job goal reduced to one line the plan follows (jobline.h). Only on a slot with no addon
             // lane frame, on wheels, not in combat or a scripted command, farther than jobline::rules::handBack from the goal; the old
             // autopilot keeps the final approach (arrive, land, hold, park). The line is the core's own: no addon provider is asked for it.
@@ -5560,17 +5919,38 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     const double al=laneline::Project(*lane,in.x,in.y,in.z).along;const auto pa=laneWindow.At(al-3.0),pb=laneWindow.At(al+3.0);
                     const double run=std::hypot(pb.x-pa.x,pb.y-pa.y);
                     if(run>1.0){const double gr=std::clamp((pb.z-pa.z)/run,-1.5,1.5),fx=(pb.x-pa.x)/run,fy=(pb.y-pa.y)/run,nl=std::sqrt(1+gr*gr);
-                        g_railRoadN[idx][0]=float(-gr*fx/nl);g_railRoadN[idx][1]=float(-gr*fy/nl);g_railRoadN[idx][2]=float(1/nl);g_railRoadNAt[idx]=GetTickCount64();}}
+                        g_railRoadN[idx][0]=float(-gr*fx/nl);g_railRoadN[idx][1]=float(-gr*fy/nl);g_railRoadN[idx][2]=float(1/nl);g_railRoadNAt[idx]=GetTickCount64();
+                        // Populate 60 Hz virtual guardrail barrier from authored road edges (excluding no-go bands) minus car half-width.
+                        const auto pCen = laneWindow.At(al);
+                        double wallLo = -std::max(lane->halfWidth, in.shape.halfWidth + 0.5);
+                        double wallHi =  std::max(lane->halfWidth, in.shape.halfWidth + 0.5);
+                        if (ld.roadLanesOk && ld.roadLanes.count > 0) {
+                            wallLo = ld.roadLanes.left[0]; wallHi = ld.roadLanes.right[0];
+                            for (int rk = 1; rk < ld.roadLanes.count; ++rk) {
+                                wallLo = std::min(wallLo, ld.roadLanes.left[rk]);
+                                wallHi = std::max(wallHi, ld.roadLanes.right[rk]);
+                            }
+                        }
+                        const double carHW = std::max(0.8, in.shape.halfWidth);
+                        corridorwall::Barrier wb{};
+                        wb.refX = pCen.x; wb.refY = pCen.y;
+                        wb.tx = fx; wb.ty = fy;
+                        wb.minLat = std::min(-0.15, wallLo + carHW);
+                        wb.maxLat = std::max( 0.15, wallHi - carHW);
+                        wb.valid = std::isfinite(wb.refX) && std::isfinite(wb.refY) && wb.maxLat > wb.minLat;
+                        g_railWall[idx] = wb;
+                        g_railWallAt[idx] = GetTickCount64();}}
                 // planHover: a lane car not on the rail (in the air, or still landing) keeps its plan too; the hover follows it (planhover.h).
                 const bool planFlies=!railCar&&idx>=0&&idx<planenergy::kSlots;  // removal step 1: World reads the lane as a 3D line for a car off its wheels
                 // NH-1 (user 2026-11-15: "the route said there should be no hover"): on a drive-only lane the lane stays a ground line and the
                 // car is a wheeled car even off its wheels (it only comes down); only Both / Hover lanes are 3D lines a car flies.
                 const bool driveOnly=lane->travel==1;const bool flightLine=planFlies&&!driveOnly;
+                if(idx>=0&&idx<int(sizeof g_driveOnlyLane/sizeof g_driveOnlyLane[0]))g_driveOnlyLane[idx]=driveOnly;
                 if(idx>=0&&idx<int(sizeof g_planFlies/sizeof g_planFlies[0])){
-                    if(planFlies!=g_planFlies[idx])logger::Write("OBS system=plan.hover vehicle=%08X pilot=%d event=%s on_wheels=%d travel=%d reason=%s",self,idx,planFlies?"start":"end",int(in.onWheels),int(lane->travel),
+                    if(flightLine!=g_planFlies[idx])logger::Write("OBS system=plan.hover vehicle=%08X pilot=%d event=%s on_wheels=%d travel=%d reason=%s",self,idx,flightLine?"start":"end",int(in.onWheels),int(lane->travel),
                         !planFlies?"on_its_wheels":driveOnly?"off_its_wheels_drive_only_comes_down_no_hover":"off_its_wheels_the_lane_is_a_3d_line");
-                    g_planFlies[idx]=planFlies;}
-                driverOwner=railCar?"plan_rail":"plan_flies";
+                    g_planFlies[idx]=flightLine;}
+                driverOwner=(railCar||driveOnly)?"plan_rail":"plan_flies";
                 g.adOut={};g.adOut.bearing=in.heading;g.adOut.mode=in.onWheels||driveOnly?drive::Mode::Drive:drive::Mode::Hover;  // NH-1: never a hover start on drive onlyg.adOut.phase=drive::Phase::Travel;  // removal step 1: the lane driver no longer decides; the energy plan writes the controls below
                 laneWhy=nullptr;laneSpeed=0;
                 if(idx>=0&&railCar)g_railLaneAt[idx]=GetTickCount64();  // traffic and the player's Cruise, wherever the selector gives Rail
@@ -5653,6 +6033,23 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     std::uint64_t privatePulseSerial = 0;
 #endif
                     const double planLook=0;  // the rail aims along the lane itself (the energy plan's path is followed when fresh)
+                    // CW-1 step 3 (2026-11-22, the user: the centre line is a convex well and obstacles push the car out of it, "plan on how to get it to
+                    // work for all cases"; notes/centreline-well-20261122/PLAN.md). A lane car on its wheels (or on a drive-only stretch) is planned by the
+                    // centre-line well: one convex lateral problem, its path to the AF-1 follower, its speed to FollowSpeed. The energy plan keeps flight,
+                    // goal scenes and, outside Script mode, the backing-up families while no forward fit exists (wellRecovering). Script mode (SD-2) is the
+                    // same well with hazard boxes as the only pushes and no floor reads; vehicles and people only stop it.
+                    const bool scriptMode_=features::On(features::Id::ScriptMode);
+                    const bool wellLane=arb&&lane->count>=2&&lane->travel!=2&&(in.onWheels||lane->travel==1)&&
+                        !(idx<int(sizeof g_testActive/sizeof g_testActive[0])&&g_testActive[idx]);
+                    if(wellLane&&g_well[idx].vehicle!=self){g_well[idx]=WellState{};g_well[idx].vehicle=self;}
+                    const bool wellRecovering=wellLane&&!scriptMode_&&g_well[idx].recovering;
+                    const bool wellDrive=wellLane&&!wellRecovering;
+                    {static int wellWas[1+prefetch::kSlotPilotCount]={};const int now_=wellDrive?(scriptMode_?3:2):wellRecovering?4:1;
+                        if(idx>=0&&idx<int(sizeof wellWas/sizeof wellWas[0])&&wellWas[idx]!=now_){wellWas[idx]=now_;
+                        logger::Write("OBS system=plan.well vehicle=%08X pilot=%d event=%s on_wheels=%d travel=%d reason=%s",self,idx,
+                            now_==3?"script_drive":now_==2?"well_drive":now_==4?"recover_handoff":"energy_plan",int(in.onWheels),int(lane->travel),
+                            now_==3?"script_mode_well_hazard_boxes_only":now_==2?"centre_line_well_plans_this_lane_car":now_==4?"no_forward_fit_energy_plan_backs_up":
+                            lane->travel==2?"flight_only_lane_keeps_the_energy_plan":(idx<int(sizeof g_testActive/sizeof g_testActive[0])&&g_testActive[idx])?"spot_test_active":lane->count<2?"lane_too_short":"off_its_wheels_on_a_lane_that_allows_flight");}}
                     if(arb){
                         // World -> Route -> Avoid -> Mode -> Speed -> Arbiter: notes/VEHICLE_DECISION_DESIGN_20261106.md. This block only gathers
                         // what already exists; every decision is in planrun.h and runs offline. Arbiter rule change plus new speakers, actuator locked.
@@ -5999,7 +6396,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 #endif
                                 shapes.push_back(s);}}
                         pcWorldUs+=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-tWorld1).count();
-                        planrun::Frame f;f.script=scriptMode;f.now=in.now;f.speed=spd;f.lateral=c0;f.station=stNow;f.x=in.x;f.y=in.y;f.carBase=carBase;
+                        planrun::Frame f;f.now=in.now;f.speed=spd;f.lateral=c0;f.station=stNow;f.x=in.x;f.y=in.y;f.carBase=carBase;
                         f.topSpeed=f.want=planbranch::WantedSpeed(lane->speed,flightLine?in.limits.hoverTop:in.limits.driveTop,idx>=1);
                         {   // PD-1c: say why the line holds or slows the car (route data), so a stop is never "held by nothing"
                             const double carTop=planbranch::WantedSpeed(1e9,flightLine?in.limits.hoverTop:in.limits.driveTop,idx>=1);
@@ -6394,7 +6791,99 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                         bool ed1Submitted=false;
                         // ED-1 (user: "Yes, move to it"): your car on wheels is driven by the energy planner when its newest result is fresh and nothing in
                         // planenergy::Use rules it out; otherwise the legacy plan above drives, as before. The planner runs on a worker (planenergy.h).
-                        if(idx==0&&in.shape.steerLock>0&&in.shape.wheelbase>0){  // removal step 1: your car's energy plan, every gather (the old ED-1 check and writer are gone)
+                        if(wellLane){  // CW-1 step 3: the centre-line well (made even while recovering: it says when a forward fit is back)
+                            const auto tW0=std::chrono::steady_clock::now();
+                            auto& W=g_well[idx];
+                            const double wFwd=in.vx*std::sin(in.heading)+in.vy*std::cos(in.heading),wV=std::max(3.0,std::fabs(wFwd));
+                            constexpr double kGrip=3.5;  // m/s^2 sideways the car holds (railturn's limit, design section 7)
+                            const double kClimbTol=std::max(.5,carcap::kCar.climb);  // under the wheels' climb
+                            const double kDropTol=std::max(1.5,carcap::kCar.climb);  // 2026-11-23: coarse 4 m navmap only closes a real drop below the road (higher hits are railings/solids, not floor holes)
+                            centrewell::Line wl;for(int k=0;k<lane->count;++k)wl.Add(lane->points[k].x,lane->points[k].y);
+                            centrewell::Problem wp;double carS=0;
+                            centrewell::Frame(wp,wl,in.x,in.y,in.heading,lane->halfWidth,in.shape.halfWidth,std::clamp(int(wV*3.0+20.0),20,centrewell::kMaxStations),1.0,carS);
+                            // Floor: only a measured drop closes road (unknown never does). Not in Script mode (no detection but hazard boxes).
+                            int floorNarrowed=0;
+                            if(!scriptMode_)floorNarrowed=centrewell::FloorBounds(wp,[&](double st,double y){if(st<1.5&&in.onWheels)return true;double x=0,yy=0;if(!wl.At(carS+st,y,x,yy))return true;
+                                const int wi=std::clamp(int(std::lround(st/kStep)),0,kSamples-1);if(!wantHave[wi]||!wantMeasured[wi])return true;
+                                const auto m=navmap::At(x,yy,wantZ[wi]+1.0);if(!m.haveGround)return true;return double(m.ground)>=wantZ[wi]-kDropTol;});
+                            std::vector<centrewell::Obstacle> wobs;wobs.reserve(64);int nHaz=0,nHard=0,nSoft=0;
+                            const auto inRange=[&](const centrewell::Obstacle& o){return o.s1>=-2.0&&o.s0<=wp.n*wp.step;};
+                            {routehazard::Box hb[16];const int hn=hazardfield::NearNow(in.x,in.y,in.z-20.0,in.z+20.0,150.0,hb,16);  // the user's marks: always hard
+                                for(int k=0;k<hn;++k){const unsigned id=0x48000000u^(unsigned(std::lround(hb[k].x*2))*73856093u)^(unsigned(std::lround(hb[k].y*2))*19349663u);
+                                    auto o=centrewell::FromBox(wl,carS,id,hb[k].x,hb[k].y,hb[k].yaw*3.14159265358979323846/180.0,hb[k].hy,hb[k].hx,in.shape.halfWidth+centrewell::margin::kHazardBox,in.shape.halfLength);
+                                    if(!inRange(o))continue;o.kept=W.mem.Side(o.id);wobs.push_back(o);++nHaz;}}
+                            // World's shapes (not in Script mode). Moving vehicles and people, and occupied traffic cars (wait behind, D1), are the speed
+                            // layer's; a standing vehicle or a person is hard; game boxes, radar bodies, contacts, sweep solids and agreeing sensor hits are hard;
+                            // a lone sensor hit or an unexplained road hit is a soft push (step 2: 11 of 22 recorded blocks were lone volume and ray points).
+                            scriptdrive::Blocker wbl[48];int wbn=0;
+                            for(const auto& sh:shapes){
+                                const bool live=sh.source==planworld::Source::Vehicle||sh.source==planworld::Source::Person;
+                                if(live&&(scriptMode_||planworld::Moving(sh)||(sh.source==planworld::Source::Vehicle&&!sh.steerRound))){
+                                    if(wbn<48&&sh.expires>=in.now)wbl[wbn++]={sh.centre.x,sh.centre.y,sh.heading,sh.halfLength,sh.halfWidth,sh.source==planworld::Source::Person};continue;}
+                                if(scriptMode_||sh.hazardMark||sh.unmeasured||sh.expires<in.now||sh.source==planworld::Source::Ground||planrun::SolidAllowed(sh,f))continue;
+                                double m=centrewell::margin::kSensor;bool hard=true;
+                                if(sh.source==planworld::Source::Person)m=centrewell::margin::kPerson;
+                                else if(sh.source==planworld::Source::Vehicle)m=centrewell::margin::kVehicle;
+                                else{const double top=sh.centre.z+sh.halfHeight,bot=sh.centre.z-sh.halfHeight;
+                                    if(top<=carBase+kClimbTol||bot>=carBase+in.shape.height)continue;  // under the wheels' climb or over the roof
+                                    if(sh.source==planworld::Source::Box)m=centrewell::margin::kGameBox;
+                                    const bool trusted=sh.mayStop&&(sh.source==planworld::Source::Box||sh.source==planworld::Source::Radar||sh.source==planworld::Source::Contact||
+                                        sh.source==planworld::Source::Survey||sh.support>=2);
+                                    hard=trusted;}
+                                const unsigned id=sh.owner?(sh.owner^(unsigned(sh.layer+1)<<27)):(0x52000000u^(unsigned(std::lround(sh.centre.x*2))*73856093u)^(unsigned(std::lround(sh.centre.y*2))*19349663u));
+                                auto o=centrewell::FromBox(wl,carS,id,sh.centre.x,sh.centre.y,sh.heading,std::max(.05,sh.halfLength),std::max(.05,sh.halfWidth),in.shape.halfWidth+m,in.shape.halfLength);
+                                if(!inRange(o))continue;
+                                if(hard){o.kept=W.mem.Side(o.id);wobs.push_back(o);++nHard;}
+                                else{const double mid=.5*(o.left+o.right);const int side=mid>0?-1:+1;
+                                    const int i0=std::max(0,centrewell::StationOf(o.s0,1.0)),i1=std::min(wp.n-1,centrewell::StationOf(o.s1,1.0)+1);
+                                    for(int k=i0;k<=i1;++k)wp.Soft(k,side,side>0?o.right:o.left,.3*std::min(1.0,double(sh.support)/2.0));++nSoft;}
+                            }
+                            const auto wsides=centrewell::Choose(wp,wobs);centrewell::ApplySides(wp,wobs,wsides);W.mem.Update(wobs,wsides);
+                            const double wFitV=std::clamp(std::max(wV,f.want),3.0,25.0);  // 2026-11-23: fit smoothness to target speed so standing cars do not build a 2 m kink capped at 4.2 m/s
+                            const auto wg=centrewell::SolveWithinGrip(wp,wFitV,kGrip);const auto& wr=wg.r;
+                            // The path for the follower (AF-1 takes at most kMaxPoints, 1 m apart from where the car is).
+                            // Reject singular SolveWithinGrip rollouts (e.g. grip_peak=173 / length=212km) -> clean lane centreline.
+                            const bool singularWell=!std::isfinite(wg.peak)||wg.peak>30.0||!std::isfinite(wg.w.length)||wg.w.length>5000.0;
+                            pathfollow::Path wpath;
+                            for(int i=0;i<wr.n&&wpath.count<pathfollow::kMaxPoints;++i){double x=0,yy=0;if(!wl.At(carS+i,singularWell?0.0:wr.y[i],x,yy))break;wpath.x[wpath.count]=x;wpath.y[wpath.count]=yy;++wpath.count;}
+                            // Speed along that path: the lane's (crest, slide and tracking caps already in f.want), hold, stop line, bend, grip, the block point,
+                            // and the first vehicle or person on the path ahead (scriptdrive.h's stop rule on the well's own path).
+                            struct WP{double x,y;};
+                            const auto pathAt=[&](double st){const double c=std::clamp(st,0.0,double(std::max(0,wr.n-1)));const int i=std::min(int(c),std::max(0,wr.n-2));const double t=c-i;
+                                const double y=wr.n>=2?wr.y[i]+(wr.y[i+1]-wr.y[i])*t:0.0;double x=0,yy=0;wl.At(carS+st,y,x,yy);return WP{x,yy};};
+                            scriptdrive::Car wc;wc.along=0;wc.speed=wFwd;wc.halfWidth=in.shape.halfWidth;wc.halfLength=in.shape.halfLength;wc.brake=f.brake;wc.want=f.want;
+                            wc.held=lane->held!=0;wc.stopDistance=lane->stopDistance;wc.lookEnd=std::max(0,wr.n-1);
+                            wc.bendCap=idx<int(sizeof g_railCorner/sizeof g_railCorner[0])&&g_railCorner[idx]>0&&g_railCorner[idx]<1e8?g_railCorner[idx]:0.0;
+                            const double blockCap=wr.blockAt>=0?std::sqrt(2.0*std::max(.5,f.brake)*std::max(0.0,wr.blockAt*wp.step-in.shape.halfLength-2.0)):1e9;
+                            const double cap=std::min(wg.speedCap,blockCap);
+                            const auto wso=scriptdrive::Speed(wc,pathAt,0.0,cap,wbl,wbn);
+                            const char* wwhy=std::strcmp(wso.why,"script_hazard_box")==0?(wr.blockAt>=0&&blockCap<=wg.speedCap?"well_block_point":"well_grip_cap"):wso.why;
+                            W.path=wpath;W.centre=wr.maxOffset<.05;W.speed=wso.speed;W.why=wwhy;W.at=in.now;W.maxOffset=wr.maxOffset;W.blockAt=wr.blockAt;
+                            // D3 (default: keep the backing-up families): no forward fit and standing, or off the road's surface, hands the car to the energy plan;
+                            // a forward fit on the road for 1 s hands it back. Never in Script mode (it waits).
+                            const bool standing=std::fabs(wFwd)<.3;
+                            const bool offRoad=wantHave[0]&&wantMeasured[0]&&std::fabs(carBase-wantZ[0])>1.0;
+                            if(wr.blockAt>=0&&standing){if(W.blockedStandSince<0)W.blockedStandSince=in.now;}else W.blockedStandSince=-1;
+                            if(offRoad){if(W.offRoadSince<0)W.offRoadSince=in.now;}else W.offRoadSince=-1;
+                            const bool fit=wr.blockAt<0&&!offRoad;if(fit){if(W.clearSince<0)W.clearSince=in.now;}else W.clearSince=-1;
+                            if(!scriptMode_&&!W.recovering&&((W.blockedStandSince>=0&&in.now-W.blockedStandSince>=planbranch::rules::notMovingAfter)||(W.offRoadSince>=0&&in.now-W.offRoadSince>=1.0))){
+                                W.recovering=true;W.recoverSince=in.now;
+                                logger::Write("OBS system=plan.well vehicle=%08X pilot=%d event=recover_start block_at=%d off_road=%d car_base=%.2f road=%.2f reason=%s",self,idx,wr.blockAt,int(offRoad),carBase,wantZ[0],
+                                    offRoad?"car_off_the_road_surface_energy_plan_takes_it":"no_forward_fit_standing_energy_plan_backs_up");}
+                            else if(W.recovering&&(scriptMode_||(W.clearSince>=0&&in.now-W.clearSince>=1.0)||in.now-W.recoverSince>=planbranch::rules::passGiveUp)){
+                                logger::Write("OBS system=plan.well vehicle=%08X pilot=%d event=recover_end seconds=%.1f reason=%s",self,idx,in.now-W.recoverSince,
+                                    scriptMode_?"script_mode_never_recovers":W.clearSince>=0?"forward_fit_on_the_road_for_1s":"recovery_gave_up_after_pass_give_up");
+                                W.recovering=false;}
+                            const double wUs=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-tW0).count();
+                            int nL=0,nR=0,nT=0;for(const auto& c:wsides){if(c.touching)++nT;if(c.need>.05)(c.side>0?nR:nL)++;}
+                            if(in.now-W.logAt>=2.0||in.now<W.logAt||W.loggedWhy!=wwhy||(W.loggedBlock>=0)!=(wr.blockAt>=0)||W.loggedRecover!=W.recovering){
+                                W.logAt=in.now;W.loggedWhy=wwhy;W.loggedBlock=wr.blockAt;W.loggedRecover=W.recovering;
+                                logger::Write("OBS system=plan.well vehicle=%08X pilot=%d event=plan mode=%s why=%s speed=%.1f want=%.1f actual=%.1f block_at=%d max_offset=%.2f y0=%.2f stations=%d pass_left=%d pass_right=%d touching=%d hazards=%d hard=%d soft=%d movers=%d floor_narrowed=%d grip_peak=%.2f speed_cap=%.1f length=%.1f solves=%d rounds=%d stop_in=%.1f recovering=%d us=%.0f pos=%.1f,%.1f reason=centre_line_well",
+                                    self,idx,scriptMode_?"script":"normal",wwhy,wso.speed,f.want,wFwd,wr.blockAt,wr.maxOffset,wp.y0,wr.n,nL,nR,nT,nHaz,nHard,nSoft,wbn,floorNarrowed,wg.peak,
+                                    wg.speedCap>1e8?-1.0:wg.speedCap,wg.w.length,wg.solves,wr.rounds,wso.stopIn,int(W.recovering),wUs,in.x,in.y);}
+                            if(wellDrive)ed1Submitted=true;  // the well drives this car: nothing goes to the energy plan
+                        }
+                        if(!wellDrive&&idx==0&&in.shape.steerLock>0&&in.shape.wheelbase>0){  // removal step 1: your car's energy plan, every gather (the old ED-1 check and writer are gone)
                             auto espec=planinput::Spec(f);espec.car={in.shape.steerLock,in.shape.wheelbase,in.shape.slopePoint,in.shape.initialSlope,in.shape.fullSteerSpeed};
                             FlightSpec(espec,idx,self);NoteFlightPlan(idx,f.want,nullptr);  // FC-1: the gear row; FG-1 reads the lane's wanted speed
                             const double eforward=in.vx*std::sin(in.heading)+in.vy*std::cos(in.heading);
@@ -6450,6 +6939,19 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     // Step 7 (one authority): the energy Plan's newest result for THIS car is the decision, every update (replan or not). Wheels:
                     // the AF-1 path follower; hover: the step-5 hover follower into the hover actuator's channels; mode: the Plan's. Not ready
                     // (no result, another car's, older than 500 ms, or none finite): stand, and say so. A spot test keeps its own pulse (D12).
+                    if(wellDrive){  // CW-1 step 3: the well's newest path and speed (made at the World gather, 4 Hz) drive this car
+                        g_energyOwnsAt[idx]=GetTickCount64();
+                        const auto& W=g_well[idx];const double wspd=std::hypot(in.vx,in.vy);
+                        if(W.vehicle==self&&W.at>=0&&in.now-W.at<.6&&in.now>=W.at&&W.path.count>=2){
+                            NoteFollowPath(idx,W.path,false,W.centre);
+                            g.adOut.mode=drive::Mode::Drive;g.adOut.reverse=false;g.adOut.phase=drive::Phase::Travel;g.adOut.boost=false;
+                            FollowSpeed(idx,W.speed<.1?0.0:W.speed,in.now,in.limits.brake,wspd,g.adOut.speed,g.adOut.brake);
+                            g.adOut.why=W.why;capBy="centre-line well";laneSpeed=g.adOut.speed;bearingBy="centre-line well (path follower)";
+                        } else {
+                            g.adOut.speed=0;g.adOut.brake=true;g.adOut.reverse=false;g.adOut.boost=false;g.adOut.why="well not ready";capBy="well not ready";laneSpeed=0;
+                        }
+                        if(idx<int(sizeof g_planSplit/sizeof g_planSplit[0]))g_planSplit[idx].at=0;
+                    } else
                     if(idx>=0&&idx<planenergy::kSlots){  // removal step 1: always (the spot test's pulse is the energy plan's own, D12)
                         g_energyOwnsAt[idx]=GetTickCount64();
                         const auto er=planenergy::Latest(idx);const ULONGLONG eage=er.at?GetTickCount64()-er.at:~0ull;
@@ -6513,6 +7015,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                 g_laneOwnership[idx].Change(trafficcoordinator::Owner::Hold,policy->identity);
                 g.adOut={};g.adOut.bearing=in.heading;g.adOut.mode=in.onWheels?drive::Mode::Drive:drive::Mode::Hover;
                 g.adOut.brake=true;g.adOut.phase=drive::Phase::Boxed;g.adOut.why=routeguidance::Refusal(idx);
+                if (g.adOut.why && std::strcmp(g.adOut.why, "expired_lane_command") == 0)
+                    archproof::State().violExpiredLane.fetch_add(1, std::memory_order_relaxed);
                 logger::Observe("traffic.boundary",self,0x10000ull,"event=refused operation=lane_command caller=coordinator reason=%s pilot=%d",g.adOut.why,idx);
             } else {
                 // Removal 2026-11-14: a car with no lane (a job, a summon, an escort, combat, your car's trip) is the energy plan's goal scene. The
@@ -6538,7 +7042,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
             std::snprintf(observation.reason,sizeof observation.reason,"%s",o.why?o.why:"");trafficinspect::Publish(self,observation);
 			logger::Observe("autopilot",self,unsigned(o.phase)|(std::uint64_t(o.mode)<<8)|(std::uint64_t(in.driverSeated)<<17)|(std::uint64_t(in.paused)<<18),
 				"pilot=%d phase=%s mode=%s driver_seated=%d paused=%d pos=%.2f,%.2f,%.2f goal=%.2f,%.2f,%.2f speed_asked=%.2f speed_actual=%.2f distance=%.2f owner=%s reason=%s",
-				idx,drive::Name(o.phase),drive::Name(o.mode),in.driverSeated,in.paused,pos.x,pos.y,pos.z,goal.x,goal.y,goal.z,o.speed,std::hypot(in.vx,in.vy),dist,driverOwner,o.why?o.why:"");
+				idx,drive::Name(o.phase),drive::Name(o.mode),in.driverSeated,in.paused,pos.x,pos.y,pos.z,goal.x,goal.y,std::isfinite(goal.z)?goal.z:pos.z,o.speed,std::hypot(in.vx,in.vy),dist,driverOwner,o.why?o.why:"");
 			logger::Observe("avoidance",self,std::uint64_t(groundOk)<<32,
 				"pilot=%d ground_known=%d ground_z=%.2f ceiling_room=%.2f contacts=%d neighbours=%d bearing=%.3f health_share=%.3f",
 				idx,groundOk,groundZ,ceilingRoom,in.contact,in.otherCount,o.bearing,vehiclehits::HealthShare(self));
@@ -7026,8 +7530,9 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 				}
 				// Only on known ground (2026-10-29 23:02 run: traffic placed on its lane with the ground below not yet known read
 				// "0.0 m above ground" (height from where its hover started), switched hover off and dropped ~150 m into the city).
-				const bool enterDrive = decided ? nativeWanted && groundOk && above < 2.5 : groundOk && g.cramped >= kCrampedOn;  // a hovering vehicle comes down first
-				if (!g.drive && occupied && enterDrive && std::fabs(v[2]) < 4.0) {  // not mid-fall  // not mid-fall or mid-climb (it may stand on a structure the ground rays miss); the rail: at once
+				const bool forceDriveOnly = idx >= 0 && idx < int(sizeof g_driveOnlyLane / sizeof g_driveOnlyLane[0]) && g_driveOnlyLane[idx];
+				const bool enterDrive = decided ? nativeWanted && (forceDriveOnly || (groundOk && above < 2.5)) : groundOk && g.cramped >= kCrampedOn;  // a hovering vehicle comes down first; drive-only never hovers
+				if (!g.drive && occupied && enterDrive && (forceDriveOnly || std::fabs(v[2]) < 4.0)) {  // not mid-fall or mid-climb; drive-only disengages hover at once
 					g.drive = true;
 					g.driveSince = tNow;
 					g.drvT = 0;
@@ -7090,7 +7595,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					}
 					const double spD = g.drvSp;
 					double steer = 0, accel = 0, brake = 0, pedalDemand = 0; bool fwdBoost = false, vert = false;  // pedalDemand: BO-1
-					double railVx = 0, railVy = 0, railYaw = 0;
+					double railVx = 0, railVy = 0, railYaw = 0, railAimOut = 0;
 					bool railActive = false, railTyres = false;
 					const double wheelFwd = v[0] * std::sin(heading) + v[1] * std::cos(heading);
 					const double tgt = std::min(top, kDriveTop);
@@ -7170,7 +7675,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                                         following = true; aim = follow.bearing;
                                         laneYaw = follow.yawRate;
                                         const auto yawAt = g_yawAt[idx].load(std::memory_order_acquire);
-                                        if (fp.laneCentre && tyreMode && !o.reverse && fwd > .1 &&
+                                        if (tyreMode && !o.reverse && fwd > .1 &&
                                             yawAt && yawAt <= tNow && tNow - yawAt <= 250 &&
                                             g_yawInstance[idx].load(std::memory_order_relaxed) == g_sh.instance.load(std::memory_order_relaxed)) {
                                             // The physics spin convention is positive left; the follower is positive right.
@@ -7191,21 +7696,22 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 								// stops overshooting and swinging back (the +-4 m/s sideways flips at corners).
 								const double yawTarget = -std::clamp(following ? laneYaw : 2.5 * eRail, -maxYaw, maxYaw);  // heading + = right; world spin + = left (AF-1: the follower's rate)
 								g_railYawCmd[idx] += (yawTarget - g_railYawCmd[idx]) * 0.3;
-								railYaw = g_railYawCmd[idx]; railActive = true;
+								railYaw = g_railYawCmd[idx]; railAimOut = aim; railActive = true;
 								// TY-2 (user: "use rail for backward it's fine"): backing up stays on the rail's velocity writes (the plan's reverse speed).
 								// TY-3: with railTyresReverse on, backing up is on the tyres too (one signed pedal); off, it stays on the rail (TY-2).
 								{ const bool tyOn = tyreMode, ty = tyOn && (!o.reverse || RailTyresReverseOn());
 								  if (ty != g_sh.railTyres) logger::Observe("traffic.tyres", 0, 0x500ull + idx, "event=%s pilot=%d speed=%.1f reason=%s", ty ? "tyres_on" : "tyres_off", idx, fwd, ty ? (o.reverse ? "reverse_on_tyres" : "forward") : (tyOn ? "reverse_on_rail" : "switch_off"));
 								  railTyres = ty; }
-								if (tNow - g_railRoadNAt[idx] < 300) { for (int k = 0; k < 3; ++k) g_sh.railRoad[k] = g_railRoadN[idx][k]; g_sh.railRoadAt = g_railRoadNAt[idx]; }
+								if (tNow - g_railRoadNAt[idx] < 1000) { for (int k = 0; k < 3; ++k) g_sh.railRoad[k] = g_railRoadN[idx][k]; g_sh.railRoadAt = g_railRoadNAt[idx]; }
+								if (tNow - g_railFloorZAt[idx] < 1000) { g_sh.railFloorZ = g_railFloorZ[idx]; g_sh.railFloorAt = g_railFloorZAt[idx]; }
 								g_sh.railAir = idx == 0 && keysOn && bindings::Held(bindings::Action::VerticalBoost, VK_SPACE);
 								g_sh.px = float(pos.x); g_sh.py = float(pos.y); g_sh.pz = float(pos.z);
 							}
-							else if (was) { g_sh.railOn = false; g_sh.railTyres = false; g_sh.railCommand = -1; g_sh.railMotion.store(0); }
+							else if (was) { g_sh.railOn = false; g_sh.railTyres = false; g_sh.railWall.valid = false; g_sh.railCommand = -1; g_sh.railMotion.store(0); }
 							if (rail != was) logger::Observe("traffic.rail", 0, 0x400ull + idx, "event=%s pilot=%d speed=%.1f steps=%u faults=%u", rail ? "on" : "off", idx, fwd, g_sh.railSteps, g_sh.railFaults);
 							// Probes: what the wheel stage decided, and whether the rail's physics step is running at all.
 							static ULONGLONG wheelProbeAt[kPilots] = {};
-							if (rail && tNow - wheelProbeAt[idx] >= 500) {
+							if (rail && tNow - wheelProbeAt[idx] >= 3000) {
 								wheelProbeAt[idx] = tNow;
 								logger::Write("OBS system=drive.wheel pilot=%d selected_speed=%.2f rail_target=%.2f fwd=%.2f reverse=%d jump=%d accel_before_rail=%.2f brake_before_rail=%.2f aim_err=%.1f aim_jump=%.2f yaw_cmd=%.2f",
 									idx, o.speed, std::hypot(railVx, railVy), fwd, int(o.reverse), int(g_sh.railAir), accel, brake,
@@ -7262,10 +7768,13 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 								// WK-1: and the game's own body wake (the throttle alone left the body asleep 24 s), at most every 250 ms.
 								static ULONGLONG bodyWakeAt[kPilots] = {}, bodyWakeLog[kPilots] = {};
 								if (tNow - bodyWakeAt[idx] >= 250) { bodyWakeAt[idx] = tNow;
-									const int before = WakeBody(g_sh.instance.load(std::memory_order_relaxed));
+									const auto inst = g_sh.instance.load(std::memory_order_relaxed);
+									int before = -1; bool queued = false;
+									if (routesurvey::OnMainThread()) before = WakeBody(inst);
+									else if (inst) { g_wakeQueue[idx].store(inst, std::memory_order_relaxed); queued = true; }
 									if (tNow - bodyWakeLog[idx] >= 1000) { bodyWakeLog[idx] = tNow;
 										logger::Write("OBS system=traffic.rail pilot=%d event=wake_body state_before=%d step_age_ms=%llu reason=%s", idx, before, (unsigned long long)(tNow - g_sh.lastStepAt),
-											before < 0 ? "not_done_no_valid_body_or_not_main_thread" : before == 1 ? "already_active_so_not_asleep" : "activated_as_the_component_update_does"); } }
+											queued ? "queued_for_main_thread" : before < 0 ? "not_done_no_valid_body_or_not_main_thread" : before == 1 ? "already_active_so_not_asleep" : "activated_as_the_component_update_does"); } }
 							}
 							// Jump: the game's own vertical boost, your jump key during Cruise (Cruise keeps going).
 							const bool jumpKey = idx == 0 && keysOn && bindings::Held(bindings::Action::VerticalBoost, VK_SPACE);
@@ -7294,8 +7803,15 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 					if (railActive) {
 						std::lock_guard lk(g_sh.lock);
 						g_sh.railVx = float(railVx); g_sh.railVy = float(railVy); g_sh.railYaw = float(railYaw);
+						g_sh.railAim = float(railAimOut); g_sh.railMaxYaw = float(std::min(1.6, 0.4 + std::fabs(wheelFwd) / 4.0));
+						g_sh.railAimValid = std::isfinite(railAimOut);
+						if (idx >= 0 && idx < int(sizeof g_railWall / sizeof g_railWall[0]) && tNow - g_railWallAt[idx] < 1500) {
+							g_sh.railWall = g_railWall[idx];
+						} else {
+							g_sh.railWall.valid = false;
+						}
 						g_sh.railTyres = railTyres;
-						g_sh.railUntil = tNow + 250; g_sh.railOn = true;
+						g_sh.railUntil = tNow + 800; g_sh.railOn = true;
 					}
 					const bool driveBoost = fwdBoost || (vert && accel > 0.4);
 					if (!manual && idx >= 0 && idx < kPilots) { g_pedalDemand[idx].store(float(pedalDemand), std::memory_order_relaxed); g_pedalAt[idx].store(tNow, std::memory_order_relaxed); }  // BO-1
@@ -8737,6 +9253,8 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     }
                     if (binding.handoffStepInstance == instance && binding.handoffStepBody == body)
                         driveStep = binding.handoffStepAt;
+                    if (binding.lastStepInstance == instance && binding.lastStepAt > driveStep)
+                        driveStep = binding.lastStepAt;
                 }
                 const bool playerTook = PlayerDriving(id);
                 const auto currentDriver = ref && !playerTook ? npcvehicles::VehicleDriverId(id) : 0;
@@ -8790,69 +9308,80 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     }
                     car.mode = playerTook || (currentDriver && currentDriver != driver) ? fleetrail::Mode::Awaiting :
                         chassisReady ? fleetrail::Mode::Auto : movedVirtually ? fleetrail::Mode::Rail : fleetrail::Mode::Awaiting;
-                } else if (playerTook || (currentDriver && currentDriver != driver)) {
+                } else if (playerTook || (currentDriver && currentDriver != driver) || vehiclediag::BirthHeld(id) || HasPendingFarDispatch(id)) {
+                    if (vehiclediag::BirthHeld(id)) archproof::State().railBlockedBirthHold.fetch_add(1, std::memory_order_relaxed);
                     car.railOwner = false;
                     car.mode = fleetrail::Mode::Awaiting;
-                } else if (ref && hereKnown && !(here.cellAttached && !here.crossCell) && !railFresh && !driveFresh) {
-                    // Outside the attached cells the engine has dropped the body: move the reference along the path instead.
-                    if (car.mode != fleetrail::Mode::Reference) {
-                        if (!car.railOwner || !car.seeded) {
-                            car.station = station;
-                            car.position = position;
-                            car.seeded = true;
-                        }
-                        if (!(car.railSpeed > 0.0)) car.railSpeed = car.speed;
-                        car.refStepAt = now;
-                        car.blendReady = false;
-                        logger::Write("OBS system=traffic.fleet_rail event=reference_start vehicle=%08X driver=%08X station=%.1f speed=%.1f pos=%.1f,%.1f,%.1f",
-                            id, driver, car.station, car.railSpeed, car.position.x, car.position.y, car.position.z);
-                    }
-                    car.railOwner = true;
-                    car.mode = fleetrail::Mode::Reference;
-                    if (now - car.refStepAt >= fleetrail::rules::kReferenceStepMs) {
-                        const double dt = std::min(1.0, double(now - car.refStepAt) / 1000.0);
-                        const double want = std::min(car.speed, car.path.CornerSpeed(car.station));
-                        const double v = fleetrail::Approach(car.railSpeed, want, dt);
-                        const double s = car.path.Advance(car.station, v * dt);
-                        const auto target = car.path.At(s);
-                        if (loadedarea::StepReference(id, driver, float(target.x), float(target.y), float(target.z))) {
-                            car.station = s;
-                            car.railSpeed = v;
-                            car.position = target;
-                            car.refStepAt = now;
-                            if (++car.refSteps % 20 == 1)
-                                logger::Write("OBS system=traffic.fleet_rail event=reference_step vehicle=%08X steps=%u station=%.1f of %.1f speed=%.1f pos=%.1f,%.1f,%.1f",
-                                    id, car.refSteps, s, car.path.End(), v, target.x, target.y, target.z);
-                        }
-                    }
-                } else if (!hereKnown || !nextKnown) {
-                    if (!car.railOwner || !chassisReady) car.mode = fleetrail::Mode::Awaiting;
                 } else {
-                    const auto prior = car.railOwner ? fleetrail::Mode::Rail : car.mode;
-                    fleetrail::Facts facts;
-                    facts.attachedNow = here.cellAttached && !here.crossCell;
-                    facts.exitAheadAttached = next.cellAttached;
-                    facts.enterAheadAttached = furtherKnown && further.cellAttached;
-                    facts.chassisReady = chassisReady;
-                    facts.autopilotReady = autopilotReady;
-                    car.mode = fleetrail::Choose(prior == fleetrail::Mode::Reference ? fleetrail::Mode::Rail : prior, facts,
-                        car.modeSince && now >= car.modeSince ? now - car.modeSince : ~0ull);
-                    if (car.mode == fleetrail::Mode::Auto) {
+                    // Authoritative SimTier from once-per-frame FrameContext (semantic loadedColliderMetres <= 160 m).
+                    const auto* ctxEntry = simtier::Context().Find(id);
+                    const double farRadius = double(game::ClampLoadedColliderMetres(float(managerRadius)));
+                    const double d = ctxEntry ? ctxEntry->distM
+                        : (managerHavePlayer && ref ? std::hypot(double(position.x) - managerPlayer.x, double(position.y) - managerPlayer.y) : 0.0);
+                    const simtier::Tier tier = ctxEntry ? ctxEntry->tier
+                        : simtier::Decide(car.railOwner ? simtier::Tier::FarRail : simtier::Tier::NearPhysical, d, ref != 0, farRadius, kManagerBandM);
+                    const bool beyondPhysics = tier == simtier::Tier::FarRail;
+                    const bool insidePhysics = tier == simtier::Tier::NearPhysical && (!car.railOwner || d < farRadius - kManagerBandM);
+                    if (insidePhysics) {
                         if (car.railOwner) {
                             NoteFleetHandoff(id, car.railSpeed, now);
-                            logger::Write("OBS system=traffic.fleet_rail event=exit_ramp vehicle=%08X rail_speed=%.1f ramp_ms=%llu",
-                                id, car.railSpeed, fleetrail::rules::kRampMs);
+                            logger::Write("OBS system=traffic.fleet_rail event=exit_ramp vehicle=%08X rail_speed=%.1f ramp_ms=%llu distance=%.0f",
+                                id, car.railSpeed, fleetrail::rules::kRampMs, d);
                         }
                         car.railOwner = false;
                         car.seeded = false;
-                    } else if (car.mode == fleetrail::Mode::Rail) {
-                        if (!car.railOwner || !car.seeded) {
-                            car.station = station;
-                            car.position = position;
-                            car.seeded = true;
-                            car.blendReady = false;  // the next rail step starts the entry blend from the car's actual pose
+                        car.position = position;
+                        car.station = station;
+                        car.mode = chassisReady ? fleetrail::Mode::Auto : fleetrail::Mode::Awaiting;
+                    } else if (beyondPhysics || car.railOwner) {
+                        if (chassisReady && car.path.End() > 1.0) {
+                            if (!car.railOwner || !car.seeded) {
+                                car.station = station;
+                                car.position = position;
+                                car.seeded = true;
+                                car.blendReady = false;
+                                logger::Write("OBS system=traffic.fleet_rail event=rail_enter vehicle=%08X driver=%08X distance=%.0f far_radius=%.0f station=%.1f speed=%.1f",
+                                    id, driver, d, farRadius, car.station, car.speed);
+                            }
+                            car.railOwner = true;
+                            car.mode = fleetrail::Mode::Rail;
+                            // Keep far-gliding chassis level and aligned with its lane tangent on the main thread.
+                            if (ref) {
+                                const auto pNow = car.path.At(car.station);
+                                const auto pNext = car.path.At(car.path.Advance(car.station, 2.0));
+                                const double tdx = pNext.x - pNow.x, tdy = pNext.y - pNow.y;
+                                if (std::hypot(tdx, tdy) > 0.1) FarLevelYaw(ref, std::atan2(tdx, tdy));
+                            }
+                        } else if (ref && !FarHas3D(ref) && !railFresh && !driveFresh && car.path.End() > 1.0 &&
+                                   hereKnown && !(here.cellAttached && !here.crossCell) &&
+                                   (car.mode == fleetrail::Mode::Reference || (car.mode == fleetrail::Mode::Awaiting && car.modeSince && now - car.modeSince >= 5000))) {
+                            if (car.mode != fleetrail::Mode::Reference) {
+                                if (!car.railOwner || !car.seeded) { car.station = station; car.position = position; car.seeded = true; }
+                                if (!(car.railSpeed > 0.0)) car.railSpeed = car.speed;
+                                car.refStepAt = now; car.blendReady = false;
+                            }
+                            car.railOwner = true;
+                            car.mode = fleetrail::Mode::Reference;
+                            if (now - car.refStepAt >= fleetrail::rules::kReferenceStepMs) {
+                                const double dt = std::min(1.0, double(now - car.refStepAt) / 1000.0);
+                                const double want = std::min(car.speed, car.path.CornerSpeed(car.station));
+                                const double v = fleetrail::Approach(car.railSpeed, want, dt);
+                                const double s = car.path.Advance(car.station, v * dt);
+                                const auto target = car.path.At(s);
+                                if (loadedarea::StepReference(id, driver, float(target.x), float(target.y), float(target.z))) {
+                                    car.station = s; car.railSpeed = v; car.position = target; car.refStepAt = now;
+                                }
+                            }
+                        } else {
+                            if (!(car.path.End() > 1.0)) archproof::State().railBlockedNoPath.fetch_add(1, std::memory_order_relaxed);
+                            else if (!chassisReady) archproof::State().railBlockedNoChassis.fetch_add(1, std::memory_order_relaxed);
+                            car.railOwner = false;
+                            car.mode = fleetrail::Mode::Awaiting;
                         }
-                        car.railOwner = true;
+                    } else {
+                        // In the hysteresis band (farRadius - 20 .. farRadius) while in Auto: stay Auto.
+                        car.railOwner = false;
+                        car.mode = chassisReady ? fleetrail::Mode::Auto : fleetrail::Mode::Awaiting;
                     }
                 }
                 if (car.railOwner && currentDriver == driver && instance && body) {
@@ -8868,6 +9397,38 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
                     logger::Write("OBS system=traffic.fleet_rail event=mode vehicle=%08X driver=%08X mode=%d current_attached=%d ahead_attached=%d chassis_ready=%d",
                         id, driver, int(car.mode), hereKnown && here.cellAttached, nextKnown && next.cellAttached, chassisReady);
             }
+#ifndef FVO_RELEASE
+            static std::uint64_t lastSummary = 0;
+            if (now - lastSummary >= 10000) {
+                lastSummary = now;
+                int nAuto = 0, nRail = 0, nAwait = 0, nRef = 0;
+                {
+                    std::lock_guard lk(g_fleetRailLock);
+                    for (const auto& [vid, c] : g_fleetRails) {
+                        if (c.mode == fleetrail::Mode::Auto) ++nAuto;
+                        else if (c.mode == fleetrail::Mode::Rail) ++nRail;
+                        else if (c.mode == fleetrail::Mode::Reference) ++nRef;
+                        else ++nAwait;
+                    }
+                }
+                int activePilots = 0, moving = 0, askingStalled = 0, holding = 0;
+                for (int slot = 1; slot < kPilots; ++slot) {
+                    if (!g_gs[slot].active) continue;
+                    const auto vid = g_jobs[slot].vehicleId;
+                    if (FleetRailOwns(vid)) continue;
+                    ++activePilots;
+                    const auto& rv = g_shs[slot].v;
+                    const double spd = std::hypot(double(rv[0]), double(rv[1]));
+                    const auto& ao = g_gs[slot].adOut;
+                    if (spd >= 0.5) ++moving;
+                    else if (ao.speed >= 0.5 && !ao.brake) ++askingStalled;
+                    else ++holding;
+                }
+                logger::Write("OBS system=traffic.fleet_summary rail=%d auto=%d awaiting=%d ref=%d near_pilots=%d moving=%d asking_stalled=%d holding=%d",
+                    nRail, nAuto, nAwait, nRef, activePilots, moving, askingStalled, holding);
+                archproof::State().railActive.store(std::uint32_t(nRail + nRef), std::memory_order_relaxed);
+            }
+#endif
         }
 
 		// Descend before the drop. A stop for an autopilot-flown vehicle (every NPC pilot; the player's own vehicle while Auto, follow
@@ -8961,26 +9522,41 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			else { yawRate = 0; camAt = 0; }
 			const double lead = std::clamp(yawRate * kViewLeadS, -kViewLeadMax, kViewLeadMax);
 			const auto ppos = player ? At<game::Vec3>(player, off::kRefPosition) : game::Vec3{};
+			int order[kPilots], nActive = 0;
 			{
 				const auto pp = player ? At<game::Vec3>(player, off::kRefPosition) : game::Vec3{};
-				int order[kPilots], n = 0;
 				for (int idx = 1; idx < kPilots; ++idx) {
 					dist[idx] = 1e18;
-					if (!g_gs[idx].active) continue;
-					const auto v = g_shs[idx].vehicle.load();
-					if (v) { const auto vp = At<game::Vec3>(v, off::kRefPosition); dist[idx] = std::hypot(double(vp.x) - pp.x, double(vp.y) - pp.y); }
-					order[n++] = idx;
+					if (!g_gs[idx].active) { flownAt[idx] = unboundSince[idx] = seenAt[idx] = dangerAt[idx] = 0; g_straight[idx] = g_farHold[idx] = wasRelaxed[idx] = false; continue; }
+					if (const auto* ce = simtier::Context().Find(g_jobs[idx].vehicleId)) {
+						dist[idx] = ce->distM;
+					} else if (const auto v = g_shs[idx].vehicle.load()) {
+						const auto vp = At<game::Vec3>(v, off::kRefPosition);
+						dist[idx] = std::hypot(double(vp.x) - pp.x, double(vp.y) - pp.y);
+					}
+					order[nActive++] = idx;
 				}
-				std::sort(order, order + n, [&](int a, int b) { return dist[a] < dist[b]; });
-				for (int k = 0; k < n; ++k) {
+				std::sort(order, order + nActive, [&](int a, int b) { return dist[a] < dist[b]; });
+				for (int k = 0; k < nActive; ++k) {
 					const int idx = order[k];
 					const double d = dist[idx];
-					tierEvery[idx] = (k < kNearPilots && d < kNearM) ? 50 : d < kMidM ? 100 : 200;
+					tierEvery[idx] = (k < kNearPilots && d < kNearM) ? 50 : d < kMidM ? 120 : d < 350.0 ? 250 : 400;
 					g_ageScale[idx] = unsigned(tierEvery[idx] / 50);
 				}
 			}
-			for (int idx = 1; idx < kPilots; ++idx) {
-				if (!g_gs[idx].active) { flownAt[idx] = unboundSince[idx] = seenAt[idx] = dangerAt[idx] = 0; g_straight[idx] = g_farHold[idx] = wasRelaxed[idx] = false; continue; }
+			// Process the nearest kNearPilots first so cars right beside the player never wait behind distant ones,
+			// then round-robin the remaining active pilots within the 4 ms frame budget.
+			static int rrPilot = 0;
+			const int nearCount = std::min(nActive, kNearPilots);
+			const int farCount = nActive - nearCount;
+			LARGE_INTEGER ptFreq{}, ptStart{}, ptNow{};
+			QueryPerformanceFrequency(&ptFreq);
+			QueryPerformanceCounter(&ptStart);
+			constexpr double kPilotsBudgetMs = 2.5;
+			int pilotsRunThisFrame = 0;
+			for (int step = 0; step < nActive; ++step) {
+				const int idx = step < nearCount ? order[step] : order[nearCount + ((rrPilot + (step - nearCount)) % farCount)];
+				if (!g_gs[idx].active) continue;
 				const auto id = g_jobs[idx].vehicleId;
                 if (FleetRailOwns(id)) { flownAt[idx] = 0; continue; }
 #ifndef FVO_RELEASE
@@ -9047,7 +9623,16 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 						continue;
 					}
 					if (flownAt[idx] && now - flownAt[idx] < every) continue;
+					if (pilotsRunThisFrame >= 2) {
+						QueryPerformanceCounter(&ptNow);
+						if (1000.0 * double(ptNow.QuadPart - ptStart.QuadPart) / double(ptFreq.QuadPart) >= kPilotsBudgetMs) {
+							++framebudget::Main().pilotsCapped;
+							if (step >= nearCount && farCount > 0) rrPilot = (rrPilot + (step - nearCount)) % farCount;
+							break;
+						}
+					}
 					flownAt[idx] = now;
+					++pilotsRunThisFrame;
 					if (unbound) ++slowed; else { ++flown; ++tierCount[every <= 50 ? 0 : every <= 100 ? 1 : 2];
 						++costparts::g_pass[every <= 50 ? 0 : every <= 100 ? 1 : 2]; if (nearOut) ++costparts::g_passNearOut; if (relaxed) ++costparts::g_passFarOut; }
 					if (g_farHold[idx]) ++held; else if (relaxed) ++outOfView;
@@ -9403,7 +9988,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			return triplogic::Reached(std::hypot(x-pos.x,y-pos.y),stop,pos.z-expected,requireStopped?speed:0,
 				shared.matched && state.haveGround && GetTickCount64()-state.groundAt<=500);
 		}
-        static thread_local world::Snapshot snap;if(world::Vehicles(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].ref==vehicle) {
+        static thread_local world::Snapshot snap;if(world::VehiclesAndHeld(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].ref==vehicle) {
             const auto& v=snap.v[k];const double speed=std::hypot(std::hypot(v.vel[0],v.vel[1]),v.vel[2]);
             const auto site=environment::BoardingSite(vehicle);
             bool landing=false;
@@ -9699,13 +10284,13 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         return false;
     }
     double CruiseLimit(std::uint32_t id) {
-        static thread_local world::Snapshot snap; if(world::Vehicles(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].formId==id) {
+        static thread_local world::Snapshot snap; if(world::VehiclesAndHeld(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].formId==id) {
             const auto&v=snap.v[k];return kAiGearTop[4]*hulllogic::For(v.half[0],v.half[1],v.half[2]).acceleration;
         }
         return kAiGearTop[2];
     }
     double TurnLimit(std::uint32_t id) {
-        static thread_local world::Snapshot snap;if(world::Vehicles(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].formId==id) {
+        static thread_local world::Snapshot snap;if(world::VehiclesAndHeld(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].formId==id) {
             const auto&v=snap.v[k];const double speed=std::hypot(v.vel[0],v.vel[1]);
             // A pilot flying it physically turns within the chassis' real grip (hulllogic::Physical), so the combat AI's turn
             // radius plans for its momentum too.
@@ -9818,8 +10403,13 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 
 	void Tick()
 	{
+        if (routesurvey::OnMainThread()) {
+            for (int i = 0; i < kPilots; ++i) {
+                if (const auto inst = g_wakeQueue[i].exchange(0, std::memory_order_relaxed)) WakeBody(inst);
+            }
+        }
         ReportStepCost();
-		{costparts::Scope c(costparts::FlightSnapshot);g_vsnapOk = world::Vehicles(g_vsnap);}
+		{costparts::Scope c(costparts::FlightSnapshot);g_vsnapOk = world::VehiclesAndHeld(g_vsnap);}
 		{costparts::Scope c(costparts::FlightEnv);EnvTick();}
 		{costparts::Scope c(costparts::FlightPlayer);
 			if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
@@ -9829,6 +10419,21 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
 			PlayerTick();
             using fleetownershipstore::Control;
             const auto driven = g_manualDriverId.load() ? g_driverVehicle.load() : 0;
+            if (driven) {
+                const auto drivenId = At<std::uint32_t>(driven, off::kFormId);
+                if (drivenId) {
+                    if (vehiclediag::BirthHeld(drivenId)) {
+                        vehiclelifecycle::OnPlayerEnteredVehicle(drivenId, false);
+                    } else {
+                        static ULONGLONG lastDynAt = 0;
+                        const ULONGLONG nowDyn = GetTickCount64();
+                        if (nowDyn - lastDynAt >= 250) {
+                            lastDynAt = nowDyn;
+                            vehiclelifecycle::OnPlayerEnteredVehicle(drivenId, true);
+                        }
+                    }
+                }
+            }
             // The player's own Auto or Cruise only (not a guard or summon flight without the player).
             const auto flown = g_gs[0].active && g_gs[0].autopilot && g_gs[0].playerAuto ? g_hoverVehicle.load() : 0;
             const auto rover = RefById(g_roverId);
@@ -9848,6 +10453,58 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         }
         {costparts::Scope c(costparts::FlightRails);RefreshFleetRails();}
 		{costparts::Scope c(costparts::FlightPilots);PilotsTick();}
+		// Unified vehicle management + Core Fall Guard (2026-11-23):
+		// Every loaded vehicle in the world is registered in g_owners (no unmanaged vehicles fall through the cracks).
+		// Any vehicle with no active pilot and no player in the seat that enters an uncontrolled fall is frozen in place.
+		if (g_vsnapOk) {
+			const double nowSec = double(GetTickCount64()) / 1000.0;
+			const std::uint32_t roverId = g_roverId;
+			const bool playerAutoActive = g_gs[0].active && g_gs[0].autopilot;
+			for (std::uint32_t vi = 0; vi < g_vsnap.count && vi < world::kMaxVehicles; ++vi) {
+				const auto& v = g_vsnap.v[vi];
+				if (!v.formId || !std::isfinite(v.pos[0]) || !std::isfinite(v.pos[1]) || !std::isfinite(v.pos[2])) continue;
+				const bool playerManualSeat = (v.who == world::VehicleInfo::Who::Player) && !playerAutoActive;
+				bool hasActivePilot = false;
+				planowner::Owner curOwner = planowner::Owner::None;
+				{
+					std::lock_guard<std::mutex> ownersGuard(g_ownersLock);
+					if (playerManualSeat) {
+						g_owners.Claim(v.formId, planowner::Owner::Player, trafficrank::Rank::Player, -1, nowSec, "player_manual");
+					} else if (!g_owners.Of(v.formId, nowSec)) {
+						g_owners.Claim(v.formId, planowner::Owner::Parked, trafficrank::Rank::Parked, -1, nowSec,
+							v.formId == roverId ? "player_rover_parked" : "world_managed_parked");
+					}
+					if (auto* rec = g_owners.Find(v.formId)) {
+						curOwner = rec->owner;
+						if (rec->owner == planowner::Owner::Parked || rec->owner == planowner::Owner::Player) {
+							rec->x = v.pos[0]; rec->y = v.pos[1]; rec->z = v.pos[2];
+							rec->speed = std::hypot(v.vel[0], v.vel[1]); rec->placedAt = nowSec;
+						}
+						if (rec->pilot >= 0 && rec->pilot < kPilots && PilotActive(rec->pilot)) hasActivePilot = true;
+					}
+				}
+				const float vz = v.vel[2];
+				const float hSpeed = std::hypot(v.vel[0], v.vel[1]);
+				// Only freeze true below-world void falls — never an above-ground drop (which would leave the car
+				// permanently frozen in mid-air via StageBirth) and never a car driving downhill on a steep ramp.
+				const bool deepVoidFall = std::isfinite(vz) && v.pos[2] < -220.0f && vz < -12.0f;
+				if (playerManualSeat || (hasActivePilot && !deepVoidFall) || vehiclediag::BirthHeld(v.formId)) continue;
+				bool falling = std::isfinite(vz) && (deepVoidFall || (v.pos[2] < -220.0f && vz < -6.0f));
+				if (!falling && std::isfinite(vz) && std::isfinite(hSpeed) && vz < -6.0f && hSpeed < 5.0f) {
+					double floorZ = 0.0;
+					const auto nav = navmap::At(v.pos[0], v.pos[1], double(v.pos[2]) + 2.0);
+					const bool haveFloor = (nav.haveGround && std::isfinite(nav.ground) && (floorZ = nav.ground, true)) ||
+						(cellbake::Ground(v.pos[0], v.pos[1], floorZ) && std::isfinite(floorZ));
+					if (haveFloor && double(v.pos[2]) < floorZ - 12.0) falling = true;
+				}
+				if (falling) {
+					vehiclediag::StageBirth(v.formId);
+					archproof::State().violFallguard.fetch_add(1, std::memory_order_relaxed);
+					logger::Write("OBS system=vehicle.fallguard vehicle=%08X event=frozen owner=%s pos=%.2f,%.2f,%.2f vz=%.2f",
+						v.formId, planowner::Name(curOwner), v.pos[0], v.pos[1], v.pos[2], vz);
+				}
+			}
+		}
 		{costparts::Scope c(costparts::FlightBind);
 			for(auto&s:g_shs){std::lock_guard lk(s.lock);if(const auto ref=s.vehicle.load())BindBody(s,ref);}
 			if (const auto player = Ptr(addr::kPlayerCharacterPtr)) {
@@ -9906,8 +10563,22 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         return it->second.mode == fleetrail::Mode::Reference ? int(fleetrail::Mode::Rail) : int(it->second.mode);
     }
 
+	void ArmFarDispatch(std::uint32_t vehicleId, std::uint32_t driverId, double x, double y, double z)
+	{
+		fardisp::Arm(vehicleId, driverId, x, y, z);
+	}
+	bool HasPendingFarDispatch(std::uint32_t vehicleId)
+	{
+		return fardisp::HasPending(vehicleId);
+	}
+	bool FleetRailActive(std::uint32_t vehicleId)
+	{
+		return FleetRailOwns(vehicleId);
+	}
+
 	void LoadReset()
 	{
+        fardisp::Clear();
         FleetRailRelease(0);
         { std::lock_guard lock(g_floorProofLock); g_floorProofs = {}; g_nextFloorProof = 0; }
         (void)planenergy::TakeFloorProbe();
@@ -9922,7 +10593,7 @@ goaldoor::Door<1 + prefetch::kSlotPilotCount> g_door;  // step 4: one way in for
         for(auto& f:g_stockFloat)f={};for(auto& i:g_stockPulseIssued)i={};
 #endif
         }for(auto& sp:g_spot)sp=spottest::State{};for(auto& v:g_spotVehicle)v=0;  // ST-B: ids are reused across saves
-        for(int i=0;i<kPilots;++i)g_door.Clear(i);g_contacts.Reset();for(auto& f:g_planFlies)f=false;  // nothing carried into the next save
+        for(int i=0;i<kPilots;++i){g_door.Clear(i);g_wakeQueue[i].store(0,std::memory_order_relaxed);}g_contacts.Reset();for(auto& f:g_planFlies)f=false;for(auto& f:g_driveOnlyLane)f=false;  // nothing carried into the next save
         for(auto& t:g_navWantAt)t=0;
 		for (auto& s : g_shs) { s.physOn.store(false); PhysicalRelease(s); }
 		vehiclecamera::Reset();

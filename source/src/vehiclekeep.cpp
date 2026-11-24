@@ -238,11 +238,11 @@ namespace vehiclekeep
 			WriteJournal();
 		}
 
-		unsigned g_birthMax = 40;
+		unsigned g_birthMax = 96;
 		void ReadSettings()
 		{
 			// Fixed (2026-11-05 settings strip; was settings.ini [view] keepInSight / keepCone / keepMax / holdFromBirth).
-			g_enabled = true; g_coneDeg = 60.0f; g_max = 16; g_birthMax = 40;
+			g_enabled = true; g_coneDeg = 60.0f; g_max = 24; g_birthMax = 96;
 			logger::Write("Keep in sight: on, view cone 60 deg, at most 16 vehicles; held from birth 40");
 		}
 
@@ -354,9 +354,11 @@ namespace vehiclekeep
 				// Wanted (traffic from birth) but not held: the reason is traced once per change (keep.skip), never silent.
 				const char* skip = !(inSight || busy) ? nullptr : dPlayer < edge ? nullptr : id == own ? nullptr
 					: !SameWorld(v, pv.world) ? "other_world" : g_native.count(id) ? "native_full_lod" : !trafficpair::MayHold(busy,decorative,g_max) ? "budget"
+					: vehicleflight::CensusBroken(id) ? "pair_broken"
 					: !trafficpair::MayHoldFar(trafficpair::PairHealth(trafficpool::PairHealth(id))) ? "pair_health" : nullptr;
 				if (wanted && skip) TraceSkip(id, v, pv.world, skip, dPlayer, trafficpool::PairHealth(id));
 				if (!(inSight || busy) || dPlayer < edge || id == own || !SameWorld(v, pv.world) || g_native.count(id) || !trafficpair::MayHold(busy,decorative,g_max)) continue;
+				if (vehicleflight::CensusBroken(id)) continue;  // matches release gate (line 342): never re-hold a broken pair
 				if (!trafficpair::MayHoldFar(trafficpair::PairHealth(trafficpool::PairHealth(id)))) continue;  // the pair health record: no far pass until it is seated
 				if (v.world != pv.world) TraceWorld(id, v, pv.world, "hold_in_persistent_cell");
 				if (v.flags & kFullLodFlag) { g_native[id] = true; continue; }  // its plugin made it Full LOD: not ours
@@ -420,6 +422,28 @@ namespace vehiclekeep
 		if (!id || !g_birthMax) return;
 		std::lock_guard lock(g_wantedLock);
 		g_wanted.insert(id);
+	}
+	bool HoldFullLodNow(std::uint32_t id)
+	{
+		if (!id || !g_enabled || !g_birthMax) return false;
+		WantFromBirth(id);
+		if (g_held.count(id)) return true;
+		if (g_held.size() >= g_birthMax + g_max) return false;
+		const uptr ref = runtimeforms::LookupChecked(id);
+		RefView v;
+		if (!ref || !ReadRef(ref, v) || v.id != id) return false;
+		if (v.flags & kFullLodFlag) { g_native[id] = true; return true; }
+		if (!CallSetLod(ref, 1)) return false;
+		RefView after;
+		if (!ReadRef(ref, after) || !(after.flags & kFullLodFlag)) return false;
+		const ULONGLONG now = GetTickCount64();
+		Held h;
+		h.setLod = true;
+		h.setPersist = !(v.flags & kPersistentFlag) && (after.flags & kPersistentFlag);
+		h.since = h.seen = now;
+		g_held[id] = h;
+		WriteJournal();
+		return true;
 	}
 #ifndef FVO_RELEASE
 	bool ReadCameraPose(float origin[3], float forward[3]) { return CameraView(origin, forward); }

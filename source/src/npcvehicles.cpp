@@ -34,6 +34,7 @@
 #include "vcontract.h"
 #include "vehicleflight.h"
 #include "vehiclediag.h"
+#include "simtier.h"
 #include "vehiclekeep.h"
 #include "environment.h"
 #include "targetsession.h"
@@ -874,8 +875,18 @@ namespace npcvehicles
 		}
 		bool PlaceSeated(uptr actor, uptr vehicle, const trafficpair::SeatPose& pose)
 		{
+			const unsigned id=At<unsigned>(actor,off::kFormId),vid=At<unsigned>(vehicle,off::kFormId);
+			if (Dist3(actor, vehicle) > 100.0) {
+				// 2026-11-23: throttle far/origin-stranded driver seat-pose retries (was 28x/1.1 s on a (0,0,0) driver).
+				static std::mutex farLock;
+				static std::unordered_map<unsigned, ULONGLONG> farAt;
+				const ULONGLONG now = GetTickCount64();
+				std::lock_guard lk(farLock);
+				auto& at = farAt[id];
+				if (at && now - at < 1000) return false;
+				at = now;
+			}
 			if(!lifecycle::InService()) {
-				const unsigned id=At<unsigned>(actor,off::kFormId),vid=At<unsigned>(vehicle,off::kFormId);
 				return lifecycle::Post("seat-pose:"+std::to_string(id),id,[=]()->lifecycle::Work {
 					const auto a=lifecycle::Keep(actor,id),v=lifecycle::Keep(vehicle,vid);if(!a||!v)return {};
 					return [=]()->std::uint64_t {
@@ -983,11 +994,22 @@ namespace npcvehicles
             j.resumeFoe=0;
         }
         void LeaveFarCell(uptr actor);
+        bool VehicleHeld(uptr vehicle);
         void Set(Job& j, Phase p)
 		{
 			logger::Write("OBS system=npc.assignment vehicle=%08X driver=%08X pilot=%d event=transition from=%s to=%s task=%d passenger=%d cold_start=%d",j.vehicle,j.npc,j.pilot,Name(j.phase),Name(p),j.task,j.passenger,j.coldStart);
 			logger::Write("NPC vehicles: [%d] %s -> %s (NPC %08X, vehicle %08X)", j.pilot, Name(j.phase), Name(p), j.npc, j.vehicle);
-			if (p == Phase::Idle) { if(j.coldStart)pilotquest::Release(j.pilot-1);lifecycle::Cancel(j.npc);lifecycle::Cancel(j.vehicle);j.passMarked = false; LeaveFarCell(RefById(j.npc)); }
+			bool keepTrafficSeat = false;
+			if (p == Phase::Idle) {
+				const uptr npcRef = RefById(j.npc), vehRef = RefById(j.vehicle);
+				keepTrafficSeat = j.task == 9 && npcRef && vehRef && InVehicle(npcRef) == vehRef;
+				if (j.coldStart && !keepTrafficSeat) pilotquest::Release(j.pilot - 1);
+				lifecycle::Cancel(j.npc); lifecycle::Cancel(j.vehicle);
+				j.passMarked = false;
+				// Never pull a seated or far-held traffic driver out of the far cell: doing so unseats the actor
+				// into a detached visual mesh with no Havok collision at the vehicle's far-dispatched coordinates.
+				if (npcRef && !InVehicle(npcRef) && (!vehRef || !VehicleHeld(vehRef))) LeaveFarCell(npcRef);
+			}
 			if((p==Phase::Following||p==Phase::Idle)&&j.resumeFoe) ResumeCombat(j);
             vehicleflight::ClearPilotCommand(j.pilot);
             if (p != Phase::Boarding && j.combatReq) CombatBoardRelease(j.combatReq);
@@ -1027,7 +1049,7 @@ namespace npcvehicles
 			// A cold-start driver keeps the pilot quest package for its whole trip (2026-10-30 07:16 run: once drivers really sat,
 			// sit state 3, their own AI stood them up (sit 4) seconds after the package was released at the trip start, and they fell
 			// out in mid-air; the 2026-10-28 runs saw the same wish to dismount right after each trip start).
-			if (j.cmd && p != Phase::Boarding && !(j.coldStart && p == Phase::Following)) pilotquest::Release(j.pilot - 1);
+			if (j.cmd && p != Phase::Boarding && !(j.coldStart && p == Phase::Following) && !keepTrafficSeat) pilotquest::Release(j.pilot - 1);
 			if (p == Phase::Idle) {
 				j.scheduledTraffic = false;
 				j.gang = false;
@@ -2530,7 +2552,7 @@ namespace npcvehicles
             j.aiAt=now;const auto pos=At<game::Vec3>(vehicle,off::kRefPosition);
             situation.me.id=j.vehicle;situation.me.unit.body.pos={pos.x,pos.y,pos.z};
             situation.me.unit.body.heading=At<game::Vec3>(vehicle,off::kRefRotation).z;
-            static thread_local world::Snapshot snap;if(world::Vehicles(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].formId==j.vehicle){const auto&v=snap.v[k];situation.me.unit.body.vel={v.vel[0],v.vel[1],v.vel[2]};situation.me.unit.mass=v.mass;situation.me.unit.body.radius=std::hypot(v.half[0],v.half[1]);}
+            static thread_local world::Snapshot snap;if(world::VehiclesAndHeld(snap))for(unsigned k=0;k<snap.count&&k<world::kMaxVehicles;++k)if(snap.v[k].formId==j.vehicle){const auto&v=snap.v[k];situation.me.unit.body.vel={v.vel[0],v.vel[1],v.vel[2]};situation.me.unit.mass=v.mass;situation.me.unit.body.radius=std::hypot(v.half[0],v.half[1]);}
             situation.me.unit.maxSpeed=vehicleflight::CruiseLimit(j.vehicle);situation.me.turnRate=vehicleflight::TurnLimit(j.vehicle);
             situation.me.unit.health=vehiclehits::HealthShare(j.vehicle);situation.me.wrecked=vehiclehits::Wrecked(j.vehicle);
             situation.me.person=brain::PersonalityFor(TemperOf(npc),j.npc,Difficulty());
@@ -2557,7 +2579,7 @@ namespace npcvehicles
 		bool ParkSpot(std::uint32_t self, uptr player, double x, double y, double& ox, double& oy)
 		{
 			static world::Snapshot snap;
-			const bool have = world::Vehicles(snap);
+			const bool have = world::VehiclesAndHeld(snap);
 			const auto pp = player ? At<game::Vec3>(player, off::kRefPosition) : game::Vec3{};
 			const auto playerVehicle = player ? InVehicle(player) : 0;
 			const bool playerAboard = playerVehicle && At<std::uint32_t>(playerVehicle, off::kFormId) == self;
@@ -2791,7 +2813,8 @@ namespace npcvehicles
 				logger::Write("NPC vehicles: [%d] traffic cycle unavailable; parking normally", j.pilot);
 			}
 			// Flee (2026-10-20): a hostile vehicle (a pursuer) within kFleeNear -> drive kFleeDist away from it, then park.
-			const bool enemyDriver = player && HostileTo(npc, player);  // an enemy patrol / convoy: never flees from its own side, offers no rides
+			// Skip HostileTo engine query for scripted/parking traffic (task 9 / task 4) where enemyDriver is never used.
+			const bool enemyDriver = j.task != 4 && j.task != 9 && player && HostileTo(npc, player);  // an enemy patrol / convoy: never flees from its own side, offers no rides
 			// 2026-10-28 (03:24 run): a ring trip (task 9) fled from the other ring vehicle, became a "transit" that parked 310 m
 			// up; an addon's scripted trip never turns into a flight.
 			if (j.task != 4 && j.task != 9 && j.taskStep >= 0 && !enemyDriver) {
@@ -2919,8 +2942,30 @@ namespace npcvehicles
 				j.trafficDwell.Step(now, false);
 			}
 			else if (j.task == 9) {  // an addon's scripted trip (fvo_addon_api.h): the addon gives the goal each frame
-				FvoTripGoal tg{};
-				const int r = j.trip.step ? j.trip.step(j.trip.user, vp.x, vp.y, vp.z, &tg) : 1;
+				// Per-pilot throttle cache for scripted traffic trips (2026-11-23 perf pass):
+				// - While FleetRail owns a far car (>160 m), FleetRailStep drives it on its lane spline and PilotsTick
+				//   skips it, so we only refresh j.trip.step at 2 Hz (500 ms) to keep slot->seen fresh and skip RouteNav/PilotFly.
+				// - For near physical cars, PilotsTick runs at <=20 Hz (50 ms), so refreshing trip.step + RouteNav at
+				//   20 Hz (50 ms) keeps routeguidance (800 ms freshness) fresh while avoiding redundant 60+ Hz LaneProvider walks.
+				struct TripCache { std::uint32_t vehicle = 0; void* user = nullptr; ULONGLONG since = 0; ULONGLONG at = 0; bool wasRail = false; FvoTripGoal goal{}; };
+				static TripCache s_tripCache[kJobs + 1]{};
+				const bool onRail = vehicleflight::FleetRailActive(j.vehicle);
+				TripCache& tc = (j.pilot >= 1 && j.pilot <= kJobs) ? s_tripCache[j.pilot] : s_tripCache[0];
+				const bool cacheValid = tc.vehicle == j.vehicle && tc.user == j.trip.user && tc.since == j.since && tc.at != 0;
+				const ULONGLONG minInterval = onRail ? 500u : 50u;
+				const bool needStep = !cacheValid || (tc.wasRail && !onRail) || (now - tc.at >= minInterval);
+				FvoTripGoal tg = cacheValid ? tc.goal : FvoTripGoal{};
+				int r = 0;
+				if (needStep) {
+					r = j.trip.step ? j.trip.step(j.trip.user, vp.x, vp.y, vp.z, &tg) : 1;
+					if (r == 0) {
+						tc.vehicle = j.vehicle; tc.user = j.trip.user; tc.since = j.since; tc.at = now; tc.wasRail = onRail; tc.goal = tg;
+					} else {
+						tc = {};
+					}
+				} else {
+					tc.wasRail = onRail;
+				}
 #ifndef FVO_RELEASE
                 if (j.factoryLease && r != 0) {
                     EndJobOf(j.vehicle, "factory private route ended");
@@ -2936,6 +2981,14 @@ namespace npcvehicles
 					j.repeatTraffic = trafficcycle::Repeat(r) && g_trafficCycle;
 					return;
 				}
+				if (onRail) {
+					// Keep routeguidance fresh at 2 Hz while on FleetRail so exiting into < 140 m never hits expired_lane_command.
+					if (needStep) {
+						vcontract::NavParams dummyNav{};
+						vehicleflight::RouteNav(j.pilot, j.trip.user, tg, dummyNav);
+					}
+					return;
+				}
 				g.x = tg.x; g.y = tg.y; g.z = tg.z; g.stop = tg.stop > 0 ? tg.stop : 6.0;
 				g.nav.passThrough = tg.passThrough != 0;
 #ifndef FVO_RELEASE
@@ -2945,7 +2998,18 @@ namespace npcvehicles
                     g.hold = true;
                 } else
 #endif
-                vehicleflight::RouteNav(j.pilot,j.trip.user,tg,g.nav);
+                if (needStep) {
+                    vehicleflight::RouteNav(j.pilot,j.trip.user,tg,g.nav);
+                } else {
+                    const auto* lane = routeguidance::Get(j.pilot, now);
+                    if (lane) {
+                        g.nav.trafficLane = true;
+                        g.nav.travel = lane->travel == 1 ? travelmode::Default::Drive : lane->travel == 2 ? travelmode::Default::Hover : travelmode::Default::Auto;
+                        g.nav.priority = lane->priority;
+                    } else {
+                        vehicleflight::RouteNav(j.pilot,j.trip.user,tg,g.nav);
+                    }
+                }
 #ifndef FVO_RELEASE
                 if (j.factoryLease && !j.factoryStock) {
                     const auto* lane = routeguidance::Get(j.pilot, GetTickCount64());
@@ -3658,7 +3722,7 @@ namespace npcvehicles
 						"pilot %s (last end: %s); pitch %.0f roll %.0f deg", j.pilot, (now - j.watchAt) / 1000.0, j.npc, j.vehicle, base ? At<std::uint32_t>(base, off::kFormId) : 0,
 						vp.x, vp.y, vp.z, Name(j.phase), kProfiles[int(j.profile)].name, j.foe, foe && Dead(foe) ? " (dead)" : "", foe ? Dist(vehicle, foe) : -1.0, toPlayer,
 						vehicleflight::PilotActive(j.pilot) ? "flying" : "OFF", vehicleflight::PilotEndReason(j.pilot) ? vehicleflight::PilotEndReason(j.pilot) : "-", rot.x * 57.29578, rot.y * 57.29578);
-					if (j.task == 9 && j.trip.step &&
+					if (j.task == 9 && j.trip.step && toPlayer <= 250.0 &&
 #ifndef FVO_RELEASE
                         !j.factoryLease &&
 #endif
@@ -6990,8 +7054,16 @@ namespace npcvehicles
 				if (barVeh) std::snprintf(barName, sizeof(barName), "%s", BaseName(barVeh)[0] ? BaseName(barVeh) : "Vehicle");
 				hoverui::SetVehicleBar(barName, barVeh ? vehiclehits::HealthShare(barId) : 0.0f);
 			}
+			uptr hudGang[32];
+			const int hudGangN = Followers(player, hudGang, 32);
+			archproof::State().hudFollowerCacheUses.fetch_add(1, std::memory_order_relaxed);
+			auto inHudGang = [&](uptr a) {
+				if (!a) return false;
+				for (int gi = 0; gi < hudGangN; ++gi) if (hudGang[gi] == a) return true;
+				return false;
+			};
 			for (const auto& j : g_jobs) {
-				if (j.phase == Phase::Idle || !IsFollower(player,RefById(j.npc)) || nr >= hoverui::kMaxRows) continue;
+				if (j.phase == Phase::Idle || j.task == 9 || nr >= hoverui::kMaxRows || !hudGangN || !inHudGang(RefById(j.npc))) continue;
 				const uptr v = RefById(j.vehicle);
 				char name[40] = "";
 				ActorName(RefById(j.npc), j.npc, name, sizeof(name));  // who, not which vehicle
@@ -7792,7 +7864,7 @@ namespace npcvehicles
 		const std::uint32_t vehId = At<std::uint32_t>(vehicle, off::kFormId), npcId = At<std::uint32_t>(actor, off::kFormId);
 		static thread_local world::Snapshot trafficWorld;
 		bool bodyReady=false;
-		if(world::Vehicles(trafficWorld))for(unsigned i=0;i<trafficWorld.count;++i)if(trafficWorld.v[i].formId==vehId&&trafficpair::Body(trafficWorld.v[i].bodyId)){bodyReady=true;break;}
+		if(world::VehiclesAndHeld(trafficWorld))for(unsigned i=0;i<trafficWorld.count;++i)if(trafficWorld.v[i].formId==vehId&&trafficpair::Body(trafficWorld.v[i].bodyId)){bodyReady=true;break;}
 		if(!bodyReady)return "the vehicle has no live chassis in this world";
 		if (Busy(vehId)) return "the vehicle already has an NPC job";
 		if (Busy(npcId)) return "the driver already has an NPC job";
